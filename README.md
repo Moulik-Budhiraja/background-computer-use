@@ -30,6 +30,8 @@ args = ["mcp"]
 
 The MCP server's instructions tell the agent how to work: open a window of the app (or the default browser) on its display, read it with `get_window_state`, act on numbered elements, release windows at the end, and hand off to you when it needs you.
 
+After the first read of a window, `get_window_state` lists only what changed, and an element keeps its number for as long as it exists. Right after an action it waits up to 3 s for the window to settle. `batch` runs a list of actions in one call (say, click the address bar, type a URL, press Return), stops at the first failure, and returns the changes at the end, so the agent makes fewer round trips to the model.
+
 For debugging: `bcu call <tool> '{json}'`, `bcu status`, `bcu tools`.
 
 ## How it stays out of your way

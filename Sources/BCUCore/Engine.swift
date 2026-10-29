@@ -27,6 +27,8 @@ public final class Engine {
     private let queue = DispatchQueue(label: "bcu.engine")
     private let stateLock = NSLock()
     private var snapshots: [CGWindowID: AXSnapshotResult] = [:]
+    /// When the agent last acted on each window, so a state read can wait for it to settle.
+    private var lastActionMs: [CGWindowID: Double] = [:]
     private var enhancedPids: Set<pid_t> = []
     private var _activity: [ActivityItem] = []
     private var _paused = false
@@ -198,12 +200,22 @@ public final class Engine {
         case "click", "perform_action": return "Clicking"
         case "type_text", "set_value": return "Typing"
         case "press_key": return "Pressing keys"
+        case "batch": return "Working"
         case "scroll": return "Scrolling"
         default: return "Working"
         }
     }
 
     private func run(tool: String, args: Args) throws -> ToolResult {
+        defer {
+            if Self.batchable.contains(tool), tool != "wait", let id = args.int("window_id") {
+                lastActionMs[CGWindowID(id)] = nowMs()
+            }
+        }
+        return try dispatch(tool: tool, args: args)
+    }
+
+    private func dispatch(tool: String, args: Args) throws -> ToolResult {
         switch tool {
         case "status": return status(args)
         case "list_apps": return listApps()
@@ -224,6 +236,7 @@ public final class Engine {
         case "handoff": return try handoff(args)
         case "take_back": return try takeBack(args)
         case "guard_report": return guardReport()
+        case "batch": return try batch(args)
         // Maintenance, not in the agent tool catalog.
         case "admin_close_window":
             return ToolResult(text: windows.closeAny(CGWindowID(try args.requireInt("window_id"))) ? "closed" : "failed")
@@ -534,18 +547,122 @@ public final class Engine {
             AX.set(AX.app(w.pid), "AXEnhancedUserInterface", kCFBooleanTrue)
             if fresh { sleepMs(300) }
         }
-        let popups = popupWindows(of: w, frame: AX.frame(ax))
-        var snap = AXSnapshot.take(window: ax, windowID: w.id, title: title, appName: w.appName, pid: w.pid, maxElements: maxElements, popups: popups)
+        let previous = snapshots[w.id]
+        func take() -> AXSnapshotResult {
+            let popups = popupWindows(of: w, frame: AX.frame(ax))
+            return AXSnapshot.take(window: ax, windowID: w.id, title: AX.string(ax, "AXTitle") ?? title, appName: w.appName, pid: w.pid,
+                                   maxElements: maxElements, popups: popups, previous: previous)
+        }
+        var snap = take()
         if fresh && snap.nodes.count < 12 {
             sleepMs(700)
-            snap = AXSnapshot.take(window: ax, windowID: w.id, title: title, appName: w.appName, pid: w.pid, maxElements: maxElements, popups: popups)
+            snap = take()
+        }
+        // Right after an action, wait for the window to settle: no web area
+        // loading, and nothing changing for 400 ms. Up to 5 s from the action.
+        if let acted = lastActionMs[w.id], nowMs() - acted < 5000 {
+            let deadline = acted + 5000
+            let earliest = acted + 400
+            if nowMs() < earliest { sleepMs(earliest - nowMs()); snap = take() }
+            var stableSince = nowMs()
+            while nowMs() < deadline {
+                if !isLoading(snap) && nowMs() - stableSince >= 400 { break }
+                sleepMs(130)
+                let again = take()
+                if again.text != snap.text { stableSince = nowMs() }
+                snap = again
+            }
+            lastActionMs[w.id] = nil
         }
         snapshots[w.id] = snap
         var images: [ToolImage] = []
         if args.bool("screenshot") ?? true, let img = try? Capture.windowInPoints(w.id, display: display.bounds), let png = pngImage(img) {
             images.append(png)
         }
-        return ToolResult(text: snap.text, images: images)
+        let full = args.bool("full") ?? false
+        if !full, let previous, let changes = AXSnapshot.diff(from: previous, to: snap) {
+            return ToolResult(text: changes, images: images)
+        }
+        var text = snap.text
+        if snap.renumbered { text += "\n(Most elements are new, so numbering restarted; numbers from earlier reads no longer apply.)" }
+        return ToolResult(text: text, images: images)
+    }
+
+    /// A web area in the snapshot is still loading (the standard AXLoaded,
+    /// AXLoadingProgress and AXElementBusy attributes).
+    private func isLoading(_ snap: AXSnapshotResult) -> Bool {
+        snap.nodes.values.contains { n in
+            guard n.role == "AXWebArea" else { return false }
+            if AX.bool(n.element, "AXLoaded") == false { return true }
+            if AX.bool(n.element, "AXElementBusy") == true { return true }
+            if let p = AX.double(n.element, "AXLoadingProgress"), p < 1 { return true }
+            return false
+        }
+    }
+
+    // MARK: Batch
+
+    private static let batchable: Set<String> = ["click", "set_value", "perform_action", "type_text", "press_key",
+                                                 "scroll", "drag", "press_menu_item", "wait"]
+
+    /// Run several actions on a window in one call, in order, stopping at the
+    /// first failure, then optionally read the window's state once.
+    private func batch(_ args: Args) throws -> ToolResult {
+        guard let steps = args.raw["actions"] as? [JSONObject], !steps.isEmpty else {
+            throw ToolError("`actions` must be a non-empty array of objects like {\"tool\": \"click\", \"element\": 4}")
+        }
+        if steps.count > 40 { throw ToolError("at most 40 actions per batch") }
+        let defaultWindow = args.int("window_id")
+        // Check every step before running any.
+        for (i, step) in steps.enumerated() {
+            guard let tool = step["tool"] as? String else { throw ToolError("action \(i + 1) has no `tool`") }
+            guard Self.batchable.contains(tool) else {
+                throw ToolError("action \(i + 1): `\(tool)` can't be batched. Allowed: \(Self.batchable.sorted().joined(separator: ", ")). Read state with the batch's `state` option.")
+            }
+            if tool != "wait" && step["window_id"] == nil && defaultWindow == nil {
+                throw ToolError("action \(i + 1) needs a window_id (or set window_id on the batch)")
+            }
+        }
+        var lines: [String] = []
+        var lastWindow = defaultWindow
+        var failed = false
+        for (i, step) in steps.enumerated() {
+            let tool = step["tool"] as! String
+            var stepArgs = step
+            stepArgs["tool"] = nil
+            if stepArgs["window_id"] == nil, let d = defaultWindow { stepArgs["window_id"] = d }
+            if let wid = Args(stepArgs).int("window_id") { lastWindow = wid }
+            if tool == "wait" {
+                let ms = min(max(Args(stepArgs).double("ms") ?? 500, 0), 5000)
+                sleepMs(ms)
+                lines.append("\(i + 1). wait: \(Int(ms)) ms")
+                continue
+            }
+            do {
+                let r = try run(tool: tool, args: Args(stepArgs))
+                lines.append("\(i + 1). \(tool): \(r.text.split(separator: "\n").first.map(String.init) ?? "done")")
+            } catch {
+                lines.append("\(i + 1). \(tool) FAILED: \(error)")
+                if i + 2 == steps.count { lines.append("Stopped; action \(i + 2) didn't run.") }
+                if i + 2 < steps.count { lines.append("Stopped; actions \(i + 2)–\(steps.count) didn't run.") }
+                failed = true
+                break
+            }
+        }
+        var images: [ToolImage] = []
+        if args.bool("state") ?? true, let wid = lastWindow, windows.window(CGWindowID(wid)) != nil {
+            var stateArgs: JSONObject = ["window_id": wid, "screenshot": args.bool("screenshot") ?? false]
+            if let full = args.bool("full") { stateArgs["full"] = full }
+            if let m = args.int("max_elements") { stateArgs["max_elements"] = m }
+            if let state = try? getWindowState(Args(stateArgs)) {
+                lines.append("")
+                lines.append(state.text)
+                images = state.images
+            }
+        }
+        var result = ToolResult(text: lines.joined(separator: "\n"), images: images)
+        if failed { result.isError = true }
+        return result
     }
 
     /// The app's other accessibility windows that aren't standard windows and

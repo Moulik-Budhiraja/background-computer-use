@@ -442,19 +442,21 @@ public final class WindowManager {
     }
 
     private var sweeping = false
-    private var fitTries: [CGWindowID: Int] = [:]
+    private var fitTries: [CGWindowID: (count: Int, lastMs: Double)] = [:]
     private var seenOnAgent: [CGWindowID: Double] = [:]
 
     /// Shrink and shift an agent window that sticks out past the agent
     /// display's edge (apps can undo the first resize while a new window
-    /// settles). Gives up after a few tries so an app that refuses isn't
-    /// resized every sweep.
+    /// settles, or animate from their old size). Tries at most every 300 ms,
+    /// so an animation can finish, and gives up after 5 tries so an app that
+    /// refuses isn't resized every sweep.
     private func fitInside(_ w: AgentWindow, frame: CGRect) {
         lock.lock()
-        let tries = fitTries[w.id, default: 0]
-        fitTries[w.id] = tries + 1
+        let prior = fitTries[w.id] ?? (0, -1e12)
+        let due = prior.count < 5 && nowMs() - prior.lastMs >= 300
+        if due { fitTries[w.id] = (prior.count + 1, nowMs()) }
         lock.unlock()
-        guard tries < 5, let ax = AX.window(pid: w.pid, id: w.id) else { return }
+        guard due, let ax = AX.window(pid: w.pid, id: w.id) else { return }
         let b = display.bounds
         let inset: CGFloat = 24
         let size = CGSize(width: min(frame.width, b.width - inset * 2), height: min(frame.height, b.height - inset * 2 - 30))

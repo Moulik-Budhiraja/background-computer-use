@@ -12,7 +12,10 @@ public enum ToolCatalog {
     2. `open_window` opens a new window of an app on your display (for a browser, a new window in the \
     user's own profile). Use `borrow_window` only for single-window apps.
     3. `get_window_state` returns the window's accessibility tree with numbered elements and a screenshot. \
-    Act on elements by number. Use x/y (window points, matching the screenshot pixels) only when no element fits.
+    Act on elements by number. Use x/y (window points, matching the screenshot pixels) only when no element fits. \
+    An element keeps its number for as long as it exists. After the first read, `get_window_state` lists only \
+    what changed (- removed, + added, ~ changed); pass full=true when you need the whole list again. Right \
+    after an action it waits (up to 3 s) for the window to settle, so you don't need to sleep.
     4. Prefer `click` on an element and `set_value`: they work through accessibility. `type_text`, \
     `press_key` and pixel clicks make your window its app's key window for a few milliseconds and then hand \
     key focus straight back; this works even while the user is using the same app (the user's input is held \
@@ -20,7 +23,9 @@ public enum ToolCatalog {
     Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's \
     elements in `get_window_state`; click their rows by number. In a browser, to go to a URL: click the \
     address bar, then `type_text` the URL followed by "\\n".
-    5. Check the result with `get_window_state` after each meaningful step.
+    5. When you already know the next few steps (fill a form and submit, type a URL and press Return), send \
+    them in one `batch` call: it runs them in order, stops at the first failure, and returns the window's \
+    state at the end. Otherwise check the result with `get_window_state` after each meaningful step.
     6. When finished, `release_window` every window you opened or borrowed.
     7. If you need the user (a login, 2FA, a decision), call `handoff` with a reason and stop.
     Never ask the user to watch or click on your display. Never use other tools that take over the screen.
@@ -50,9 +55,10 @@ public enum ToolCatalog {
               "keep_open": prop("boolean", "Leave an opened window open on your display instead of closing it.")],
              required: ["window_id"]),
         tool("get_window_state",
-             "Accessibility tree of your window with numbered elements, plus a screenshot. Element numbers stay valid until the next get_window_state for that window.",
+             "Accessibility tree of your window with numbered elements, plus a screenshot. An element keeps its number while it exists. After the first read of a window this lists only what changed since your last read (- removed, + added, ~ changed) unless you pass full=true; when most elements are new (another page) it lists everything and numbering restarts. Waits for the window to settle after an action.",
              ["window_id": prop("integer", "Your window."),
               "screenshot": prop("boolean", "Include a screenshot (default true)."),
+              "full": prop("boolean", "List every element instead of the changes (default false)."),
               "max_elements": prop("integer", "Cap on listed elements (default 250).")],
              required: ["window_id"]),
         tool("screenshot",
@@ -120,6 +126,14 @@ public enum ToolCatalog {
              "Move a handed-off window back onto your display once the user is done.",
              ["window_id": prop("integer", "Your window.")],
              required: ["window_id"]),
+        tool("batch",
+             "Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {\"tool\": \"click\", \"element\": 6}, {\"tool\": \"type_text\", \"text\": \"example.com\\n\"}, {\"tool\": \"wait\", \"ms\": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, wait. Element numbers refer to your last get_window_state.",
+             ["window_id": prop("integer", "Window for every action that doesn't set its own window_id."),
+              "actions": ["type": "array", "items": ["type": "object"], "description": "Up to 40 actions: {\"tool\": name, ...that tool's arguments}."] as JSONObject,
+              "state": prop("boolean", "Read the window's state after the actions (default true)."),
+              "screenshot": prop("boolean", "Include a screenshot with that state (default false)."),
+              "full": prop("boolean", "List every element in that state instead of the changes (default false).")],
+             required: ["actions"]),
         tool("guard_report",
              "Focus-guard events: anything that touched the user's focus, cursor or screen, with the action that caused it.",
              [:]),

@@ -13,8 +13,19 @@ public struct AXNode {
 public struct AXSnapshotResult {
     public let windowID: CGWindowID
     public let nodes: [Int: AXNode]
+    /// The full listing: header, every element line, footer.
     public let text: String
     public let visited: Int
+    let header: String
+    let footer: [String]
+    /// Each element's line (indent, number, description) by element number.
+    let lines: [Int: String]
+    let indexByElement: [AXUIElement: Int]
+    /// Numbered elements still in the window but past max_elements this time.
+    let unlisted: Set<Int>
+    let nextIndex: Int
+    /// True when numbering restarted at 1, so numbers from the last read mean nothing.
+    public let renumbered: Bool
 }
 
 /// Walks a window's accessibility tree and lists the elements worth acting on.
@@ -72,10 +83,17 @@ public enum AXSnapshot {
         return raw
     }
 
-    public static func take(window: AXUIElement, windowID: CGWindowID, title: String, appName: String, pid: pid_t, maxElements: Int = 250, popups: [AXUIElement] = []) -> AXSnapshotResult {
+    /// Element numbers carry over from `previous`: an element still there keeps
+    /// its number and new elements get new ones, so a diff between two reads
+    /// is meaningful. When most elements are new (another page), numbering
+    /// restarts at 1.
+    public static func take(window: AXUIElement, windowID: CGWindowID, title: String, appName: String, pid: pid_t, maxElements: Int = 250, popups: [AXUIElement] = [], previous: AXSnapshotResult? = nil) -> AXSnapshotResult {
         let windowFrame = AX.frame(window) ?? .zero
-        var nodes: [Int: AXNode] = [:]
-        var lines: [String] = []
+        // Collected first and numbered after the walk. `element` is nil for a
+        // plain text line (the popup heading).
+        struct Entry { let element: AXUIElement?; let indent: String; let body: String; let node: (String, CGRect, [String], Bool)? }
+        var entries: [Entry] = []
+        var overflow: [AXUIElement] = []
         var visited = 0
         var listed = 0
         var skippedOffscreen = 0
@@ -101,13 +119,12 @@ public enum AXSnapshot {
                     skippedOffscreen += 1
                 } else if listed >= maxElements {
                     truncated = true
+                    overflow.append(el)
                 } else {
                     listed += 1
-                    let idx = listed
                     let actions = AX.actions(el)
                     let settable = AX.isSettable(el, "AXValue")
-                    nodes[idx] = AXNode(index: idx, element: el, role: raw.role, frame: f, actions: actions, valueSettable: settable)
-                    var line = String(repeating: "  ", count: min(indent, 12)) + "[\(idx)] \(raw.role.replacingOccurrences(of: "AX", with: ""))"
+                    var line = raw.role.replacingOccurrences(of: "AX", with: "")
                     if !raw.subrole.isEmpty && raw.subrole != "AXUnknown" { line += "(\(raw.subrole.replacingOccurrences(of: "AX", with: "")))" }
                     if !label.isEmpty { line += " \"\(clean(label))\"" }
                     if !raw.value.isEmpty && raw.value != label { line += " value=\"\(clean(raw.value, 160))\"" }
@@ -125,7 +142,7 @@ public enum AXSnapshot {
                         .map { $0.replacingOccurrences(of: "AX", with: "").lowercased() }
                     if !acts.isEmpty { flags.append(acts.joined(separator: ",")) }
                     if !flags.isEmpty { line += " [\(flags.joined(separator: " "))]" }
-                    lines.append(line)
+                    entries.append(Entry(element: el, indent: String(repeating: "  ", count: min(indent, 12)), body: line, node: (raw.role, f, actions, settable)))
                     childIndent = indent + 1
                 }
             }
@@ -137,15 +154,82 @@ public enum AXSnapshot {
         // separate windows; list them after it so their rows can be pressed.
         for popup in popups {
             bounds = AX.frame(popup) ?? windowFrame
-            lines.append("Popup over this window:")
+            entries.append(Entry(element: nil, indent: "", body: "Popup over this window:", node: nil))
             walk(popup, depth: 0, indent: 1)
         }
+        // Number the elements.
+        let elements = entries.compactMap(\.element)
+        let matched = previous.map { prev in elements.filter { prev.indexByElement[$0] != nil }.count } ?? 0
+        let renumber = previous == nil || elements.isEmpty || Double(matched) < 0.4 * Double(elements.count)
+        var next = renumber ? 1 : previous!.nextIndex
+        var used = Set<Int>()
+        var nodes: [Int: AXNode] = [:]
+        var lineByIndex: [Int: String] = [:]
+        var indexByElement: [AXUIElement: Int] = [:]
+        var listing: [String] = []
+        for e in entries {
+            guard let el = e.element, let n = e.node else { listing.append(e.indent + e.body); continue }
+            var idx: Int
+            if !renumber, let old = previous!.indexByElement[el], !used.contains(old) {
+                idx = old
+            } else {
+                idx = next
+                next += 1
+            }
+            used.insert(idx)
+            let line = e.indent + "[\(idx)] " + e.body
+            nodes[idx] = AXNode(index: idx, element: el, role: n.0, frame: n.1, actions: n.2, valueSettable: n.3)
+            lineByIndex[idx] = line
+            indexByElement[el] = idx
+            listing.append(line)
+        }
+
+        // Elements pushed past max_elements keep their numbers for when
+        // they're listed again, and aren't reported as removed.
+        var unlisted = Set<Int>()
+        if !renumber, let prev = previous {
+            for el in overflow {
+                if let old = prev.indexByElement[el], !used.contains(old) {
+                    used.insert(old)
+                    indexByElement[el] = old
+                    unlisted.insert(old)
+                }
+            }
+        }
+
         var header = "Window \(windowID) \"\(clean(title, 80))\" of \(appName) (pid \(pid)), \(Int(windowFrame.width))x\(Int(windowFrame.height)) points. Coordinates are window-relative points; the screenshot is 1 pixel per point."
         if listed == 0 { header += "\nNo accessible elements found. Use the screenshot and x/y clicks." }
         var footer: [String] = []
         if truncated { footer.append("(more elements not listed; raise max_elements or scroll)") }
         if skippedOffscreen > 0 { footer.append("(\(skippedOffscreen) elements scrolled out of view not listed)") }
-        let text = ([header] + lines + footer).joined(separator: "\n")
-        return AXSnapshotResult(windowID: windowID, nodes: nodes, text: text, visited: visited)
+        let text = ([header] + listing + footer).joined(separator: "\n")
+        return AXSnapshotResult(windowID: windowID, nodes: nodes, text: text, visited: visited, header: header, footer: footer,
+                                lines: lineByIndex, indexByElement: indexByElement, unlisted: unlisted, nextIndex: next, renumbered: renumber && previous != nil)
+    }
+
+    /// What changed between two reads of the same window, or nil when the
+    /// full listing is the better answer (renumbered, or most lines changed).
+    public static func diff(from old: AXSnapshotResult, to new: AXSnapshotResult) -> String? {
+        if new.renumbered { return nil }
+        let order = new.lines.keys.sorted()
+        let added = order.filter { old.lines[$0] == nil }
+        let changed = order.filter { old.lines[$0] != nil && old.lines[$0] != new.lines[$0] }
+        let removed = old.lines.keys.sorted().filter { new.lines[$0] == nil && !new.unlisted.contains($0) }
+        let pushedOut = old.lines.keys.filter { new.unlisted.contains($0) }.count
+        let touched = added.count + changed.count + removed.count
+        if touched > max(20, new.lines.count / 2) { return nil }
+        var out = [new.header]
+        if touched == 0 {
+            out.append("No changes since your last get_window_state of this window.")
+        } else {
+            out.append("Changes since your last get_window_state of this window. The other \(new.lines.count - added.count - changed.count) elements are unchanged and keep their numbers; pass full=true for the whole list.")
+            let trim: (String) -> String = { $0.trimmingCharacters(in: .whitespaces) }
+            for i in removed { out.append("- " + trim(old.lines[i]!)) }
+            for i in added { out.append("+ " + trim(new.lines[i]!)) }
+            for i in changed { out.append("~ " + trim(new.lines[i]!)) }
+        }
+        if pushedOut > 0 { out.append("(\(pushedOut) elements from your last read are still there but past max_elements now; they keep their numbers)") }
+        out += new.footer
+        return out.joined(separator: "\n")
     }
 }

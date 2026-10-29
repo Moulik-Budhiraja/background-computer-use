@@ -27,6 +27,10 @@ public enum AX {
         (attr(el, name) as? NSNumber)?.boolValue
     }
 
+    public static func double(_ el: AXUIElement, _ name: String) -> Double? {
+        (attr(el, name) as? NSNumber)?.doubleValue
+    }
+
     public static func element(_ el: AXUIElement, _ name: String) -> AXUIElement? {
         guard let v = attr(el, name), CFGetTypeID(v) == AXUIElementGetTypeID() else { return nil }
         return unsafeBitCast(v, to: AXUIElement.self)
