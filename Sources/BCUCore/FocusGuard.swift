@@ -186,7 +186,7 @@ public final class FocusGuard {
     // MARK: Front monitor
 
     private var monitorDepth = 0
-    private var monitorLog: [(ms: Double, pid: pid_t)] = []
+    private var monitorLog: [(ms: Double, pid: pid_t, agent: Bool)] = []
     private var monitorStartMs = 0.0
 
     /// Sample the front process every 5 ms until `stopMonitor`, so each action
@@ -196,7 +196,7 @@ public final class FocusGuard {
         monitorDepth += 1
         let first = monitorDepth == 1
         if first {
-            monitorLog = [(0, BCUFrontProcessPID())]
+            monitorLog = [(0, BCUFrontProcessPID(), false)]
             monitorStartMs = nowMs()
         }
         lock.unlock()
@@ -210,12 +210,13 @@ public final class FocusGuard {
                 if !active { break }
                 let pid = BCUFrontProcessPID()
                 if pid != last {
+                    let agent = pid != 0 && pid != self.userFront && self.agentCaused(pid)
                     self.lock.lock()
-                    self.monitorLog.append((nowMs() - self.monitorStartMs, pid))
+                    self.monitorLog.append((nowMs() - self.monitorStartMs, pid, agent))
                     self.lock.unlock()
                     // Restore here rather than waiting for NSWorkspace's
                     // notification, which arrives ~25 ms later.
-                    if pid != 0 && pid != self.userFront && self.agentCaused(pid) {
+                    if agent {
                         self.restoreUserFront(reason: "self-activation", immediate: true)
                     }
                 }
@@ -234,7 +235,9 @@ public final class FocusGuard {
         monitorDepth = max(0, monitorDepth - 1)
         let log = monitorLog
         lock.unlock()
-        guard log.count > 1 else { return nil }
+        // Report only when the agent caused a change; the user's own app
+        // switches during an action aren't news.
+        guard log.count > 1, log.contains(where: { $0.agent }) else { return nil }
         func name(_ pid: pid_t) -> String { NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)" }
         var parts: [String] = []
         for (i, entry) in log.enumerated() where i > 0 {
