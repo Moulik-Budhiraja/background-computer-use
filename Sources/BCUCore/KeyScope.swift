@@ -17,21 +17,29 @@ public final class KeyScope {
     public let target: CGWindowID
     public let previous: CGWindowID?
     public let primed: Prime
+    /// The app counted itself inactive before (no AppKit key window at all).
+    private let wasInactive: Bool
     private var exited = false
 
     private static let settleMs: Double = 120
 
-    private init(pid: pid_t, target: CGWindowID, previous: CGWindowID?, primed: Prime) {
+    private init(pid: pid_t, target: CGWindowID, previous: CGWindowID?, primed: Prime, wasInactive: Bool) {
         self.pid = pid
         self.target = target
         self.previous = previous
         self.primed = primed
+        self.wasInactive = wasInactive
     }
 
     public static func enter(pid: pid_t, window target: CGWindowID) throws -> KeyScope {
         let previous = AX.focusedWindowID(pid)
-        if previous == target && AX.focusedElementWindowID(pid) != nil {
-            return KeyScope(pid: pid, target: target, previous: previous, primed: .alreadyKey)
+        // AXFocusedWindow keeps naming the last key window after the app goes
+        // inactive, when AppKit has no key window at all and keys sent to the
+        // app land nowhere (and make it beep). AXFrontmost is AppKit's own
+        // "active" flag, so trust the shortcut only when it's set.
+        let active = AX.bool(AX.app(pid), "AXFrontmost") == true
+        if active && previous == target && AX.focusedElementWindowID(pid) != nil {
+            return KeyScope(pid: pid, target: target, previous: previous, primed: .alreadyKey, wasInactive: false)
         }
         // First try is quick (5 ms between records): fast enough that the
         // user's window never repaints as inactive. The second uses cua's settle.
@@ -39,7 +47,7 @@ public final class KeyScope {
             if postRecords(pid: pid, from: previous, to: target, settle: settle) {
                 awaitKey(pid: pid, target: target, budgetMs: settle < 50 ? 250 : 400)
                 if AX.focusedWindowID(pid) == target {
-                    return KeyScope(pid: pid, target: target, previous: previous, primed: .records)
+                    return KeyScope(pid: pid, target: target, previous: previous, primed: .records, wasInactive: !active)
                 }
             }
         }
@@ -47,7 +55,7 @@ public final class KeyScope {
            AX.set(AX.app(pid), "AXFocusedWindow", window) == .success {
             awaitKey(pid: pid, target: target, budgetMs: 200)
             if AX.focusedWindowID(pid) == target {
-                return KeyScope(pid: pid, target: target, previous: previous, primed: .axFocus)
+                return KeyScope(pid: pid, target: target, previous: previous, primed: .axFocus, wasInactive: !active)
             }
         }
         throw ToolError("could not make window \(target) the app's key window without activating it (the app's key window is \(previous.map(String.init) ?? "none")), so no keys were sent. Use accessibility actions (set_value, click on an element) instead.")
@@ -57,7 +65,14 @@ public final class KeyScope {
     public func exit() {
         guard !exited else { return }
         exited = true
-        guard primed != .alreadyKey, let previous, previous != target else { return }
+        guard primed != .alreadyKey else { return }
+        // The app had no key window before: resign key so it goes back to
+        // counting itself inactive, instead of handing key to `previous`.
+        if wasInactive && primed == .records {
+            _ = BCUPostFocusRecord(pid, target, false)
+            return
+        }
+        guard let previous, previous != target else { return }
         // Only restore to a window that still exists.
         guard WindowList.info(previous) != nil else { return }
         switch primed {
