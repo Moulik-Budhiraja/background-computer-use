@@ -13,9 +13,13 @@ public enum ToolCatalog {
     user's own profile). Use `borrow_window` only for single-window apps.
     3. `get_window_state` returns the window's accessibility tree with numbered elements and a screenshot. \
     Act on elements by number. Use x/y (window points, matching the screenshot pixels) only when no element fits.
-    4. Prefer `set_value` and `click` on an element: they work through accessibility and never touch \
-    keyboard focus. `type_text`, `press_key` and pixel clicks briefly make your window the app's key window, \
-    so if the user is using that same app they wait until the user switches away.
+    4. Prefer `click` on an element and `set_value`: they work through accessibility. `type_text`, \
+    `press_key` and pixel clicks make your window its app's key window for a few milliseconds and then hand \
+    key focus straight back; this works even while the user is using the same app (the user's input is held \
+    for that moment and replayed). Long text is typed in short bursts when the user shares the app.
+    Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's \
+    elements in `get_window_state`; click their rows by number. In a browser, to go to a URL: click the \
+    address bar, then `type_text` the URL followed by "\\n".
     5. Check the result with `get_window_state` after each meaningful step.
     6. When finished, `release_window` every window you opened or borrowed.
     7. If you need the user (a login, 2FA, a decision), call `handoff` with a reason and stop.
@@ -76,13 +80,13 @@ public enum ToolCatalog {
               "action": prop("string", "Action name from the element's action list.")],
              required: ["window_id", "element", "action"]),
         tool("type_text",
-             "Type text into your window. With `element`, that element is focused first. Uses accessibility insertion when it works, otherwise keystrokes (which wait if the user is in the same app).",
+             "Type text into your window. With `element`, that element is focused first. Uses accessibility insertion when it works, otherwise keystrokes.",
              ["window_id": prop("integer", "Your window."),
               "text": prop("string", "Text to type. \\n presses Return."),
               "element": prop("integer", "Optional element to focus first.")],
              required: ["window_id", "text"]),
         tool("press_key",
-             "Press a key or shortcut in your window, e.g. key \"return\", or key \"l\" with modifiers [\"cmd\"]. Waits if the user is in the same app.",
+             "Press a key or shortcut in your window, e.g. key \"return\", or key \"l\" with modifiers [\"cmd\"].",
              ["window_id": prop("integer", "Your window."),
               "key": prop("string", "Key name: a letter or digit, return, tab, space, escape, delete, forward_delete, up, down, left, right, home, end, page_up, page_down, f1-f12, or a punctuation character."),
               "modifiers": ["type": "array", "items": ["type": "string"], "description": "Any of cmd, shift, option, ctrl, fn."] as JSONObject],

@@ -28,6 +28,10 @@ public final class FocusGuard {
     private var lastUserKeyMs = 0.0
     private var holding = false
     private var held: [CGEvent] = []
+    /// Nesting count of key-window swaps in progress (see `beginHold`).
+    private var swapHolds = 0
+    /// Replaying held events; anything new queues behind them to keep order.
+    private var draining = false
     private var restoring = false
     private var tap: CFMachPort?
     private let restoreQueue = DispatchQueue(label: "bcu.guard.restore")
@@ -67,7 +71,7 @@ public final class FocusGuard {
     public func installTap() {
         guard tap == nil else { return }
         let types: [CGEventType] = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
-                                    .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel,
+                                    .leftMouseDown, .rightMouseDown, .otherMouseDown, .leftMouseUp, .rightMouseUp, .otherMouseUp, .scrollWheel,
                                     .keyDown, .keyUp, .flagsChanged]
         let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
         guard let port = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
@@ -292,17 +296,13 @@ public final class FocusGuard {
                 Log.info("guard: restore (\(reason)) setFront=\(status) call \(Int(t1 - t0)) ms, front back after \(Int(nowMs() - t0)) ms")
             }
             self.lock.lock()
-            let replay = self.held
-            self.held.removeAll()
             self.holding = false
             self.restoring = false
+            let swapping = self.swapHolds > 0
             self.lock.unlock()
-            for e in replay {
-                e.setIntegerValueField(.eventSourceUserData, value: FocusGuard.replayMarker)
-                e.post(tap: .cghidEventTap)
-            }
-            if !replay.isEmpty {
-                self.record("held \(replay.count) of your key events during a focus change (\(reason)) and replayed them into your app")
+            if !swapping {
+                let n = self.drain()
+                if n > 0 { self.record("held \(n) of your key events during a focus change (\(reason)) and replayed them into your app") }
             }
         }
     }
@@ -326,10 +326,20 @@ public final class FocusGuard {
                 CGWarpMouseCursorPosition(q)
                 CGAssociateMouseAndMouseCursorPosition(1)
             }
+            if type != .mouseMoved {
+                lock.lock(); let pressHeld = held.contains { [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains($0.type) }; lock.unlock()
+                if pressHeld { hold(event); return nil }
+            }
             return event
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
-            lock.lock(); lastUserMouseDownMs = nowMs(); lock.unlock()
+            lock.lock(); lastUserMouseDownMs = nowMs(); let swapping = swapHolds > 0 || draining; lock.unlock()
             if display.isRunning && display.bounds.contains(event.location) { return nil }
+            // A click now would make the user's window key mid-swap; hold it.
+            if swapping { hold(event); return nil }
+            return event
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            lock.lock(); let swapping = swapHolds > 0 || draining || held.contains { [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains($0.type) }; lock.unlock()
+            if swapping { hold(event); return nil }
             return event
         case .scrollWheel:
             if display.isRunning && display.bounds.contains(event.location) { return nil }
@@ -342,7 +352,7 @@ public final class FocusGuard {
                 lock.unlock()
             }
             lock.lock()
-            let alreadyHolding = holding
+            let alreadyHolding = holding || swapHolds > 0 || draining
             let now = nowMs()
             let anyTaint = taints.values.contains { $0.until >= now }
             lock.unlock()
@@ -363,6 +373,45 @@ public final class FocusGuard {
         default:
             return event
         }
+    }
+
+    /// Hold the user's keys and clicks until `endHold`, then replay them in
+    /// order. Used while the agent briefly owns an app's key window, so
+    /// nothing the user types lands in the agent's window and no click of
+    /// theirs moves key focus mid-swap.
+    public func beginHold() {
+        lock.lock(); swapHolds += 1; lock.unlock()
+    }
+
+    public func endHold() {
+        lock.lock()
+        swapHolds = max(0, swapHolds - 1)
+        guard swapHolds == 0, !holding else { lock.unlock(); return }
+        lock.unlock()
+        let n = drain()
+        if n > 0 { Log.info("guard: replayed \(n) held events after a key-window swap") }
+    }
+
+    /// Replay held events in order, about 1 ms apart. Events the user makes
+    /// meanwhile queue up behind them, so nothing is reordered.
+    @discardableResult
+    private func drain() -> Int {
+        lock.lock()
+        if draining { lock.unlock(); return 0 }
+        draining = true
+        lock.unlock()
+        var n = 0
+        while true {
+            lock.lock()
+            if held.isEmpty || holding || swapHolds > 0 { draining = false; lock.unlock(); break }
+            let e = held.removeFirst()
+            lock.unlock()
+            e.setIntegerValueField(.eventSourceUserData, value: FocusGuard.replayMarker)
+            e.post(tap: .cghidEventTap)
+            n += 1
+            usleep(1000)
+        }
+        return n
     }
 
     private func hold(_ event: CGEvent) {

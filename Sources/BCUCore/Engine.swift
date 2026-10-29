@@ -231,6 +231,95 @@ public final class Engine {
             return ToolResult(text: windows.moveToUser(CGWindowID(try args.requireInt("window_id")), frame: frame) ? "moved" : "failed")
         case "admin_type_hid":
             return TestHarness.shared.startTyping(try args.requireString("text"), intervalMs: args.double("interval_ms") ?? 35)
+        case "admin_swap_test":
+            // Experiment: which records, in what spacing, move key from one window to another.
+            let pid = pid_t(try args.requireInt("pid"))
+            let from = CGWindowID(try args.requireInt("from"))
+            let to = CGWindowID(try args.requireInt("to"))
+            let defocus = args.bool("defocus") ?? true
+            let focus = args.bool("focus") ?? true
+            let makeKey = args.bool("make_key") ?? true
+            let settle = args.double("settle_ms") ?? 0
+            let t0 = nowMs()
+            if defocus { _ = BCUPostFocusRecord(pid, from, false); sleepMs(settle) }
+            if focus { _ = BCUPostFocusRecord(pid, to, true); sleepMs(settle) }
+            if makeKey { _ = BCUPostMakeKeyRecords(pid, to) }
+            let deadline = nowMs() + 600
+            while AX.focusedWindowID(pid) != to && nowMs() < deadline { usleep(1000) }
+            let ok = AX.focusedWindowID(pid) == to
+            return ToolResult(text: "\(ok ? "OK" : "FAIL") after \(Int(nowMs() - t0)) ms (key now \(AX.focusedWindowID(pid).map(String.init) ?? "none"))")
+        case "admin_focus_state":
+            let pid = pid_t(try args.requireInt("pid"))
+            return ToolResult(text: "front=\(BCUFrontProcessPID()) keyWindow=\(AX.focusedWindowID(pid).map(String.init) ?? "none")")
+        case "admin_activate":
+            let pid = pid_t(try args.requireInt("pid"))
+            let wid = CGWindowID(args.int("window_id") ?? 0)
+            let r = BCUSetFrontProcess(pid, wid, 0x200)
+            if wid != 0 { _ = BCUPostMakeKeyRecords(pid, wid) }
+            sleepMs(300)
+            return ToolResult(text: "setFront=\(r) front=\(BCUFrontProcessPID()) keyWindow=\(AX.focusedWindowID(pid).map(String.init) ?? "none")")
+        case "admin_ax_set":
+            let (w, _) = try agentWindow(args)
+            let n = try node(args, window: w)
+            let attr = try args.requireString("attr")
+            let value: AnyObject
+            if let b = args.bool("bool") { value = b ? kCFBooleanTrue : kCFBooleanFalse } else { value = try args.requireString("value") as CFString }
+            let err = AX.set(n.element, attr, value)
+            return ToolResult(text: "\(attr) -> \(AX.errorName(err)); value now \"\(AX.string(n.element, "AXValue") ?? "")\"")
+        case "admin_click_raw":
+            let (w, ax) = try agentWindow(args)
+            let p: CGPoint
+            if args.int("element") != nil { p = try node(args, window: w).frame.center } else { p = try globalPoint(args, window: ax) }
+            try Input.click(pid: w.pid, windowID: w.id, at: p)
+            return ToolResult(text: "raw click posted")
+        case "admin_flicker":
+            // Experiment: does moving key focus show up in the user's window?
+            let pid = pid_t(try args.requireInt("pid"))
+            let user = CGWindowID(try args.requireInt("user_window"))
+            let agent = CGWindowID(try args.requireInt("agent_window"))
+            let mode = args.string("mode") ?? "none"
+            let settle = args.double("settle_ms") ?? 5
+            let hold = args.double("hold_ms") ?? 0
+            var rect: CGRect?
+            if let rx = args.double("rx"), let ry = args.double("ry"), let rw = args.double("rw"), let rh = args.double("rh") { rect = CGRect(x: rx, y: ry, width: rw, height: rh) }
+            let text = FlickerProbe.run(userWindow: user, rect: rect, options: UInt32(args.int("options") ?? 0), saveDir: args.string("save_dir"), durationMs: args.double("duration_ms") ?? 500) {
+                func records(_ from: CGWindowID, _ to: CGWindowID) {
+                    _ = BCUPostFocusRecord(pid, from, false); if settle > 0 { sleepMs(settle) }
+                    _ = BCUPostFocusRecord(pid, to, true); if settle > 0 { sleepMs(settle) }
+                    _ = BCUPostMakeKeyRecords(pid, to)
+                }
+                func waitKey(_ id: CGWindowID) -> Double {
+                    let t = nowMs()
+                    while AX.focusedWindowID(pid) != id && nowMs() - t < 400 { usleep(500) }
+                    return nowMs() - t
+                }
+                switch mode {
+                case "swap":
+                    records(user, agent)
+                    let a = waitKey(agent)
+                    sleepMs(hold)
+                    records(agent, user)
+                    let b = waitKey(user)
+                    return "swap: agent key after \(Int(a)) ms, back after \(Int(b)) ms"
+                case "pipelined":
+                    records(user, agent)
+                    sleepMs(hold)
+                    records(agent, user)
+                    let b = waitKey(user)
+                    return "pipelined: settled \(Int(b)) ms after posting"
+                case "click":
+                    if let w = windows.window(agent), let ax = AX.window(pid: pid, id: agent), let f = AX.frame(ax) {
+                        try? Input.click(pid: w.pid, windowID: agent, at: CGPoint(x: f.midX, y: f.maxY - 40))
+                    }
+                    let a = waitKey(agent)
+                    records(agent, user)
+                    let b = waitKey(user)
+                    return "click: agent key after \(Int(a)) ms, user key again after \(Int(b)) ms"
+                default:
+                    return "no action"
+                }
+            }
+            return ToolResult(text: text)
         case "admin_key_hid":
             let (code, _) = try KeyMap.code(for: try args.requireString("key"))
             for down in [true, false] {
@@ -281,41 +370,26 @@ public final class Engine {
         return ToolImage(mime: "image/png", base64: data.base64EncodedString())
     }
 
-    /// Keystrokes and pixel clicks change the app's key window. If the user is
-    /// in that same app, wait until they leave it.
-    private func waitForTurn(_ w: AgentWindow) throws {
-        try waitForTurn(pid: w.pid, appName: w.appName)
-    }
-
-    private func waitForTurn(pid: pid_t, appName: String) throws {
-        func userIsIn() -> Bool {
-            let front = BCUFrontProcessPID()
-            return front == pid || NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
-        }
-        guard userIsIn() else { return }
-        stateLock.lock(); _waitingReason = "Waiting for you to leave \(appName)"; stateLock.unlock()
-        changed()
-        defer {
-            stateLock.lock(); _waitingReason = nil; stateLock.unlock()
-            changed()
-        }
-        let deadline = nowMs() + 120_000
-        while userIsIn() {
-            if paused { throw ToolError("paused by the user") }
-            if nowMs() > deadline {
-                throw ToolError("the user has been using \(appName) for 2 minutes, so keyboard steps can't run without disturbing them. Use set_value / element clicks, or retry later.")
-            }
-            sleepMs(150)
-        }
-        sleepMs(150)
+    /// Is the user in this app right now (so its key window is theirs)?
+    private func userIsIn(_ pid: pid_t) -> Bool {
+        BCUFrontProcessPID() == pid || NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
     }
 
     /// Run `body` with the window as its app's key window, under the guard.
+    /// Keystrokes and pixel clicks go to the app's key window, so the agent's
+    /// window is made key for the length of `body` and key goes straight back
+    /// to the user's window. The swap takes a few milliseconds and doesn't
+    /// repaint the user's window. If the user is in that app, their keys and
+    /// clicks are held during the swap and replayed after, so none of them
+    /// land in the agent's window.
     private func keyed<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) throws -> T {
-        try waitForTurn(w)
+        if paused { throw ToolError("paused by the user") }
         focusGuard.beginAction(pid: w.pid, cause: cause)
         windows.noteBefore(pid: w.pid)
         defer { focusGuard.endAction(pid: w.pid) }
+        let shared = userIsIn(w.pid)
+        if shared { focusGuard.beginHold() }
+        defer { if shared { focusGuard.endHold() } }
         let scope = try KeyScope.enter(pid: w.pid, window: w.id)
         defer { scope.exit() }
         return try body()
@@ -376,10 +450,11 @@ public final class Engine {
 
     private func openWindow(_ args: Args) throws -> ToolResult {
         let app = try args.requireString("app")
-        // A new window becomes its app's key window; don't do that under the user.
-        if let running = try windows.resolveApp(app).running {
-            try waitForTurn(pid: running.processIdentifier, appName: running.localizedName ?? app)
-        }
+        // A new window becomes its app's key window until it's handed back;
+        // hold the user's input meanwhile if they're in that app.
+        let shared = (try windows.resolveApp(app).running).map { userIsIn($0.processIdentifier) } ?? false
+        if shared { focusGuard.beginHold() }
+        defer { if shared { focusGuard.endHold() } }
         let result = try windows.open(app: app, placement: WindowManager.Placement(name: args.string("placement")), trigger: args.string("trigger"))
         let w = result.window
         let frame = WindowList.info(w.id)?.bounds ?? .zero
@@ -443,15 +518,22 @@ public final class Engine {
         let (w, ax) = try agentWindow(args)
         let maxElements = args.int("max_elements") ?? 250
         let title = AX.string(ax, "AXTitle") ?? WindowList.info(w.id)?.title ?? ""
-        var snap = AXSnapshot.take(window: ax, windowID: w.id, title: title, appName: w.appName, pid: w.pid, maxElements: maxElements)
-        // Web content (Chromium, Electron) only builds its accessibility tree once
-        // an assistive client asks. AXEnhancedUserInterface is the standard way
-        // VoiceOver asks; set it once per app.
-        if snap.nodes.count < 12 && !enhancedPids.contains(w.pid) {
+        // Web content (Chromium, Electron) only builds its full accessibility
+        // tree, with press actions on links and buttons, once an assistive
+        // client asks. AXEnhancedUserInterface is the standard way VoiceOver
+        // asks; set it once per app.
+        var fresh = false
+        if !enhancedPids.contains(w.pid) {
             enhancedPids.insert(w.pid)
+            fresh = AX.bool(AX.app(w.pid), "AXEnhancedUserInterface") != true
             AX.set(AX.app(w.pid), "AXEnhancedUserInterface", kCFBooleanTrue)
+            if fresh { sleepMs(300) }
+        }
+        let popups = popupWindows(of: w, frame: AX.frame(ax))
+        var snap = AXSnapshot.take(window: ax, windowID: w.id, title: title, appName: w.appName, pid: w.pid, maxElements: maxElements, popups: popups)
+        if fresh && snap.nodes.count < 12 {
             sleepMs(700)
-            snap = AXSnapshot.take(window: ax, windowID: w.id, title: title, appName: w.appName, pid: w.pid, maxElements: maxElements)
+            snap = AXSnapshot.take(window: ax, windowID: w.id, title: title, appName: w.appName, pid: w.pid, maxElements: maxElements, popups: popups)
         }
         snapshots[w.id] = snap
         var images: [ToolImage] = []
@@ -459,6 +541,18 @@ public final class Engine {
             images.append(png)
         }
         return ToolResult(text: snap.text, images: images)
+    }
+
+    /// The app's other accessibility windows that aren't standard windows and
+    /// sit over this one: suggestion lists, menus, dropdowns.
+    private func popupWindows(of w: AgentWindow, frame: CGRect?) -> [AXUIElement] {
+        guard let frame else { return [] }
+        return AX.windows(w.pid).filter { other in
+            guard AX.string(other, "AXSubrole") != "AXStandardWindow",
+                  let f = AX.frame(other), f.width > 4, f.height > 4, f.intersects(frame) else { return false }
+            if let id = AX.windowID(other), id == w.id { return false }
+            return true
+        }
     }
 
     private func screenshot(_ args: Args) throws -> ToolResult {
@@ -541,12 +635,19 @@ public final class Engine {
                 return ToolResult(text: "Inserted the text into element \(n.index) through accessibility.")
             }
         }
-        try keyed(w, cause: "typing") {
-            if let n = target {
-                AX.set(n.element, "AXFocused", kCFBooleanTrue)
-                sleepMs(50)
-            }
-            try Input.typeText(pid: w.pid, text)
+        if let n = target {
+            guarded(w, cause: "focusing") { _ = AX.set(n.element, "AXFocused", kCFBooleanTrue) }
+            sleepMs(50)
+        }
+        // While the user is in the same app their input is held during each
+        // swap, so type in short bursts to keep that delay small.
+        let chunk = userIsIn(w.pid) ? 16 : Int.max
+        var rest = Substring(text)
+        while !rest.isEmpty {
+            let piece = rest.prefix(chunk)
+            rest = rest.dropFirst(piece.count)
+            try keyed(w, cause: "typing") { try Input.typeText(pid: w.pid, String(piece)) }
+            if !rest.isEmpty { sleepMs(40) }
         }
         return ToolResult(text: "Typed \(text.count) characters with keystrokes.")
     }

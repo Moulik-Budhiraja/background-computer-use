@@ -473,9 +473,12 @@ public final class WindowManager {
             lock.unlock()
             // "The user is in this app": WindowServer's front app is it AND the
             // guard counts it as the user's (not a self-activation it's undoing).
+            // Only standard windows: popups the agent's own window opens
+            // (suggestion lists, menus) are separate windows too.
             guard nowMs() - firstSeen < 1500, info.pid == front, info.pid == focusGuard.userFront,
                   info.bounds.width > 100, info.bounds.height > 100,
-                  let ax = AX.window(pid: info.pid, id: info.id) else { continue }
+                  let ax = AX.window(pid: info.pid, id: info.id),
+                  AX.string(ax, "AXSubrole") == "AXStandardWindow" else { continue }
             let main = CGDisplayBounds(CGMainDisplayID())
             let w = min(info.bounds.width, main.width - 80), h = min(info.bounds.height, main.height - 120)
             AX.setPosition(ax, CGPoint(x: main.midX - w / 2, y: main.midY - h / 2))

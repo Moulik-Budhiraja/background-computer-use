@@ -72,7 +72,7 @@ public enum AXSnapshot {
         return raw
     }
 
-    public static func take(window: AXUIElement, windowID: CGWindowID, title: String, appName: String, pid: pid_t, maxElements: Int = 250) -> AXSnapshotResult {
+    public static func take(window: AXUIElement, windowID: CGWindowID, title: String, appName: String, pid: pid_t, maxElements: Int = 250, popups: [AXUIElement] = []) -> AXSnapshotResult {
         let windowFrame = AX.frame(window) ?? .zero
         var nodes: [Int: AXNode] = [:]
         var lines: [String] = []
@@ -86,6 +86,7 @@ public enum AXSnapshot {
             return one.count > limit ? String(one.prefix(limit)) + "…" : one
         }
 
+        var bounds = windowFrame
         func walk(_ el: AXUIElement, depth: Int, indent: Int) {
             guard visited < 6000, depth < 60 else { return }
             visited += 1
@@ -95,7 +96,7 @@ public enum AXSnapshot {
             let hasText = !label.isEmpty || !raw.value.isEmpty || !raw.placeholder.isEmpty
             let interesting = interactiveRoles.contains(raw.role) && (raw.role != "AXStaticText" || hasText) && (raw.role != "AXImage" || !label.isEmpty)
             if interesting, let f = raw.frame, f.width > 0, f.height > 0 {
-                let visible = f.intersects(windowFrame.insetBy(dx: -2, dy: -2))
+                let visible = f.intersects(bounds.insetBy(dx: -2, dy: -2))
                 if !visible {
                     skippedOffscreen += 1
                 } else if listed >= maxElements {
@@ -132,6 +133,13 @@ public enum AXSnapshot {
         }
 
         walk(window, depth: 0, indent: 0)
+        // Popups the window opened (suggestion lists, menus, dropdowns) are
+        // separate windows; list them after it so their rows can be pressed.
+        for popup in popups {
+            bounds = AX.frame(popup) ?? windowFrame
+            lines.append("Popup over this window:")
+            walk(popup, depth: 0, indent: 1)
+        }
         var header = "Window \(windowID) \"\(clean(title, 80))\" of \(appName) (pid \(pid)), \(Int(windowFrame.width))x\(Int(windowFrame.height)) points. Coordinates are window-relative points; the screenshot is 1 pixel per point."
         if listed == 0 { header += "\nNo accessible elements found. Use the screenshot and x/y clicks." }
         var footer: [String] = []
