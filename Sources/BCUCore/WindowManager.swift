@@ -249,7 +249,11 @@ public final class WindowManager {
         let previousKey = AX.focusedWindowID(pid)
         let catcher = WindowCatcher(pid: pid, before: before, manager: self)
         focusGuard.beginAction(pid: pid, cause: "opening a \(name) window")
-        defer { focusGuard.endAction(pid: pid) }
+        lock.lock(); opening.insert(pid); lock.unlock()
+        defer {
+            focusGuard.endAction(pid: pid)
+            lock.lock(); opening.remove(pid); lock.unlock()
+        }
         noteBefore(pid: pid)
         var notes: [String] = []
 
@@ -438,6 +442,8 @@ public final class WindowManager {
     }
 
     private var sweeping = false
+    private var seenOnAgent: [CGWindowID: Double] = [:]
+    private var opening: Set<pid_t> = []
 
     /// Keep agent windows off the user's displays and catch new windows an
     /// agent action spawned there (dialogs, popups, extra windows).
@@ -451,9 +457,32 @@ public final class WindowManager {
         guard display.isRunning else { return }
 
         let tainted = Set(focusGuard.activeTaints)
-        let agentPids = Set(agent.values.map(\.pid))
-        guard !tainted.isEmpty || !agentPids.isEmpty else { return }
         let onScreen = WindowList.all(onScreenOnly: true)
+
+        // Reverse catch: apps place new windows next to their last window, so
+        // after the agent used an app, a window the USER opens in it can land on
+        // the agent display. A new, unregistered window there, from the app the
+        // user is in, is theirs: move it to their screen.
+        let front = BCUFrontProcessPID()
+        for info in onScreen where info.layer == 0 && agent[info.id] == nil && display.holds(info.bounds) {
+            // Judge each new window for 1.5 s: the guard learns the user's front
+            // app a moment after it changes.
+            lock.lock()
+            let firstSeen = seenOnAgent[info.id] ?? nowMs()
+            if seenOnAgent[info.id] == nil { seenOnAgent[info.id] = firstSeen }
+            lock.unlock()
+            // "The user is in this app": WindowServer's front app is it AND the
+            // guard counts it as the user's (not a self-activation it's undoing).
+            guard nowMs() - firstSeen < 1500, info.pid == front, info.pid == focusGuard.userFront,
+                  info.bounds.width > 100, info.bounds.height > 100,
+                  let ax = AX.window(pid: info.pid, id: info.id) else { continue }
+            let main = CGDisplayBounds(CGMainDisplayID())
+            let w = min(info.bounds.width, main.width - 80), h = min(info.bounds.height, main.height - 120)
+            AX.setPosition(ax, CGPoint(x: main.midX - w / 2, y: main.midY - h / 2))
+            AX.setSize(ax, CGSize(width: w, height: h))
+            lock.lock(); seenOnAgent[info.id] = -1e12; lock.unlock()
+            focusGuard.record("moved a new \(info.owner) window you opened from the agent display to your screen")
+        }
 
         for info in onScreen where info.layer == 0 {
             if let w = agent[info.id] {
@@ -464,7 +493,12 @@ public final class WindowManager {
                 }
                 continue
             }
-            guard tainted.contains(info.pid) else { continue }
+            // Only while the agent acts on the app and the user isn't in it:
+            // a window that appears in the app the user is using is theirs.
+            lock.lock()
+            let midOpen = opening.contains(info.pid)
+            lock.unlock()
+            guard tainted.contains(info.pid), !midOpen, info.pid != front, info.pid != focusGuard.userFront else { continue }
             lock.lock()
             let before = knownBefore[info.pid] ?? []
             lock.unlock()

@@ -42,8 +42,14 @@ For debugging: `bcu call <tool> '{json}'`, `bcu status`, `bcu tools`.
 
 ## Status
 
-Early. Known gaps:
-- Chromium browsers (Helium, Chrome) make themselves frontmost for about 25–50 ms when a new window opens. The guard restores your app, but the menu bar can flicker.
-- A new window of an app you already have windows in can briefly appear on your screen before it's moved. Native apps open new windows next to their key window, so once the agent has one window of an app, later ones open on its display.
+Early, but the core works. Measured on macOS 26.6 against real apps (Helium, TextEdit):
+
+- **Focus test:** a script typed 627 characters into TextEdit on the user's screen while the agent opened Helium windows, navigated with keystrokes, used `cmd+L` and scrolled. All 627 characters landed in TextEdit, twice. Keys typed during Helium's self-activation were held and replayed.
+- **Agent tools:** accessibility values, element presses, keystroke typing, `cmd+A` and other menu shortcuts, menu items, scroll, save sheets and logged-in web pages all work in the background.
+
+Known gaps:
+- **First window of an app you already use.** The agent's first new window in such an app can show on your screen for about 15–170 ms before it is moved. Later windows open next to the agent's existing one and never appear on your screen.
+- **Chromium self-activation.** Chromium browsers make themselves frontmost for 15–60 ms when they open a window. The guard puts your app back and replays your keys, but the menu bar can flicker.
+- `SLSProcessAssignToSpace` would open windows on the agent display with zero frames, but it moves every window of the app, yours included, so it's disabled (placement `space-unsafe`).
 
 See [PLAN.md](PLAN.md) for the design.

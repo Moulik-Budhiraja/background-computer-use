@@ -25,6 +25,7 @@ public final class FocusGuard {
     private var userFrontWindow: CGWindowID?
     private var lastUserMouseDownMs = 0.0
     private var lastUserSwitchKeyMs = 0.0
+    private var lastUserKeyMs = 0.0
     private var holding = false
     private var held: [CGEvent] = []
     private var restoring = false
@@ -138,6 +139,26 @@ public final class FocusGuard {
         return now - lastUserMouseDownMs < withinMs || now - lastUserSwitchKeyMs < withinMs
     }
 
+    /// Whether `pid` becoming frontmost right now is the agent's doing.
+    /// While an action on it is running: yes, unless the user clicked or
+    /// switched apps. In the grace period after: only if the user hasn't
+    /// pressed any key or clicked either (launchers, Terminal `open`, links).
+    func debugCause(_ pid: pid_t) -> String {
+        lock.lock(); defer { lock.unlock() }
+        let now = nowMs()
+        let until = taints[pid].map { $0.until == .infinity ? "running" : "\(Int($0.until - now))ms left" } ?? "none"
+        return "taint=\(until) key=\(Int(now - lastUserKeyMs))ms click=\(Int(now - lastUserMouseDownMs))ms"
+    }
+
+    func agentCaused(_ pid: pid_t) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let now = nowMs()
+        guard let t = taints[pid], t.until >= now else { return false }
+        let clickOrSwitch = now - lastUserMouseDownMs < 400 || now - lastUserSwitchKeyMs < 400
+        if t.until == .infinity { return !clickOrSwitch }
+        return !clickOrSwitch && now - lastUserKeyMs >= 1500
+    }
+
     func record(_ summary: String) {
         let e = GuardEvent(time: Date(), summary: summary)
         lock.lock()
@@ -151,9 +172,13 @@ public final class FocusGuard {
     // MARK: Activation
 
     private func noteUserFront(_ pid: pid_t) {
-        let window = AX.focusedWindowID(pid)
         lock.lock()
         userFrontPid = pid
+        userFrontWindow = nil
+        lock.unlock()
+        let window = AX.focusedWindowID(pid)
+        lock.lock()
+        guard userFrontPid == pid else { lock.unlock(); return }
         userFrontWindow = window
         lock.unlock()
     }
@@ -190,7 +215,7 @@ public final class FocusGuard {
                     self.lock.unlock()
                     // Restore here rather than waiting for NSWorkspace's
                     // notification, which arrives ~25 ms later.
-                    if pid != 0 && pid != self.userFront && self.isTainted(pid) && !self.userCausedRecently() {
+                    if pid != 0 && pid != self.userFront && self.agentCaused(pid) {
                         self.restoreUserFront(reason: "self-activation", immediate: true)
                     }
                 }
@@ -222,9 +247,9 @@ public final class FocusGuard {
 
     private func activated(_ app: NSRunningApplication) {
         let pid = app.processIdentifier
-        Log.info("guard: activated \(app.localizedName ?? "?") pid \(pid) tainted=\(isTainted(pid)) userFront=\(userFront) userCaused=\(userCausedRecently())")
+        Log.info("guard: activated \(app.localizedName ?? "?") pid \(pid) tainted=\(isTainted(pid)) userFront=\(userFront) agentCaused=\(agentCaused(pid)) \(debugCause(pid))")
         if pid == getpid() { return }
-        if isTainted(pid) && !userCausedRecently() && pid != userFront {
+        if agentCaused(pid) && pid != userFront {
             // The monitor thread usually restored already; this is the backup path.
             if BCUFrontProcessPID() == pid { restoreUserFront(reason: "activation") }
         } else {
@@ -307,8 +332,11 @@ public final class FocusGuard {
             if display.isRunning && display.bounds.contains(event.location) { return nil }
             return event
         case .keyDown, .keyUp, .flagsChanged:
-            if type == .keyDown && event.flags.contains(.maskCommand) && event.getIntegerValueField(.keyboardEventKeycode) == 48 {
-                lock.lock(); lastUserSwitchKeyMs = nowMs(); lock.unlock()
+            if type == .keyDown {
+                lock.lock()
+                lastUserKeyMs = nowMs()
+                if event.flags.contains(.maskCommand) && event.getIntegerValueField(.keyboardEventKeycode) == 48 { lastUserSwitchKeyMs = nowMs() }
+                lock.unlock()
             }
             lock.lock()
             let alreadyHolding = holding
@@ -322,7 +350,7 @@ public final class FocusGuard {
             // Nothing to protect against unless the agent is mid-action.
             guard anyTaint else { return event }
             let front = BCUFrontProcessPID()
-            if front != 0 && front != userFront && isTainted(front) && !userCausedRecently() {
+            if front != 0 && front != userFront && agentCaused(front) {
                 lock.lock(); holding = true; lock.unlock()
                 hold(event)
                 restoreUserFront(reason: "keystroke")

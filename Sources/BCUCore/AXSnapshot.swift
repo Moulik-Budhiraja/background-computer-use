@@ -118,7 +118,9 @@ public enum AXSnapshot {
                     if raw.focused { flags.append("focused") }
                     if raw.selected { flags.append("selected") }
                     if settable { flags.append("settable") }
-                    let acts = actions.filter { $0 != "AXScrollToVisible" && $0 != "AXShowDefaultUI" && $0 != "AXShowAlternateUI" }
+                    // Skip noise and app-defined custom actions ("Name:…\ntarget:…").
+                    let acts = actions.filter { $0.hasPrefix("AX") && !$0.contains(":") && !$0.contains("\n")
+                        && $0 != "AXScrollToVisible" && $0 != "AXShowDefaultUI" && $0 != "AXShowAlternateUI" }
                         .map { $0.replacingOccurrences(of: "AX", with: "").lowercased() }
                     if !acts.isEmpty { flags.append(acts.joined(separator: ",")) }
                     if !flags.isEmpty { line += " [\(flags.joined(separator: " "))]" }

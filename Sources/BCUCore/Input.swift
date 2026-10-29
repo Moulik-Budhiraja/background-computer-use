@@ -171,7 +171,7 @@ public enum KeyMap {
         "escape": 53, "esc": 53, "forwarddelete": 117, "home": 115, "end": 119,
         "pageup": 116, "pagedown": 121, "left": 123, "right": 124, "down": 125, "up": 126,
         "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97, "f7": 98, "f8": 100,
-        "f9": 101, "f10": 109, "f11": 103, "f12": 111, "help": 114, "keypadenter": 76,
+        "f9": 101, "f10": 109, "f11": 103, "f12": 111, "f19": 80, "help": 114, "keypadenter": 76,
     ]
 
     static let chars: [Character: CGKeyCode] = [

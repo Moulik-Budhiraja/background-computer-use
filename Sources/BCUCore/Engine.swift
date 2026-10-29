@@ -229,6 +229,21 @@ public final class Engine {
             var frame: CGRect?
             if let x = args.double("x"), let y = args.double("y"), let w = args.double("w"), let h = args.double("h") { frame = CGRect(x: x, y: y, width: w, height: h) }
             return ToolResult(text: windows.moveToUser(CGWindowID(try args.requireInt("window_id")), frame: frame) ? "moved" : "failed")
+        case "admin_type_hid":
+            return TestHarness.shared.startTyping(try args.requireString("text"), intervalMs: args.double("interval_ms") ?? 35)
+        case "admin_key_hid":
+            let (code, _) = try KeyMap.code(for: try args.requireString("key"))
+            for down in [true, false] {
+                if let e = CGEvent(keyboardEventSource: CGEventSource(stateID: .hidSystemState), virtualKey: code, keyDown: down) {
+                    e.flags = []
+                    e.post(tap: .cghidEventTap)
+                }
+            }
+            return ToolResult(text: "pressed")
+        case "admin_type_status":
+            return TestHarness.shared.typingStatus()
+        case "admin_read_text":
+            return try TestHarness.read(app: try args.requireString("app"), windows: windows)
         default: throw ToolError("unknown tool \(tool)")
         }
     }
@@ -415,6 +430,10 @@ public final class Engine {
 
     private func releaseWindow(_ args: Args) throws -> ToolResult {
         let id = CGWindowID(try args.requireInt("window_id"))
+        if windows.window(id) == nil && WindowList.info(id) == nil {
+            snapshots[id] = nil
+            return ToolResult(text: "window \(id) is already closed")
+        }
         let text = try windows.release(id, keepOpen: args.bool("keep_open") ?? false)
         snapshots[id] = nil
         return ToolResult(text: text)
