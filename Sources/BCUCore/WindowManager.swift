@@ -442,7 +442,28 @@ public final class WindowManager {
     }
 
     private var sweeping = false
+    private var fitTries: [CGWindowID: Int] = [:]
     private var seenOnAgent: [CGWindowID: Double] = [:]
+
+    /// Shrink and shift an agent window that sticks out past the agent
+    /// display's edge (apps can undo the first resize while a new window
+    /// settles). Gives up after a few tries so an app that refuses isn't
+    /// resized every sweep.
+    private func fitInside(_ w: AgentWindow, frame: CGRect) {
+        lock.lock()
+        let tries = fitTries[w.id, default: 0]
+        fitTries[w.id] = tries + 1
+        lock.unlock()
+        guard tries < 5, let ax = AX.window(pid: w.pid, id: w.id) else { return }
+        let b = display.bounds
+        let inset: CGFloat = 24
+        let size = CGSize(width: min(frame.width, b.width - inset * 2), height: min(frame.height, b.height - inset * 2 - 30))
+        let x = min(max(frame.minX, b.minX + inset), b.maxX - inset - size.width)
+        let y = min(max(frame.minY, b.minY + inset + 30), b.maxY - inset - size.height)
+        if size != frame.size { AX.setSize(ax, size) }
+        AX.setPosition(ax, CGPoint(x: x, y: y))
+        Log.info("fit \(w.appName) window \(w.id) from \(frame.short) to \(Int(x)),\(Int(y)) \(Int(size.width))x\(Int(size.height))")
+    }
     private var opening: Set<pid_t> = []
 
     /// Keep agent windows off the user's displays and catch new windows an
@@ -473,9 +494,12 @@ public final class WindowManager {
             lock.unlock()
             // "The user is in this app": WindowServer's front app is it AND the
             // guard counts it as the user's (not a self-activation it's undoing).
+            // Only standard windows: popups the agent's own window opens
+            // (suggestion lists, menus) are separate windows too.
             guard nowMs() - firstSeen < 1500, info.pid == front, info.pid == focusGuard.userFront,
                   info.bounds.width > 100, info.bounds.height > 100,
-                  let ax = AX.window(pid: info.pid, id: info.id) else { continue }
+                  let ax = AX.window(pid: info.pid, id: info.id),
+                  AX.string(ax, "AXSubrole") == "AXStandardWindow" else { continue }
             let main = CGDisplayBounds(CGMainDisplayID())
             let w = min(info.bounds.width, main.width - 80), h = min(info.bounds.height, main.height - 120)
             AX.setPosition(ax, CGPoint(x: main.midX - w / 2, y: main.midY - h / 2))
@@ -490,6 +514,8 @@ public final class WindowManager {
                    let ax = AX.window(pid: w.pid, id: w.id) {
                     moveToAgent(ax, size: info.bounds.size)
                     focusGuard.record("moved your agent's \(w.appName) window back off your display")
+                } else if !w.handedOff && !display.bounds.contains(info.bounds) {
+                    fitInside(w, frame: info.bounds)
                 }
                 continue
             }

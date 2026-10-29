@@ -33,9 +33,11 @@ public final class KeyScope {
         if previous == target && AX.focusedElementWindowID(pid) != nil {
             return KeyScope(pid: pid, target: target, previous: previous, primed: .alreadyKey)
         }
-        for _ in 0..<2 {
-            if postRecords(pid: pid, from: previous, to: target) {
-                awaitKey(pid: pid, target: target, budgetMs: 400)
+        // First try is quick (5 ms between records): fast enough that the
+        // user's window never repaints as inactive. The second uses cua's settle.
+        for settle in [5.0, settleMs] {
+            if postRecords(pid: pid, from: previous, to: target, settle: settle) {
+                awaitKey(pid: pid, target: target, budgetMs: settle < 50 ? 250 : 400)
                 if AX.focusedWindowID(pid) == target {
                     return KeyScope(pid: pid, target: target, previous: previous, primed: .records)
                 }
@@ -60,7 +62,11 @@ public final class KeyScope {
         guard WindowList.info(previous) != nil else { return }
         switch primed {
         case .records:
-            _ = KeyScope.postRecords(pid: pid, from: target, to: previous)
+            _ = KeyScope.postRecords(pid: pid, from: target, to: previous, settle: 5)
+            KeyScope.awaitKey(pid: pid, target: previous, budgetMs: 250)
+            if AX.focusedWindowID(pid) != previous {
+                _ = KeyScope.postRecords(pid: pid, from: target, to: previous)
+            }
         case .axFocus:
             if let w = AX.window(pid: pid, id: previous) {
                 AX.set(AX.app(pid), "AXFocusedWindow", w)
@@ -74,23 +80,22 @@ public final class KeyScope {
     deinit { exit() }
 
     @discardableResult
-    static func postRecords(pid: pid_t, from current: CGWindowID?, to target: CGWindowID) -> Bool {
+    static func postRecords(pid: pid_t, from current: CGWindowID?, to target: CGWindowID, settle: Double = settleMs) -> Bool {
         var ok = true
         if let current, current != target {
             ok = ok && BCUPostFocusRecord(pid, current, false) == 0
-            sleepMs(settleMs)
+            sleepMs(settle)
         }
         ok = ok && BCUPostFocusRecord(pid, target, true) == 0
-        sleepMs(settleMs)
+        sleepMs(settle)
         ok = ok && BCUPostMakeKeyRecords(pid, target) == 0
         return ok
     }
 
     static func awaitKey(pid: pid_t, target: CGWindowID, budgetMs: Double) {
         let deadline = nowMs() + budgetMs
-        sleepMs(40)
         while AX.focusedWindowID(pid) != target && nowMs() < deadline {
-            sleepMs(30)
+            sleepMs(2)
         }
     }
 }

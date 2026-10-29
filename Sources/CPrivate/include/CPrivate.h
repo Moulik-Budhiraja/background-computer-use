@@ -63,6 +63,8 @@ int BCUSetFrontProcess(pid_t pid, uint32_t windowID, uint32_t options);
 /// releases), or NULL. Reads the window directly: no ScreenCaptureKit session,
 /// so macOS shows no screen-sharing indicator.
 CGImageRef _Nullable BCUCaptureWindow(uint32_t windowID) CF_RETURNS_RETAINED;
+/// Capture part of one window (SLSCaptureWindowsContentsToRectWithOptions).
+CGImageRef _Nullable BCUCaptureWindowRect(uint32_t windowID, CGRect rect, uint32_t options) CF_RETURNS_RETAINED;
 
 #pragma mark - Spaces
 

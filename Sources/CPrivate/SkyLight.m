@@ -160,6 +160,19 @@ CGImageRef BCUCaptureWindow(uint32_t windowID) {
     return image;
 }
 
+typedef int32_t (*CaptureToRectFn)(int32_t cid, uint32_t *wid, bool windowOnly, CGRect rect, uint32_t options, CGImageRef *out);
+
+CGImageRef BCUCaptureWindowRect(uint32_t windowID, CGRect rect, uint32_t options) {
+    MainConnectionIDFn cid = (MainConnectionIDFn)Sym("CGSMainConnectionID");
+    CaptureToRectFn capture = (CaptureToRectFn)Sym("SLSCaptureWindowsContentsToRectWithOptions");
+    if (!capture) capture = (CaptureToRectFn)Sym("CGSCaptureWindowsContentsToRectWithOptions");
+    if (!cid || !capture) return NULL;
+    uint32_t wid = windowID;
+    CGImageRef image = NULL;
+    if (capture((int32_t)cid(), &wid, true, rect, options, &image) != 0) return NULL;
+    return image;
+}
+
 typedef uint64_t (*ManagedDisplayGetCurrentSpaceFn)(uint32_t cid, CFStringRef displayUUID);
 typedef int32_t (*ProcessAssignToSpaceFn)(uint32_t cid, pid_t pid, uint64_t sid);
 

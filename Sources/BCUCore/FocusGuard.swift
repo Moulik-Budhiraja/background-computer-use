@@ -9,7 +9,9 @@ public struct GuardEvent {
 
 /// Keeps the user's focus, keystrokes and cursor theirs.
 ///
-/// - Cursor fence: mouse moves that would land on the agent display are pulled back.
+/// - Cursor fence: mouse moves that would land on the agent display are pulled
+///   back in the event tap, and a watcher thread checks the cursor every 4 ms
+///   and brings it back from anything that got past the tap.
 /// - Keystroke hold: if an app the agent is acting on makes itself frontmost,
 ///   the user's keystrokes are held, the user's app is put back in front, and
 ///   the keys are replayed into it. Nothing typed lands in the agent's window.
@@ -28,8 +30,14 @@ public final class FocusGuard {
     private var lastUserKeyMs = 0.0
     private var holding = false
     private var held: [CGEvent] = []
+    /// Nesting count of key-window swaps in progress (see `beginHold`).
+    private var swapHolds = 0
+    /// Replaying held events; anything new queues behind them to keep order.
+    private var draining = false
     private var restoring = false
     private var tap: CFMachPort?
+    private var lastEscapeLogMs = 0.0
+    private var lastTapDisabledLogMs = 0.0
     private let restoreQueue = DispatchQueue(label: "bcu.guard.restore")
     private var events: [GuardEvent] = []
 
@@ -67,7 +75,7 @@ public final class FocusGuard {
     public func installTap() {
         guard tap == nil else { return }
         let types: [CGEventType] = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
-                                    .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel,
+                                    .leftMouseDown, .rightMouseDown, .otherMouseDown, .leftMouseUp, .rightMouseUp, .otherMouseUp, .scrollWheel, .tabletPointer,
                                     .keyDown, .keyUp, .flagsChanged]
         let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
         guard let port = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
@@ -89,6 +97,53 @@ public final class FocusGuard {
         thread.qualityOfService = .userInteractive
         thread.start()
         Log.info("guard: event tap installed")
+    }
+
+    // MARK: Cursor watch
+
+    /// Check the cursor every 4 ms on its own thread and move it off the agent
+    /// display whatever put it there: the tap not installed yet, the tap
+    /// disabled by macOS, displays being rearranged, or another app warping it.
+    public func startCursorWatch() {
+        let thread = Thread { [weak self] in
+            while let s = self {
+                // Every 4 ms near the agent display, every 16 ms elsewhere: a
+                // cursor far away can't reach it between checks except by a
+                // warp, which this still undoes within 16 ms.
+                let near = s.checkCursor()
+                usleep(near ? 4000 : 16000)
+            }
+        }
+        thread.name = "bcu.guard.cursor"
+        thread.qualityOfService = .userInteractive
+        thread.start()
+    }
+
+    /// Returns whether the cursor is near the agent display.
+    @discardableResult
+    private func checkCursor() -> Bool {
+        guard display.isRunning, let p = CGEvent(source: nil)?.location else { return false }
+        let agent = display.liveBounds
+        guard agent.contains(p) else { return agent.insetBy(dx: -400, dy: -400).contains(p) }
+        let q = nearestUserPoint(p, agent: agent)
+        CGWarpMouseCursorPosition(q)
+        CGAssociateMouseAndMouseCursorPosition(1)
+        let tapState: String
+        if let tap {
+            let on = CGEvent.tapIsEnabled(tap: tap)
+            if !on { CGEvent.tapEnable(tap: tap, enable: true) }
+            tapState = on ? "tap on" : "tap was off, re-enabled"
+        } else {
+            tapState = "tap not installed"
+        }
+        lock.lock()
+        let log = nowMs() - lastEscapeLogMs > 2000
+        if log { lastEscapeLogMs = nowMs() }
+        lock.unlock()
+        if log {
+            Log.info("guard: cursor was on the agent display at \(Int(p.x)),\(Int(p.y)); moved it back to \(Int(q.x)),\(Int(q.y)) (\(tapState); agent display at \(agent.short), cached \(display.bounds.short))")
+        }
+        return true
     }
 
     // MARK: Agent actions
@@ -292,17 +347,13 @@ public final class FocusGuard {
                 Log.info("guard: restore (\(reason)) setFront=\(status) call \(Int(t1 - t0)) ms, front back after \(Int(nowMs() - t0)) ms")
             }
             self.lock.lock()
-            let replay = self.held
-            self.held.removeAll()
             self.holding = false
             self.restoring = false
+            let swapping = self.swapHolds > 0
             self.lock.unlock()
-            for e in replay {
-                e.setIntegerValueField(.eventSourceUserData, value: FocusGuard.replayMarker)
-                e.post(tap: .cghidEventTap)
-            }
-            if !replay.isEmpty {
-                self.record("held \(replay.count) of your key events during a focus change (\(reason)) and replayed them into your app")
+            if !swapping {
+                let n = self.drain()
+                if n > 0 { self.record("held \(n) of your key events during a focus change (\(reason)) and replayed them into your app") }
             }
         }
     }
@@ -312,27 +363,43 @@ public final class FocusGuard {
     fileprivate func handle(type: CGEventType, event: CGEvent) -> CGEvent? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            lock.lock()
+            let log = nowMs() - lastTapDisabledLogMs > 5000
+            if log { lastTapDisabledLogMs = nowMs() }
+            lock.unlock()
+            if log { Log.info("guard: macOS disabled the event tap (\(type == .tapDisabledByTimeout ? "timeout" : "user input")); re-enabled") }
             return event
         }
         if event.getIntegerValueField(.eventSourceUserData) == FocusGuard.replayMarker {
             return event
         }
         switch type {
-        case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+        case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .tabletPointer:
             let p = event.location
-            if display.isRunning && display.bounds.contains(p) {
-                let q = nearestUserPoint(p)
+            let agent = display.liveBounds
+            if display.isRunning && agent.contains(p) {
+                let q = nearestUserPoint(p, agent: agent)
                 event.location = q
                 CGWarpMouseCursorPosition(q)
                 CGAssociateMouseAndMouseCursorPosition(1)
             }
+            if type != .mouseMoved {
+                lock.lock(); let pressHeld = held.contains { [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains($0.type) }; lock.unlock()
+                if pressHeld { hold(event); return nil }
+            }
             return event
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
-            lock.lock(); lastUserMouseDownMs = nowMs(); lock.unlock()
-            if display.isRunning && display.bounds.contains(event.location) { return nil }
+            lock.lock(); lastUserMouseDownMs = nowMs(); let swapping = swapHolds > 0 || draining; lock.unlock()
+            if display.isRunning && display.liveBounds.contains(event.location) { return nil }
+            // A click now would make the user's window key mid-swap; hold it.
+            if swapping { hold(event); return nil }
+            return event
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            lock.lock(); let swapping = swapHolds > 0 || draining || held.contains { [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains($0.type) }; lock.unlock()
+            if swapping { hold(event); return nil }
             return event
         case .scrollWheel:
-            if display.isRunning && display.bounds.contains(event.location) { return nil }
+            if display.isRunning && display.liveBounds.contains(event.location) { return nil }
             return event
         case .keyDown, .keyUp, .flagsChanged:
             if type == .keyDown {
@@ -342,7 +409,7 @@ public final class FocusGuard {
                 lock.unlock()
             }
             lock.lock()
-            let alreadyHolding = holding
+            let alreadyHolding = holding || swapHolds > 0 || draining
             let now = nowMs()
             let anyTaint = taints.values.contains { $0.until >= now }
             lock.unlock()
@@ -365,6 +432,45 @@ public final class FocusGuard {
         }
     }
 
+    /// Hold the user's keys and clicks until `endHold`, then replay them in
+    /// order. Used while the agent briefly owns an app's key window, so
+    /// nothing the user types lands in the agent's window and no click of
+    /// theirs moves key focus mid-swap.
+    public func beginHold() {
+        lock.lock(); swapHolds += 1; lock.unlock()
+    }
+
+    public func endHold() {
+        lock.lock()
+        swapHolds = max(0, swapHolds - 1)
+        guard swapHolds == 0, !holding else { lock.unlock(); return }
+        lock.unlock()
+        let n = drain()
+        if n > 0 { Log.info("guard: replayed \(n) held events after a key-window swap") }
+    }
+
+    /// Replay held events in order, about 1 ms apart. Events the user makes
+    /// meanwhile queue up behind them, so nothing is reordered.
+    @discardableResult
+    private func drain() -> Int {
+        lock.lock()
+        if draining { lock.unlock(); return 0 }
+        draining = true
+        lock.unlock()
+        var n = 0
+        while true {
+            lock.lock()
+            if held.isEmpty || holding || swapHolds > 0 { draining = false; lock.unlock(); break }
+            let e = held.removeFirst()
+            lock.unlock()
+            e.setIntegerValueField(.eventSourceUserData, value: FocusGuard.replayMarker)
+            e.post(tap: .cghidEventTap)
+            n += 1
+            usleep(1000)
+        }
+        return n
+    }
+
     private func hold(_ event: CGEvent) {
         guard let copy = event.copy() else { return }
         lock.lock()
@@ -372,16 +478,61 @@ public final class FocusGuard {
         lock.unlock()
     }
 
-    private func nearestUserPoint(_ p: CGPoint) -> CGPoint {
+    private func nearestUserPoint(_ p: CGPoint, agent: CGRect) -> CGPoint {
         var best = p
         var bestDistance = CGFloat.infinity
         for id in display.userDisplayIDs() {
             let r = CGDisplayBounds(id)
+            // Skip any display that overlaps the agent's (mirroring, mid-rearrangement).
+            let overlap = r.intersection(agent)
+            if !overlap.isNull && overlap.width > 0 && overlap.height > 0 { continue }
             let q = CGPoint(x: min(max(p.x, r.minX), r.maxX - 1), y: min(max(p.y, r.minY), r.maxY - 1))
             let d = hypot(q.x - p.x, q.y - p.y)
+            if agent.contains(q) { continue }
             if d < bestDistance { bestDistance = d; best = q }
         }
+        if bestDistance == .infinity {
+            let main = CGDisplayBounds(CGMainDisplayID())
+            return CGPoint(x: main.midX, y: main.midY)
+        }
         return best
+    }
+
+    // MARK: Tests
+
+    /// Test only: push the cursor onto the agent display the way an escape
+    /// would, and measure how long it stays there. `via`: "warp" bypasses the
+    /// tap entirely; "tap_off" disables the tap and posts HID moves into it.
+    public func escapeTest(via: String) -> String {
+        guard display.isRunning, let start = CGEvent(source: nil)?.location else { return "no agent display" }
+        let agent = display.liveBounds
+        let target = CGPoint(x: agent.midX, y: agent.midY)
+        let t0 = nowMs()
+        switch via {
+        case "tap_off":
+            if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+            if let e = CGEvent(mouseEventSource: CGEventSource(stateID: .hidSystemState), mouseType: .mouseMoved, mouseCursorPosition: target, mouseButton: .left) {
+                e.post(tap: .cghidEventTap)
+            }
+        default:
+            CGWarpMouseCursorPosition(target)
+            CGAssociateMouseAndMouseCursorPosition(1)
+        }
+        var seenOn = false, backAt: Double?
+        while nowMs() - t0 < 300 {
+            if let p = CGEvent(source: nil)?.location {
+                if agent.contains(p) { seenOn = true } else if seenOn { backAt = nowMs() - t0; break }
+            }
+            usleep(500)
+        }
+        let end = CGEvent(source: nil)?.location ?? .zero
+        // Put the cursor back where the user left it.
+        CGWarpMouseCursorPosition(start)
+        CGAssociateMouseAndMouseCursorPosition(1)
+        let tapOn = tap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false
+        if !seenOn { return "\(via): cursor never reached the agent display (ended at \(Int(end.x)),\(Int(end.y)))" }
+        guard let backAt else { return "\(via): cursor STILL on the agent display after 300 ms" }
+        return "\(via): cursor back on the user's display after \(String(format: "%.1f", backAt)) ms at \(Int(end.x)),\(Int(end.y)); tap \(tapOn ? "on" : "off")"
     }
 }
 

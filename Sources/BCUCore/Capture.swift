@@ -63,12 +63,41 @@ public enum Capture {
         }
         for w in windows.reversed() {
             guard let image = BCUCaptureWindow(w.id) else { continue }
-            let x = (w.bounds.minX - b.minX) * scale
-            let yTop = (w.bounds.minY - b.minY) * scale
-            let h = w.bounds.height * scale
-            ctx.draw(image, in: CGRect(x: x, y: CGFloat(outH) - yTop - h, width: w.bounds.width * scale, height: h))
+            let r = coveredRect(image, bounds: w.bounds, display: b)
+            let x = (r.minX - b.minX) * scale
+            let yTop = (r.minY - b.minY) * scale
+            let h = r.height * scale
+            ctx.draw(image, in: CGRect(x: x, y: CGFloat(outH) - yTop - h, width: r.width * scale, height: h))
         }
         return ctx.makeImage()
+    }
+
+    /// The part of a window, in global points, that a capture of it shows.
+    /// When a window hangs off the edge of a display, the capture holds only
+    /// the part on that display; tell the two cases apart by aspect ratio.
+    static func coveredRect(_ image: CGImage, bounds: CGRect, display: CGRect) -> CGRect {
+        let visible = bounds.intersection(display)
+        guard !visible.isNull, visible.width > 0, visible.height > 0, visible.size != bounds.size else { return bounds }
+        let imageAspect = CGFloat(image.width) / CGFloat(image.height)
+        let fullAspect = bounds.width / bounds.height
+        let visibleAspect = visible.width / visible.height
+        return abs(imageAspect - visibleAspect) < abs(imageAspect - fullAspect) ? visible : bounds
+    }
+
+    /// A window screenshot at 1 pixel per point, so pixels match the
+    /// window-relative points the agent clicks at. The agent display is
+    /// Retina, so raw captures are twice that size.
+    public static func windowInPoints(_ id: CGWindowID, display: CGRect) throws -> CGImage {
+        let image = try window(id)
+        guard let bounds = WindowList.info(id)?.bounds, bounds.width > 0, bounds.height > 0 else { return image }
+        let size = coveredRect(image, bounds: bounds, display: display).size
+        let w = Int(size.width.rounded()), h = Int(size.height.rounded())
+        guard w > 0, h > 0, w != image.width || h != image.height,
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue) else { return image }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage() ?? image
     }
 
     /// PNG, downscaled so the long side is at most `maxSide` pixels.

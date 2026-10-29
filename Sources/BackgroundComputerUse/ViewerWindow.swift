@@ -86,7 +86,8 @@ final class ViewerWindowController {
         dim = dimPanel
         panel = p
         model.refresh()
-        model.startPreview(width: engine.display.width, fps: 15)
+        // Twice the display's points: one preview pixel per Retina pixel.
+        model.startPreview(width: engine.display.width * 2, fps: 15)
     }
 
     func refresh() {

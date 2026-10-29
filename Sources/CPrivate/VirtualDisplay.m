@@ -47,8 +47,10 @@
     CGVirtualDisplayDescriptor *descriptor = [descriptorClass new];
     descriptor.queue = dispatch_get_main_queue();
     descriptor.name = name;
-    descriptor.maxPixelsWide = width;
-    descriptor.maxPixelsHigh = height;
+    // Retina: `width` x `height` points backed by twice the pixels, so the
+    // live preview stays sharp on the user's Retina screen.
+    descriptor.maxPixelsWide = width * 2;
+    descriptor.maxPixelsHigh = height * 2;
     descriptor.sizeInMillimeters = CGSizeMake(width * 25.4 / ppi, height * 25.4 / ppi);
     // macOS 14+ needs a non-zero vendor and a serial unique per display.
     descriptor.serialNum = serial;
@@ -62,7 +64,7 @@
     if (!_display) return nil;
 
     CGVirtualDisplaySettings *settings = [NSClassFromString(@"CGVirtualDisplaySettings") new];
-    settings.hiDPI = 0;  // 1 point = 1 pixel, so screenshots map straight to points.
+    settings.hiDPI = 1;  // Screenshots for the agent are scaled back to 1 pixel per point.
     settings.modes = @[[[NSClassFromString(@"CGVirtualDisplayMode") alloc] initWithWidth:width height:height refreshRate:60]];
     if (![_display applySettings:settings]) {
         _display = nil;
