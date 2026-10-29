@@ -232,7 +232,8 @@ public final class Engine {
             if let x = args.double("x"), let y = args.double("y"), let w = args.double("w"), let h = args.double("h") { frame = CGRect(x: x, y: y, width: w, height: h) }
             return ToolResult(text: windows.moveToUser(CGWindowID(try args.requireInt("window_id")), frame: frame) ? "moved" : "failed")
         case "admin_type_hid":
-            return TestHarness.shared.startTyping(try args.requireString("text"), intervalMs: args.double("interval_ms") ?? 35)
+            return TestHarness.shared.startTyping(try args.requireString("text"), intervalMs: args.double("interval_ms") ?? 35,
+                                                  onlyPid: args.int("pid").map { pid_t($0) })
         case "admin_swap_test":
             // Experiment: which records, in what spacing, move key from one window to another.
             let pid = pid_t(try args.requireInt("pid"))
@@ -541,7 +542,7 @@ public final class Engine {
         }
         snapshots[w.id] = snap
         var images: [ToolImage] = []
-        if args.bool("screenshot") ?? true, let img = try? Capture.window(w.id), let png = pngImage(img) {
+        if args.bool("screenshot") ?? true, let img = try? Capture.windowInPoints(w.id, display: display.bounds), let png = pngImage(img) {
             images.append(png)
         }
         return ToolResult(text: snap.text, images: images)
@@ -562,7 +563,7 @@ public final class Engine {
     private func screenshot(_ args: Args) throws -> ToolResult {
         if args.int("window_id") != nil {
             let (w, _) = try agentWindow(args)
-            let img = try Capture.window(w.id)
+            let img = try Capture.windowInPoints(w.id, display: display.bounds)
             guard let png = pngImage(img) else { throw ToolError("couldn't encode the screenshot") }
             return ToolResult(text: "Window \(w.id), \(img.width)x\(img.height)", images: [png])
         }

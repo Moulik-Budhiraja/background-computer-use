@@ -12,7 +12,9 @@ final class TestHarness {
     private var total = 0
     private var running = false
 
-    func startTyping(_ text: String, intervalMs: Double) -> ToolResult {
+    /// Types `text` as real HID keystrokes. With `onlyPid`, stops the moment
+    /// another app is in front, so stray keys never reach the user's apps.
+    func startTyping(_ text: String, intervalMs: Double, onlyPid: pid_t? = nil) -> ToolResult {
         lock.lock()
         if running { lock.unlock(); return .error("already typing") }
         running = true
@@ -22,6 +24,10 @@ final class TestHarness {
         let thread = Thread { [weak self] in
             let src = CGEventSource(stateID: .hidSystemState)
             for ch in text {
+                if let pid = onlyPid, BCUFrontProcessPID() != pid {
+                    Log.info("admin_type_hid: stopped, \(BCUFrontProcessPID()) is in front instead of \(pid)")
+                    break
+                }
                 let utf16 = Array(String(ch).utf16)
                 for down in [true, false] {
                     guard let e = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: down) else { continue }

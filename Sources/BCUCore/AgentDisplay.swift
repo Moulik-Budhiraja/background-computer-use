@@ -36,7 +36,7 @@ public final class AgentDisplay {
     /// Must be called on the main thread.
     public func start() throws {
         guard display == nil else { return }
-        guard let vd = BCUVirtualDisplay(name: "Agent Display", width: UInt32(width), height: UInt32(height), ppi: 110, serial: 0x4243_5531) else {
+        guard let vd = BCUVirtualDisplay(name: "Agent Display", width: UInt32(width), height: UInt32(height), ppi: 110, serial: 0x4243_5532) else {
             throw ToolError("could not create the virtual display")
         }
         display = vd
@@ -50,6 +50,7 @@ public final class AgentDisplay {
             stop()
             throw ToolError("virtual display never came online")
         }
+        useRetinaMode()
         place()
         AgentDisplay.current = self
         CGDisplayRegisterReconfigurationCallback(reconfigurationCallback, nil)
@@ -73,6 +74,23 @@ public final class AgentDisplay {
 
     private func computeUserBounds() -> CGRect {
         userDisplayIDs().reduce(CGRect.null) { $0.union(CGDisplayBounds($1)) }
+    }
+
+    /// Switch to the 2x mode at our point size. macOS remembers a mode per
+    /// display serial, so a display first made at 1x would stay 1x.
+    private func useRetinaMode() {
+        if let current = CGDisplayCopyDisplayMode(displayID), current.width == width, current.pixelWidth == width * 2 { return }
+        let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+        guard let modes = CGDisplayCopyAllDisplayModes(displayID, opts) as? [CGDisplayMode],
+              let retina = modes.first(where: { $0.width == width && $0.height == height && $0.pixelWidth == width * 2 }) else {
+            Log.info("agent display has no 2x mode at \(width)x\(height)")
+            return
+        }
+        var config: CGDisplayConfigRef?
+        CGBeginDisplayConfiguration(&config)
+        CGConfigureDisplayWithDisplayMode(config, displayID, retina, nil)
+        let err = CGCompleteDisplayConfiguration(config, .forSession)
+        Log.info("agent display switched to \(width)x\(height) at 2x (\(err.rawValue))")
     }
 
     fileprivate func place() {
