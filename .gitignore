@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Build output
+build/
+bin/
+target/
+DerivedData/
+*.dylib
+*.o
+
+# Local-only notes and secrets
+*.local.md
+.env
+.env.*
+*.p12
+*.cer
+*.provisionprofile
+*.mobileprovision
+notarytool-*.json
+
+# Claude Code local state
+.claude/settings.local.json
