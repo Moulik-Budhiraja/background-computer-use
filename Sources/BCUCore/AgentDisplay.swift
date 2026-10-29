@@ -26,6 +26,13 @@ public final class AgentDisplay {
 
     public var isRunning: Bool { display != nil && displayID != 0 }
 
+    /// Where the display is right now. Unlike `bounds`, this is never stale
+    /// while macOS is rearranging displays (wake, a monitor plugged in).
+    public var liveBounds: CGRect {
+        let id = displayID
+        return id == 0 ? .zero : CGDisplayBounds(id)
+    }
+
     /// Must be called on the main thread.
     public func start() throws {
         guard display == nil else { return }

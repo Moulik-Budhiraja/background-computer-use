@@ -34,7 +34,7 @@ For debugging: `bcu call <tool> '{json}'`, `bcu status`, `bcu tools`.
 
 ## How it stays out of your way
 
-- **Its own display.** A 1600×1000 virtual display touches your screens at one corner. An event tap keeps your cursor off it.
+- **Its own display.** A 1600×1000 virtual display touches your screens at one corner. An event tap keeps your cursor off it, and a watcher thread checks the cursor every 4–16 ms and pulls it back from anything that got past the tap (the tap not installed yet or disabled by macOS, displays being rearranged, another app warping the cursor).
 - **Background input.** Clicks and keys are posted to one process through SkyLight, stamped with the target window. Accessibility actions (`AXPress`, value writes) are preferred because they need no keyboard focus.
 - **Shared apps.** You and the agent can use the same app at once (say, both in Helium). Element clicks and value writes go through accessibility and never touch your window. Keystrokes and pixel clicks go to an app's key window, so the agent makes its window key inside the app for a few milliseconds and hands key straight back to yours. Your keys and clicks during that moment are held and replayed in order. Chromium doesn't repaint your window for a swap that short.
 - **Web content.** Chromium and Electron build their full accessibility tree (with press actions on links and buttons) only when an assistive app asks. The agent sets `AXEnhancedUserInterface`, the standard attribute VoiceOver uses, once per app. Popups the agent's window opens, like address-bar suggestions, are listed with its elements so the agent can press them.

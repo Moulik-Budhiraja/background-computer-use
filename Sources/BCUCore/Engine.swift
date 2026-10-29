@@ -43,6 +43,8 @@ public final class Engine {
 
     /// Main thread.
     public func start() throws {
+        // Before the display exists, so the cursor can never be on it unwatched.
+        focusGuard.startCursorWatch()
         try display.start()
         let recovered = windows.recoverFromPreviousRun()
         if !recovered.isEmpty { log("Cleaned up after the last run: " + recovered.joined(separator: "; ")) }
@@ -320,6 +322,8 @@ public final class Engine {
                 }
             }
             return ToolResult(text: text)
+        case "admin_cursor_escape":
+            return ToolResult(text: focusGuard.escapeTest(via: args.string("via") ?? "warp"))
         case "admin_key_hid":
             let (code, _) = try KeyMap.code(for: try args.requireString("key"))
             for down in [true, false] {
