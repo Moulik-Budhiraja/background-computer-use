@@ -62,7 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func showViewer() {
         statusController?.close()
-        if viewer == nil { viewer = ViewerWindowController(engine: engine) }
+        if viewer == nil { viewer = ViewerWindowController(engine: engine, openSettings: { [weak self] in self?.showSettings() }) }
         viewer?.toggle()
     }
 

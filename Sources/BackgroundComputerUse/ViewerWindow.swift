@@ -23,9 +23,11 @@ final class ViewerWindowController {
     private var dim: NSPanel?
     private var panel: OverlayPanel?
 
-    init(engine: Engine) {
+    init(engine: Engine, openSettings: @escaping () -> Void) {
         self.engine = engine
-        model = PopoverModel(engine: engine, openSettings: {}, openViewer: {})
+        var close: () -> Void = {}
+        model = PopoverModel(engine: engine, openSettings: { close(); openSettings() }, openViewer: {})
+        close = { [weak self] in self?.close() }
     }
 
     var isShown: Bool { panel != nil }
@@ -49,14 +51,16 @@ final class ViewerWindowController {
         dimView.onClick = { [weak self] in self?.close() }
         dimPanel.contentView = dimView
 
-        // 88% of the visible screen, at the agent display's aspect ratio.
+        // 88% of the visible screen, sized so the preview keeps the agent
+        // display's aspect ratio inside the panel's padding and header.
         let area = screen.visibleFrame
         let aspect = CGFloat(engine.display.width) / CGFloat(engine.display.height)
+        let padX = ExpandedView.horizontalChrome, padY = ExpandedView.verticalChrome
         var w = area.width * 0.88
-        var h = w / aspect + 44
+        var h = (w - padX) / aspect + padY
         if h > area.height * 0.9 {
             h = area.height * 0.9
-            w = (h - 44) * aspect
+            w = (h - padY) * aspect + padX
         }
         let frame = NSRect(x: area.midX - w / 2, y: area.midY - h / 2, width: w, height: h)
 
@@ -109,22 +113,20 @@ private struct ExpandedView: View {
     @ObservedObject var model: PopoverModel
     let onCollapse: () -> Void
 
+    static let padding: CGFloat = 12
+    static let headerHeight: CGFloat = 28
+    static let spacing: CGFloat = 8
+    static let horizontalChrome = padding * 2
+    static let verticalChrome = padding * 2 + headerHeight + spacing
+
     var body: some View {
-        VStack(spacing: 10) {
-            HeaderBar(model: model, expandSymbol: "arrow.down.right.and.arrow.up.left", onExpand: onCollapse, showSettings: false)
-            ZStack {
-                RoundedRectangle(cornerRadius: 8).fill(Color.black)
-                if let image = model.preview {
-                    Image(decorative: image, scale: 1)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-            }
+        VStack(spacing: Self.spacing) {
+            HeaderBar(model: model, expandSymbol: "arrow.down.right.and.arrow.up.left", onExpand: onCollapse, showMore: false)
+            PreviewPane(model: model, cornerRadius: 10)
         }
-        .padding(12)
-        .background(RoundedRectangle(cornerRadius: 14).fill(Color(white: 0.12)))
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.08)))
+        .padding(Self.padding)
+        .background(RoundedRectangle(cornerRadius: 16).fill(Theme.hud))
+        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5))
         .environment(\.colorScheme, .dark)
     }
 }
