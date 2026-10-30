@@ -237,6 +237,7 @@ public final class Engine {
                 return .error("Paused by the user from the menu bar. Wait and retry later, or tell the user you're blocked.")
             }
             let monitored = !readOnly.contains(tool) || tool == "get_window_state"
+            let startMs = nowMs()
             if monitored { focusGuard.startMonitor() }
             do {
                 var result = try run(tool: tool, args: Args(args))
@@ -245,12 +246,12 @@ public final class Engine {
                     result.text += "\n[focus guard] \(focusNote)"
                 }
                 if tool != "status" && tool != "guard_report" {
-                    log("\(tool): \(result.text.split(separator: "\n").first.map(String.init) ?? "")")
+                    log("\(tool) (\(Int(nowMs() - startMs)) ms): \(result.text.split(separator: "\n").first.map(String.init) ?? "")")
                 }
                 return result
             } catch {
                 if monitored { _ = focusGuard.stopMonitor(tailMs: 0) }
-                log("\(tool) failed: \(error)", error: true)
+                log("\(tool) failed after \(Int(nowMs() - startMs)) ms: \(error)", error: true)
                 return .error("\(error)")
             }
         }
