@@ -32,7 +32,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusController = StatusController(engine: engine,
                                             openSettings: { [weak self] in self?.showSettings() },
-                                            openViewer: { [weak self] in self?.showViewer() })
+                                            openViewer: { [weak self] in self?.showViewer() },
+                                            takeOver: { [weak self] in self?.showViewer(control: true) })
         statusController?.onRefresh = { [weak self] in self?.viewer?.refresh() }
         hotKeys = HotKeys(
             togglePause: { [weak self] in
@@ -60,10 +61,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         server?.stop()
     }
 
-    func showViewer() {
+    func showViewer(control: Bool = false) {
         statusController?.close()
         if viewer == nil { viewer = ViewerWindowController(engine: engine, openSettings: { [weak self] in self?.showSettings() }) }
-        viewer?.toggle()
+        if control { viewer?.showInControl() } else { viewer?.toggle() }
     }
 
     func showSettings() {

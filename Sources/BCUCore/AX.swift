@@ -109,6 +109,13 @@ public enum AX {
         return BCUAXGetWindowID(el, &id) ? id : nil
     }
 
+    /// The app's element under a global point.
+    public static func element(at point: CGPoint, pid: pid_t) -> AXUIElement? {
+        var el: AXUIElement?
+        let err = AXUIElementCopyElementAtPosition(app(pid), Float(point.x), Float(point.y), &el)
+        return err == .success ? el : nil
+    }
+
     public static func windows(_ pid: pid_t) -> [AXUIElement] {
         elements(app(pid), "AXWindows")
     }

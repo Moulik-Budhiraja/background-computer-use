@@ -265,6 +265,17 @@ public final class WindowManager {
             scope = try? KeyScope.enter(pid: pid, window: anchor.id)
             if scope != nil { notes.append("anchored on window \(anchor.id)") }
         }
+        // macOS opens a new window full screen, in a Space of its own, when
+        // the app's key window is full screen, and may switch the user to
+        // it. Take key from that window first (without activating anything)
+        // so the new window opens as a normal one.
+        var unkeyedFullScreen: CGWindowID?
+        if scope == nil, let key = previousKey, let keyAX = AX.window(pid: pid, id: key),
+           AX.bool(keyAX, "AXFullScreen") == true, BCUPostFocusRecord(pid, key, false) == 0 {
+            unkeyedFullScreen = key
+            KeyScope.awaitNoKey(pid: pid, budgetMs: 150)
+            notes.append("took key from the app's full-screen window first")
+        }
         // Assign the app to the agent display's Space so the window is created there.
         var assigned = false
         if placement.contains(.space) {
@@ -292,12 +303,15 @@ public final class WindowManager {
         }
         scope?.exit()
         guard let id = caught else {
+            if let key = unkeyedFullScreen, WindowList.info(key) != nil { KeyScope.postRecords(pid: pid, from: nil, to: key) }
             throw ToolError("\(name) didn't open a new window (tried \(how)). It may not support multiple windows: use list_windows with app=\"\(name)\" and borrow_window.")
         }
         // Give the app's key window back to whatever had it, so switching to
         // the app lands the user on their own window.
         if let previousKey, previousKey != id, WindowList.info(previousKey) != nil, AX.focusedWindowID(pid) == id {
             KeyScope.postRecords(pid: pid, from: id, to: previousKey)
+        } else if let key = unkeyedFullScreen, WindowList.info(key) != nil, AX.focusedWindowID(pid) != key {
+            KeyScope.postRecords(pid: pid, from: nil, to: key)
         }
         let aw = AgentWindow(id: id, pid: pid, appName: name, bundleID: bundleID, kind: .opened)
         register(aw)
@@ -343,10 +357,13 @@ public final class WindowManager {
         nextSlot += 1
         lock.unlock()
         let frame = display.slotFrame(size: size, slot: slot)
-        let ok = AX.setPosition(window, frame.origin)
+        // Shrink first: AppKit puts a window that's too big for the agent
+        // display back on a screen it fits, which is the user's.
         if size != frame.size { AX.setSize(window, frame.size) }
+        let ok = AX.setPosition(window, frame.origin)
         // Some apps clamp the first move; check and retry once.
         if let p = AX.position(window), !display.bounds.contains(p) {
+            if let s = AX.size(window), s != frame.size { AX.setSize(window, frame.size) }
             AX.setPosition(window, frame.origin)
         }
         return ok
@@ -442,6 +459,17 @@ public final class WindowManager {
     }
 
     private var sweeping = false
+    /// The user is moving and resizing windows from the expanded view, so
+    /// don't fit them back inside the display. Apps also round a size by a
+    /// point or two, so a window just past the edge is left alone.
+    public var userArranging = false
+    /// Windows the user moved or resized from the expanded view. They stay
+    /// where the user put them, even hanging off an edge.
+    private var userPlaced: Set<CGWindowID> = []
+
+    public func noteUserPlaced(_ id: CGWindowID) {
+        lock.lock(); userPlaced.insert(id); lock.unlock()
+    }
     private var fitTries: [CGWindowID: (count: Int, lastMs: Double)] = [:]
     private var seenOnAgent: [CGWindowID: Double] = [:]
 
@@ -452,6 +480,7 @@ public final class WindowManager {
     /// refuses isn't resized every sweep.
     private func fitInside(_ w: AgentWindow, frame: CGRect) {
         lock.lock()
+        if userPlaced.contains(w.id) { lock.unlock(); return }
         let prior = fitTries[w.id] ?? (0, -1e12)
         let due = prior.count < 5 && nowMs() - prior.lastMs >= 300
         if due { fitTries[w.id] = (prior.count + 1, nowMs()) }
@@ -516,7 +545,7 @@ public final class WindowManager {
                    let ax = AX.window(pid: w.pid, id: w.id) {
                     moveToAgent(ax, size: info.bounds.size)
                     focusGuard.record("moved your agent's \(w.appName) window back off your display")
-                } else if !w.handedOff && !display.bounds.contains(info.bounds) {
+                } else if !w.handedOff && !userArranging && !display.bounds.insetBy(dx: -8, dy: -8).contains(info.bounds) {
                     fitInside(w, frame: info.bounds)
                 }
                 continue

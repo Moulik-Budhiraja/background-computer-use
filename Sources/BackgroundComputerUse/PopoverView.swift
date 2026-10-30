@@ -15,7 +15,9 @@ final class PopoverModel: ObservableObject {
 
     @Published var statusText = "Idle"
     @Published var status: EngineStatus = .idle
-    @Published var preview: CGImage?
+    /// Set once the first frame arrives; frames themselves go to `frame`.
+    @Published var hasFrame = false
+    let frame = FrameLayer()
     @Published var apps: [AgentApp] = []
     @Published var handoffReason: String?
     @Published var handedOffApp: String?
@@ -24,8 +26,28 @@ final class PopoverModel: ObservableObject {
     @Published var permissionsMissing = false
     @Published var screenRecordingMissing = false
     @Published var lastGuardEvent: String?
+    /// The user is driving the agent display from the expanded view.
+    @Published var controlling = false
+    /// The "Take over?" prompt is showing.
+    @Published var askingControl = false
 
-    private lazy var stream = PreviewStream(engine: engine) { [weak self] image in self?.preview = image }
+    /// Set only on the expanded view's model.
+    var remote: RemoteControl?
+    var onControlChange: ((Bool) -> Void)?
+    /// The pointer moved while dragging in the preview (global point on the agent display).
+    var onDragPoint: ((CGPoint) -> Void)?
+    weak var remoteView: RemoteControlView?
+
+    func excludeFromPreview(_ id: CGWindowID) { stream.excluded = id }
+    /// What the take-over button does here.
+    var takeOver: (() -> Void)?
+    private var previewFPS = 8
+
+    private lazy var stream = PreviewStream(engine: engine) { [weak self] image in
+        guard let self else { return }
+        self.frame.show(image)
+        if !self.hasFrame { self.hasFrame = true }
+    }
     private(set) lazy var moreMenu = MoreMenu(engine: engine, openSettings: openSettings)
 
     init(engine: Engine, openSettings: @escaping () -> Void, openViewer: @escaping () -> Void) {
@@ -41,6 +63,7 @@ final class PopoverModel: ObservableObject {
         case .working(let s): statusText = s
         case .waiting(let s): statusText = s
         case .paused: statusText = "Paused"
+        case .userInControl: statusText = "You're in control"
         }
         var seen = Set<pid_t>()
         apps = engine.windows.windows.compactMap { w in
@@ -61,20 +84,43 @@ final class PopoverModel: ObservableObject {
         }
     }
 
-    func startPreview(width: Int = 880, fps: Int = 8) {
+    func startPreview(fps: Int = 15) {
         guard engine.display.isRunning, Capture.hasPermission else { return }
-        stream.start(width: width, fps: fps)
+        previewFPS = fps
+        stream.start(fps: fps)
     }
 
     func stopPreview() {
         stream.stop()
     }
 
+    func setPreviewFPS(_ fps: Int) {
+        stream.stop()
+        startPreview(fps: fps)
+    }
+
+    func beginControl() {
+        guard remote != nil, !controlling else { return }
+        askingControl = false
+        controlling = true
+        engine.setUserInControl(true)
+        onControlChange?(true)
+    }
+
+    func endControl() {
+        askingControl = false
+        guard controlling else { return }
+        controlling = false
+        remote?.end()
+        engine.setUserInControl(false)
+        onControlChange?(false)
+    }
+
     var tally: Tally.Kind {
         switch status {
         case .working: return .live
         case .waiting: return .needs
-        case .paused: return .paused
+        case .paused, .userInControl: return .paused
         case .idle: return permissionsMissing ? .needs : .idle
         }
     }
@@ -256,10 +302,21 @@ struct HeaderBar: View {
                     model.engine.stopAll()
                 }
                 .disabled(!model.hasWindows)
-                if model.hasWindows && model.handoffReason == nil {
-                    IconButton(symbol: "hand.raised.fill", help: "Take over: move the window to your screen and pause") {
-                        model.engine.takeOver()
+                if model.controlling {
+                    Button { model.endControl() } label: {
+                        Text("Done")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 12)
+                            .frame(height: 22)
+                            .background(Capsule().fill(Color.accentColor))
+                            .contentShape(Capsule())
                     }
+                    .buttonStyle(.plain)
+                    .help("Give the display back to the agent")
+                    .padding(.horizontal, 3)
+                } else if model.hasWindows, let takeOver = model.takeOver {
+                    IconButton(symbol: "hand.raised.fill", help: "Take over: use the agent's windows yourself", action: takeOver)
                 }
                 Rectangle().fill(Theme.hairline).frame(width: 1, height: 14).padding(.leading, 2).padding(.trailing, 4)
                 IconButton(symbol: expandSymbol, help: "Expand", action: onExpand)
@@ -275,6 +332,8 @@ struct HeaderBar: View {
 struct PreviewPane: View {
     @ObservedObject var model: PopoverModel
     var cornerRadius: CGFloat = 8
+    /// Only the expanded view passes this; it makes the preview controllable.
+    var remote: RemoteControl? = nil
 
     var body: some View {
         ZStack {
@@ -283,22 +342,65 @@ struct PreviewPane: View {
                 setup
             } else if !model.hasWindows {
                 empty
-            } else if let image = model.preview {
-                Image(decorative: image, scale: 1)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
+            } else if model.hasFrame {
+                FrameView(frame: model.frame)
+            }
+            if let remote, model.hasWindows, !model.permissionsMissing {
+                RemoteSurface(model: model, remote: remote)
             }
             if !model.permissionsMissing {
-                // Take over also pauses, so the handoff marker wins.
-                if let app = model.handedOffApp {
-                    handoffMarker(app)
-                } else if model.paused {
+                if let app = model.handedOffApp, !model.controlling {
+                    handoffMarker(app).allowsHitTesting(false)
+                } else if model.paused && !model.controlling {
                     pausedScrim
                 }
             }
+            if model.askingControl {
+                controlPrompt
+            }
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
-        .overlay(RoundedRectangle(cornerRadius: cornerRadius).strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
+        .overlay(RoundedRectangle(cornerRadius: cornerRadius)
+            .strokeBorder(model.controlling ? Color.accentColor : Color.primary.opacity(0.08),
+                          lineWidth: model.controlling ? 2 : 0.5))
+    }
+
+    private var controlPrompt: some View {
+        ZStack {
+            Color.black.opacity(0.55)
+                .contentShape(Rectangle())
+                .onTapGesture { model.askingControl = false }
+            VStack(spacing: 10) {
+                Image(systemName: "hand.raised.fill").font(.system(size: 18)).foregroundStyle(.white.opacity(0.8))
+                Text("Take over?").font(.system(size: 15, weight: .semibold)).foregroundStyle(.white)
+                Text("The agent pauses while you use its windows. Your mouse and keyboard work in them while the pointer is over this view.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 300)
+                HStack(spacing: 8) {
+                    Button { model.askingControl = false } label: {
+                        Text("Cancel").frame(width: 92, height: 28)
+                            .background(Capsule().fill(Color.white.opacity(0.14)))
+                            .contentShape(Capsule())
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    Button { model.beginControl() } label: {
+                        Text("Take over").frame(width: 92, height: 28)
+                            .background(Capsule().fill(Color.accentColor))
+                            .contentShape(Capsule())
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white)
+                .padding(.top, 4)
+            }
+            .padding(20)
+            .background(RoundedRectangle(cornerRadius: 14).fill(Theme.hud))
+            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.white.opacity(0.1), lineWidth: 0.5))
+        }
     }
 
     private var empty: some View {

@@ -22,7 +22,9 @@ public final class FocusGuard {
     public var onEvent: ((GuardEvent) -> Void)?
 
     private let lock = NSLock()
-    private var taints: [pid_t: (until: Double, cause: String)] = [:]
+    /// strict: the user is driving the app from the expanded view, so their
+    /// clicks and keys (which land in this app's panel) never explain an activation.
+    private var taints: [pid_t: (until: Double, cause: String, strict: Bool)] = [:]
     private var userFrontPid: pid_t = 0
     private var userFrontWindow: CGWindowID?
     private var lastUserMouseDownMs = 0.0
@@ -150,20 +152,20 @@ public final class FocusGuard {
 
     /// Mark `pid` as being acted on. Activations of it until `endAction` +
     /// a grace period are treated as caused by the agent.
-    public func beginAction(pid: pid_t, cause: String) {
+    public func beginAction(pid: pid_t, cause: String, strict: Bool = false) {
         // Whatever is in front right now (other than the target) is the user's app.
         let front = BCUFrontProcessPID()
         if front != 0 && front != pid && front != getpid() && !isTainted(front) {
             noteUserFront(front)
         }
         lock.lock()
-        taints[pid] = (until: .infinity, cause: cause)
+        taints[pid] = (until: .infinity, cause: cause, strict: strict)
         lock.unlock()
     }
 
     public func endAction(pid: pid_t, graceMs: Double = 700) {
         lock.lock()
-        if let t = taints[pid] { taints[pid] = (until: nowMs() + graceMs, cause: t.cause) }
+        if let t = taints[pid] { taints[pid] = (until: nowMs() + graceMs, cause: t.cause, strict: t.strict) }
         lock.unlock()
     }
 
@@ -209,9 +211,10 @@ public final class FocusGuard {
         lock.lock(); defer { lock.unlock() }
         let now = nowMs()
         guard let t = taints[pid], t.until >= now else { return false }
-        let clickOrSwitch = now - lastUserMouseDownMs < 400 || now - lastUserSwitchKeyMs < 400
+        let click = !t.strict && now - lastUserMouseDownMs < 400
+        let clickOrSwitch = click || now - lastUserSwitchKeyMs < 400
         if t.until == .infinity { return !clickOrSwitch }
-        return !clickOrSwitch && now - lastUserKeyMs >= 1500
+        return !clickOrSwitch && (t.strict || now - lastUserKeyMs >= 1500)
     }
 
     func record(_ summary: String) {

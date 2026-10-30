@@ -7,6 +7,8 @@ public enum EngineStatus: Equatable {
     case working(String)
     case waiting(String)
     case paused
+    /// The user is driving the agent display from the expanded view.
+    case userInControl
 }
 
 public struct ActivityItem {
@@ -32,6 +34,8 @@ public final class Engine {
     private var enhancedPids: Set<pid_t> = []
     private var _activity: [ActivityItem] = []
     private var _paused = false
+    private var _userInControl = false
+    private lazy var testRemote = RemoteControl(engine: self)
     private var _waitingReason: String?
     private var _busy: String?
     private var lastCallMs = 0.0
@@ -84,6 +88,7 @@ public final class Engine {
 
     public var status: EngineStatus {
         stateLock.lock(); defer { stateLock.unlock() }
+        if _userInControl { return .userInControl }
         if _paused { return .paused }
         if let r = _waitingReason { return .waiting(r) }
         if let handoff = windows.windows.first(where: { $0.handedOff }) {
@@ -131,14 +136,20 @@ public final class Engine {
         }
     }
 
-    /// The user takes over: move the agent's front window onto their screen and pause.
-    public func takeOver() {
-        queue.async {
-            if let w = self.windows.windows.first(where: { !$0.handedOff }) {
-                try? self.windows.handoff(w.id, reason: "You took over this window")
-            }
-            self.setPaused(true)
-        }
+    /// The user is driving the agent display from the expanded view. The
+    /// agent's actions are refused until they give it back.
+    public var userInControl: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _userInControl
+    }
+
+    public func setUserInControl(_ value: Bool) {
+        stateLock.lock()
+        let was = _userInControl
+        _userInControl = value
+        stateLock.unlock()
+        windows.userArranging = value
+        if was != value { log(value ? "You took over the agent display" : "You gave the agent display back") }
     }
 
     /// The user is done: move handed-off windows back to the agent display and resume.
@@ -170,6 +181,10 @@ public final class Engine {
                 changed()
             }
             let readOnly: Set<String> = ["status", "guard_report", "list_apps", "list_windows", "release_window", "screenshot", "get_window_state"]
+            // Closing a window the user is working in would pull it out from under them.
+            if userInControl && (!readOnly.contains(tool) || tool == "release_window") {
+                return .error("The user took over your display and is using your windows. Wait and retry later, or tell the user you're blocked.")
+            }
             if paused && !readOnly.contains(tool) {
                 return .error("Paused by the user from the menu bar. Wait and retry later, or tell the user you're blocked.")
             }
@@ -336,6 +351,82 @@ public final class Engine {
                 }
             }
             return ToolResult(text: text)
+        case "admin_remote":
+            // Drive the remote-control path the expanded view uses, without the view.
+            let (w, ax) = try agentWindow(args)
+            guard let f = AX.frame(ax) else { throw ToolError("no frame") }
+            let p = CGPoint(x: f.minX + (args.double("x") ?? 0), y: f.minY + (args.double("y") ?? 0))
+            let remote = testRemote
+            let target = remote.window(at: p).map { "\($0.id) \($0.owner) layer \($0.layer)" } ?? "none"
+            switch args.string("action") ?? "click" {
+            case "click":
+                remote.mouse(.leftMouseDown, at: p, button: 0, clickCount: 1, flags: [])
+                remote.mouse(.leftMouseUp, at: p, button: 0, clickCount: 1, flags: [])
+            case "type":
+                let src = CGEventSource(stateID: .hidSystemState)
+                for ch in try args.requireString("text") {
+                    let (code, shift) = ch == "\n" ? (CGKeyCode(36), false) : try KeyMap.code(for: String(ch))
+                    for down in [true, false] {
+                        guard let k = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: down) else { continue }
+                        k.flags = shift ? .maskShift : []
+                        remote.key(k)
+                    }
+                }
+            case "key":
+                let (code, _) = try KeyMap.code(for: try args.requireString("key"))
+                let flags = KeyMap.flags((args.raw["modifiers"] as? [String]) ?? [])
+                for down in [true, false] {
+                    guard let k = CGEvent(keyboardEventSource: CGEventSource(stateID: .hidSystemState), virtualKey: code, keyDown: down) else { continue }
+                    k.flags = flags
+                    remote.key(k)
+                }
+            case "double":
+                for n in 1...2 {
+                    remote.mouse(.leftMouseDown, at: p, button: 0, clickCount: n, flags: [])
+                    remote.mouse(.leftMouseUp, at: p, button: 0, clickCount: n, flags: [])
+                    remote.flush()
+                    sleepMs(60)
+                }
+            case "choose":
+                let path = (args.raw["path"] as? [Any])?.compactMap { ($0 as? NSNumber)?.intValue } ?? []
+                remote.chooseMenuItem(token: remote.latestMenuToken, path: path)
+                sleepMs(900)
+            case "move":
+                remote.mouse(.mouseMoved, at: p, button: 0, clickCount: 0, flags: [])
+            case "right":
+                remote.mouse(.rightMouseDown, at: p, button: 1, clickCount: 1, flags: [])
+                remote.mouse(.rightMouseUp, at: p, button: 1, clickCount: 1, flags: [])
+            case "drag":
+                let q = CGPoint(x: f.minX + (args.double("to_x") ?? 0), y: f.minY + (args.double("to_y") ?? 0))
+                remote.mouse(.leftMouseDown, at: p, button: 0, clickCount: 1, flags: [])
+                for i in 1...10 {
+                    let t = CGFloat(i) / 10
+                    remote.mouse(.leftMouseDragged, at: CGPoint(x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t), button: 0, clickCount: 1, flags: [])
+                    remote.flush(); sleepMs(16)
+                }
+                remote.mouse(.leftMouseUp, at: q, button: 0, clickCount: 1, flags: [])
+            case "scroll":
+                if let s = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: Int32(args.int("dy") ?? -400), wheel2: 0, wheel3: 0) {
+                    remote.scroll(s, at: p)
+                }
+            default: throw ToolError("action is click, type, key or scroll")
+            }
+            remote.flush()
+            return ToolResult(text: "posted to \(target); app key window \(AX.focusedWindowID(w.pid).map(String.init) ?? "none"), front pid \(BCUFrontProcessPID())")
+        case "admin_hit":
+            let (w, ax) = try agentWindow(args)
+            guard let f = AX.frame(ax) else { throw ToolError("no frame") }
+            let p = CGPoint(x: f.minX + (args.double("x") ?? 0), y: f.minY + (args.double("y") ?? 0))
+            var el: AXUIElement?
+            let err = AXUIElementCopyElementAtPosition(AX.app(w.pid), Float(p.x), Float(p.y), &el)
+            var lines = ["hit at \(p): \(AX.errorName(err))"]
+            var cur = el
+            for _ in 0..<6 {
+                guard let e = cur else { break }
+                lines.append("\(AX.string(e, "AXRole") ?? "?") \"\(AX.string(e, "AXTitle") ?? "")\" actions \(AX.actions(e))")
+                cur = AX.element(e, "AXParent")
+            }
+            return ToolResult(text: lines.joined(separator: "\n"))
         case "admin_cursor_escape":
             return ToolResult(text: focusGuard.escapeTest(via: args.string("via") ?? "warp"))
         case "admin_key_hid":
@@ -402,6 +493,7 @@ public final class Engine {
     /// land in the agent's window.
     private func keyed<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) throws -> T {
         if paused { throw ToolError("paused by the user") }
+        if userInControl { throw ToolError("the user took over your display") }
         focusGuard.beginAction(pid: w.pid, cause: cause)
         windows.noteBefore(pid: w.pid)
         defer { focusGuard.endAction(pid: w.pid) }

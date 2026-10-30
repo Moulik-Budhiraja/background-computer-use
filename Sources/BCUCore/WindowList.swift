@@ -14,8 +14,9 @@ public struct WindowInfo {
 
 /// CGWindowList, which sees every window on every display and Space.
 public enum WindowList {
-    public static func all(onScreenOnly: Bool = false) -> [WindowInfo] {
-        let options: CGWindowListOption = onScreenOnly ? [.optionOnScreenOnly, .excludeDesktopElements] : [.optionAll, .excludeDesktopElements]
+    public static func all(onScreenOnly: Bool = false, includeDesktop: Bool = false) -> [WindowInfo] {
+        var options: CGWindowListOption = onScreenOnly ? [.optionOnScreenOnly] : [.optionAll]
+        if !includeDesktop { options.insert(.excludeDesktopElements) }
         guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return [] }
         return list.compactMap(parse)
     }

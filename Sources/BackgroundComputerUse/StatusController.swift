@@ -14,9 +14,10 @@ final class StatusController: NSObject, NSPopoverDelegate {
     private var clickMonitor: Any?
     var onRefresh: (() -> Void)?
 
-    init(engine: Engine, openSettings: @escaping () -> Void, openViewer: @escaping () -> Void) {
+    init(engine: Engine, openSettings: @escaping () -> Void, openViewer: @escaping () -> Void, takeOver: @escaping () -> Void) {
         self.engine = engine
         self.model = PopoverModel(engine: engine, openSettings: openSettings, openViewer: openViewer)
+        self.model.takeOver = takeOver
         super.init()
         item.button?.target = self
         item.button?.action = #selector(togglePopover)
@@ -34,7 +35,7 @@ final class StatusController: NSObject, NSPopoverDelegate {
         onRefresh?()
         let next: Icon
         switch engine.status {
-        case .paused: next = .paused
+        case .paused, .userInControl: next = .paused
         case .waiting: next = .waiting
         default: next = engine.isActive ? .working : .idle
         }

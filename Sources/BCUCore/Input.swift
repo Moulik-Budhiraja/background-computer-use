@@ -17,7 +17,7 @@ public enum Input {
         CGEventSource(stateID: .hidSystemState)
     }
 
-    private static func stampMouse(_ e: CGEvent, pid: pid_t, windowID: CGWindowID, phase: Int64, clickState: Int64, button: Int64, group: Int64, location: CGPoint) {
+    static func stampMouse(_ e: CGEvent, pid: pid_t, windowID: CGWindowID, phase: Int64, clickState: Int64, button: Int64, group: Int64, location: CGPoint) {
         BCUEventSetIntegerField(e, 0, phase)        // gesture phase
         BCUEventSetIntegerField(e, 1, clickState)   // kCGMouseEventClickState
         BCUEventSetIntegerField(e, 3, button)       // kCGMouseEventButtonNumber
@@ -67,6 +67,8 @@ public enum Input {
     /// Scroll wheel at a global point. Positive dy scrolls content down (towards the end).
     public static func scroll(pid: pid_t, windowID: CGWindowID, at point: CGPoint, dx: Int, dy: Int) throws {
         guard let src = source() else { throw ToolError("could not create an event source") }
+        // Chromium ignores wheel events that don't carry the point inside the target window.
+        let origin = WindowList.info(windowID)?.bounds.origin
         if let move = CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) {
             stampMouse(move, pid: pid, windowID: windowID, phase: 2, clickState: 0, button: 0, group: 0, location: point)
             BCUPostEventToPid(pid, move, false)
@@ -84,8 +86,8 @@ public enum Input {
                 BCUEventSetIntegerField(e, 91, Int64(windowID))
                 BCUEventSetIntegerField(e, 92, Int64(windowID))
             }
+            if let origin { BCUEventSetWindowLocation(e, CGPoint(x: point.x - origin.x, y: point.y - origin.y)) }
             BCUPostEventToPid(pid, e, false)
-            e.postToPid(pid)
             sleepMs(30)
         }
     }

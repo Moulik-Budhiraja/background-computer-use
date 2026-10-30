@@ -107,6 +107,13 @@ public final class KeyScope {
         return ok
     }
 
+    static func awaitNoKey(pid: pid_t, budgetMs: Double) {
+        let deadline = nowMs() + budgetMs
+        while AX.focusedElementWindowID(pid) != nil && nowMs() < deadline {
+            sleepMs(2)
+        }
+    }
+
     static func awaitKey(pid: pid_t, target: CGWindowID, budgetMs: Double) {
         let deadline = nowMs() + budgetMs
         while AX.focusedWindowID(pid) != target && nowMs() < deadline {
