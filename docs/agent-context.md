@@ -177,7 +177,7 @@ Focus-guard events: anything that touched the user's focus, cursor or screen, wi
 
 ---
 name: background-computer-use
-description: Operate the user's real Mac apps (their logged-in browser, Mail, Notes, Messages, any app) in the background with the background-computer-use MCP tools, without taking their screen, cursor or keyboard. Use when a task needs a website behind the user's login, a Mac app with no API or CLI, or anything the user would otherwise do by hand in an app.
+description: Use for all computer use. Load it whenever you're about to launch, open, focus or activate an app or window, or do anything inside a Mac app, and before anything that could take focus away from what the user is doing.
 ---
 
 ### Background Computer Use
