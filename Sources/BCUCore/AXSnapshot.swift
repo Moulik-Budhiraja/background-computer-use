@@ -127,7 +127,10 @@ public enum AXSnapshot {
                     var line = raw.role.replacingOccurrences(of: "AX", with: "")
                     if !raw.subrole.isEmpty && raw.subrole != "AXUnknown" { line += "(\(raw.subrole.replacingOccurrences(of: "AX", with: "")))" }
                     if !label.isEmpty { line += " \"\(clean(label))\"" }
-                    if !raw.value.isEmpty && raw.value != label { line += " value=\"\(clean(raw.value, 160))\"" }
+                    // Never show what's in a password field, even if the app exposes it.
+                    let secure = raw.role == "AXSecureTextField" || raw.subrole == "AXSecureTextField"
+                    if secure && !raw.value.isEmpty { line += " value=(hidden)" }
+                    else if !raw.value.isEmpty && raw.value != label { line += " value=\"\(clean(raw.value, 160))\"" }
                     if raw.value.isEmpty && !raw.placeholder.isEmpty { line += " placeholder=\"\(clean(raw.placeholder))\"" }
                     let local = CGRect(x: f.minX - windowFrame.minX, y: f.minY - windowFrame.minY, width: f.width, height: f.height)
                     line += " @(\(Int(local.minX)),\(Int(local.minY)) \(Int(local.width))x\(Int(local.height)))"

@@ -21,6 +21,8 @@ rm -rf "$OUT"
 mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
 cp "$BIN/BackgroundComputerUse" "$OUT/Contents/MacOS/BackgroundComputerUse"
 cp "$BIN/bcu" "$OUT/Contents/MacOS/bcu"
+mkdir -p "$OUT/Contents/Resources/skills"
+cp -R skills/background-computer-use "$OUT/Contents/Resources/skills/"
 
 cat > "$OUT/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

@@ -161,8 +161,4 @@ Everything after this depends on the results.
 
 **2. Hardening.** Keystroke hold, window-order restore, leftover cleanup, display reconfiguration (plugging and unplugging monitors), sleep/wake, and recovery after a crash.
 
-**3. Agents.** Register as an MCP server for Claude Code and Codex. Add a short skill telling agents:
-- use the default browser
-- prefer AX actions
-- expect keystroke steps to wait while you're in that app
-- never use foreground
+**3. Agents.** Register as an MCP server for Claude Code and Codex. The skill is in `skills/background-computer-use/SKILL.md` and installs with `bcu install-skill`. It tells agents to use the default browser, prefer AX actions, batch known steps, use only the accounts the user has allowed (asking when a task turns out to need another one), ask in one message before anything others will see, permanent deletion or payment, fill passwords only from a password manager, and never use tools that take the foreground.

@@ -730,7 +730,13 @@ public final class Engine {
         let (w, _) = try agentWindow(args)
         let n = try node(args, window: w)
         var action = try args.requireString("action")
-        if !action.hasPrefix("AX") { action = "AX" + action.prefix(1).uppercased() + action.dropFirst() }
+        // The tree lists actions as "showmenu"; match that to the element's own "AXShowMenu".
+        let bare = action.hasPrefix("AX") ? String(action.dropFirst(2)) : action
+        if let own = n.actions.first(where: { $0.hasPrefix("AX") && $0.dropFirst(2).lowercased() == bare.lowercased() }) {
+            action = own
+        } else if !action.hasPrefix("AX") {
+            action = "AX" + action.prefix(1).uppercased() + action.dropFirst()
+        }
         let err = guarded(w, cause: "performing \(action)") { AX.perform(n.element, action) }
         guard err == .success else {
             throw ToolError("\(action) on element \(n.index) failed: \(AX.errorName(err)). Its actions: \(n.actions.joined(separator: ", "))")

@@ -5,6 +5,8 @@ import BCUShared
 //   bcu mcp                      stdio MCP server (what agents run)
 //   bcu call <tool> ['<json>']   call one tool and print the result
 //   bcu status                   same as `bcu call status`
+//   bcu docs                     everything an agent is told, as Markdown
+//   bcu install-skill            copy the skill into Claude Code and Codex
 
 let usage = """
 usage:
@@ -12,6 +14,8 @@ usage:
   bcu call <tool> ['{json}']    call one tool (images are saved to /tmp/bcu-*.png)
   bcu status                    show the app's status
   bcu tools                     list tool names
+  bcu docs                      print everything an agent is told (instructions, tools, skill) as Markdown
+  bcu install-skill             install the skill for Claude Code (~/.claude/skills) and Codex (~/.codex/skills)
 """
 
 /// Connect to the app, launching it in the background if it isn't running.
@@ -92,6 +96,15 @@ case "status":
     }
 case "tools":
     for t in ToolCatalog.tools { print(t["name"] as? String ?? "") }
+case "docs":
+    print(AgentDocs.markdown(skill: AgentDocs.skillFile()))
+case "install-skill":
+    do {
+        for path in try AgentDocs.installSkill() { print("installed \(path)") }
+    } catch {
+        print("bcu: \(error)")
+        exit(1)
+    }
 default:
     print(usage)
     exit(1)
