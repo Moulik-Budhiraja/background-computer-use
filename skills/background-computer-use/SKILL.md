@@ -1,6 +1,6 @@
 ---
 name: background-computer-use
-description: Use for all computer use. Load it whenever you're about to launch, open, focus or activate an app or window, or do anything inside a Mac app, and before anything that could take focus away from what the user is doing.
+description: Use for all computer use, instead of any other computer-use tool. Load it whenever you're about to launch, open, focus or activate an app or window, or do anything inside a Mac app. Never take focus from the user; this skill does the same work in the background without it.
 ---
 
 # Background Computer Use
