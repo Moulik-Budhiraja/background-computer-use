@@ -291,13 +291,21 @@ public final class WindowManager {
         noteBefore(pid: pid)
         var notes: [String] = []
 
-        // If the agent already has a window of this app, make it the app's key
-        // window first: apps place new windows relative to their key window.
+        // If an agent already has a window of this app, make it the app's key
+        // window first: apps place new windows relative to their key window,
+        // so the new one opens on an agent display instead of the user's
+        // screen (where it would cover the pointer and end hover effects).
+        // This session's own window first, else any agent's.
+        // Key changes while opening must not interleave with another session
+        // typing into a window of the same app, so hold the input lock until
+        // key is handed back.
+        Engine.inputLock.lock()
+        var holdingInput = true
+        defer { if holdingInput { Engine.inputLock.unlock() } }
         var scope: KeyScope?
-        if placement.contains(.anchor),
-           let anchor = windows.first(where: { $0.pid == pid && !$0.handedOff && WindowList.info($0.id) != nil }) {
-            scope = try? KeyScope.enter(pid: pid, window: anchor.id)
-            if scope != nil { notes.append("anchored on window \(anchor.id)") }
+        if placement.contains(.anchor), let anchor = anchorWindow(pid: pid) {
+            scope = try? KeyScope.enter(pid: pid, window: anchor)
+            if scope != nil { notes.append("anchored on window \(anchor)") }
         }
         // macOS opens a new window full screen, in a Space of its own, when
         // the app's key window is full screen, and may switch the user to
@@ -330,21 +338,28 @@ public final class WindowManager {
             how = "cmd+N"
         }
         let caught = catcher.waitForWindow(timeoutMs: 5000)
+        // Give key back right away: while the new window is key, the user's
+        // window in the same app is blurred.
+        scope?.exit()
+        if let id = caught, let previousKey, previousKey != id, WindowList.info(previousKey) != nil, AX.focusedWindowID(pid) == id {
+            KeyScope.postRecords(pid: pid, from: id, to: previousKey)
+        }
+        Engine.inputLock.unlock()
+        holdingInput = false
+        // Keep watching a moment in case the app moves or resizes the window back.
+        sleepMs(250)
         catcher.stop()
         if assigned {
             _ = BCUProcessAssignToSpace(pid, 0)
             assigned = false
         }
-        scope?.exit()
         guard let id = caught else {
             if let key = unkeyedFullScreen, WindowList.info(key) != nil { KeyScope.postRecords(pid: pid, from: nil, to: key) }
             throw ToolError("\(name) didn't open a new window (tried \(how)). It may not support multiple windows: use list_windows with app=\"\(name)\" and borrow_window.")
         }
         // Give the app's key window back to whatever had it, so switching to
         // the app lands the user on their own window.
-        if let previousKey, previousKey != id, WindowList.info(previousKey) != nil, AX.focusedWindowID(pid) == id {
-            KeyScope.postRecords(pid: pid, from: id, to: previousKey)
-        } else if let key = unkeyedFullScreen, WindowList.info(key) != nil, AX.focusedWindowID(pid) != key {
+        if let key = unkeyedFullScreen, WindowList.info(key) != nil, AX.focusedWindowID(pid) != key {
             KeyScope.postRecords(pid: pid, from: nil, to: key)
         }
         let aw = AgentWindow(id: id, pid: pid, appName: name, bundleID: bundleID, kind: .opened)
@@ -352,6 +367,16 @@ public final class WindowManager {
         notes.insert("opened with \(how)", at: 0)
         notes.append(catcher.flashReport)
         return OpenResult(window: aw, notes: notes)
+    }
+
+    /// A window of `pid` on an agent display to open the new window next to.
+    private func anchorWindow(pid: pid_t) -> CGWindowID? {
+        if let own = windows.first(where: { $0.pid == pid && !$0.handedOff && WindowList.info($0.id) != nil }) { return own.id }
+        let displays = AgentDisplay.running.map(\.bounds)
+        return WindowList.of(pid: pid, onScreenOnly: true).first { w in
+            w.layer == 0 && w.bounds.width > 100 && w.bounds.height > 100
+                && displays.contains { $0.contains(CGPoint(x: w.bounds.midX, y: w.bounds.midY)) }
+        }?.id
     }
 
     struct MenuItemRef {
@@ -386,11 +411,21 @@ public final class WindowManager {
     /// Move a window onto the agent display, keeping its size where it fits.
     @discardableResult
     func moveToAgent(_ window: AXUIElement, size: CGSize) -> Bool {
+        moveToAgent(window, frame: nextFrame(size: size))
+    }
+
+    /// The next cascade position on the agent display for a window this size.
+    func nextFrame(size: CGSize) -> CGRect {
         lock.lock()
         let slot = nextSlot
         nextSlot += 1
         lock.unlock()
-        let frame = display.slotFrame(size: size, slot: slot)
+        return display.slotFrame(size: size, slot: slot)
+    }
+
+    @discardableResult
+    func moveToAgent(_ window: AXUIElement, frame: CGRect) -> Bool {
+        let size = AX.size(window) ?? frame.size
         // Shrink first: AppKit puts a window that's too big for the agent
         // display back on a screen it fits, which is the user's.
         if size != frame.size { AX.setSize(window, frame.size) }
@@ -632,7 +667,10 @@ final class WindowCatcher {
     private var firstOnUserMs: Double?
     private var lastOnUserMs: Double?
     private var movedMs: Double?
-    private var moved: Set<CGWindowID> = []
+    /// Move attempts per window: how many, and when the last one ended.
+    private var moved: [CGWindowID: (count: Int, lastMs: Double)] = [:]
+    /// Where the new window goes; the same frame for every retry.
+    private var target: CGRect?
 
     init(pid: pid_t, before: Set<CGWindowID>, manager: WindowManager) {
         self.pid = pid
@@ -675,12 +713,19 @@ final class WindowCatcher {
 
     private func catchWindow(id: CGWindowID, element: AXUIElement) {
         lock.lock()
-        if moved.contains(id) { lock.unlock(); return }
-        moved.insert(id)
+        // Apps can reset a new window's position just after creating it,
+        // undoing the move, so a window still on the user's screen is moved
+        // again, every 30 ms, up to 10 times.
+        if let m = moved[id], m.count >= 10 || nowMs() - m.lastMs < 30 || m.lastMs == 0 { lock.unlock(); return }
+        let count = (moved[id]?.count ?? 0) + 1
+        moved[id] = (count, 0)  // 0: a move is in progress
         lock.unlock()
-        let size = AX.size(element) ?? CGSize(width: 1200, height: 800)
-        manager?.moveToAgent(element, size: size)
+        if target == nil {
+            target = manager?.nextFrame(size: AX.size(element) ?? CGSize(width: 1200, height: 800))
+        }
+        if let target { manager?.moveToAgent(element, frame: target) }
         lock.lock()
+        moved[id] = (count, nowMs())
         if caughtID == nil { caughtID = id }
         if movedMs == nil { movedMs = nowMs() }
         lock.unlock()
@@ -699,15 +744,34 @@ final class WindowCatcher {
                     lock.lock()
                     if firstOnUserMs == nil { firstOnUserMs = now }
                     lastOnUserMs = now
-                    let alreadyMoved = moved.contains(info.id)
+                    let m = moved[info.id]
                     lock.unlock()
-                    if !alreadyMoved && now - (firstOnUserMs ?? now) > 15, let ax = AX.window(pid: pid, id: info.id) {
+                    let due = m == nil ? now - (firstOnUserMs ?? now) > 15 : (m!.lastMs > 0 && now - m!.lastMs >= 30 && m!.count < 10)
+                    if due, let ax = AX.window(pid: pid, id: info.id) {
                         catchWindow(id: info.id, element: ax)
                     }
                 } else if manager?.display.holds(info.bounds) == true {
                     lock.lock()
                     if caughtID == nil { caughtID = info.id }
+                    let m = moved[info.id]
+                    let t = target
                     lock.unlock()
+                    // Chromium also resets the size after the move. A window
+                    // wider than the agent display gets put back on the
+                    // user's screen, and the next window copies its size.
+                    if let m, let t, m.lastMs > 0, now - m.lastMs >= 30, m.count < 10,
+                       abs(info.bounds.width - t.width) > 2 || abs(info.bounds.height - t.height) > 2,
+                       let ax = AX.window(pid: pid, id: info.id) {
+                        catchWindow(id: info.id, element: ax)
+                    }
+                } else if AgentDisplay.containing(CGPoint(x: info.bounds.midX, y: info.bounds.midY)) != nil {
+                    // Opened next to another session's window: bring it to ours.
+                    lock.lock()
+                    let m = moved[info.id]
+                    lock.unlock()
+                    if m == nil || (m!.lastMs > 0 && now - m!.lastMs >= 30 && m!.count < 10), let ax = AX.window(pid: pid, id: info.id) {
+                        catchWindow(id: info.id, element: ax)
+                    }
                 }
             }
             usleep(2000)
@@ -721,7 +785,6 @@ final class WindowCatcher {
             let id = caughtID
             lock.unlock()
             if let id, let info = WindowList.info(id), manager?.display.holds(info.bounds) == true {
-                sleepMs(60)  // let the exposure measurement see the final state
                 return id
             }
             sleepMs(10)
