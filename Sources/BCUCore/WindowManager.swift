@@ -24,19 +24,37 @@ public final class AgentWindow {
     }
 }
 
-/// Owns which windows belong to the agent and keeps them on the agent display.
+/// Owns which windows belong to one agent session and keeps them on its display.
 public final class WindowManager {
     let display: AgentDisplay
     let focusGuard: FocusGuard
+    /// Names this session's crash-recovery file.
+    let sessionKey: String
     private let lock = NSLock()
     private var registry: [CGWindowID: AgentWindow] = [:]
     private var knownBefore: [pid_t: Set<CGWindowID>] = [:]
     private var nextSlot = 0
     private var watchdog: Timer?
 
-    init(display: AgentDisplay, focusGuard: FocusGuard) {
+    init(display: AgentDisplay, focusGuard: FocusGuard, sessionKey: String) {
         self.display = display
         self.focusGuard = focusGuard
+        self.sessionKey = sessionKey.filter { $0.isLetter || $0.isNumber || $0 == "-" }
+    }
+
+    // MARK: Across sessions
+
+    /// Apps some session is opening a window in. Another session's watchdog
+    /// leaves new windows of these apps alone; they belong to the opener.
+    private static let sharedLock = NSLock()
+    private static var openingAnywhere: Set<pid_t> = []
+    /// One window opening at a time across sessions, so one session's
+    /// catcher can't take another's new window.
+    static let openLock = NSLock()
+
+    static func isOpening(_ pid: pid_t) -> Bool {
+        sharedLock.lock(); defer { sharedLock.unlock() }
+        return openingAnywhere.contains(pid)
     }
 
     public var windows: [AgentWindow] {
@@ -59,7 +77,7 @@ public final class WindowManager {
         persist()
     }
 
-    private var registryURL: URL { BCUPaths.supportDirectory.appendingPathComponent("windows.json") }
+    private var registryURL: URL { BCUPaths.supportDirectory.appendingPathComponent("windows-\(sessionKey).json") }
 
     /// Written on every change, so the next launch can clean up after a crash.
     private func persist() {
@@ -70,15 +88,28 @@ public final class WindowManager {
             return e
         }
         lock.unlock()
+        if entries.isEmpty {
+            try? FileManager.default.removeItem(at: registryURL)
+            return
+        }
         if let data = try? JSONSerialization.data(withJSONObject: entries) {
             try? FileManager.default.createDirectory(at: BCUPaths.supportDirectory, withIntermediateDirectories: true)
             try? data.write(to: registryURL, options: .atomic)
         }
     }
 
-    /// On launch: close windows a previous run opened, return ones it borrowed.
-    public func recoverFromPreviousRun() -> [String] {
-        guard let data = try? Data(contentsOf: registryURL),
+    /// On launch: close windows a previous run opened, return ones it
+    /// borrowed, for every session it had.
+    public static func recoverFromPreviousRun() -> [String] {
+        let dir = BCUPaths.supportDirectory
+        let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .filter { $0.hasPrefix("windows") && $0.hasSuffix(".json") }
+        return files.flatMap { recover(dir.appendingPathComponent($0)) }
+    }
+
+    private static func recover(_ url: URL) -> [String] {
+        defer { try? FileManager.default.removeItem(at: url) }
+        guard let data = try? Data(contentsOf: url),
               let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
         var notes: [String] = []
         for e in entries {
@@ -93,7 +124,6 @@ public final class WindowManager {
                 notes.append("closed leftover \(e["app"] ?? "?") window \(id)")
             }
         }
-        try? FileManager.default.removeItem(at: registryURL)
         return notes
     }
 
@@ -248,11 +278,15 @@ public final class WindowManager {
         let before = Set(WindowList.of(pid: pid).map(\.id))
         let previousKey = AX.focusedWindowID(pid)
         let catcher = WindowCatcher(pid: pid, before: before, manager: self)
+        Self.openLock.lock()
         focusGuard.beginAction(pid: pid, cause: "opening a \(name) window")
         lock.lock(); opening.insert(pid); lock.unlock()
+        Self.sharedLock.lock(); Self.openingAnywhere.insert(pid); Self.sharedLock.unlock()
         defer {
             focusGuard.endAction(pid: pid)
             lock.lock(); opening.remove(pid); lock.unlock()
+            Self.sharedLock.lock(); Self.openingAnywhere.remove(pid); Self.sharedLock.unlock()
+            Self.openLock.unlock()
         }
         noteBefore(pid: pid)
         var notes: [String] = []
@@ -451,6 +485,11 @@ public final class WindowManager {
         lock.lock(); knownBefore[pid] = ids; lock.unlock()
     }
 
+    func stopWatchdog() {
+        watchdog?.invalidate()
+        watchdog = nil
+    }
+
     func startWatchdog() {
         watchdog?.invalidate()
         watchdog = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
@@ -516,7 +555,8 @@ public final class WindowManager {
         // the agent display. A new, unregistered window there, from the app the
         // user is in, is theirs: move it to their screen.
         let front = BCUFrontProcessPID()
-        for info in onScreen where info.layer == 0 && agent[info.id] == nil && display.holds(info.bounds) {
+        for info in onScreen where info.layer == 0 && agent[info.id] == nil && display.holds(info.bounds)
+            && !opening.contains(info.pid) && !Self.isOpening(info.pid) {
             // Judge each new window for 1.5 s: the guard learns the user's front
             // app a moment after it changes.
             lock.lock()
@@ -553,7 +593,7 @@ public final class WindowManager {
             // Only while the agent acts on the app and the user isn't in it:
             // a window that appears in the app the user is using is theirs.
             lock.lock()
-            let midOpen = opening.contains(info.pid)
+            let midOpen = opening.contains(info.pid) || Self.isOpening(info.pid)
             lock.unlock()
             guard tainted.contains(info.pid), !midOpen, info.pid != front, info.pid != focusGuard.userFront else { continue }
             lock.lock()

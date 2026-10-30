@@ -17,11 +17,18 @@ public struct ActivityItem {
     public let isError: Bool
 }
 
-/// Runs tool calls one at a time on its own queue and publishes state for the menu bar.
+/// One agent session: its own display (created when it first needs one),
+/// windows, activity, pause and take-over. Runs the session's tool calls one
+/// at a time on its own queue; input to apps is serialized across sessions.
 public final class Engine {
+    public let sessionID: String
+    /// Shown in the menu bar, e.g. "Claude Code".
+    public let label: String
     public let display: AgentDisplay
     public let focusGuard: FocusGuard
     public let windows: WindowManager
+    /// Sound from apps only this session uses goes here instead of the speakers.
+    public let audio: SessionAudio
 
     /// Called on the main thread whenever status, activity or windows change.
     public var onChange: (() -> Void)?
@@ -40,38 +47,78 @@ public final class Engine {
     private var _busy: String?
     private var lastCallMs = 0.0
 
-    public init(width: Int = 1600, height: Int = 1000) {
+    /// Input to apps (key-window swaps, clicks, keys) from any session goes
+    /// one at a time: two sessions in the same app would fight over its key window.
+    public static let inputLock = NSRecursiveLock()
+
+    public init(sessionID: String, label: String, focusGuard: FocusGuard, width: Int = AgentDisplay.defaultWidth, height: Int = AgentDisplay.defaultHeight) {
+        self.sessionID = sessionID
+        self.label = label
+        self.focusGuard = focusGuard
         display = AgentDisplay(width: width, height: height)
-        focusGuard = FocusGuard(display: display)
-        windows = WindowManager(display: display, focusGuard: focusGuard)
-        focusGuard.onEvent = { [weak self] _ in self?.changed() }
+        windows = WindowManager(display: display, focusGuard: focusGuard, sessionKey: sessionID)
+        let safe = label.replacingOccurrences(of: " ", with: "-").lowercased()
+        audio = SessionAudio(name: "\(safe)-\(sessionID.prefix(8))")
     }
 
-    /// Main thread.
-    public func start() throws {
-        // Before the display exists, so the cursor can never be on it unwatched.
-        focusGuard.startCursorWatch()
-        try display.start()
-        let recovered = windows.recoverFromPreviousRun()
-        if !recovered.isEmpty { log("Cleaned up after the last run: " + recovered.joined(separator: "; ")) }
-        focusGuard.start()
-        windows.startWatchdog()
-        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.changed() }
+    /// Create the session's display if it doesn't exist yet. Any thread.
+    public func ensureDisplay() throws {
+        guard !display.isRunning else { return }
+        var failure: Error?
+        let work = {
+            do {
+                try self.display.start()
+                self.windows.startWatchdog()
+            } catch { failure = error }
+        }
+        if Thread.isMainThread { work() } else { DispatchQueue.main.sync(execute: work) }
+        if let failure { throw failure }
+        log("Created \(display.slot == 0 ? "the agent display" : "agent display \(display.slot + 1)")")
     }
 
-    /// Main thread. Releases windows (closing opened, returning borrowed) before
-    /// the display goes away, so nothing lands on the user's screen.
-    public func shutdown() {
-        var done = false
+    /// No display, no windows and no calls for `idleMs`: the session can be forgotten.
+    public func isDormant(idleMs: Double) -> Bool {
+        guard !display.isRunning, windows.windows.isEmpty, !userInControl else { return false }
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _busy == nil && nowMs() - lastCallMs > idleMs
+    }
+
+    /// Remove the display once the session has had no windows and no calls
+    /// for `idleMs`, so an unused display doesn't sit in the user's arrangement.
+    public func tearDownIfIdle(idleMs: Double) {
+        queue.async {
+            guard self.display.isRunning, self.windows.windows.isEmpty, !self.userInControl else { return }
+            self.stateLock.lock()
+            let idle = self._busy == nil && nowMs() - self.lastCallMs > idleMs
+            self.stateLock.unlock()
+            guard idle else { return }
+            DispatchQueue.main.sync {
+                self.windows.stopWatchdog()
+                self.display.stop()
+            }
+            self.snapshots.removeAll()
+            self.audio.end()
+            self.log("Removed the agent display: no windows for a while")
+        }
+    }
+
+    /// Release windows (closing opened, returning borrowed) on the session's
+    /// queue; `group` is left when done. Release doesn't need the main thread,
+    /// which may be busy quitting.
+    public func releaseForShutdown(_ group: DispatchGroup) {
+        group.enter()
         queue.async {
             _ = self.windows.releaseAll()
-            DispatchQueue.main.async { done = true }
+            group.leave()
         }
-        let deadline = Date().addingTimeInterval(4)
-        while !done && Date() < deadline {
-            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
-        }
+    }
+
+    /// Main thread, after the windows are released, so nothing lands on the
+    /// user's screen when the display goes away.
+    public func finishShutdown() {
+        windows.stopWatchdog()
         display.stop()
+        audio.end()
     }
 
     // MARK: State for the UI
@@ -123,7 +170,8 @@ public final class Engine {
         changed()
     }
 
-    private func changed() {
+    /// Tell the menu bar something changed (the hub forwards it).
+    func changed() {
         DispatchQueue.main.async { self.onChange?() }
     }
 
@@ -227,6 +275,8 @@ public final class Engine {
                 lastActionMs[CGWindowID(id)] = nowMs()
             }
         }
+        // Opening or borrowing a window is what needs a display.
+        if tool == "open_window" || tool == "borrow_window" { try ensureDisplay() }
         return try dispatch(tool: tool, args: args)
     }
 
@@ -494,6 +544,8 @@ public final class Engine {
     private func keyed<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) throws -> T {
         if paused { throw ToolError("paused by the user") }
         if userInControl { throw ToolError("the user took over your display") }
+        Self.inputLock.lock()
+        defer { Self.inputLock.unlock() }
         focusGuard.beginAction(pid: w.pid, cause: cause)
         windows.noteBefore(pid: w.pid)
         defer { focusGuard.endAction(pid: w.pid) }
@@ -506,6 +558,8 @@ public final class Engine {
     }
 
     private func guarded<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) rethrows -> T {
+        Self.inputLock.lock()
+        defer { Self.inputLock.unlock() }
         focusGuard.beginAction(pid: w.pid, cause: cause)
         windows.noteBefore(pid: w.pid)
         defer { focusGuard.endAction(pid: w.pid) }
@@ -531,12 +585,15 @@ public final class Engine {
 
     private func status(_ args: Args) -> ToolResult {
         var lines: [String] = []
-        lines.append("Agent display: \(display.width)x\(display.height) points" + (display.isRunning ? "" : " (NOT RUNNING)"))
+        lines.append("Agent display: \(display.width)x\(display.height) points" + (display.isRunning ? "" : " (created when you open your first window)"))
         if let b = Self.defaultBrowser() {
             lines.append("User's default browser: \(b.name) (\(b.bundleID)). Use it when a task needs a browser.")
         }
         lines.append("Permissions: accessibility \(AX.isTrusted ? "granted" : "MISSING"), screen recording \(Capture.hasPermission ? "granted" : "MISSING")")
         if paused { lines.append("Paused by the user.") }
+        if !audio.routedApps.isEmpty {
+            lines.append("Audio from \(audio.routedApps.joined(separator: ", ")) is muted on the speakers and recorded to \(audio.url.path) (deleted when your display is removed).")
+        }
         let ws = windows.windows
         if ws.isEmpty {
             lines.append("You have no windows open.")

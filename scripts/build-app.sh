@@ -40,6 +40,7 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSHumanReadableCopyright</key><string>Background Computer Use</string>
+  <key>NSAudioCaptureUsageDescription</key><string>Sound from apps only the agent is using is kept off your speakers and saved to a file for the session.</string>
 </dict>
 </plist>
 PLIST
@@ -59,7 +60,9 @@ echo "built $OUT (signed: $IDENTITY)"
 if [ "${1:-}" = "--install" ]; then
   # SIGTERM makes the app release its windows and remove its display; wait for it.
   pkill -x BackgroundComputerUse 2>/dev/null || true
-  for _ in $(seq 1 50); do pgrep -x BackgroundComputerUse >/dev/null || break; sleep 0.1; done
+  for _ in $(seq 1 150); do pgrep -x BackgroundComputerUse >/dev/null || break; sleep 0.1; done
+  # Opening the new copy while the old one is still quitting does nothing.
+  if pgrep -x BackgroundComputerUse >/dev/null; then echo "error: the old app didn't quit" >&2; exit 1; fi
   rm -rf "/Applications/$APP_NAME.app"
   cp -R "$OUT" "/Applications/"
   open -g "/Applications/$APP_NAME.app"

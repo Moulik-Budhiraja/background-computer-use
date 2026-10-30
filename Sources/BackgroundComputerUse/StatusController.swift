@@ -6,26 +6,29 @@ import BCUCore
 final class StatusController: NSObject, NSPopoverDelegate {
     private enum Icon: Equatable { case idle, working, waiting, paused }
 
-    private let engine: Engine
+    private let hub: Hub
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let popover = NSPopover()
-    private let model: PopoverModel
+    private let model: MenuModel
     private var icon: Icon?
     private var clickMonitor: Any?
     var onRefresh: (() -> Void)?
 
-    init(engine: Engine, openSettings: @escaping () -> Void, openViewer: @escaping () -> Void, takeOver: @escaping () -> Void) {
-        self.engine = engine
-        self.model = PopoverModel(engine: engine, openSettings: openSettings, openViewer: openViewer)
-        self.model.takeOver = takeOver
+    /// `openViewer(engine, takeOver)` expands one session's display.
+    init(hub: Hub, openSettings: @escaping () -> Void, openViewer: @escaping (Engine, Bool) -> Void) {
+        self.hub = hub
+        self.model = MenuModel(hub: hub, openSettings: openSettings, openViewer: openViewer)
         super.init()
         item.button?.target = self
         item.button?.action = #selector(togglePopover)
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
-        popover.contentViewController = NSHostingController(rootView: PopoverView(model: model))
-        engine.onChange = { [weak self] in self?.refresh() }
+        let hosting = NSHostingController(rootView: PopoverView(menu: model))
+        // The popover grows with the number of agent displays.
+        hosting.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = hosting
+        hub.onChange = { [weak self] in self?.refresh() }
         refresh()
     }
 
@@ -34,10 +37,10 @@ final class StatusController: NSObject, NSPopoverDelegate {
         if popover.isShown { model.refresh() }
         onRefresh?()
         let next: Icon
-        switch engine.status {
+        switch hub.status {
         case .paused, .userInControl: next = .paused
         case .waiting: next = .waiting
-        default: next = engine.isActive ? .working : .idle
+        default: next = hub.isActive ? .working : .idle
         }
         if next != icon {
             icon = next
@@ -57,7 +60,7 @@ final class StatusController: NSObject, NSPopoverDelegate {
             popover.performClose(nil)
         } else {
             model.refresh()
-            model.startPreview()
+            model.startPreviews()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             // The app never activates, so .transient alone doesn't close the
             // popover on outside clicks. Watch for them instead.
@@ -72,7 +75,7 @@ final class StatusController: NSObject, NSPopoverDelegate {
     }
 
     func popoverDidClose(_ notification: Notification) {
-        model.stopPreview()
+        model.stopPreviews()
         if let m = clickMonitor {
             NSEvent.removeMonitor(m)
             clickMonitor = nil

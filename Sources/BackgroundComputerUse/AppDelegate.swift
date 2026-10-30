@@ -3,11 +3,12 @@ import BCUCore
 import BCUShared
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    let engine = Engine()
+    let hub = Hub()
     private var server: SocketServer?
     private var statusController: StatusController?
     private var settings: SettingsWindowController?
-    private var viewer: ViewerWindowController?
+    /// One expanded view per session, made when first opened.
+    private var viewers: [String: ViewerWindowController] = [:]
     private var hotKeys: HotKeys?
     private var permissionTimer: Timer?
 
@@ -20,27 +21,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        do {
-            try engine.start()
-        } catch {
-            Log.info("engine start failed: \(error)")
-        }
+        CrashLog.install()
+        hub.start()
 
-        let server = SocketServer { [engine] tool, args in engine.call(tool: tool, args: args) }
+        let server = SocketServer { [hub] tool, args in hub.call(tool: tool, args: args) }
         do { try server.start() } catch { Log.info("socket failed: \(error)") }
         self.server = server
 
-        statusController = StatusController(engine: engine,
+        statusController = StatusController(hub: hub,
                                             openSettings: { [weak self] in self?.showSettings() },
-                                            openViewer: { [weak self] in self?.showViewer() },
-                                            takeOver: { [weak self] in self?.showViewer(control: true) })
-        statusController?.onRefresh = { [weak self] in self?.viewer?.refresh() }
+                                            openViewer: { [weak self] engine, control in self?.showViewer(engine, control: control) })
+        statusController?.onRefresh = { [weak self] in self?.refreshViewers() }
         hotKeys = HotKeys(
             togglePause: { [weak self] in
                 guard let self else { return }
-                self.engine.setPaused(!self.engine.paused)
+                self.hub.setPausedAll(!self.hub.allPaused)
             },
-            stop: { [weak self] in self?.engine.stopAll() }
+            stop: { [weak self] in self?.hub.stopAll() }
         )
 
         if !AX.isTrusted || !Capture.hasPermission {
@@ -49,26 +46,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // The event tap needs Accessibility; install it as soon as it's granted.
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] timer in
             guard let self else { return }
-            if AX.isTrusted && !self.engine.focusGuard.tapInstalled {
-                self.engine.focusGuard.installTap()
+            if AX.isTrusted && !self.hub.focusGuard.tapInstalled {
+                self.hub.focusGuard.installTap()
             }
-            if self.engine.focusGuard.tapInstalled { timer.invalidate() }
+            if self.hub.focusGuard.tapInstalled { timer.invalidate() }
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        engine.shutdown()
+        hub.shutdown()
         server?.stop()
     }
 
-    func showViewer(control: Bool = false) {
+    /// Expand one session's display. Only one expanded view shows at a time.
+    func showViewer(_ engine: Engine, control: Bool = false) {
         statusController?.close()
-        if viewer == nil { viewer = ViewerWindowController(engine: engine, openSettings: { [weak self] in self?.showSettings() }) }
-        if control { viewer?.showInControl() } else { viewer?.toggle() }
+        for (id, v) in viewers where id != engine.sessionID { v.close() }
+        let viewer = viewers[engine.sessionID] ?? ViewerWindowController(engine: engine, openSettings: { [weak self] in self?.showSettings() })
+        viewers[engine.sessionID] = viewer
+        if control { viewer.showInControl() } else { viewer.toggle() }
+    }
+
+    /// A viewer whose display was torn down closes and is dropped.
+    private func refreshViewers() {
+        for (id, v) in viewers {
+            if v.engine.display.isRunning {
+                v.refresh()
+            } else {
+                v.close()
+                viewers[id] = nil
+            }
+        }
     }
 
     func showSettings() {
-        if settings == nil { settings = SettingsWindowController(engine: engine) }
+        if settings == nil { settings = SettingsWindowController(engine: hub.engine(for: Hub.defaultSession, client: nil)) }
         settings?.show()
     }
 }

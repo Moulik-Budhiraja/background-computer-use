@@ -98,3 +98,27 @@ extension CGRect {
     var center: CGPoint { CGPoint(x: midX, y: midY) }
     var short: String { "\(Int(origin.x)),\(Int(origin.y)) \(Int(width))x\(Int(height))" }
 }
+
+/// Writes a stack trace to logs/crash.log when the app dies on a signal
+/// (Swift runtime traps included), then lets it die as it would have.
+public enum CrashLog {
+    private static var fd: Int32 = -1
+
+    public static func install() {
+        let url = BCUPaths.logDirectory.appendingPathComponent("crash.log")
+        fd = open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        guard fd >= 0 else { return }
+        for sig in [SIGTRAP, SIGSEGV, SIGBUS, SIGILL, SIGABRT, SIGFPE] {
+            signal(sig) { sig in
+                let fd = CrashLog.fd
+                var header = Array("\n--- crash, signal \(sig), pid \(getpid()), \(Date())\n".utf8)
+                _ = write(fd, &header, header.count)
+                var frames = [UnsafeMutableRawPointer?](repeating: nil, count: 128)
+                let n = backtrace(&frames, 128)
+                backtrace_symbols_fd(&frames, n, fd)
+                signal(sig, SIG_DFL)
+                raise(sig)
+            }
+        }
+    }
+}

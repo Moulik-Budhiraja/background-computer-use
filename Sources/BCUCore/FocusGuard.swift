@@ -17,8 +17,9 @@ public struct GuardEvent {
 ///   the keys are replayed into it. Nothing typed lands in the agent's window.
 /// - Activation watch: the same restore runs when such an activation is seen
 ///   even without typing.
+/// One guard for every agent display: it fences the cursor off all of them
+/// and watches the front app for every session.
 public final class FocusGuard {
-    public let display: AgentDisplay
     public var onEvent: ((GuardEvent) -> Void)?
 
     private let lock = NSLock()
@@ -46,8 +47,7 @@ public final class FocusGuard {
     static let replayMarker: Int64 = 0x4243_5552
     fileprivate static weak var shared: FocusGuard?
 
-    public init(display: AgentDisplay) {
-        self.display = display
+    public init() {
     }
 
     public var recentEvents: [GuardEvent] {
@@ -124,9 +124,11 @@ public final class FocusGuard {
     /// Returns whether the cursor is near the agent display.
     @discardableResult
     private func checkCursor() -> Bool {
-        guard display.isRunning, let p = CGEvent(source: nil)?.location else { return false }
-        let agent = display.liveBounds
-        guard agent.contains(p) else { return agent.insetBy(dx: -400, dy: -400).contains(p) }
+        let displays = AgentDisplay.running
+        guard !displays.isEmpty, let p = CGEvent(source: nil)?.location else { return false }
+        guard let agent = displays.first(where: { $0.liveBounds.contains(p) })?.liveBounds else {
+            return displays.contains { $0.liveBounds.insetBy(dx: -400, dy: -400).contains(p) }
+        }
         let q = nearestUserPoint(p, agent: agent)
         CGWarpMouseCursorPosition(q)
         CGAssociateMouseAndMouseCursorPosition(1)
@@ -143,7 +145,7 @@ public final class FocusGuard {
         if log { lastEscapeLogMs = nowMs() }
         lock.unlock()
         if log {
-            Log.info("guard: cursor was on the agent display at \(Int(p.x)),\(Int(p.y)); moved it back to \(Int(q.x)),\(Int(q.y)) (\(tapState); agent display at \(agent.short), cached \(display.bounds.short))")
+            Log.info("guard: cursor was on the agent display at \(Int(p.x)),\(Int(p.y)); moved it back to \(Int(q.x)),\(Int(q.y)) (\(tapState); agent display at \(agent.short))")
         }
         return true
     }
@@ -379,8 +381,7 @@ public final class FocusGuard {
         switch type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .tabletPointer:
             let p = event.location
-            let agent = display.liveBounds
-            if display.isRunning && agent.contains(p) {
+            if let agent = AgentDisplay.containing(p)?.liveBounds {
                 let q = nearestUserPoint(p, agent: agent)
                 event.location = q
                 CGWarpMouseCursorPosition(q)
@@ -393,7 +394,7 @@ public final class FocusGuard {
             return event
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             lock.lock(); lastUserMouseDownMs = nowMs(); let swapping = swapHolds > 0 || draining; lock.unlock()
-            if display.isRunning && display.liveBounds.contains(event.location) { return nil }
+            if AgentDisplay.containing(event.location) != nil { return nil }
             // A click now would make the user's window key mid-swap; hold it.
             if swapping { hold(event); return nil }
             return event
@@ -402,7 +403,7 @@ public final class FocusGuard {
             if swapping { hold(event); return nil }
             return event
         case .scrollWheel:
-            if display.isRunning && display.liveBounds.contains(event.location) { return nil }
+            if AgentDisplay.containing(event.location) != nil { return nil }
             return event
         case .keyDown, .keyUp, .flagsChanged:
             if type == .keyDown {
@@ -484,14 +485,15 @@ public final class FocusGuard {
     private func nearestUserPoint(_ p: CGPoint, agent: CGRect) -> CGPoint {
         var best = p
         var bestDistance = CGFloat.infinity
-        for id in display.userDisplayIDs() {
+        let agents = AgentDisplay.running.map(\.liveBounds)
+        for id in AgentDisplay.userDisplayIDs() {
             let r = CGDisplayBounds(id)
             // Skip any display that overlaps the agent's (mirroring, mid-rearrangement).
             let overlap = r.intersection(agent)
             if !overlap.isNull && overlap.width > 0 && overlap.height > 0 { continue }
             let q = CGPoint(x: min(max(p.x, r.minX), r.maxX - 1), y: min(max(p.y, r.minY), r.maxY - 1))
             let d = hypot(q.x - p.x, q.y - p.y)
-            if agent.contains(q) { continue }
+            if agent.contains(q) || agents.contains(where: { $0.contains(q) }) { continue }
             if d < bestDistance { bestDistance = d; best = q }
         }
         if bestDistance == .infinity {
@@ -507,7 +509,7 @@ public final class FocusGuard {
     /// would, and measure how long it stays there. `via`: "warp" bypasses the
     /// tap entirely; "tap_off" disables the tap and posts HID moves into it.
     public func escapeTest(via: String) -> String {
-        guard display.isRunning, let start = CGEvent(source: nil)?.location else { return "no agent display" }
+        guard let display = AgentDisplay.running.first, let start = CGEvent(source: nil)?.location else { return "no agent display" }
         let agent = display.liveBounds
         let target = CGPoint(x: agent.midX, y: agent.midY)
         let t0 = nowMs()

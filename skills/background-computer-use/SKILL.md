@@ -11,7 +11,7 @@ Use these tools when the task needs the user's logged-in session or an app with 
 
 ## Starting
 
-1. Call `status` once. It gives your display size, the user's default browser and any windows you still have open. Use that browser for anything on the web, because it holds the user's logins.
+1. Call `status` once. It gives your display size, the user's default browser and any windows you still have open. Other agents may be working at the same time, each on its own display; you only see and control your own windows. Sound from apps that only you are using doesn't play on the user's speakers. While one plays, `status` gives the file it is recorded to, if the task needs what it says. Use that browser for anything on the web, because it holds the user's logins.
 2. Call `open_window` with the app name. It opens a new window on your display and returns its `window_id`. For a browser the window opens in the user's own profile, signed in to everything the user is. Open only apps and sites the task is allowed to use. Use `list_windows` and `borrow_window` only for apps that have a single window, such as System Settings. `release_window` puts a borrowed window back where it was.
 
 ## Reading a window

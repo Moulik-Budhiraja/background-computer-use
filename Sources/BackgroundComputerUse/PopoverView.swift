@@ -48,7 +48,7 @@ final class PopoverModel: ObservableObject {
         self.frame.show(image)
         if !self.hasFrame { self.hasFrame = true }
     }
-    private(set) lazy var moreMenu = MoreMenu(engine: engine, openSettings: openSettings)
+    private(set) lazy var moreMenu = MoreMenu(openSettings: openSettings)
 
     init(engine: Engine, openSettings: @escaping () -> Void, openViewer: @escaping () -> Void) {
         self.engine = engine
@@ -134,11 +134,9 @@ final class PopoverModel: ObservableObject {
 
 /// The ⋯ menu: settings, open at login, display size and quit.
 final class MoreMenu: NSObject {
-    private let engine: Engine
     private let openSettings: () -> Void
 
-    init(engine: Engine, openSettings: @escaping () -> Void) {
-        self.engine = engine
+    init(openSettings: @escaping () -> Void) {
         self.openSettings = openSettings
     }
 
@@ -152,7 +150,7 @@ final class MoreMenu: NSObject {
         login.state = LaunchAtLogin.isEnabled ? .on : .off
         menu.addItem(login)
         menu.addItem(.separator())
-        let display = NSMenuItem(title: "Agent display \(engine.display.width) × \(engine.display.height)", action: nil, keyEquivalent: "")
+        let display = NSMenuItem(title: "Agent displays \(AgentDisplay.defaultWidth) × \(AgentDisplay.defaultHeight)", action: nil, keyEquivalent: "")
         display.isEnabled = false
         menu.addItem(display)
         menu.addItem(.separator())
@@ -241,16 +239,17 @@ private struct AnchorView: NSViewRepresentable {
 }
 
 private struct MoreButton: View {
-    @ObservedObject var model: PopoverModel
+    let menu: MoreMenu
+    let badge: Bool
     @State private var holder = ViewHolder()
 
     var body: some View {
         IconButton(symbol: "ellipsis", help: "More", size: 14) {
-            model.moreMenu.show(below: holder.view)
+            menu.show(below: holder.view)
         }
         .background(AnchorView(holder: holder))
         .overlay(alignment: .topTrailing) {
-            if model.permissionsMissing {
+            if badge {
                 Circle().fill(Theme.needs).frame(width: 6, height: 6).offset(x: -5, y: 5).allowsHitTesting(false)
             }
         }
@@ -320,7 +319,7 @@ struct HeaderBar: View {
                 }
                 Rectangle().fill(Theme.hairline).frame(width: 1, height: 14).padding(.leading, 2).padding(.trailing, 4)
                 IconButton(symbol: expandSymbol, help: "Expand", action: onExpand)
-                if showMore { MoreButton(model: model) }
+                if showMore { MoreButton(menu: model.moreMenu, badge: model.permissionsMissing) }
             }
         }
         .frame(height: 28)
@@ -462,40 +461,263 @@ struct PreviewPane: View {
     }
 }
 
+/// The menu bar popover across every agent session: one header, then a
+/// live preview per agent display. Clicking a preview expands that display.
+final class MenuModel: ObservableObject {
+    let hub: Hub
+    let openSettings: () -> Void
+    /// Expand a session's display; `true` goes straight into take-over.
+    let openViewer: (Engine, Bool) -> Void
+
+    @Published var sessions: [PopoverModel] = []
+    @Published var statusText = "Idle"
+    @Published var tally: Tally.Kind = .idle
+    @Published var allPaused = false
+    @Published var permissionsMissing = false
+    @Published var screenRecordingMissing = false
+    private var previewing = false
+    let moreMenu: MoreMenu
+
+    init(hub: Hub, openSettings: @escaping () -> Void, openViewer: @escaping (Engine, Bool) -> Void) {
+        self.hub = hub
+        self.openSettings = openSettings
+        self.openViewer = openViewer
+        moreMenu = MoreMenu(openSettings: openSettings)
+    }
+
+    /// Previews update less often when there are several.
+    private var fps: Int { sessions.count > 1 ? 10 : 15 }
+
+    func refresh() {
+        let active = Array(hub.activeEngines.prefix(6))
+        var next: [PopoverModel] = []
+        for e in active {
+            if let m = sessions.first(where: { $0.engine === e }) {
+                next.append(m)
+            } else {
+                let m = PopoverModel(engine: e, openSettings: openSettings, openViewer: { [weak self] in self?.openViewer(e, false) })
+                m.takeOver = { [weak self] in self?.openViewer(e, true) }
+                next.append(m)
+            }
+        }
+        for m in sessions where !next.contains(where: { $0 === m }) { m.stopPreview() }
+        if next.map(ObjectIdentifier.init) != sessions.map(ObjectIdentifier.init) {
+            sessions = next
+            if previewing { for m in sessions { m.setPreviewFPS(fps) } }
+        }
+        for m in sessions { m.refresh() }
+        screenRecordingMissing = !Capture.hasPermission
+        permissionsMissing = !AX.isTrusted || screenRecordingMissing
+        allPaused = hub.allPaused
+        let status = hub.status
+        switch status {
+        case .working: tally = .live
+        case .waiting: tally = .needs
+        case .paused, .userInControl: tally = .paused
+        case .idle: tally = permissionsMissing ? .needs : .idle
+        }
+        if sessions.count > 1 {
+            let waiting = sessions.filter { if case .waiting = $0.status { return true }; return false }.count
+            statusText = "\(sessions.count) agents" + (waiting > 0 ? " · \(waiting) need\(waiting == 1 ? "s" : "") you" : "")
+        } else if let only = sessions.first {
+            statusText = only.statusText
+        } else {
+            statusText = permissionsMissing ? "Setup needed" : "Idle"
+        }
+    }
+
+    func startPreviews() {
+        previewing = true
+        for m in sessions { m.startPreview(fps: fps) }
+    }
+
+    func stopPreviews() {
+        previewing = false
+        for m in sessions { m.stopPreview() }
+    }
+}
+
 struct PopoverView: View {
-    @ObservedObject var model: PopoverModel
+    @ObservedObject var menu: MenuModel
+
+    /// One preview, then 2 across, 2×2, and 3 across for 5–6.
+    private var columns: Int {
+        switch menu.sessions.count {
+        case 0, 1: return 1
+        case 2, 3, 4: return 2
+        default: return 3
+        }
+    }
+
+    private var tileWidth: CGFloat { columns == 1 ? 440 : 320 }
 
     var body: some View {
         VStack(spacing: 10) {
-            HeaderBar(model: model, expandSymbol: "arrow.up.left.and.arrow.down.right", onExpand: model.openViewer)
-
-            PreviewPane(model: model)
-                .frame(width: 440, height: 275)
-                .onTapGesture(count: 2) { model.openViewer() }
-
-            if let reason = model.handoffReason {
-                HStack(spacing: 10) {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Theme.needs.opacity(0.14))
-                        .frame(width: 28, height: 28)
-                        .overlay(Image(systemName: "hand.raised").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.needsInk))
-                    Text(reason)
-                        .font(.system(size: 13, weight: .semibold))
-                        .lineLimit(2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    Button { model.engine.handBack() } label: {
-                        Circle().fill(Color.accentColor).frame(width: 28, height: 28)
-                            .overlay(Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).foregroundStyle(.white))
-                            .contentShape(Circle())
+            MenuHeader(menu: menu)
+            if menu.permissionsMissing {
+                Placeholder(kind: .setup(screenRecording: menu.screenRecordingMissing), openSettings: menu.openSettings)
+                    .frame(width: 440, height: 275)
+            } else if menu.sessions.isEmpty {
+                Placeholder(kind: .empty, openSettings: menu.openSettings)
+                    .frame(width: 440, height: 275)
+            } else {
+                let grid = Array(repeating: GridItem(.fixed(tileWidth), spacing: 10, alignment: .top), count: columns)
+                LazyVGrid(columns: grid, alignment: .leading, spacing: 10) {
+                    ForEach(menu.sessions, id: \.engine.sessionID) { session in
+                        SessionTile(model: session, width: tileWidth)
                     }
-                    .buttonStyle(.plain)
-                    .help("Done: hand it back to the agent")
                 }
-                .padding(.horizontal, 2)
-                .padding(.top, 2)
             }
         }
         .padding(10)
-        .frame(width: 460)
+        .fixedSize()
+    }
+}
+
+/// Status across every agent, and pause, stop and more for all of them.
+private struct MenuHeader: View {
+    @ObservedObject var menu: MenuModel
+
+    var body: some View {
+        HStack(spacing: 2) {
+            Tally(kind: menu.tally).help(menu.statusText)
+            Text(menu.statusText)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .padding(.leading, 2)
+            Spacer(minLength: 4)
+            HStack(spacing: 0) {
+                IconButton(symbol: menu.allPaused ? "play.fill" : "pause.fill",
+                           help: menu.allPaused ? "Resume all agents (⌃⌥⌘P)" : "Pause all agents (⌃⌥⌘P)") {
+                    menu.hub.setPausedAll(!menu.allPaused)
+                }
+                .disabled(menu.sessions.isEmpty)
+                IconButton(symbol: "stop.fill", help: "Stop: close every agent's windows (⌃⌥⌘.)") {
+                    menu.hub.stopAll()
+                }
+                .disabled(menu.sessions.isEmpty)
+                Rectangle().fill(Theme.hairline).frame(width: 1, height: 14).padding(.leading, 2).padding(.trailing, 4)
+                MoreButton(menu: menu.moreMenu, badge: menu.permissionsMissing)
+            }
+        }
+        .frame(height: 28)
+    }
+}
+
+/// One agent's display: click to expand it.
+private struct SessionTile: View {
+    @ObservedObject var model: PopoverModel
+    let width: CGFloat
+    @State private var hovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            PreviewPane(model: model)
+                .frame(width: width, height: (width * 10 / 16).rounded())
+                .overlay(alignment: .bottomLeading) { label.padding(8) }
+                .overlay {
+                    if hovering {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 40, height: 40)
+                            .background(Circle().fill(Color.black.opacity(0.5)))
+                            .allowsHitTesting(false)
+                    }
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { model.openViewer() }
+                .onHover { hovering = $0 }
+                .help("Expand \(model.engine.label)'s display")
+            if model.handoffReason != nil {
+                HandoffBanner(model: model)
+            }
+        }
+        .frame(width: width, alignment: .leading)
+    }
+
+    private var label: some View {
+        HStack(spacing: 5) {
+            Tally(kind: model.tally).frame(width: 12, height: 16)
+            Text(model.engine.label).font(.system(size: 11, weight: .semibold))
+            ForEach(model.apps.prefix(3)) { app in
+                if let icon = app.icon {
+                    Image(nsImage: icon).resizable().frame(width: 14, height: 14)
+                }
+            }
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 7)
+        .frame(height: 22)
+        .background(Capsule().fill(Color.black.opacity(0.55)))
+    }
+}
+
+private struct HandoffBanner: View {
+    @ObservedObject var model: PopoverModel
+
+    var body: some View {
+        HStack(spacing: 10) {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Theme.needs.opacity(0.14))
+                .frame(width: 28, height: 28)
+                .overlay(Image(systemName: "hand.raised").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.needsInk))
+            Text(model.handoffReason ?? "")
+                .font(.system(size: 13, weight: .semibold))
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button { model.engine.handBack() } label: {
+                Circle().fill(Color.accentColor).frame(width: 28, height: 28)
+                    .overlay(Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).foregroundStyle(.white))
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .help("Done: hand it back to the agent")
+        }
+        .padding(.horizontal, 2)
+    }
+}
+
+/// The popover's preview area when there's nothing to preview.
+private struct Placeholder: View {
+    enum Kind { case empty, setup(screenRecording: Bool) }
+    let kind: Kind
+    let openSettings: () -> Void
+
+    var body: some View {
+        ZStack {
+            Theme.monitor
+            switch kind {
+            case .empty:
+                VStack(spacing: 8) {
+                    Image(systemName: "rectangle.dashed").font(.system(size: 20, weight: .regular))
+                    Text("Nothing running").font(.system(size: 12, weight: .medium))
+                }
+                .foregroundStyle(.white.opacity(0.45))
+            case .setup(let screenRecording):
+                VStack(spacing: 12) {
+                    Image(systemName: "eye.slash").font(.system(size: 20)).foregroundStyle(.white.opacity(0.45))
+                    Text(screenRecording ? "Screen Recording is off" : "Accessibility is off")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.88))
+                    Button(action: openSettings) {
+                        HStack(spacing: 4) {
+                            Text("Open Settings")
+                            Image(systemName: "arrow.up.forward").font(.system(size: 9, weight: .bold))
+                        }
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12)
+                        .frame(height: 26)
+                        .background(Capsule().fill(Color.white.opacity(0.14)))
+                        .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
     }
 }

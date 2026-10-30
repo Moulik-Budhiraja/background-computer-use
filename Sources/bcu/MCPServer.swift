@@ -6,6 +6,10 @@ import BCUShared
 final class MCPServer {
     private var client: SocketClient?
     private let out = FileHandle.standardOutput
+    /// This agent's session: its own display and windows in the app.
+    private let sessionID = UUID().uuidString
+    /// The agent's name from `initialize` (e.g. "claude-code"), for the menu bar.
+    private var clientName: String?
 
     func run() {
         while let line = readLine(strippingNewline: true) {
@@ -35,6 +39,7 @@ final class MCPServer {
         let params = message["params"] as? JSONObject ?? [:]
         switch method {
         case "initialize":
+            clientName = (params["clientInfo"] as? JSONObject)?["name"] as? String
             let version = params["protocolVersion"] as? String ?? "2025-06-18"
             reply(id, result: [
                 "protocolVersion": version,
@@ -73,7 +78,10 @@ final class MCPServer {
         for attempt in 0..<2 {
             do {
                 if client == nil { client = try connect() }
-                return try client!.call(tool: name, args: arguments)
+                var args = arguments
+                args["_session"] = sessionID
+                if let clientName { args["_client"] = clientName }
+                return try client!.call(tool: name, args: args)
             } catch {
                 client = nil
                 if attempt == 1 { throw error }

@@ -18,7 +18,7 @@ private final class DimView: NSView {
 /// backdrop on the screen under the cursor. Not macOS full screen, and
 /// non-activating, so the user's own app stays active underneath.
 final class ViewerWindowController {
-    private let engine: Engine
+    let engine: Engine
     private let model: PopoverModel
     private let remote: RemoteControl
     private var dim: NSPanel?
