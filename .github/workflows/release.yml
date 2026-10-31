@@ -1,0 +1,8 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+jobs:
+  release:
+    uses: Moulik-Budhiraja/app-hosting/.github/workflows/release-mac.yml@main
+    secrets: inherit

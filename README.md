@@ -6,11 +6,19 @@ No app is modified and nothing is app-specific. It only uses what macOS provides
 
 ## Install
 
+Download the app from **https://apps.moulik.dev/background-computer-use/**, open the DMG and drag it to Applications. Open it, grant Accessibility and Screen Recording when it asks, then quit and reopen it once.
+
+It updates itself. Updates download in the background and install when you quit the app or when no agent is working, so an agent is never cut off mid-task. "Check for Updates…" is in the ⋯ menu.
+
+### Build from source
+
 ```bash
 scripts/build-app.sh --install
 ```
 
-This builds `Background Computer Use.app`, signs it with your Developer ID (or ad hoc), copies it to /Applications and starts it. Grant Accessibility and Screen Recording when it asks, then quit and reopen it once.
+This builds `Background Computer Use.app`, signs it with your Developer ID (or ad hoc), copies it to /Applications and starts it. Permissions carry over between builds only while the Developer ID team stays the same; an ad hoc build asks for them again.
+
+Releases: push a tag `vX.Y.Z` on main. The release workflow (from [app-hosting](https://github.com/Moulik-Budhiraja/app-hosting), configured by `apps.json`) builds with `scripts/build-app.sh`, signs with the Developer ID, notarizes and publishes to the update feed.
 
 ## Connect an agent
 
