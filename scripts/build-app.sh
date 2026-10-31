@@ -43,6 +43,8 @@ cp "$BIN/BackgroundComputerUse" "$OUT/Contents/MacOS/BackgroundComputerUse"
 cp "$BIN/bcu" "$OUT/Contents/MacOS/bcu"
 mkdir -p "$OUT/Contents/Resources/skills"
 cp -R skills/background-computer-use "$OUT/Contents/Resources/skills/"
+# Generated from Resources/AppIcon.svg by scripts/make-icon.swift.
+cp Resources/AppIcon.icns "$OUT/Contents/Resources/AppIcon.icns"
 
 # Sparkle, with its symlinks intact, and the rpath the app finds it by.
 ditto "$BIN/Sparkle.framework" "$OUT/Contents/Frameworks/Sparkle.framework"
@@ -60,6 +62,7 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundleExecutable</key><string>BackgroundComputerUse</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$BUILD</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>

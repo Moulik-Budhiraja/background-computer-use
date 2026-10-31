@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- "Lit Shadow": your window in front, the agent's screen glowing green just behind it.
+       Source for AppIcon.icns; regenerate with scripts/make-icon.swift. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#22355C"/><stop offset="1" stop-color="#0E1729"/></linearGradient>
+    <linearGradient id="agent" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4BD67A"/><stop offset="1" stop-color="#1E9447"/></linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
+  <rect x="316" y="356" width="508" height="418" rx="60" fill="#2FB457" fill-opacity=".2"/>
+  <rect x="330" y="370" width="480" height="390" rx="48" fill="url(#agent)"/>
+  <path d="M0 0 L0 72 L17 56 L29 84 L41 79 L29 52 L52 52 Z" transform="translate(722 628) scale(1.4)" fill="#FFFFFF" stroke="#17733A" stroke-width="2.4" stroke-linejoin="round"/>
+  <rect x="214" y="248" width="480" height="390" rx="48" fill="#FFFFFF"/>
+  <circle cx="270" cy="302" r="15" fill="#CBD3E1"/>
+  <circle cx="316" cy="302" r="15" fill="#CBD3E1"/>
+  <circle cx="362" cy="302" r="15" fill="#CBD3E1"/>
+  <rect x="262" y="380" width="230" height="26" rx="13" fill="#DDE3EC"/>
+  <rect x="262" y="436" width="340" height="26" rx="13" fill="#E9EDF3"/>
+  <rect x="262" y="492" width="280" height="26" rx="13" fill="#E9EDF3"/>
+</svg>
