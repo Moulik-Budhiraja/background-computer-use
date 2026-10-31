@@ -6,7 +6,7 @@ No app is modified and nothing is app-specific. It only uses what macOS provides
 
 ## Install
 
-Download the app from **https://apps.moulik.dev/background-computer-use/**, open the DMG and drag it to Applications. Open it, grant Accessibility and Screen Recording when it asks, then quit and reopen it once.
+Download the app from **https://apps.moulik.dev/background-computer-use/**, open the DMG and drag it to Applications. Open it and follow the setup window. It asks for Accessibility and Screen Recording, reopens itself once, and then adds the MCP server and the skill to Claude Code and Codex.
 
 It updates itself. Updates download in the background and install when you quit the app or when no agent is working, so an agent is never cut off mid-task. "Check for Updates…" is in the ⋯ menu.
 
@@ -21,6 +21,8 @@ This builds `Background Computer Use.app`, signs it with your Developer ID (or a
 Releases: push a tag `vX.Y.Z` on main. The release workflow (from [app-hosting](https://github.com/Moulik-Budhiraja/app-hosting), configured by `apps.json`) builds with `scripts/build-app.sh`, signs with the Developer ID, notarizes and publishes to the update feed.
 
 ## Connect an agent
+
+The setup window does this for you. To do it by hand, or for another agent:
 
 Claude Code:
 

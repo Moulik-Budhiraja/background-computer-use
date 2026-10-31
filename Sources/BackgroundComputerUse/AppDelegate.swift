@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var server: SocketServer?
     private var statusController: StatusController?
     private var settings: SettingsWindowController?
+    private var onboarding: OnboardingWindowController?
     /// One expanded view per session, made when first opened.
     private var viewers: [String: ViewerWindowController] = [:]
     private var hotKeys: HotKeys?
@@ -42,7 +43,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stop: { [weak self] in self?.hub.stopAll() }
         )
 
-        if !AX.isTrusted || !Capture.hasPermission {
+        if OnboardingModel.shouldShow() {
+            showOnboarding()
+        } else if !AX.isTrusted || !Capture.hasPermission {
             showSettings()
         }
         // The event tap needs Accessibility; install it as soon as it's granted.
@@ -79,6 +82,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 viewers[id] = nil
             }
         }
+    }
+
+    func showOnboarding() {
+        if onboarding == nil {
+            let controller = OnboardingWindowController()
+            controller.onClose = { [weak self] in self?.onboarding = nil }
+            onboarding = controller
+        }
+        onboarding?.show()
     }
 
     func showSettings() {

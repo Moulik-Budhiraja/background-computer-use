@@ -297,7 +297,7 @@ private extension View {
     }
 }
 
-private struct Keycaps: View {
+struct Keycaps: View {
     let keys: [String]
     var body: some View {
         HStack(spacing: 3) {

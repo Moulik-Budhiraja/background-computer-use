@@ -74,16 +74,7 @@ enum AgentDocs {
         guard let source = skillFile()?.deletingLastPathComponent() else {
             throw NSError(domain: "bcu", code: 1, userInfo: [NSLocalizedDescriptionKey: "can't find the skill next to this bcu"])
         }
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        var installed: [String] = []
-        for root in [".claude/skills", ".codex/skills"] {
-            let dest = home.appendingPathComponent(root).appendingPathComponent(skillName)
-            try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-            if FileManager.default.fileExists(atPath: dest.path) { try FileManager.default.removeItem(at: dest) }
-            try FileManager.default.copyItem(at: source, to: dest)
-            installed.append(dest.path)
-        }
-        return installed
+        return try AgentKind.allCases.map { try AgentSetup.installSkill(from: source, for: $0).path }
     }
 
     /// Required parameters first, then the rest, each group alphabetical.
