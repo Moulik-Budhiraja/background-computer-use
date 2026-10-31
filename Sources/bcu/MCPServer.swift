@@ -11,6 +11,9 @@ final class MCPServer {
     /// The agent's name from `initialize` (e.g. "claude-code"), for the menu bar.
     private var clientName: String?
 
+    /// bcu lives in the app's Contents/MacOS, so the main bundle is the app.
+    static let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+
     func run() {
         while let line = readLine(strippingNewline: true) {
             guard !line.isEmpty, let data = line.data(using: .utf8),
@@ -44,7 +47,7 @@ final class MCPServer {
             reply(id, result: [
                 "protocolVersion": version,
                 "capabilities": ["tools": ["listChanged": false]],
-                "serverInfo": ["name": "background-computer-use", "version": "0.1.0"],
+                "serverInfo": ["name": "background-computer-use", "version": Self.appVersion],
                 "instructions": ToolCatalog.serverInstructions,
             ])
         case "ping":

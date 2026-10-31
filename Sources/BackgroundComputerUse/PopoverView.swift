@@ -132,7 +132,7 @@ final class PopoverModel: ObservableObject {
     }
 }
 
-/// The ⋯ menu: settings, open at login, display size and quit.
+/// The ⋯ menu: settings, open at login, updates, display size and quit.
 final class MoreMenu: NSObject {
     private let openSettings: () -> Void
 
@@ -142,6 +142,7 @@ final class MoreMenu: NSObject {
 
     func show(below view: NSView?) {
         let menu = NSMenu()
+        menu.autoenablesItems = false
         let settings = NSMenuItem(title: "Settings…", action: #selector(settingsAction), keyEquivalent: ",")
         settings.target = self
         menu.addItem(settings)
@@ -149,6 +150,18 @@ final class MoreMenu: NSObject {
         login.target = self
         login.state = LaunchAtLogin.isEnabled ? .on : .off
         menu.addItem(login)
+        if let updater = Updater.shared {
+            let update: NSMenuItem
+            if let version = updater.pendingVersion {
+                // Installs on its own once no agent is working; this is for now.
+                update = NSMenuItem(title: "Restart to Update to \(version)", action: #selector(installUpdate), keyEquivalent: "")
+            } else {
+                update = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+                update.isEnabled = updater.canCheckForUpdates
+            }
+            update.target = self
+            menu.addItem(update)
+        }
         menu.addItem(.separator())
         let display = NSMenuItem(title: "Agent displays \(AgentDisplay.defaultWidth) × \(AgentDisplay.defaultHeight)", action: nil, keyEquivalent: "")
         display.isEnabled = false
@@ -168,6 +181,8 @@ final class MoreMenu: NSObject {
 
     @objc private func settingsAction() { openSettings() }
     @objc private func toggleLogin() { LaunchAtLogin.set(!LaunchAtLogin.isEnabled) }
+    @objc private func checkForUpdates() { Updater.shared?.checkForUpdates() }
+    @objc private func installUpdate() { Updater.shared?.installNow() }
 }
 
 /// Borderless SF Symbol button with a 28pt hit area.

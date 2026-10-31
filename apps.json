@@ -1,0 +1,16 @@
+{
+  "app": "background-computer-use",
+  "remote": {
+    "name": "moulik",
+    "url": "https://apps.moulik.dev"
+  },
+  "updater": "sparkle",
+  "tagPrefix": "v",
+  "build": {
+    "kind": "native",
+    "command": "./scripts/build-app.sh",
+    "app": "build/Background Computer Use.app",
+    "entitlements": null,
+    "dmgName": "BackgroundComputerUse"
+  }
+}

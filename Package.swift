@@ -8,6 +8,9 @@ let package = Package(
         .executable(name: "BackgroundComputerUse", targets: ["BackgroundComputerUse"]),
         .executable(name: "bcu", targets: ["bcu"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.0"),
+    ],
     targets: [
         // Private macOS APIs (CGVirtualDisplay, SkyLight) wrapped in plain C/ObjC calls.
         .target(
@@ -37,7 +40,7 @@ let package = Package(
         // The menu bar app. Owns the virtual display and serves tool calls over a unix socket.
         .executableTarget(
             name: "BackgroundComputerUse",
-            dependencies: ["BCUCore", "BCUShared"],
+            dependencies: ["BCUCore", "BCUShared", .product(name: "Sparkle", package: "Sparkle")],
             path: "Sources/BackgroundComputerUse",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var viewers: [String: ViewerWindowController] = [:]
     private var hotKeys: HotKeys?
     private var permissionTimer: Timer?
+    private var updater: Updater?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // One instance only.
@@ -23,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         CrashLog.install()
         hub.start()
+        updater = Updater(hub: hub)
 
         let server = SocketServer { [hub] tool, args in hub.call(tool: tool, args: args) }
         do { try server.start() } catch { Log.info("socket failed: \(error)") }
