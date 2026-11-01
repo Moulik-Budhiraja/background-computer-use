@@ -179,11 +179,66 @@ def failures(d: Path):
     return out
 
 
+def render_md(S):
+    A = list(S["agents"])
+    L = []
+    def row(cells):
+        L.append("| " + " | ".join(str(c) for c in cells) + " |")
+    def hdr(cells):
+        row(cells); row(["---"] * len(cells))
+    g = S["agents"]
+    hdr(["Metric"] + [f"{a} ({g[a]['model']}, {g[a]['effort']})" for a in A])
+    row(["Pass rate, pass@1 over all attempts"] + [f"{pct(g[a]['pass_rate'])} ({g[a]['attempts']} attempts, 95% CI {pct(g[a]['pass_rate_ci95'][0])}–{pct(g[a]['pass_rate_ci95'][1])})" for a in A])
+    row(["Per-trial pass rate"] + [", ".join(f"t{t}: {pct(v)}" for t, v in g[a]["per_trial_pass_rate"].items()) for a in A])
+    row(["Tasks passed in every trial / in any trial"] + [f"{pct(g[a]['pass_all_k'] or 0)} / {pct(g[a]['pass_at_k_any'] or 0)}" for a in A])
+    row(["Mean partial score"] + [f"{g[a]['mean_partial_score']:.2f}" for a in A])
+    row(["Feasible tasks pass rate"] + [pct(g[a]["feasible_pass_rate"]) for a in A])
+    row(["Infeasible tasks correctly declined"] + [pct(g[a]["infeasible_correct_rate"] or 0) for a in A])
+    row(["False 'infeasible' on feasible tasks"] + [g[a]["false_infeasible"] for a in A])
+    row(["Wall time per attempt, mean / median (s)"] + [f"{g[a]['wall_s_mean']:.0f} / {g[a]['wall_s_median']:.0f}" for a in A])
+    row(["BCU tool calls per attempt, mean / median"] + [f"{g[a]['tool_calls_mean']:.1f} / {g[a]['tool_calls_median']:.0f}" for a in A])
+    row(["Screenshots per attempt"] + [f"{g[a]['screenshots_mean']:.1f}" for a in A])
+    row(["Share of wall time inside BCU tools"] + [pct(g[a]["tool_time_share"]) for a in A])
+    row(["Tokens per attempt, input (incl. cached) / output"] + [f"{g[a]['input_tokens_mean']/1000:.0f}k / {g[a]['output_tokens_mean']/1000:.1f}k" for a in A])
+    row(["Cost per attempt / total (USD)"] + [(f"${g[a]['cost_usd_mean']:.2f} / ${g[a]['cost_usd_total']:.0f}" if g[a]["cost_usd_mean"] is not None else "n/a") for a in A])
+    row(["Timeouts"] + [g[a]["timeouts"] for a in A])
+    row(["Pass rate within step budget"] + [pct(g[a]["within_step_budget_pass_rate"]) for a in A])
+    row(["Attempts where agent released all its windows"] + [f"{g[a]['agent_released_all_windows']}/{g[a]['attempts']}" for a in A])
+    row(["Out-of-band (non-BCU) tool calls"] + [g[a]["out_of_band_calls"] for a in A])
+    L.append("")
+    for key, title in (("by_tier", "Tier"), ("by_category", "Category")):
+        keys = sorted({k for a in A for k in g[a][key]}, key=lambda k: ["easy", "medium", "hard", "infeasible"].index(k) if k in ["easy", "medium", "hard", "infeasible"] else 9)
+        hdr([title] + [f"{a} pass (partial)" for a in A] + ["n per agent"])
+        for k in keys:
+            row([k] + [f"{pct(g[a][key].get(k, {}).get('pass', 0))} ({g[a][key].get(k, {}).get('score', 0):.2f})" for a in A] + [g[A[0]][key].get(k, {}).get("n", 0)])
+        L.append("")
+    keys = sorted({k for a in A for k in g[a]["by_app"]})
+    hdr(["Apps"] + [f"{a} pass" for a in A] + ["n"])
+    for k in keys:
+        row([k] + [pct(g[a]["by_app"].get(k, {}).get("pass", 0)) for a in A] + [g[A[0]]["by_app"].get(k, {}).get("n", 0)])
+    L.append("")
+    hdr(["Task", "Tier"] + [f"{a} (per trial)" for a in A] + [f"{a} s / calls" for a in A])
+    def mark(ps, sc):
+        return " ".join("✅" if p else ("◐" if x > 0.5 else "❌") for p, x in zip(ps, sc))
+    for tid, v in S["per_task"].items():
+        row([tid, v["tier"]] + [mark(v[a]["passed"], v[a]["score"]) if a in v else "" for a in A]
+            + [(" / ".join(f"{w:.0f}" for w in v[a]["wall_s"]) + " · " + " / ".join(str(c) for c in v[a]["calls"])) if a in v else "" for a in A])
+    L.append("")
+    L.append("✅ pass · ◐ failed with partial score > 0.5 · ❌ failed")
+    L.append("")
+    hdr(["BCU tool", "Calls", "Errors", "Error rate", "Mean ms", "p90 ms"])
+    for k, v in S["bcu_tools"].items():
+        row([k, v["calls"], v["errors"], pct(v["error_rate"]), v["mean_ms"], v["p90_ms"]])
+    L.append("")
+    return "\n".join(L)
+
+
 if __name__ == "__main__":
     d = Path(sys.argv[1])
     S = summarize(d)
     (d / "summary.json").write_text(json.dumps(S, indent=1, default=str))
     (d / "failures.json").write_text(json.dumps(failures(d), indent=1, default=str))
+    (d / "tables.md").write_text(render_md(S))
     for a, s in S["agents"].items():
         print(a, s["model"], s["effort"], "pass", pct(s["pass_rate"]), "n", s["attempts"], "score", round(s["mean_partial_score"], 3),
               "wall", round(s["wall_s_mean"]), "calls", round(s["tool_calls_mean"], 1), "cost", s["cost_usd_mean"])
