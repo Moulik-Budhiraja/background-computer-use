@@ -64,6 +64,12 @@ public enum AX {
         return AXValueGetValue(v, .cgSize, &s) ? s : nil
     }
 
+    public static func range(_ el: AXUIElement, _ name: String) -> CFRange? {
+        guard let v = axValue(attr(el, name)) else { return nil }
+        var r = CFRange()
+        return AXValueGetValue(v, .cfRange, &r) ? r : nil
+    }
+
     public static func frame(_ el: AXUIElement) -> CGRect? {
         guard let p = position(el), let s = size(el) else { return nil }
         return CGRect(origin: p, size: s)

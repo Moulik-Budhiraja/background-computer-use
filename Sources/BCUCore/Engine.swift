@@ -61,6 +61,9 @@ public final class Engine {
     /// When the agent last acted on each window, so a state read can wait for it to settle.
     private var lastActionMs: [CGWindowID: Double] = [:]
     private var enhancedPids: Set<pid_t> = []
+    /// The text element that had focus in each window the last time it was
+    /// key, for typing into it later without making the window key.
+    private var focusedText: [CGWindowID: AXUIElement] = [:]
     private var _activity: [ActivityItem] = []
     private var _paused = false
     private var _userInControl = false
@@ -580,11 +583,11 @@ public final class Engine {
 
     /// Run `body` with the window as its app's key window, under the guard.
     /// Keystrokes and pixel clicks go to the app's key window, so the agent's
-    /// window is made key for the length of `body` and key goes straight back
-    /// to the user's window. The swap takes a few milliseconds and doesn't
-    /// repaint the user's window. If the user is in that app, their keys and
-    /// clicks are held during the swap and replayed after, so none of them
-    /// land in the agent's window.
+    /// window is made key for the length of `body` and key goes straight back.
+    /// If the user is in that app, this takes key focus from their window for
+    /// that moment: their keys and clicks are held and replayed after, so none
+    /// of them land in the agent's window. Typing avoids this altogether where
+    /// it can (see `typeText`).
     private func keyed<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) throws -> T {
         if paused { throw ToolError("paused by the user") }
         if userInControl { throw ToolError("the user took over your display") }
@@ -598,7 +601,9 @@ public final class Engine {
         defer { if shared { focusGuard.endHold() } }
         let scope = try KeyScope.enter(pid: w.pid, window: w.id)
         defer { scope.exit() }
-        return try body()
+        let result = try body()
+        rememberFocusedText(in: w)
+        return result
     }
 
     private func guarded<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) rethrows -> T {
@@ -718,10 +723,12 @@ public final class Engine {
         let id = CGWindowID(try args.requireInt("window_id"))
         if windows.window(id) == nil && WindowList.info(id) == nil {
             snapshots[id] = nil
+            focusedText[id] = nil
             return ToolResult(text: "window \(id) is already closed")
         }
         let text = try windows.release(id, keepOpen: args.bool("keep_open") ?? false)
         snapshots[id] = nil
+        focusedText[id] = nil
         return ToolResult(text: text)
     }
 
@@ -891,7 +898,10 @@ public final class Engine {
             point(n.frame.center, .click)
             if button == .left && count == 1 && n.actions.contains("AXPress") {
                 let err = guarded(w, cause: "pressing an element") { AX.perform(n.element, "AXPress") }
-                if err == .success { return ToolResult(text: "Pressed element \(n.index) (\(n.role)) through accessibility.") }
+                if err == .success {
+                    if Self.textRoles.contains(n.role) { focusedText[w.id] = n.element }
+                    return ToolResult(text: "Pressed element \(n.index) (\(n.role)) through accessibility.")
+                }
             }
             if button == .right && n.actions.contains("AXShowMenu") {
                 let err = guarded(w, cause: "opening a context menu") { AX.perform(n.element, "AXShowMenu") }
@@ -948,6 +958,12 @@ public final class Engine {
         if args.int("element") != nil { target = try node(args, window: w) }
         if let n = target { point(n.frame.center) }
 
+        // The user is in this app, so keystrokes would take key focus from
+        // their window. Write the text through accessibility instead.
+        if userIsIn(w.pid), AX.focusedWindowID(w.pid) != w.id {
+            return try typeShared(w, text: text, target: target)
+        }
+
         // Accessibility insertion first: no keyboard focus involved.
         if let n = target, !text.contains("\n"), !text.contains("\t"), AX.isSettable(n.element, "AXSelectedText") {
             let before = AX.string(n.element, "AXValue") ?? ""
@@ -965,6 +981,11 @@ public final class Engine {
             guarded(w, cause: "focusing") { _ = AX.set(n.element, "AXFocused", kCFBooleanTrue) }
             sleepMs(50)
         }
+        try typeKeys(w, text)
+        return ToolResult(text: "Typed \(text.count) characters with keystrokes.")
+    }
+
+    private func typeKeys(_ w: AgentWindow, _ text: String) throws {
         // While the user is in the same app their input is held during each
         // swap, so type in short bursts to keep that delay small.
         let chunk = userIsIn(w.pid) ? 16 : Int.max
@@ -975,7 +996,126 @@ public final class Engine {
             try keyed(w, cause: "typing") { try Input.typeText(pid: w.pid, String(piece)) }
             if !rest.isEmpty { sleepMs(40) }
         }
-        return ToolResult(text: "Typed \(text.count) characters with keystrokes.")
+    }
+
+    /// Typing while the user is in the same app. The text goes in through
+    /// accessibility, which doesn't need key focus. Keys, and so a moment of
+    /// key focus, only for Return and Tab and for fields that ignore
+    /// accessibility writes.
+    private func typeShared(_ w: AgentWindow, text: String, target: AXNode?) throws -> ToolResult {
+        let element = target?.element ?? focusedTextElement(in: w)
+        // Runs of text, with each Return or Tab on its own.
+        var parts: [String] = []
+        var run = ""
+        for ch in text {
+            if ch == "\n" || ch == "\r" || ch == "\t" {
+                if !run.isEmpty { parts.append(run); run = "" }
+                parts.append(String(ch))
+            } else {
+                run.append(ch)
+            }
+        }
+        if !run.isEmpty { parts.append(run) }
+        var viaAX = 0, viaKeys = 0
+        var focused = target == nil
+        for part in parts {
+            let isKey = part == "\n" || part == "\r" || part == "\t"
+            if !isKey, let el = element, guarded(w, cause: "typing", { axInsert(el, part) }) {
+                viaAX += part.count
+                focusedText[w.id] = el
+                continue
+            }
+            // Keys go to the window's focused element: make that the target first.
+            if !focused, let el = element {
+                guarded(w, cause: "focusing") { _ = AX.set(el, "AXFocused", kCFBooleanTrue) }
+                sleepMs(50)
+                focused = true
+            }
+            try typeKeys(w, part)
+            viaKeys += part.count
+        }
+        let into = target.map { " into element \($0.index)" } ?? ""
+        if viaKeys == 0 {
+            return ToolResult(text: "Typed \(viaAX) characters\(into) through accessibility (the user is using \(w.appName), so no keystrokes).")
+        }
+        if viaAX == 0 {
+            return ToolResult(text: "Typed \(viaKeys) characters\(into) with keystrokes.")
+        }
+        return ToolResult(text: "Typed \(viaAX) characters\(into) through accessibility and \(viaKeys) (Return/Tab) with keystrokes.")
+    }
+
+    private static let textRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+
+    /// The text element with focus in the agent's window, found without making
+    /// the window key: the element the window's own tree marks focused (web
+    /// content does), else the one that had focus when the window was last
+    /// key (AppKit marks nothing focused in a window that isn't key). Nil when
+    /// something other than a text field has focus: then keys decide.
+    private func focusedTextElement(in w: AgentWindow) -> AXUIElement? {
+        if let snap = snapshots[w.id],
+           let n = snap.nodes.values.first(where: { AX.bool($0.element, "AXFocused") == true && $0.role != "AXWebArea" }) {
+            return Self.textRoles.contains(n.role) ? n.element : nil
+        }
+        if let el = focusedText[w.id], AX.string(el, "AXRole") != nil { return el }
+        return nil
+    }
+
+    /// Note the window's focused text element while the window is key.
+    private func rememberFocusedText(in w: AgentWindow) {
+        guard let el = AX.element(AX.app(w.pid), "AXFocusedUIElement"),
+              Self.textRoles.contains(AX.string(el, "AXRole") ?? ""),
+              let win = AX.element(el, "AXWindow"), AX.windowID(win) == w.id else { return }
+        focusedText[w.id] = el
+    }
+
+    /// Insert `text` at the element's selection through accessibility, and
+    /// check that the field reads exactly as typing would have left it.
+    /// Single-line fields get their value rewritten with the text spliced in
+    /// at the selection: web fields in a window without key focus take only
+    /// that, and Chromium's address bar inserts AXSelectedText at an older
+    /// selection and then ignores Return. Text areas, which can hold
+    /// formatting, take AXSelectedText (AppKit text views do); a rewrite only
+    /// when they're empty.
+    private func axInsert(_ el: AXUIElement, _ text: String) -> Bool {
+        let role = AX.string(el, "AXRole") ?? ""
+        guard Self.textRoles.contains(role), AX.string(el, "AXSubrole") != "AXSecureTextField" else { return false }
+        let before = AX.string(el, "AXValue") ?? ""
+        let old = before as NSString
+        // At the selection if the field has focus, else at the end, where
+        // clicking into it would put the caret.
+        var r = NSRange(location: old.length, length: 0)
+        if AX.bool(el, "AXFocused") == true, let s = AX.range(el, "AXSelectedTextRange"),
+           s.location >= 0, s.length >= 0, s.location + s.length <= old.length {
+            r = NSRange(location: s.location, length: s.length)
+        }
+        let expected = old.replacingCharacters(in: r, with: text)
+        func rewrite() -> Bool {
+            guard AX.isSettable(el, "AXValue"), AX.set(el, "AXValue", expected as CFString) == .success,
+                  waitForValue(el, ms: 300, { $0 == expected }) else { return false }
+            var caret = CFRange(location: r.location + (text as NSString).length, length: 0)
+            if let v = AXValueCreate(.cfRange, &caret) { AX.set(el, "AXSelectedTextRange", v) }
+            return true
+        }
+        if role != "AXTextArea" { return rewrite() }
+        if AX.isSettable(el, "AXSelectedText"), AX.set(el, "AXSelectedText", text as CFString) == .success,
+           waitForValue(el, ms: 150, { $0 == expected }) {
+            return true
+        }
+        let now = AX.string(el, "AXValue") ?? ""
+        if now != before {
+            // It went in some other way: count it typed rather than type it twice.
+            return now.contains(text)
+        }
+        return before.isEmpty && rewrite()
+    }
+
+    private func waitForValue(_ el: AXUIElement, ms: Double, _ ok: (String) -> Bool) -> Bool {
+        let deadline = nowMs() + ms
+        while true {
+            if ok(AX.string(el, "AXValue") ?? "") { return true }
+            if nowMs() >= deadline { return false }
+            sleepMs(10)
+        }
     }
 
     private func pressKey(_ args: Args) throws -> ToolResult {
