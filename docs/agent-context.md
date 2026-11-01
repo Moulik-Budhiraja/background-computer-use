@@ -13,7 +13,7 @@ How to work:
 1. Call `status` once to learn the user's default browser. When a task needs a browser, use that one.
 2. `open_window` opens a new window of an app on your display (for a browser, a new window in the user's own profile). Use `borrow_window` only for single-window apps.
 3. `get_window_state` returns the window's accessibility tree with numbered elements and a screenshot. Act on elements by number. Use x/y (window points, matching the screenshot pixels) only when no element fits. An element keeps its number for as long as it exists. After the first read, `get_window_state` lists only what changed (- removed, + added, ~ changed); pass full=true when you need the whole list again. Right after an action it waits (up to 5 s) for the window to settle, so you don't need to sleep.
-4. Prefer `click` on an element and `set_value`: they work through accessibility. `type_text`, `press_key` and pixel clicks make your window its app's key window for a few milliseconds and then hand key focus straight back; this works even while the user is using the same app (the user's input is held for that moment and replayed). Long text is typed in short bursts when the user shares the app.
+4. Prefer `click` on an element and `set_value`: they work through accessibility. While the user is in the same app, `type_text` writes into the field through accessibility too (pass `element` when you know the field); only Return and Tab go as keys. Keys and pixel clicks make your window its app's key window for a moment and then hand key focus straight back; this works even while the user is using the same app (the user's input is held for that moment and replayed).
 Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's elements in `get_window_state`; click their rows by number. In a browser, to go to a URL: click the address bar, then `type_text` the URL followed by "\n".
 5. When you already know the next few steps (fill a form and submit, type a URL and press Return), send them in one `batch` call: it runs them in order, stops at the first failure, and returns the window's state at the end. Otherwise check the result with `get_window_state` after each meaningful step.
 6. When finished, `release_window` every window you opened or borrowed.
@@ -218,7 +218,7 @@ Prefer, in order:
 4. `type_text` and `press_key` for typing and shortcuts, `press_menu_item` for menu bar commands such as `["File", "Export…"]`.
 5. `click` with x and y, `scroll` and `drag`, only when no element fits.
 
-Keystrokes and pixel clicks make your window its app's key window for a few milliseconds, then give it back. This works while the user types in another window of the same app. Their input is held for that moment and replayed. When the user is in the same app, long text is typed in bursts of 16 characters to keep that hold short.
+When the user is in another window of the same app, `type_text` writes the text into the field through accessibility, without keystrokes; only Return and Tab are pressed as keys. Pass `element` when you know the field. Keystrokes and pixel clicks make your window its app's key window for a moment, then give it back. This works while the user types in another window of the same app: their input is held for that moment and replayed.
 
 To open a URL in a browser, press `cmd+l` (or click the address bar) and `type_text` the URL followed by `\n`.
 

@@ -41,7 +41,7 @@ Prefer, in order:
 4. `type_text` and `press_key` for typing and shortcuts, `press_menu_item` for menu bar commands such as `["File", "Export…"]`.
 5. `click` with x and y, `scroll` and `drag`, only when no element fits.
 
-Keystrokes and pixel clicks make your window its app's key window for a few milliseconds, then give it back. This works while the user types in another window of the same app. Their input is held for that moment and replayed. When the user is in the same app, long text is typed in bursts of 16 characters to keep that hold short.
+When the user is in another window of the same app, `type_text` writes the text into the field through accessibility, without keystrokes; only Return and Tab are pressed as keys. Pass `element` when you know the field. Keystrokes and pixel clicks make your window its app's key window for a moment, then give it back. This works while the user types in another window of the same app: their input is held for that moment and replayed.
 
 To open a URL in a browser, press `cmd+l` (or click the address bar) and `type_text` the URL followed by `\n`.
 

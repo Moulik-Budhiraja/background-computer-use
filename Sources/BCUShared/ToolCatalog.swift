@@ -16,10 +16,11 @@ public enum ToolCatalog {
     An element keeps its number for as long as it exists. After the first read, `get_window_state` lists only \
     what changed (- removed, + added, ~ changed); pass full=true when you need the whole list again. Right \
     after an action it waits (up to 5 s) for the window to settle, so you don't need to sleep.
-    4. Prefer `click` on an element and `set_value`: they work through accessibility. `type_text`, \
-    `press_key` and pixel clicks make your window its app's key window for a few milliseconds and then hand \
-    key focus straight back; this works even while the user is using the same app (the user's input is held \
-    for that moment and replayed). Long text is typed in short bursts when the user shares the app.
+    4. Prefer `click` on an element and `set_value`: they work through accessibility. While the user is in \
+    the same app, `type_text` writes into the field through accessibility too (pass `element` when you know \
+    the field); only Return and Tab go as keys. Keys and pixel clicks make your window its app's key window \
+    for a moment and then hand key focus straight back; this works even while the user is using the same app \
+    (the user's input is held for that moment and replayed).
     Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's \
     elements in `get_window_state`; click their rows by number. In a browser, to go to a URL: click the \
     address bar, then `type_text` the URL followed by "\\n".
