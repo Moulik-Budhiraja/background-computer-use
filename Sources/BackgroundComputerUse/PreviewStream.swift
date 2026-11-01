@@ -74,9 +74,32 @@ final class FrameLayer {
         return c
     }()
 
+    /// Where the agent is acting, drawn over the frames.
+    let cursor = AgentCursor()
+
     init() {
         ghostClip.addSublayer(ghost)
         layer.addSublayer(ghostClip)
+        layer.addSublayer(cursor.effects)
+        layer.addSublayer(cursor.layer)
+        cursor.map = { [unowned self] p in self.map(CGRect(origin: p, size: .zero)).origin }
+        cursor.scale = { [unowned self] in self.scale }
+    }
+
+    /// Points of this layer per point of the agent display.
+    private var scale: CGFloat {
+        let L = layer.bounds, b = displayBounds
+        guard b.width > 0, b.height > 0 else { return 1 }
+        return min(L.width / b.width, L.height / b.height)
+    }
+
+    /// The layer was resized.
+    func didLayout() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        cursor.effects.frame = layer.bounds
+        CATransaction.commit()
+        cursor.relayout()
     }
 
     /// Draw a window (or, with no image, a resize outline) at `rect`, in global points.
@@ -157,5 +180,6 @@ final class FrameHostView: NSView {
         CATransaction.setDisableActions(true)
         frameLayer?.layer.frame = bounds
         CATransaction.commit()
+        frameLayer?.didLayout()
     }
 }

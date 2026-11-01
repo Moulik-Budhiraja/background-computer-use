@@ -11,6 +11,18 @@ public enum EngineStatus: Equatable {
     case userInControl
 }
 
+/// Where an agent action lands, so the previews can draw a cursor going there.
+public struct AgentPointer {
+    public enum Kind {
+        case move
+        case click
+        case drag(to: CGPoint)
+    }
+    /// Global (top-left origin) point on the agent display.
+    public let point: CGPoint
+    public let kind: Kind
+}
+
 public struct ActivityItem {
     public let time: Date
     public let text: String
@@ -32,6 +44,16 @@ public final class Engine {
 
     /// Called on the main thread whenever status, activity or windows change.
     public var onChange: (() -> Void)?
+
+    /// Posted on the main thread with the engine as object and an
+    /// `AgentPointer` under "pointer" just before an action lands somewhere.
+    public static let pointerNotification = Notification.Name("bcu.agentPointer")
+    private var _lastPointer: CGPoint?
+    /// Where the last action landed, for a preview that opens later.
+    public var lastPointer: CGPoint? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _lastPointer
+    }
 
     private let queue = DispatchQueue(label: "bcu.engine")
     private let stateLock = NSLock()
@@ -499,6 +521,24 @@ public final class Engine {
 
     // MARK: Helpers
 
+    /// Tell the previews where this action lands.
+    private func point(_ p: CGPoint, _ kind: AgentPointer.Kind = .move) {
+        let b = display.bounds
+        guard !b.isEmpty else { return }
+        func clamp(_ q: CGPoint) -> CGPoint {
+            CGPoint(x: min(max(q.x, b.minX), b.maxX - 1), y: min(max(q.y, b.minY), b.maxY - 1))
+        }
+        var kind = kind
+        if case .drag(let to) = kind { kind = .drag(to: clamp(to)) }
+        let pointer = AgentPointer(point: clamp(p), kind: kind)
+        stateLock.lock()
+        if case .drag(let to) = kind { _lastPointer = to } else { _lastPointer = pointer.point }
+        stateLock.unlock()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Self.pointerNotification, object: self, userInfo: ["pointer": pointer])
+        }
+    }
+
     private func agentWindow(_ args: Args) throws -> (AgentWindow, AXUIElement) {
         let id = CGWindowID(try args.requireInt("window_id"))
         guard let w = windows.window(id) else {
@@ -845,6 +885,7 @@ public final class Engine {
         let count = args.int("count") ?? 1
         if args.int("element") != nil {
             let n = try node(args, window: w)
+            point(n.frame.center, .click)
             if button == .left && count == 1 && n.actions.contains("AXPress") {
                 let err = guarded(w, cause: "pressing an element") { AX.perform(n.element, "AXPress") }
                 if err == .success { return ToolResult(text: "Pressed element \(n.index) (\(n.role)) through accessibility.") }
@@ -858,6 +899,7 @@ public final class Engine {
             return ToolResult(text: "Clicked element \(n.index) at its center.")
         }
         let p = try globalPoint(args, window: ax)
+        point(p, .click)
         try keyed(w, cause: "clicking") { try Input.click(pid: w.pid, windowID: w.id, at: p, button: button, count: count) }
         return ToolResult(text: "Clicked at (\(Int(args.double("x") ?? 0)), \(Int(args.double("y") ?? 0))).")
     }
@@ -866,6 +908,7 @@ public final class Engine {
         let (w, _) = try agentWindow(args)
         let n = try node(args, window: w)
         let value = try args.requireString("value")
+        point(n.frame.center)
         let err = guarded(w, cause: "setting a value") { AX.set(n.element, "AXValue", value as CFString) }
         guard err == .success else {
             throw ToolError("couldn't set element \(n.index)'s value (\(AX.errorName(err))). Try type_text with element=\(n.index).")
@@ -887,6 +930,7 @@ public final class Engine {
         } else if !action.hasPrefix("AX") {
             action = "AX" + action.prefix(1).uppercased() + action.dropFirst()
         }
+        point(n.frame.center, .click)
         let err = guarded(w, cause: "performing \(action)") { AX.perform(n.element, action) }
         guard err == .success else {
             throw ToolError("\(action) on element \(n.index) failed: \(AX.errorName(err)). Its actions: \(n.actions.joined(separator: ", "))")
@@ -899,6 +943,7 @@ public final class Engine {
         let text = try args.requireString("text")
         var target: AXNode?
         if args.int("element") != nil { target = try node(args, window: w) }
+        if let n = target { point(n.frame.center) }
 
         // Accessibility insertion first: no keyboard focus involved.
         if let n = target, !text.contains("\n"), !text.contains("\t"), AX.isSettable(n.element, "AXSelectedText") {
@@ -953,6 +998,7 @@ public final class Engine {
         }
         let dx = args.int("dx") ?? 0, dy = args.int("dy") ?? 0
         guard dx != 0 || dy != 0 else { throw ToolError("give dx or dy") }
+        point(p)
         try guarded(w, cause: "scrolling") { try Input.scroll(pid: w.pid, windowID: w.id, at: p, dx: dx, dy: dy) }
         return ToolResult(text: "Scrolled dx=\(dx) dy=\(dy).")
     }
@@ -963,6 +1009,7 @@ public final class Engine {
               let fx = args.double("from_x"), let fy = args.double("from_y"),
               let tx = args.double("to_x"), let ty = args.double("to_y") else { throw ToolError("give from_x, from_y, to_x, to_y") }
         let from = CGPoint(x: f.minX + fx, y: f.minY + fy), to = CGPoint(x: f.minX + tx, y: f.minY + ty)
+        point(from, .drag(to: to))
         try keyed(w, cause: "dragging") { try Input.drag(pid: w.pid, windowID: w.id, from: from, to: to) }
         return ToolResult(text: "Dragged from (\(Int(fx)),\(Int(fy))) to (\(Int(tx)),\(Int(ty))).")
     }

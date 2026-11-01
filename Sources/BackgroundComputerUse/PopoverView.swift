@@ -42,9 +42,12 @@ final class PopoverModel: ObservableObject {
     /// What the take-over button does here.
     var takeOver: (() -> Void)?
     private var previewFPS = 8
+    private var previewing = false
+    private var pointerObserver: NSObjectProtocol?
 
     private lazy var stream = PreviewStream(engine: engine) { [weak self] image in
         guard let self else { return }
+        self.frame.displayBounds = self.engine.display.bounds
         self.frame.show(image)
         if !self.hasFrame { self.hasFrame = true }
     }
@@ -54,6 +57,16 @@ final class PopoverModel: ObservableObject {
         self.engine = engine
         self.openSettings = openSettings
         self.openViewer = openViewer
+        pointerObserver = NotificationCenter.default.addObserver(forName: Engine.pointerNotification, object: engine, queue: .main) { [weak self] n in
+            guard let self, let pointer = n.userInfo?["pointer"] as? AgentPointer else { return }
+            self.frame.displayBounds = self.engine.display.bounds
+            // Only glide while someone can see it.
+            self.frame.cursor.handle(pointer, animated: self.previewing)
+        }
+    }
+
+    deinit {
+        if let pointerObserver { NotificationCenter.default.removeObserver(pointerObserver) }
     }
 
     func refresh() {
@@ -87,10 +100,14 @@ final class PopoverModel: ObservableObject {
     func startPreview(fps: Int = 15) {
         guard engine.display.isRunning, Capture.hasPermission else { return }
         previewFPS = fps
+        frame.displayBounds = engine.display.bounds
+        frame.cursor.place(engine.lastPointer)
+        previewing = true
         stream.start(fps: fps)
     }
 
     func stopPreview() {
+        previewing = false
         stream.stop()
     }
 
@@ -103,6 +120,8 @@ final class PopoverModel: ObservableObject {
         guard remote != nil, !controlling else { return }
         askingControl = false
         controlling = true
+        // The user's own pointer is the one that matters now.
+        frame.cursor.hidden = true
         engine.setUserInControl(true)
         onControlChange?(true)
     }
@@ -111,6 +130,7 @@ final class PopoverModel: ObservableObject {
         askingControl = false
         guard controlling else { return }
         controlling = false
+        frame.cursor.hidden = false
         remote?.end()
         engine.setUserInControl(false)
         onControlChange?(false)
