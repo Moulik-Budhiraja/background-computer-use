@@ -1,0 +1,20 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Book a table</title><link rel="stylesheet" href="/style.css"></head>
+<body><h1>Book a table</h1>
+<form method="post" action="/api/submit/booking">
+<label for="date">Date</label><input type="date" id="date" name="date" required>
+<label for="time">Time</label>
+<select id="time" name="time"><option value="">Choose…</option><option>17:30</option><option>18:00</option><option>18:30</option><option>19:00</option><option>19:30</option><option>20:00</option><option>20:30</option></select>
+<label>Seating</label>
+<p><input type="radio" id="s-in" name="seating" value="Indoor"> <label for="s-in" style="display:inline">Indoor</label>
+<input type="radio" id="s-pat" name="seating" value="Patio"> <label for="s-pat" style="display:inline">Patio</label>
+<input type="radio" id="s-bar" name="seating" value="Bar"> <label for="s-bar" style="display:inline">Bar</label></p>
+<label>Requests</label>
+<p><input type="checkbox" id="r-veg" name="requests" value="Vegetarian menu"> <label for="r-veg" style="display:inline">Vegetarian menu</label><br>
+<input type="checkbox" id="r-high" name="requests" value="High chair"> <label for="r-high" style="display:inline">High chair</label><br>
+<input type="checkbox" id="r-wheel" name="requests" value="Wheelchair access"> <label for="r-wheel" style="display:inline">Wheelchair access</label><br>
+<input type="checkbox" id="r-quiet" name="requests" value="Quiet table"> <label for="r-quiet" style="display:inline">Quiet table</label></p>
+<label for="party">Party size: <output id="partyout">2</output></label>
+<input type="range" id="party" name="party" min="1" max="12" value="2" oninput="partyout.value=this.value">
+<label for="notes">Notes for the restaurant</label><textarea id="notes" name="notes" rows="4"></textarea>
+<button type="submit">Book table</button>
+</form></body></html>

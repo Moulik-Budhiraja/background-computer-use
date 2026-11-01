@@ -1,0 +1,6 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Expense receipt upload</title><link rel="stylesheet" href="/style.css"></head>
+<body><h1>Upload an expense receipt</h1>
+<form method="post" action="/api/upload" enctype="multipart/form-data">
+<label for="amount">Amount (USD)</label><input type="text" id="amount" name="amount">
+<label for="receipt">Receipt image</label><input type="file" id="receipt" name="receipt" accept="image/*">
+<button type="submit">Upload receipt</button></form></body></html>

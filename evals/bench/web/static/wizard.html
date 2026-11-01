@@ -1,0 +1,34 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Checkout</title><link rel="stylesheet" href="/style.css">
+<style>.step{display:none}.step.on{display:block}</style></head>
+<body><h1>Checkout</h1><p id="progress">Step 1 of 3</p>
+<div class="step on" id="step1"><h2>Contact</h2>
+<label for="fullname">Full name</label><input type="text" id="fullname">
+<label for="email">Email</label><input type="email" id="email">
+<p class="err" id="err1"></p><button onclick="go(2)">Continue</button></div>
+<div class="step" id="step2"><h2>Shipping address</h2>
+<label for="street">Street address</label><input type="text" id="street">
+<label for="city">City</label><input type="text" id="city">
+<label for="state">State</label><select id="state"><option value="">Choose…</option><option>California</option><option>Colorado</option><option>New York</option><option>Oregon</option><option>Texas</option><option>Washington</option></select>
+<label for="zip">ZIP code (5 digits)</label><input type="text" id="zip">
+<label>Delivery</label><p><input type="radio" name="speed" id="std" value="Standard" checked> <label style="display:inline" for="std">Standard (free)</label> <input type="radio" name="speed" id="exp" value="Express"> <label style="display:inline" for="exp">Express ($9)</label></p>
+<p class="err" id="err2"></p><button onclick="go(1)">Back</button> <button onclick="go(3)">Continue</button></div>
+<div class="step" id="step3"><h2>Review</h2><pre id="review"></pre>
+<p><input type="checkbox" id="confirm"> <label style="display:inline" for="confirm">I confirm these details are correct</label></p>
+<p class="err" id="err3"></p><button onclick="go(2)">Back</button> <button onclick="place()">Place order</button></div>
+<div class="step" id="done"><h2>Order placed</h2><p>Your confirmation number is <b id="conf"></b>.</p></div>
+<script>
+const $=id=>document.getElementById(id);
+function data(){return {fullname:$('fullname').value.trim(),email:$('email').value.trim(),street:$('street').value.trim(),city:$('city').value.trim(),state:$('state').value,zip:$('zip').value.trim(),speed:document.querySelector('input[name=speed]:checked').value}}
+let cur=1;
+function show(n){document.querySelectorAll('.step').forEach(s=>s.classList.remove('on'));$(n==='done'?'done':'step'+n).classList.add('on');if(n!=='done'){$('progress').textContent='Step '+n+' of 3';cur=n}else{$('progress').textContent='Complete'}}
+function go(n){const d=data();
+ if(n>cur){
+  if(cur===1){if(!d.fullname){$('err1').textContent='Enter your name.';return}if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(d.email)){$('err1').textContent='Enter a valid email.';return}$('err1').textContent=''}
+  if(cur===2){if(!d.street||!d.city){$('err2').textContent='Enter street and city.';return}if(!d.state){$('err2').textContent='Choose a state.';return}if(!/^\d{5}$/.test(d.zip)){$('err2').textContent='ZIP must be 5 digits.';return}$('err2').textContent=''}
+ }
+ if(n===3){$('review').textContent=JSON.stringify(d,null,2)}
+ show(n)}
+async function place(){if(!$('confirm').checked){$('err3').textContent='Please confirm your details.';return}
+ const d=data();const r=await fetch('/api/submit/wizard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
+ $('conf').textContent='BC-'+(1000+Math.floor(Math.random()*9000));show('done')}
+</script></body></html>

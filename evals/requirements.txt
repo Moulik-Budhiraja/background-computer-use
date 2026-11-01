@@ -1,0 +1,9 @@
+numbers-parser
+python-docx
+openpyxl
+python-pptx
+pypdf
+reportlab
+pillow
+pyobjc-framework-Quartz
+pyobjc-framework-Cocoa

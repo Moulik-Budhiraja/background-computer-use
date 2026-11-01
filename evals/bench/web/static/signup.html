@@ -1,0 +1,12 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Create your account</title><link rel="stylesheet" href="/style.css"></head>
+<body><h1>Create your account</h1>
+<form method="post" action="/api/submit/signup">
+<label for="name">Full name</label><input type="text" id="name" name="name" required>
+<label for="email">Email</label><input type="email" id="email" name="email" required>
+<label for="country">Country</label>
+<select id="country" name="country"><option value="">Choose…</option><option>Australia</option><option>Brazil</option><option>Canada</option><option>Germany</option><option>India</option><option>Japan</option><option>Mexico</option><option>United Kingdom</option><option>United States</option></select>
+<label for="plan">Plan</label>
+<select id="plan" name="plan"><option>Free</option><option>Pro</option><option>Team</option></select>
+<p><input type="checkbox" id="agree" name="agree" value="yes"> <label for="agree" style="display:inline">I agree to the terms</label></p>
+<button type="submit">Create account</button>
+</form></body></html>

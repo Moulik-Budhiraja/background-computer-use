@@ -1,0 +1,29 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Sprint board</title><link rel="stylesheet" href="/style.css">
+<style>body{max-width:1100px}.board{display:flex;gap:16px}.col{flex:1;background:#f2f3f5;border-radius:8px;padding:10px;min-height:420px}
+.col h2{font-size:16px;margin:4px 0 10px}.card{background:#fff;border:1px solid #ccd;border-radius:6px;padding:10px;margin-bottom:8px;cursor:grab;user-select:none}
+.card.drag{opacity:.6;position:fixed;pointer-events:none;z-index:9;width:200px}.col.over{outline:2px dashed #4a7}#saved{color:#4a7}</style></head>
+<body><h1>Sprint board</h1><p>Drag cards between columns. Changes save automatically. <span id="saved"></span></p>
+<div class="board" id="board"></div>
+<script>
+const COLS=['To do','In progress','Done'];
+let state=null;
+async function load(){const r=await fetch('/api/state/kanban');state=await r.json();render()}
+function render(){const b=document.getElementById('board');b.innerHTML='';
+ COLS.forEach(c=>{const col=document.createElement('div');col.className='col';col.dataset.col=c;col.setAttribute('role','list');col.setAttribute('aria-label',c);
+  col.innerHTML='<h2>'+c+'</h2>';
+  state[c].forEach(t=>{const d=document.createElement('div');d.className='card';d.textContent=t;d.setAttribute('role','listitem');d.addEventListener('mousedown',start);col.appendChild(d)});
+  b.appendChild(col)})}
+let dragEl=null,ghost=null,src=null;
+function start(e){dragEl=e.currentTarget;src=dragEl.parentElement.dataset.col;ghost=dragEl.cloneNode(true);ghost.classList.add('drag');document.body.appendChild(ghost);move(e);
+ document.addEventListener('mousemove',move);document.addEventListener('mouseup',end);e.preventDefault()}
+function colAt(x,y){return [...document.querySelectorAll('.col')].find(c=>{const r=c.getBoundingClientRect();return x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom})}
+function move(e){ghost.style.left=(e.clientX-100)+'px';ghost.style.top=(e.clientY-15)+'px';document.querySelectorAll('.col').forEach(c=>c.classList.remove('over'));const c=colAt(e.clientX,e.clientY);if(c)c.classList.add('over')}
+async function end(e){document.removeEventListener('mousemove',move);document.removeEventListener('mouseup',end);ghost.remove();document.querySelectorAll('.col').forEach(c=>c.classList.remove('over'));
+ const c=colAt(e.clientX,e.clientY);if(c){const dst=c.dataset.col;const t=dragEl.textContent;
+  // insert position by y
+  const cards=[...c.querySelectorAll('.card')].filter(x=>x!==dragEl);let idx=cards.findIndex(x=>{const r=x.getBoundingClientRect();return e.clientY<r.top+r.height/2});
+  state[src]=state[src].filter(x=>x!==t);if(idx<0)idx=state[dst].length;state[dst].splice(idx,0,t);
+  render();await fetch('/api/state/kanban',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(state)});document.getElementById('saved').textContent='Saved.'}
+ dragEl=null}
+load();
+</script></body></html>

@@ -1,0 +1,7 @@
+body{font-family:-apple-system,Helvetica,Arial,sans-serif;max-width:820px;margin:32px auto;padding:0 16px;color:#222}
+label{display:block;margin:12px 0 4px;font-weight:600}
+input[type=text],input[type=email],input[type=tel],input[type=date],select,textarea{width:100%;padding:6px;font-size:14px;box-sizing:border-box}
+button{margin-top:16px;padding:8px 18px;font-size:14px}
+table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:4px 8px;text-align:left}
+.err{color:#b00020;font-size:13px}
+nav a{margin-right:14px}

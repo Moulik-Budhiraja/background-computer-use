@@ -1,0 +1,10 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Settings – Nimbus Docs</title><link rel="stylesheet" href="/style.css">
+<style>.tab{display:none}.tab.on{display:block}[role=tab][aria-selected=true]{font-weight:700}</style></head>
+<body><nav><a href="/docs/index.html">Home</a><a href="/docs/start.html">Getting started</a><a href="/docs/settings.html">Settings</a><a href="/docs/faq.html">FAQ</a></nav>
+<h1>Settings</h1>
+<div role="tablist"><button role="tab" aria-selected="true" onclick="t('general',this)">General</button> <button role="tab" aria-selected="false" onclick="t('sync',this)">Sync</button> <button role="tab" aria-selected="false" onclick="t('advanced',this)">Advanced</button></div>
+<div class="tab on" id="general"><p>Theme: System. Language: English.</p></div>
+<div class="tab" id="sync"><p>Sync interval: 15 minutes.</p></div>
+<div class="tab" id="advanced"><details><summary>Show activation details</summary><p>Your activation code is <b>ZK-4471-Q</b>.</p></details></div>
+<script>function t(id,b){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));document.getElementById(id).classList.add('on');document.querySelectorAll('[role=tab]').forEach(x=>x.setAttribute('aria-selected','false'));b.setAttribute('aria-selected','true')}</script>
+</body></html>
