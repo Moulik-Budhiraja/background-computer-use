@@ -430,6 +430,30 @@ public final class Engine {
                 }
             }
             return ToolResult(text: text)
+        case "admin_film":
+            // Test: film a user window (its pixels and the screen around it)
+            // and the menu bar while running `steps` (like batch's actions).
+            let user = CGWindowID(try args.requireInt("user_window"))
+            guard let info = WindowList.info(user) else { throw ToolError("no window \(user)") }
+            let steps = (args.raw["steps"] as? [JSONObject]) ?? []
+            var display: CGDirectDisplayID = 0
+            var count: UInt32 = 0
+            CGGetDisplaysWithPoint(CGPoint(x: info.bounds.midX, y: info.bounds.midY), 1, &display, &count)
+            let around = info.bounds.insetBy(dx: -64, dy: -64).intersection(count == 1 ? CGDisplayBounds(display) : info.bounds)
+            var tracks = [Film.window("user window", user), Film.screen("user window on screen", around)]
+            if let bar = WindowList.all(onScreenOnly: true).first(where: { $0.owner == "Window Server" && $0.title == "Menubar" && $0.bounds.contains(CGPoint(x: info.bounds.midX, y: $0.bounds.midY)) }) {
+                tracks.append(Film.window("menu bar", bar.id))
+                tracks.append(Film.screen("menu bar on screen", bar.bounds))
+            }
+            let report = Film.run(tracks, tailMs: args.double("tail_ms") ?? 500) {
+                steps.map { step -> String in
+                    var a = step
+                    let tool = a.removeValue(forKey: "tool") as? String ?? ""
+                    let r = (try? run(tool: tool, args: Args(a)))?.text ?? "failed"
+                    return "\(tool): \(r.split(separator: "\n").first.map(String.init) ?? "")"
+                }.joined(separator: "; ")
+            }
+            return ToolResult(text: report)
         case "admin_remote":
             // Drive the remote-control path the expanded view uses, without the view.
             let (w, ax) = try agentWindow(args)
