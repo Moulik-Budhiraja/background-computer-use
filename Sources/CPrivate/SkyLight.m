@@ -173,6 +173,13 @@ CGImageRef BCUCaptureWindowRect(uint32_t windowID, CGRect rect, uint32_t options
     return image;
 }
 
+typedef CGImageRef (*DisplayCreateImageForRectFn)(CGDirectDisplayID, CGRect);
+
+CGImageRef BCUCaptureDisplayRect(CGDirectDisplayID display, CGRect rect) {
+    DisplayCreateImageForRectFn f = (DisplayCreateImageForRectFn)Sym("CGDisplayCreateImageForRect");
+    return f ? f(display, rect) : NULL;
+}
+
 typedef uint64_t (*ManagedDisplayGetCurrentSpaceFn)(uint32_t cid, CFStringRef displayUUID);
 typedef int32_t (*ProcessAssignToSpaceFn)(uint32_t cid, pid_t pid, uint64_t sid);
 

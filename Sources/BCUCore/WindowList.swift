@@ -26,6 +26,12 @@ public enum WindowList {
         return list.compactMap(parse).first
     }
 
+    /// On-screen windows in front of `id`, frontmost first.
+    public static func above(_ id: CGWindowID) -> [WindowInfo] {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow], id) as? [[String: Any]] else { return [] }
+        return list.compactMap(parse)
+    }
+
     public static func of(pid: pid_t, onScreenOnly: Bool = false) -> [WindowInfo] {
         all(onScreenOnly: onScreenOnly).filter { $0.pid == pid }
     }

@@ -586,8 +586,9 @@ public final class Engine {
     /// window is made key for the length of `body` and key goes straight back.
     /// If the user is in that app, this takes key focus from their window for
     /// that moment: their keys and clicks are held and replayed after, so none
-    /// of them land in the agent's window. Typing avoids this altogether where
-    /// it can (see `typeText`).
+    /// of them land in the agent's window, and a still copy of their window
+    /// and the menu bar covers the moment their window is drawn inactive.
+    /// Typing avoids this altogether where it can (see `typeText`).
     private func keyed<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) throws -> T {
         if paused { throw ToolError("paused by the user") }
         if userInControl { throw ToolError("the user took over your display") }
@@ -599,6 +600,11 @@ public final class Engine {
         let shared = userIsIn(w.pid)
         if shared { focusGuard.beginHold() }
         defer { if shared { focusGuard.endHold() } }
+        var freeze: ScreenFreeze?
+        if shared, let userWindow = AX.focusedWindowID(w.pid), userWindow != w.id {
+            freeze = ScreenFreeze.begin(userWindow: userWindow)
+        }
+        defer { freeze?.end() }
         let scope = try KeyScope.enter(pid: w.pid, window: w.id)
         defer { scope.exit() }
         let result = try body()

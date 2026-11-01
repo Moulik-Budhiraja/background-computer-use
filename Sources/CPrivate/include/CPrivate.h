@@ -66,6 +66,12 @@ CGImageRef _Nullable BCUCaptureWindow(uint32_t windowID) CF_RETURNS_RETAINED;
 /// Capture part of one window (SLSCaptureWindowsContentsToRectWithOptions).
 CGImageRef _Nullable BCUCaptureWindowRect(uint32_t windowID, CGRect rect, uint32_t options) CF_RETURNS_RETAINED;
 
+/// What a display shows in `rect` (display-local points, top-left origin),
+/// composited the way the user sees it: window shadows and rims included,
+/// the cursor not. CGDisplayCreateImageForRect, looked up at run time because
+/// the SDK no longer declares it. NULL if it's gone or fails.
+CGImageRef _Nullable BCUCaptureDisplayRect(CGDirectDisplayID display, CGRect rect) CF_RETURNS_RETAINED;
+
 #pragma mark - Spaces
 
 /// The current Space of a display (SLSManagedDisplayGetCurrentSpace). 0 if unknown.
