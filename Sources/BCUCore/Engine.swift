@@ -86,15 +86,18 @@ public final class Engine {
     /// Create the session's display if it doesn't exist yet. Any thread.
     public func ensureDisplay() throws {
         guard !display.isRunning else { return }
+        func onMain(_ work: () -> Void) { if Thread.isMainThread { work() } else { DispatchQueue.main.sync(execute: work) } }
         var failure: Error?
-        let work = {
-            do {
-                try self.display.start()
-                self.windows.startWatchdog()
-            } catch { failure = error }
-        }
-        if Thread.isMainThread { work() } else { DispatchQueue.main.sync(execute: work) }
+        onMain { do { try self.display.start() } catch { failure = error } }
         if let failure { throw failure }
+        guard display.waitUntilOnline() else {
+            onMain { self.display.stop() }
+            throw ToolError("virtual display never came online")
+        }
+        onMain {
+            self.display.finishStart()
+            self.windows.startWatchdog()
+        }
         log("Created \(display.slot == 0 ? "the agent display" : "agent display \(display.slot + 1)")")
     }
 

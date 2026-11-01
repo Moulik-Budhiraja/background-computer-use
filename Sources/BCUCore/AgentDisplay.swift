@@ -72,6 +72,8 @@ public final class AgentDisplay {
 
     /// Must be called on the main thread. `slot` picks the display's place in
     /// the staircase and its serial, which macOS keys remembered modes on.
+    /// The display comes online asynchronously: follow with `waitUntilOnline`
+    /// and then `finishStart` on the main thread.
     public func start(slot: Int = AgentDisplay.freeSlot()) throws {
         guard display == nil else { return }
         self.slot = slot
@@ -82,7 +84,7 @@ public final class AgentDisplay {
         display = vd
         displayID = vd.displayID
         // Registered right away so a display starting at the same time
-        // (another session, while this one waits below) takes another slot.
+        // (another session, while this one waits) takes another slot.
         Self.registryLock.lock()
         Self.registry.removeAll { $0.display == nil || $0.display === self }
         Self.registry.append(Ref(self))
@@ -91,15 +93,22 @@ public final class AgentDisplay {
             CGDisplayRegisterReconfigurationCallback(reconfigurationCallback, nil)
         }
         Self.registryLock.unlock()
-        // The display comes online asynchronously.
-        let deadline = Date().addingTimeInterval(5)
-        while CGDisplayBounds(displayID).isEmpty && Date() < deadline {
-            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    }
+
+    /// Wait for the display started by `start` to come online. Call it off the
+    /// main queue: on macOS 15 the display only comes online once the main
+    /// queue is free, so waiting inside a main-queue block always times out.
+    public func waitUntilOnline(timeout: TimeInterval = 5) -> Bool {
+        let id = displayID
+        let deadline = Date().addingTimeInterval(timeout)
+        while CGDisplayBounds(id).isEmpty && Date() < deadline {
+            if Thread.isMainThread { RunLoop.current.run(until: Date().addingTimeInterval(0.05)) } else { sleepMs(20) }
         }
-        guard !CGDisplayBounds(displayID).isEmpty else {
-            stop()
-            throw ToolError("virtual display never came online")
-        }
+        return id != 0 && !CGDisplayBounds(id).isEmpty
+    }
+
+    /// Main thread, once the display is online.
+    public func finishStart() {
         useRetinaMode()
         place()
         Log.info("agent display \(slot + 1) (\(displayID)) at \(bounds.short); user displays \(userBounds.short)")
