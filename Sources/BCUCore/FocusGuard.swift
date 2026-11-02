@@ -196,6 +196,22 @@ public final class FocusGuard {
         let fenced = AgentDisplay.fencedBounds
         guard !fenced.isEmpty, let p = CGEvent(source: nil)?.location else { return false }
         guard let agent = fenced.first(where: { $0.contains(p) }) else {
+            // Off every display (an event posted with a far-off location can
+            // leave it there): just as invisible, and macOS only brings it
+            // back when the displays change.
+            if !AgentDisplay.userDisplayIDs().contains(where: { CGDisplayBounds($0).contains(p) }) {
+                let q = nearestUserPoint(p, agent: .null)
+                if q != p {
+                    CGWarpMouseCursorPosition(q)
+                    CGAssociateMouseAndMouseCursorPosition(1)
+                    lock.lock()
+                    let log = nowMs() - lastEscapeLogMs > 2000
+                    if log { lastEscapeLogMs = nowMs() }
+                    lock.unlock()
+                    if log { Log.info("guard: cursor was off every display at \(Int(p.x)),\(Int(p.y)); moved it back to \(Int(q.x)),\(Int(q.y))") }
+                }
+                return true
+            }
             return fenced.contains { $0.insetBy(dx: -400, dy: -400).contains(p) }
         }
         let q = nearestUserPoint(p, agent: agent)

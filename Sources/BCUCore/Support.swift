@@ -96,7 +96,11 @@ public struct ToolError: Error, CustomStringConvertible {
 
 extension CGRect {
     var center: CGPoint { CGPoint(x: midX, y: midY) }
-    var short: String { "\(Int(origin.x)),\(Int(origin.y)) \(Int(width))x\(Int(height))" }
+    /// Safe for CGRect.null and infinite rects: Int() traps on those.
+    var short: String {
+        guard !isNull, !isInfinite, [minX, minY, width, height].allSatisfy(\.isFinite) else { return "none" }
+        return "\(Int(origin.x)),\(Int(origin.y)) \(Int(width))x\(Int(height))"
+    }
 }
 
 /// Writes a stack trace to logs/crash.log when the app dies on a signal
