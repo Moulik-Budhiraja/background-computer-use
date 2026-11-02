@@ -16,10 +16,16 @@ public enum ToolCatalog {
     An element keeps its number for as long as it exists. After the first read, `get_window_state` lists only \
     what changed (- removed, + added, ~ changed); pass full=true when you need the whole list again. Right \
     after an action it waits (up to 5 s) for the window to settle, so you don't need to sleep.
-    4. Prefer `click` on an element and `set_value`: they work through accessibility. `type_text`, \
-    `press_key` and pixel clicks make your window its app's key window for a few milliseconds and then hand \
-    key focus straight back; this works even while the user is using the same app (the user's input is held \
-    for that moment and replayed). Long text is typed in short bursts when the user shares the app.
+    4. Prefer `click` on an element and `set_value`: they work through accessibility. While the user is in \
+    the same app, `type_text` writes into the field through accessibility too (pass `element` when you know \
+    the field); only Return and Tab go as keys. Keys and pixel clicks make your window its app's key window \
+    for a moment and then hand key focus straight back; this works even while the user is using the same app \
+    (the user's input is held for that moment and replayed). When the user is in that app, such a step first \
+    waits (3 s at most, usually much less) for a pause in their typing, clicking or scrolling, and the result \
+    says how long; that's expected, don't repeat the step. If the user has a menu open in that app, the step \
+    fails instead of closing it: retry in a few seconds. Keystroke typing stops if the user switches to that \
+    app partway; the error says how much was typed, so type the rest. Pass priority="now" only when the step \
+    can't wait (a dialog or toast about to close, a hover then a click, a code about to expire).
     Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's \
     elements in `get_window_state`; click their rows by number. In a browser, to go to a URL: click the \
     address bar, then `type_text` the URL followed by "\\n".
@@ -78,13 +84,14 @@ public enum ToolCatalog {
              "Screenshot of one of your windows, or of your whole display when window_id is omitted.",
              ["window_id": prop("integer", "Optional window.")]),
         tool("click",
-             "Click an element (by number) or a point (x, y in window points). Element clicks use accessibility actions when the element supports them.",
+             "Click an element (by number) or a point (x, y in window points). Element clicks use accessibility actions when the element supports them. A point click takes key focus in the app for a moment, so while the user is in that app it first waits for a pause in their input (see priority).",
              ["window_id": prop("integer", "Your window."),
               "element": prop("integer", "Element number from get_window_state."),
               "x": prop("number", "Window-relative x, if no element."),
               "y": prop("number", "Window-relative y, if no element."),
               "button": prop("string", "left (default) or right."),
-              "count": prop("integer", "1 (default) or 2 for double-click.")],
+              "count": prop("integer", "1 (default) or 2 for double-click."),
+              "priority": prop("string", "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.")],
              required: ["window_id"]),
         tool("set_value",
              "Replace the value of a text field, slider or similar element through accessibility. Never touches keyboard focus.",
@@ -102,13 +109,15 @@ public enum ToolCatalog {
              "Type text into your window. With `element`, that element is focused first. Uses accessibility insertion when it works, otherwise keystrokes.",
              ["window_id": prop("integer", "Your window."),
               "text": prop("string", "Text to type. \\n presses Return."),
-              "element": prop("integer", "Optional element to focus first.")],
+              "element": prop("integer", "Optional element to focus first."),
+              "priority": prop("string", "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.")],
              required: ["window_id", "text"]),
         tool("press_key",
-             "Press a key or shortcut in your window, e.g. key \"return\", or key \"l\" with modifiers [\"cmd\"].",
+             "Press a key or shortcut in your window, e.g. key \"return\", or key \"l\" with modifiers [\"cmd\"]. While the user is in the same app it first waits for a pause in their input (see priority).",
              ["window_id": prop("integer", "Your window."),
               "key": prop("string", "Key name: a letter or digit, return, tab, space, escape, delete, forward_delete, up, down, left, right, home, end, page_up, page_down, f1-f12, or a punctuation character."),
-              "modifiers": ["type": "array", "items": ["type": "string"], "description": "Any of cmd, shift, option, ctrl, fn."] as JSONObject],
+              "modifiers": ["type": "array", "items": ["type": "string"], "description": "Any of cmd, shift, option, ctrl, fn."] as JSONObject,
+              "priority": prop("string", "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.")],
              required: ["window_id", "key"]),
         tool("scroll",
              "Scroll in your window at an element or point. Positive dy scrolls down.",
@@ -123,12 +132,14 @@ public enum ToolCatalog {
              "Drag from one window point to another.",
              ["window_id": prop("integer", "Your window."),
               "from_x": prop("number", ""), "from_y": prop("number", ""),
-              "to_x": prop("number", ""), "to_y": prop("number", "")],
+              "to_x": prop("number", ""), "to_y": prop("number", ""),
+              "priority": prop("string", "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.")],
              required: ["window_id", "from_x", "from_y", "to_x", "to_y"]),
         tool("press_menu_item",
              "Choose a menu bar item of the window's app, applied to your window, e.g. path [\"File\", \"Save…\"].",
              ["window_id": prop("integer", "Your window."),
-              "path": ["type": "array", "items": ["type": "string"], "description": "Menu titles from the menu bar down."] as JSONObject],
+              "path": ["type": "array", "items": ["type": "string"], "description": "Menu titles from the menu bar down."] as JSONObject,
+              "priority": prop("string", "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.")],
              required: ["window_id", "path"]),
         tool("handoff",
              "Ask the user to take over a window (a sign-in, a password or 2FA code, a decision). Moves it onto the user's screen without activating it and shows your reason in the menu bar. Stop after calling this.",
@@ -140,12 +151,13 @@ public enum ToolCatalog {
              ["window_id": prop("integer", "Your window.")],
              required: ["window_id"]),
         tool("batch",
-             "Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {\"tool\": \"click\", \"element\": 6}, {\"tool\": \"type_text\", \"text\": \"example.com\\n\"}, {\"tool\": \"wait\", \"ms\": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, wait. Element numbers refer to your last get_window_state.",
+             "Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {\"tool\": \"click\", \"element\": 6}, {\"tool\": \"type_text\", \"text\": \"example.com\\n\"}, {\"tool\": \"wait\", \"ms\": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, wait. Element numbers refer to your last get_window_state. Steps that take key focus in an app the user is in wait for a pause in their input once, and back-to-back steps like that then run together.",
              ["window_id": prop("integer", "Window for every action that doesn't set its own window_id."),
               "actions": ["type": "array", "items": ["type": "object"], "description": "Up to 40 actions: {\"tool\": name, ...that tool's arguments}."] as JSONObject,
               "state": prop("boolean", "Read the window's state after the actions (default true)."),
               "screenshot": prop("boolean", "Include a screenshot with that state (default false)."),
-              "full": prop("boolean", "List every element in that state instead of the changes (default false).")],
+              "full": prop("boolean", "List every element in that state instead of the changes (default false)."),
+              "priority": prop("string", "\"now\" for every action that doesn't set its own priority: no waiting for the user. Only for steps that can't wait.")],
              required: ["actions"]),
         tool("guard_report",
              "Focus-guard events: anything that touched the user's focus, cursor or screen, with the action that caused it.",

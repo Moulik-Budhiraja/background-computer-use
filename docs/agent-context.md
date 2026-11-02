@@ -13,7 +13,7 @@ How to work:
 1. Call `status` once to learn the user's default browser. When a task needs a browser, use that one.
 2. `open_window` opens a new window of an app on your display (for a browser, a new window in the user's own profile). Use `borrow_window` only for single-window apps.
 3. `get_window_state` returns the window's accessibility tree with numbered elements and a screenshot. Act on elements by number. Use x/y (window points, matching the screenshot pixels) only when no element fits. An element keeps its number for as long as it exists. After the first read, `get_window_state` lists only what changed (- removed, + added, ~ changed); pass full=true when you need the whole list again. Right after an action it waits (up to 5 s) for the window to settle, so you don't need to sleep.
-4. Prefer `click` on an element and `set_value`: they work through accessibility. `type_text`, `press_key` and pixel clicks make your window its app's key window for a few milliseconds and then hand key focus straight back; this works even while the user is using the same app (the user's input is held for that moment and replayed). Long text is typed in short bursts when the user shares the app.
+4. Prefer `click` on an element and `set_value`: they work through accessibility. While the user is in the same app, `type_text` writes into the field through accessibility too (pass `element` when you know the field); only Return and Tab go as keys. Keys and pixel clicks make your window its app's key window for a moment and then hand key focus straight back; this works even while the user is using the same app (the user's input is held for that moment and replayed). When the user is in that app, such a step first waits (3 s at most, usually much less) for a pause in their typing, clicking or scrolling, and the result says how long; that's expected, don't repeat the step. If the user has a menu open in that app, the step fails instead of closing it: retry in a few seconds. Keystroke typing stops if the user switches to that app partway; the error says how much was typed, so type the rest. Pass priority="now" only when the step can't wait (a dialog or toast about to close, a hover then a click, a code about to expire).
 Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's elements in `get_window_state`; click their rows by number. In a browser, to go to a URL: click the address bar, then `type_text` the URL followed by "\n".
 5. When you already know the next few steps (fill a form and submit, type a URL and press Return), send them in one `batch` call: it runs them in order, stops at the first failure, and returns the window's state at the end. Otherwise check the result with `get_window_state` after each meaningful step.
 6. When finished, `release_window` every window you opened or borrowed.
@@ -75,12 +75,13 @@ Screenshot of one of your windows, or of your whole display when window_id is om
 
 ### click
 
-Click an element (by number) or a point (x, y in window points). Element clicks use accessibility actions when the element supports them.
+Click an element (by number) or a point (x, y in window points). Element clicks use accessibility actions when the element supports them. A point click takes key focus in the app for a moment, so while the user is in that app it first waits for a pause in their input (see priority).
 
 - `window_id` (integer, required): Your window.
 - `button` (string): left (default) or right.
 - `count` (integer): 1 (default) or 2 for double-click.
 - `element` (integer): Element number from get_window_state.
+- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). "now" runs at once; only for steps that can't wait.
 - `x` (number): Window-relative x, if no element.
 - `y` (number): Window-relative y, if no element.
 
@@ -107,14 +108,16 @@ Type text into your window. With `element`, that element is focused first. Uses 
 - `text` (string, required): Text to type. \n presses Return.
 - `window_id` (integer, required): Your window.
 - `element` (integer): Optional element to focus first.
+- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). "now" runs at once; only for steps that can't wait.
 
 ### press_key
 
-Press a key or shortcut in your window, e.g. key "return", or key "l" with modifiers ["cmd"].
+Press a key or shortcut in your window, e.g. key "return", or key "l" with modifiers ["cmd"]. While the user is in the same app it first waits for a pause in their input (see priority).
 
 - `key` (string, required): Key name: a letter or digit, return, tab, space, escape, delete, forward_delete, up, down, left, right, home, end, page_up, page_down, f1-f12, or a punctuation character.
 - `window_id` (integer, required): Your window.
 - `modifiers` (array of string): Any of cmd, shift, option, ctrl, fn.
+- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). "now" runs at once; only for steps that can't wait.
 
 ### scroll
 
@@ -136,6 +139,7 @@ Drag from one window point to another.
 - `to_x` (number, required)
 - `to_y` (number, required)
 - `window_id` (integer, required): Your window.
+- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). "now" runs at once; only for steps that can't wait.
 
 ### press_menu_item
 
@@ -143,6 +147,7 @@ Choose a menu bar item of the window's app, applied to your window, e.g. path ["
 
 - `path` (array of string, required): Menu titles from the menu bar down.
 - `window_id` (integer, required): Your window.
+- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). "now" runs at once; only for steps that can't wait.
 
 ### handoff
 
@@ -159,10 +164,11 @@ Move a handed-off window back onto your display once the user is done.
 
 ### batch
 
-Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {"tool": "click", "element": 6}, {"tool": "type_text", "text": "example.com\n"}, {"tool": "wait", "ms": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, wait. Element numbers refer to your last get_window_state.
+Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {"tool": "click", "element": 6}, {"tool": "type_text", "text": "example.com\n"}, {"tool": "wait", "ms": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, wait. Element numbers refer to your last get_window_state. Steps that take key focus in an app the user is in wait for a pause in their input once, and back-to-back steps like that then run together.
 
 - `actions` (array of object, required): Up to 40 actions: {"tool": name, ...that tool's arguments}.
 - `full` (boolean): List every element in that state instead of the changes (default false).
+- `priority` (string): "now" for every action that doesn't set its own priority: no waiting for the user. Only for steps that can't wait.
 - `screenshot` (boolean): Include a screenshot with that state (default false).
 - `state` (boolean): Read the window's state after the actions (default true).
 - `window_id` (integer): Window for every action that doesn't set its own window_id.
@@ -218,7 +224,9 @@ Prefer, in order:
 4. `type_text` and `press_key` for typing and shortcuts, `press_menu_item` for menu bar commands such as `["File", "Export…"]`.
 5. `click` with x and y, `scroll` and `drag`, only when no element fits.
 
-Keystrokes and pixel clicks make your window its app's key window for a few milliseconds, then give it back. This works while the user types in another window of the same app. Their input is held for that moment and replayed. When the user is in the same app, long text is typed in bursts of 16 characters to keep that hold short.
+When the user is in another window of the same app, `type_text` writes the text into the field through accessibility, without keystrokes; only Return and Tab are pressed as keys. Pass `element` when you know the field. Keystrokes and pixel clicks make your window its app's key window for a moment, then give it back. This works while the user types in another window of the same app: their input is held for that moment and replayed.
+
+The user comes first. When they're in the app you're working in, a step that takes key focus (`press_key`, Return or Tab, a click at x and y, `drag`, `press_menu_item`) first waits for a pause in their typing, clicking or scrolling, or for a menu they have open to close. The wait is 3 seconds at most and usually far less, and the result says how long it was and why, for example "Waited 1.4 s for the user to stop typing". That's expected: the step ran, so don't repeat it. In a `batch`, back-to-back steps like that wait once and run together, so batch them when you can. Pass `"priority": "now"` only when a step can't wait: a dialog or toast that closes on its own, a hover followed by a click, a code about to expire. It runs at once even mid-typing, which the user feels.
 
 To open a URL in a browser, press `cmd+l` (or click the address bar) and `type_text` the URL followed by `\n`.
 

@@ -51,11 +51,25 @@ final class TestHarness {
     }
 
     /// Text of the first text area in an app's focused window.
-    static func read(app: String, windows: WindowManager) throws -> ToolResult {
+    /// With `windowID`, that window's instead; `all` lists every text field and area.
+    /// `set`: replace the text area's text first (test setup).
+    static func read(app: String, windows: WindowManager, windowID: CGWindowID? = nil, all: Bool = false, set: String? = nil) throws -> ToolResult {
         guard let running = try windows.resolveApp(app).running else { throw ToolError("\(app) isn't running") }
         let appEl = AX.app(running.processIdentifier)
-        guard let win = AX.element(appEl, "AXFocusedWindow") ?? AX.windows(running.processIdentifier).first else {
+        let chosen = windowID.flatMap { AX.window(pid: running.processIdentifier, id: $0) }
+        guard let win = chosen ?? AX.element(appEl, "AXFocusedWindow") ?? AX.windows(running.processIdentifier).first else {
             throw ToolError("no window")
+        }
+        if all {
+            var out: [String] = []
+            func walk(_ el: AXUIElement, _ depth: Int) {
+                if depth > 14 { return }
+                let role = AX.string(el, "AXRole") ?? ""
+                if role == "AXTextArea" || role == "AXTextField" { out.append("\(role): \(AX.string(el, "AXValue") ?? "")") }
+                for c in AX.children(el) { walk(c, depth + 1) }
+            }
+            walk(win, 0)
+            return ToolResult(text: out.joined(separator: "\n"))
         }
         func find(_ el: AXUIElement, _ depth: Int) -> AXUIElement? {
             if depth > 12 { return nil }
@@ -65,6 +79,7 @@ final class TestHarness {
             return nil
         }
         guard let area = find(win, 0) else { throw ToolError("no text area") }
+        if let set { _ = AX.set(area, "AXValue", set as CFString); sleepMs(100) }
         return ToolResult(text: AX.string(area, "AXValue") ?? "")
     }
 }

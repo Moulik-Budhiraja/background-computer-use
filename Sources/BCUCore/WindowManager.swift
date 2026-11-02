@@ -32,7 +32,8 @@ public final class WindowManager {
     let sessionKey: String
     private let lock = NSLock()
     private var registry: [CGWindowID: AgentWindow] = [:]
-    private var knownBefore: [pid_t: Set<CGWindowID>] = [:]
+    /// The app's windows when this session last began acting on it, and when.
+    private var knownBefore: [pid_t: (ids: Set<CGWindowID>, ms: Double)] = [:]
     private var nextSlot = 0
     private var watchdog: Timer?
 
@@ -57,6 +58,14 @@ public final class WindowManager {
         return openingAnywhere.contains(pid)
     }
 
+    /// Windows any session has registered: no other session catches them.
+    private static var registeredAnywhere: [CGWindowID: String] = [:]
+
+    static func isRegistered(_ id: CGWindowID, byOtherThan session: String) -> Bool {
+        sharedLock.lock(); defer { sharedLock.unlock() }
+        return registeredAnywhere[id].map { $0 != session } ?? false
+    }
+
     public var windows: [AgentWindow] {
         lock.lock(); defer { lock.unlock() }
         return Array(registry.values).sorted { $0.id < $1.id }
@@ -69,11 +78,15 @@ public final class WindowManager {
 
     func register(_ w: AgentWindow) {
         lock.lock(); registry[w.id] = w; lock.unlock()
+        Self.sharedLock.lock(); Self.registeredAnywhere[w.id] = sessionKey; Self.sharedLock.unlock()
         persist()
     }
 
     func unregister(_ id: CGWindowID) {
         lock.lock(); registry[id] = nil; lock.unlock()
+        Self.sharedLock.lock()
+        if Self.registeredAnywhere[id] == sessionKey { Self.registeredAnywhere[id] = nil }
+        Self.sharedLock.unlock()
         persist()
     }
 
@@ -239,6 +252,8 @@ public final class WindowManager {
             throw ToolError("could not launch \(name): \(launchError?.localizedDescription ?? "timed out")")
         }
         let pid = app.processIdentifier
+        // A fresh launch: every window it shows is the agent's.
+        lock.lock(); knownBefore[pid] = ([], nowMs()); lock.unlock()
         focusGuard.beginAction(pid: pid, cause: "launching \(name)")
         defer { focusGuard.endAction(pid: pid, graceMs: 2000) }
 
@@ -276,7 +291,6 @@ public final class WindowManager {
     /// Open a new window of a running app and put it on the agent display.
     private func openNewWindow(pid: pid_t, name: String, bundleID: String?, placement: Placement = .auto, trigger: String? = nil) throws -> OpenResult {
         let before = Set(WindowList.of(pid: pid).map(\.id))
-        let previousKey = AX.focusedWindowID(pid)
         let catcher = WindowCatcher(pid: pid, before: before, manager: self)
         Self.openLock.lock()
         focusGuard.beginAction(pid: pid, cause: "opening a \(name) window")
@@ -301,7 +315,13 @@ public final class WindowManager {
         // key is handed back.
         Engine.inputLock.lock()
         var holdingInput = true
-        defer { if holdingInput { Engine.inputLock.unlock() } }
+        // Keys typed into the app while its key window is moving are held,
+        // even if the user wasn't in it.
+        focusGuard.beginSwap(pid)
+        defer { if holdingInput { focusGuard.endSwap(pid); Engine.inputLock.unlock() } }
+        // Read under the lock: another session's swap may have an agent
+        // window key until it's done.
+        let previousKey = AX.focusedWindowID(pid)
         var scope: KeyScope?
         if placement.contains(.anchor), let anchor = anchorWindow(pid: pid) {
             scope = try? KeyScope.enter(pid: pid, window: anchor)
@@ -343,9 +363,13 @@ public final class WindowManager {
         scope?.exit()
         if let id = caught, let previousKey, previousKey != id, WindowList.info(previousKey) != nil, AX.focusedWindowID(pid) == id {
             KeyScope.postRecords(pid: pid, from: id, to: previousKey)
+            KeyScope.awaitKey(pid: pid, target: previousKey, budgetMs: 300)
         }
+        focusGuard.endSwap(pid)
         Engine.inputLock.unlock()
         holdingInput = false
+        // The app the user is in must end with their window key.
+        if BCUFrontProcessPID() == pid { focusGuard.reclaimWhenSafe(pid) }
         // Keep watching a moment in case the app moves or resizes the window back.
         sleepMs(250)
         catcher.stop()
@@ -446,6 +470,9 @@ public final class WindowManager {
         guard let ax = AX.window(pid: info.pid, id: id) else { throw ToolError("window \(id) isn't reachable through accessibility") }
         let original = AX.frame(ax) ?? info.bounds
         let app = NSRunningApplication(processIdentifier: info.pid)
+        if Self.isRegistered(id, byOtherThan: sessionKey) { throw ToolError("window \(id) is another agent's") }
+        // Every other window of the app is the user's, not one this spawned.
+        noteBefore(pid: info.pid)
         focusGuard.beginAction(pid: info.pid, cause: "borrowing a window")
         defer { focusGuard.endAction(pid: info.pid) }
         moveToAgent(ax, size: original.size)
@@ -460,6 +487,7 @@ public final class WindowManager {
             unregister(id)
             return "window \(id) is already gone"
         }
+        noteBefore(pid: w.pid)
         focusGuard.beginAction(pid: w.pid, cause: "releasing a window")
         defer { focusGuard.endAction(pid: w.pid) }
         switch w.kind {
@@ -517,7 +545,7 @@ public final class WindowManager {
 
     func noteBefore(pid: pid_t) {
         let ids = Set(WindowList.of(pid: pid).map(\.id))
-        lock.lock(); knownBefore[pid] = ids; lock.unlock()
+        lock.lock(); knownBefore[pid] = (ids, nowMs()); lock.unlock()
     }
 
     func stopWatchdog() {
@@ -570,6 +598,9 @@ public final class WindowManager {
         Log.info("fit \(w.appName) window \(w.id) from \(frame.short) to \(Int(x)),\(Int(y)) \(Int(size.width))x\(Int(size.height))")
     }
     private var opening: Set<pid_t> = []
+    /// A window counts as spawned by this session's action only this long
+    /// after the action began.
+    private static let catchWindowMs = 10_000.0
 
     /// Keep agent windows off the user's displays and catch new windows an
     /// agent action spawned there (dialogs, popups, extra windows).
@@ -631,10 +662,16 @@ public final class WindowManager {
             let midOpen = opening.contains(info.pid) || Self.isOpening(info.pid)
             lock.unlock()
             guard tainted.contains(info.pid), !midOpen, info.pid != front, info.pid != focusGuard.userFront else { continue }
+            // Only windows that appeared since this session began acting on
+            // the app (another session's action, or none on record, says
+            // nothing about which windows are new), and never another
+            // session's window.
             lock.lock()
-            let before = knownBefore[info.pid] ?? []
+            let known = knownBefore[info.pid]
             lock.unlock()
-            guard !before.contains(info.id), display.touchesUser(info.bounds), !display.holds(info.bounds),
+            guard let known, nowMs() - known.ms < Self.catchWindowMs, !known.ids.contains(info.id),
+                  !Self.isRegistered(info.id, byOtherThan: sessionKey),
+                  display.touchesUser(info.bounds), !display.holds(info.bounds),
                   info.bounds.width > 40, info.bounds.height > 40,
                   let ax = AX.window(pid: info.pid, id: info.id) else { continue }
             moveToAgent(ax, size: info.bounds.size)

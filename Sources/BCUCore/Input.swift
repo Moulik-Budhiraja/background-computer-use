@@ -33,8 +33,11 @@ public enum Input {
         e.flags = []
     }
 
-    /// Click at a global screen point inside `windowID`.
-    public static func click(pid: pid_t, windowID: CGWindowID, at point: CGPoint, button: Button = .left, count: Int = 1) throws {
+    /// Click at a global screen point inside `windowID`. `check` runs before
+    /// anything is posted and again right before the button goes down.
+    public static func click(pid: pid_t, windowID: CGWindowID, at point: CGPoint, button: Button = .left, count: Int = 1,
+                             check: () throws -> Void = {}) throws {
+        try check()
         guard let src = source() else { throw ToolError("could not create an event source") }
         let group = Int64(DispatchTime.now().uptimeNanoseconds & 0x7fff_ffff)
         let offScreen = CGPoint(x: -1, y: -1)
@@ -55,6 +58,7 @@ public enum Input {
         sleepMs(1)
         post(.leftMouseUp, offScreen, phase: 2, state: 1, btn: 0, mouseButton: .left)
         sleepMs(100)
+        try check()
         let pairs = max(1, min(count, 3))
         for i in 1...pairs {
             post(downType, point, phase: 3, state: Int64(i), btn: buttonNumber, mouseButton: cgButton)
@@ -121,36 +125,54 @@ public enum Input {
 
     /// Press and release one key with modifiers. Shortcuts with cmd or ctrl go
     /// without the authentication message so menu key equivalents fire.
-    public static func pressKey(pid: pid_t, key: String, modifiers: [String]) throws {
+    /// Name the window a key event is for, as mouse events do: without it
+    /// the window server fills in the window it thinks has keyboard focus
+    /// in the app, which can still be the user's while ours is key.
+    static func stampKey(_ e: CGEvent, windowID: CGWindowID) {
+        guard windowID != 0 else { return }
+        BCUEventSetIntegerField(e, 51, Int64(windowID))
+        BCUEventSetIntegerField(e, 91, Int64(windowID))
+        BCUEventSetIntegerField(e, 92, Int64(windowID))
+    }
+
+    public static func pressKey(pid: pid_t, key: String, modifiers: [String], windowID: CGWindowID = 0) throws {
         let (code, implicitShift) = try KeyMap.code(for: key)
         var flags = KeyMap.flags(modifiers)
         if implicitShift { flags.insert(.maskShift) }
         let menuRoute = flags.contains(.maskCommand) || flags.contains(.maskControl)
-        try postKey(pid: pid, code: code, down: true, flags: flags, auth: !menuRoute)
+        try postKey(pid: pid, code: code, down: true, flags: flags, auth: !menuRoute, windowID: windowID)
         sleepMs(keyGapMs)
-        try postKey(pid: pid, code: code, down: false, flags: flags, auth: !menuRoute)
+        try postKey(pid: pid, code: code, down: false, flags: flags, auth: !menuRoute, windowID: windowID)
     }
 
-    public static func postKey(pid: pid_t, code: CGKeyCode, down: Bool, flags: CGEventFlags, auth: Bool) throws {
+    public static func postKey(pid: pid_t, code: CGKeyCode, down: Bool, flags: CGEventFlags, auth: Bool, windowID: CGWindowID = 0) throws {
         guard let src = source(), let e = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: down) else {
             throw ToolError("could not create a keyboard event")
         }
         // Always overwrite flags so the user's physically held modifiers can't leak in.
         e.flags = flags
+        stampKey(e, windowID: windowID)
         BCUPostEventToPid(pid, e, auth)
     }
 
-    /// Type text as Unicode payloads on key code 0; newline and tab become real keys.
-    public static func typeText(pid: pid_t, _ text: String) throws {
+    /// Type text as Unicode payloads on key code 0; newline and tab become
+    /// real keys. `before(i)` runs before character `i`: it throws to stop
+    /// (nothing more is posted) or returns false to end early. Returns how
+    /// many characters were typed.
+    @discardableResult
+    public static func typeText(pid: pid_t, _ text: String, windowID: CGWindowID = 0, before: (Int) throws -> Bool = { _ in true }) throws -> Int {
         guard let src = source() else { throw ToolError("could not create an event source") }
+        var typed = 0
         for ch in text {
+            guard try before(typed) else { return typed }
+            defer { typed += 1 }
             if ch == "\n" || ch == "\r" {
-                try pressKey(pid: pid, key: "return", modifiers: [])
+                try pressKey(pid: pid, key: "return", modifiers: [], windowID: windowID)
                 sleepMs(keyGapMs)
                 continue
             }
             if ch == "\t" {
-                try pressKey(pid: pid, key: "tab", modifiers: [])
+                try pressKey(pid: pid, key: "tab", modifiers: [], windowID: windowID)
                 sleepMs(keyGapMs)
                 continue
             }
@@ -159,10 +181,12 @@ public enum Input {
                 guard let e = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: down) else { continue }
                 e.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
                 e.flags = []
+                stampKey(e, windowID: windowID)
                 BCUPostEventToPid(pid, e, true)
                 sleepMs(keyGapMs)
             }
         }
+        return typed
     }
 }
 
