@@ -63,6 +63,11 @@ public final class FocusGuard {
     /// key's down and up are never split (a key held down that long is
     /// what the system and the app see, and a key-up carries no text).
     private var downDelivered: [Int64: Int] = [:]
+    /// Replayed keys posted but not yet back through the tap. New user keys
+    /// wait behind them: a replay goes to the back of WindowServer's queue,
+    /// so a key typed meanwhile could otherwise reach the app first.
+    private var replaysInFlight = 0
+    private var replaysInFlightSinceMs = 0.0
     /// A drain is due again (it found key on an agent window).
     private var drainRetryScheduled = false
     /// Replaying held events; anything new queues behind them to keep order.
@@ -568,6 +573,13 @@ public final class FocusGuard {
         }
         if event.getIntegerValueField(.eventSourceUserData) == FocusGuard.replayMarker {
             if type == .keyDown || type == .keyUp { noteDelivered(event, type) }
+            if Self.isKey(type) {
+                lock.lock()
+                replaysInFlight = max(0, replaysInFlight - 1)
+                let resume = replaysInFlight == 0 && !held.isEmpty && !draining && holdTokens.isEmpty && !holding
+                lock.unlock()
+                if resume { DispatchQueue.global(qos: .userInteractive).async { self.drain() } }
+            }
             return event
         }
         activity.note(type, event)
@@ -619,7 +631,7 @@ public final class FocusGuard {
                 if delivered { return passKey(event, type) }
             }
             lock.lock()
-            let alreadyHolding = holding || !holdTokens.isEmpty || draining || !held.isEmpty
+            let alreadyHolding = holding || !holdTokens.isEmpty || draining || !held.isEmpty || replaysInFlight > 0
             let anySwap = !swapping.isEmpty || !pidHeld.isEmpty
             let now = nowMs()
             let anyTaint = taints.values.contains { $0.count > 0 || $0.until >= now }
@@ -727,10 +739,19 @@ public final class FocusGuard {
         var what: [String] = []
         if !holdTokens.isEmpty && now - holdSinceMs > Self.maxHoldMs { holdTokens.removeAll(); what.append("a key swap") }
         if holding && now - holdingSinceMs > Self.maxHoldMs { holding = false; what.append("a focus change") }
+        var inFlightLost = 0
+        if replaysInFlight > 0 && now - replaysInFlightSinceMs > 500 {
+            inFlightLost = replaysInFlight
+            replaysInFlight = 0
+        }
         let stale = !held.isEmpty && !draining && now - heldSinceMs > Self.maxHoldMs
         let stalePids = pidHeld.filter { now - $0.value.sinceMs > Self.maxPidHoldMs }.map(\.key)
         lock.unlock()
         if !what.isEmpty { record("released your input after \(Int(Self.maxHoldMs)) ms held for \(what.joined(separator: " and "))") }
+        if inFlightLost > 0 {
+            Log.info("guard: \(inFlightLost) replayed key events didn't come back through the tap within 500 ms; going on")
+            if !stale && what.isEmpty { drain() }
+        }
         if !what.isEmpty || stale { drain(force: true) }
         for pid in stalePids {
             lock.lock()
@@ -835,6 +856,12 @@ public final class FocusGuard {
             }
             lock.lock(); removeHeld(e); lock.unlock()
             e.setIntegerValueField(.eventSourceUserData, value: FocusGuard.replayMarker)
+            if Self.isKey(e.type) {
+                lock.lock()
+                if replaysInFlight == 0 { replaysInFlightSinceMs = nowMs() }
+                replaysInFlight += 1
+                lock.unlock()
+            }
             e.post(tap: .cghidEventTap)
             n += 1
             usleep(1000)
