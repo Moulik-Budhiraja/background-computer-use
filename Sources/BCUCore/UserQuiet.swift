@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import os
 
 /// When to run a step that takes key focus in the app the user is in.
 ///
@@ -10,7 +11,8 @@ import CoreGraphics
 /// watching), not mid-drag or mid-scroll, not while a menu is open. Waits are
 /// kept short so the agent isn't slowed much: after `softCapMs` any short
 /// gap in the user's input will do, and after `hardCapMs` the step runs
-/// anyway (the guard still holds and replays the user's keys).
+/// anyway (the guard still holds and replays the user's keys), except over
+/// a menu open in that app: the step would close it, so it fails instead.
 public enum QuietRules {
     /// Typing: this long since the last key went down, and no key held.
     public static let typingMs = 500.0
@@ -63,8 +65,7 @@ public final class UserActivity {
         public var scrollOngoing = false
     }
 
-    private var lock = os_unfair_lock()
-    private var s = Snapshot()
+    private let state = OSAllocatedUnfairLock(initialState: Snapshot())
 
     private static let modifierMask: CGEventFlags = [.maskCommand, .maskShift, .maskControl, .maskAlternate, .maskSecondaryFn]
 
@@ -74,47 +75,33 @@ public final class UserActivity {
         switch type {
         case .keyDown:
             let code = event.getIntegerValueField(.keyboardEventKeycode)
-            os_unfair_lock_lock(&lock)
-            s.lastKeyDownMs = now; s.lastInputMs = now; s.keysDown.insert(code)
-            os_unfair_lock_unlock(&lock)
+            state.withLock { s in s.lastKeyDownMs = now; s.lastInputMs = now; s.keysDown.insert(code) }
         case .keyUp:
             let code = event.getIntegerValueField(.keyboardEventKeycode)
-            os_unfair_lock_lock(&lock)
-            s.lastInputMs = now; s.keysDown.remove(code)
-            os_unfair_lock_unlock(&lock)
+            state.withLock { s in s.lastInputMs = now; s.keysDown.remove(code) }
         case .flagsChanged:
             let held = !event.flags.intersection(Self.modifierMask).isEmpty
-            os_unfair_lock_lock(&lock)
-            s.lastInputMs = now; s.modifiersDown = held
-            os_unfair_lock_unlock(&lock)
+            state.withLock { s in s.lastInputMs = now; s.modifiersDown = held }
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             let bit = UInt32(1) << UInt32(min(31, max(0, event.getIntegerValueField(.mouseEventButtonNumber))))
-            os_unfair_lock_lock(&lock)
-            s.lastInputMs = now; s.buttonsDown |= bit
-            os_unfair_lock_unlock(&lock)
+            state.withLock { s in s.lastInputMs = now; s.buttonsDown |= bit }
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
             let bit = UInt32(1) << UInt32(min(31, max(0, event.getIntegerValueField(.mouseEventButtonNumber))))
-            os_unfair_lock_lock(&lock)
-            s.lastInputMs = now; s.lastMouseUpMs = now; s.buttonsDown &= ~bit
-            os_unfair_lock_unlock(&lock)
+            state.withLock { s in s.lastInputMs = now; s.lastMouseUpMs = now; s.buttonsDown &= ~bit }
         case .scrollWheel:
             // Phases: 1 began, 2 changed, 4 ended, 8 cancelled, 128 may begin.
             // Momentum: 1 begin, 2 continue, 3 end. A mouse wheel sets neither.
             let phase = event.getIntegerValueField(.scrollWheelEventScrollPhase)
             let momentum = event.getIntegerValueField(.scrollWheelEventMomentumPhase)
             let ongoing = phase == 1 || phase == 2 || phase == 128 || momentum == 1 || momentum == 2
-            os_unfair_lock_lock(&lock)
-            s.lastInputMs = now; s.lastScrollMs = now; s.scrollOngoing = ongoing
-            os_unfair_lock_unlock(&lock)
+            state.withLock { s in s.lastInputMs = now; s.lastScrollMs = now; s.scrollOngoing = ongoing }
         default:
             break
         }
     }
 
     public var snapshot: Snapshot {
-        os_unfair_lock_lock(&lock)
-        var copy = s
-        os_unfair_lock_unlock(&lock)
+        var copy = state.withLock { $0 }
         // A key, modifier or button whose release the tap missed (it was off
         // for a moment) would hold up every wait until the cap: after a
         // second with no input, ask the HID system what's really down.
@@ -134,7 +121,9 @@ public final class UserActivity {
 
 /// Waits for a moment the user won't notice a key-focus swap in their app.
 enum QuietWait {
-    enum Outcome { case quiet, gap, cap }
+    /// `menu`: the hard cap came with a menu open in the target app, so the
+    /// step mustn't run. `stopped`: the user paused the agent meanwhile.
+    enum Outcome { case quiet, gap, cap, menu, stopped }
 
     struct Result {
         var waitedMs: Double
@@ -163,40 +152,51 @@ enum QuietWait {
     }
 
     /// A menu, context menu, status item menu or pop-up button list is open
-    /// on the user's screens: any app's window at the pop-up menu level.
-    static func menuOpen() -> Bool {
+    /// on the user's screens (any app's window at the pop-up menu level),
+    /// and whether one of them is `pid`'s.
+    static func menus(pid: pid_t = 0) -> (any: Bool, app: Bool) {
         let level = Int(CGWindowLevelForKey(.popUpMenuWindow))
         let me = getpid()
-        return WindowList.all(onScreenOnly: true).contains { w in
+        let open = WindowList.all(onScreenOnly: true).filter { w in
             w.layer == level && w.pid != me && w.alpha > 0 && w.bounds.width > 2 && w.bounds.height > 2
                 && !AgentDisplay.running.contains { $0.liveBounds.intersects(w.bounds) }
         }
+        return (!open.isEmpty, open.contains { $0.pid == pid })
     }
 
+    static func menuOpen() -> Bool { menus().any }
+
     /// Block until quiet, or the caps (from the session's `WaitBudget`).
-    /// `willWait` runs once if it isn't quiet already.
-    static func wait(_ activity: UserActivity, softMs soft: Double, hardMs hard: Double, willWait: () -> Void = {}) -> Result {
+    /// `willWait` runs once if it isn't quiet already; `stop` is checked
+    /// on every look.
+    static func wait(_ activity: UserActivity, pid: pid_t, softMs soft: Double, hardMs hard: Double,
+                     stop: () -> Bool = { false }, willWait: () -> Void = {}) -> Result {
         let start = nowMs()
-        var menu = menuOpen()
+        var menu = menus(pid: pid)
         var menuCheckedMs = start
         var time: [String: Double] = [:]
         var last = start
         var first = true
         while true {
             let now = nowMs()
-            if now - menuCheckedMs >= QuietRules.menuPollMs { menu = menuOpen(); menuCheckedMs = nowMs() }
+            if now - menuCheckedMs >= QuietRules.menuPollMs { menu = menus(pid: pid); menuCheckedMs = nowMs() }
             let s = activity.snapshot
-            let why = blocker(s, menuOpen: menu, now: now)
+            let why = blocker(s, menuOpen: menu.any, now: now)
             if let why { time[why, default: 0] += now - last }
             last = now
             let elapsed = now - start
             func done(_ o: Outcome) -> Result {
                 Result(waitedMs: elapsed, reason: time.max { $0.value < $1.value }?.key, outcome: o)
             }
+            if stop() { return done(.stopped) }
             if why == nil { return done(.quiet) }
             if first { first = false; willWait() }
-            if elapsed >= soft && gapOK(s, menuOpen: menu, now: now) { return done(.gap) }
-            if elapsed >= hard { return done(.cap) }
+            if elapsed >= soft && gapOK(s, menuOpen: menu.any, now: now) { return done(.gap) }
+            if elapsed >= hard {
+                // Taking key focus in an app closes its open menu.
+                if menu.app { menu = menus(pid: pid); menuCheckedMs = nowMs() }
+                return done(menu.app ? .menu : .cap)
+            }
             sleepMs(QuietRules.pollMs)
         }
     }

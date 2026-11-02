@@ -25,18 +25,39 @@ public final class FocusGuard {
     public let activity = UserActivity()
 
     private let lock = NSLock()
-    /// strict: the user is driving the app from the expanded view, so their
-    /// clicks and keys (which land in this app's panel) never explain an activation.
-    private var taints: [pid_t: (until: Double, cause: String, strict: Bool)] = [:]
+    /// An app the agent is acting on. `count`: actions running now (sessions
+    /// can overlap in one app); `until`: when the grace period after the last
+    /// one ends. strict: the user is driving the app from the expanded view,
+    /// so their clicks and keys (which land in this app's panel) never
+    /// explain an activation.
+    private struct Taint {
+        var count: Int
+        var until: Double
+        var cause: String
+        var strict: Bool
+    }
+    private var taints: [pid_t: Taint] = [:]
+    /// Apps whose key window an agent has moved to one of its windows right
+    /// now (see `beginSwap`), with nesting counts.
+    private var swapping: [pid_t: Int] = [:]
+    /// Keys the user typed into an app while it was mid-swap, held until key
+    /// is back on their window. With when the first one came.
+    private var pidHeld: [pid_t: (sinceMs: Double, events: [CGEvent])] = [:]
     private var userFrontPid: pid_t = 0
     private var userFrontWindow: CGWindowID?
     private var lastUserMouseDownMs = 0.0
     private var lastUserSwitchKeyMs = 0.0
     private var lastUserKeyMs = 0.0
     private var holding = false
+    private var holdingSinceMs = 0.0
     private var held: [CGEvent] = []
-    /// Nesting count of key-window swaps in progress (see `beginHold`).
-    private var swapHolds = 0
+    private var heldSinceMs = 0.0
+    /// Holds of all the user's input in progress (see `beginHold`).
+    private var holdTokens: Set<Int> = []
+    private var nextHoldToken = 1
+    private var holdSinceMs = 0.0
+    /// A drain is due again (it found key on an agent window).
+    private var drainRetryScheduled = false
     /// Replaying held events; anything new queues behind them to keep order.
     private var draining = false
     private var restoring = false
@@ -47,6 +68,11 @@ public final class FocusGuard {
     private var events: [GuardEvent] = []
 
     static let replayMarker: Int64 = 0x4243_5552
+    /// No hold of all the user's input lasts longer than this, whatever the
+    /// agent is stuck on (a hung app, a busy main thread).
+    public static let maxHoldMs = 2000.0
+    /// Keys typed into an app mid-swap are held at most this long.
+    static let maxPidHoldMs = 5000.0
     fileprivate static weak var shared: FocusGuard?
 
     public init() {
@@ -72,6 +98,15 @@ public final class FocusGuard {
             self?.activated(app)
         }
         installTap()
+        let watchdog = Thread { [weak self] in
+            while let s = self {
+                s.watchHolds()
+                usleep(50_000)
+            }
+        }
+        watchdog.name = "bcu.guard.holds"
+        watchdog.qualityOfService = .userInteractive
+        watchdog.start()
     }
 
     public var tapInstalled: Bool { tap != nil }
@@ -163,27 +198,73 @@ public final class FocusGuard {
             noteUserFront(front)
         }
         lock.lock()
-        taints[pid] = (until: .infinity, cause: cause, strict: strict)
+        var t = taints[pid] ?? Taint(count: 0, until: .infinity, cause: cause, strict: strict)
+        t.count += 1
+        t.until = .infinity
+        t.cause = cause
+        t.strict = strict
+        taints[pid] = t
         lock.unlock()
     }
 
     public func endAction(pid: pid_t, graceMs: Double = 700) {
         lock.lock()
-        if let t = taints[pid] { taints[pid] = (until: nowMs() + graceMs, cause: t.cause, strict: t.strict) }
+        if var t = taints[pid] {
+            t.count = max(0, t.count - 1)
+            // Another session's action in the same app is still running.
+            if t.count == 0 { t.until = nowMs() + graceMs }
+            taints[pid] = t
+        }
         lock.unlock()
     }
 
     public func isTainted(_ pid: pid_t) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard let t = taints[pid] else { return false }
-        if t.until < nowMs() { taints[pid] = nil; return false }
+        if t.count == 0 && t.until < nowMs() { taints[pid] = nil; return false }
         return true
     }
 
     public var activeTaints: [pid_t] {
         lock.lock(); defer { lock.unlock() }
         let now = nowMs()
-        return taints.filter { $0.value.until >= now }.map { $0.key }
+        return taints.filter { $0.value.count > 0 || $0.value.until >= now }.map { $0.key }
+    }
+
+    // MARK: Key swaps
+
+    /// An agent is about to make one of its windows key in `pid`. Until
+    /// `endSwap`, keys the user types while `pid` is in front are held (even
+    /// if they weren't in it when the swap began: they may switch to it
+    /// mid-swap), clicks on its windows are held, nothing else moves its key
+    /// window, and they're replayed once key is back on the user's window.
+    public func beginSwap(_ pid: pid_t) {
+        lock.lock(); swapping[pid, default: 0] += 1; lock.unlock()
+    }
+
+    public func endSwap(_ pid: pid_t) {
+        lock.lock()
+        if let n = swapping[pid] { swapping[pid] = n > 1 ? n - 1 : nil }
+        let done = swapping[pid] == nil
+        lock.unlock()
+        if done { releasePidHeld(pid) }
+    }
+
+    public func isSwapping(_ pid: pid_t) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return swapping[pid] != nil
+    }
+
+    /// Keys held for `pid` mid-swap go back in the queue (in front: they came
+    /// first) and replay once it's safe.
+    private func releasePidHeld(_ pid: pid_t) {
+        lock.lock()
+        if let p = pidHeld.removeValue(forKey: pid), !p.events.isEmpty {
+            if held.isEmpty { heldSinceMs = p.sinceMs }
+            held.insert(contentsOf: p.events, at: 0)
+        }
+        lock.unlock()
+        drain()
     }
 
     /// The app the user is in, as far as the guard knows.
@@ -207,17 +288,17 @@ public final class FocusGuard {
     func debugCause(_ pid: pid_t) -> String {
         lock.lock(); defer { lock.unlock() }
         let now = nowMs()
-        let until = taints[pid].map { $0.until == .infinity ? "running" : "\(Int($0.until - now))ms left" } ?? "none"
+        let until = taints[pid].map { $0.count > 0 ? "running" : "\(Int($0.until - now))ms left" } ?? "none"
         return "taint=\(until) key=\(Int(now - lastUserKeyMs))ms click=\(Int(now - lastUserMouseDownMs))ms"
     }
 
     func agentCaused(_ pid: pid_t) -> Bool {
         lock.lock(); defer { lock.unlock() }
         let now = nowMs()
-        guard let t = taints[pid], t.until >= now else { return false }
+        guard let t = taints[pid], t.count > 0 || t.until >= now else { return false }
         let click = !t.strict && now - lastUserMouseDownMs < 400
         let clickOrSwitch = click || now - lastUserSwitchKeyMs < 400
-        if t.until == .infinity { return !clickOrSwitch }
+        if t.count > 0 { return !clickOrSwitch }
         return !clickOrSwitch && (t.strict || now - lastUserKeyMs >= 1500)
     }
 
@@ -321,15 +402,10 @@ public final class FocusGuard {
         } else {
             // Off the main thread: AX calls into Electron apps can be slow.
             DispatchQueue.global(qos: .userInitiated).async {
-                if !self.midAction(pid) { self.reclaimKey(pid) }
+                self.reclaimWhenSafe(pid)
                 self.noteUserFront(pid)
             }
         }
-    }
-
-    private func midAction(_ pid: pid_t) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return taints[pid]?.until == .infinity
     }
 
     static func onAgentDisplay(_ id: CGWindowID) -> Bool {
@@ -337,24 +413,94 @@ public final class FocusGuard {
         return AgentDisplay.running.contains { $0.liveBounds.intersects(info.bounds) }
     }
 
+    /// `reclaimKey`, but never in the middle of a key swap: a swap in any
+    /// session holds the input lock from before it moves key until key is
+    /// back, so taking the lock waits for it to end.
+    public func reclaimWhenSafe(_ pid: pid_t) {
+        Engine.inputLock.lock()
+        defer { Engine.inputLock.unlock() }
+        if isSwapping(pid) { return }
+        reclaimKey(pid)
+    }
+
+    /// `reclaimWhenSafe` again a little later, for records that may still
+    /// land (a swap that failed half-way).
+    public func scheduleReclaim(_ pid: pid_t) {
+        for ms in [150, 500, 1200] {
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(ms)) {
+                self.reclaimWhenSafe(pid)
+            }
+        }
+    }
+
     /// The user's front app must never have an agent's window as its key
     /// window outside a swap: their typing would go there. It can happen
     /// when the app comes back to the front just as a swap ends (a system
     /// alert took the front for a moment, say), because AppKit makes the
-    /// window that was key last key again. Hand key to the app's frontmost
-    /// window on the user's screens. Returns whether it had to.
+    /// window that was key last key again. Hand key to the user's window in
+    /// that app: `prefer` if given, else the one they were last in, else its
+    /// frontmost standard window on their screens. Returns whether it had to.
+    /// Callers outside a swap go through `reclaimWhenSafe`.
     @discardableResult
-    public func reclaimKey(_ pid: pid_t) -> Bool {
+    public func reclaimKey(_ pid: pid_t, prefer: CGWindowID? = nil) -> Bool {
         guard BCUFrontProcessPID() == pid, let key = AX.focusedWindowID(pid), Self.onAgentDisplay(key) else { return false }
-        let agents = AgentDisplay.running.map(\.liveBounds)
-        guard let user = WindowList.of(pid: pid, onScreenOnly: true).first(where: { w in
-            w.layer == 0 && w.alpha > 0 && w.bounds.width > 40 && !agents.contains { $0.intersects(w.bounds) }
-        }) else { return false }
-        _ = KeyScope.postRecords(pid: pid, from: key, to: user.id, settle: 5)
-        KeyScope.awaitKey(pid: pid, target: user.id, budgetMs: 250)
-        let ok = AX.focusedWindowID(pid) == user.id
-        record("\(NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)") was in front with an agent window (\(key)) as its key window; \(ok ? "gave key back to" : "COULD NOT give key back to") the user's window \(user.id)")
+        let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"
+        guard let user = userWindow(of: pid, prefer: prefer) else {
+            record("\(name) was in front with an agent window (\(key)) as its key window; COULD NOT give key back: no window of the user's on their screens")
+            return true
+        }
+        var ok = false
+        for settle in [5.0, 120.0] {
+            _ = KeyScope.postRecords(pid: pid, from: key, to: user, settle: settle)
+            KeyScope.awaitKey(pid: pid, target: user, budgetMs: settle < 50 ? 250 : 400)
+            ok = AX.focusedWindowID(pid) == user
+            if ok { break }
+        }
+        if !ok, let ax = AX.window(pid: pid, id: user) {
+            // The window is the user's front one in the app they're in, so
+            // raising it changes nothing on screen but makes it key.
+            AX.perform(ax, "AXRaise")
+            KeyScope.awaitKey(pid: pid, target: user, budgetMs: 300)
+            ok = AX.focusedWindowID(pid) == user
+        }
+        record("\(name) was in front with an agent window (\(key)) as its key window; \(ok ? "gave key back to" : "COULD NOT give key back to") the user's window \(user)")
         return true
+    }
+
+    /// The window of `pid` the user would expect to be key: a standard
+    /// window on their screens (not a popup, tooltip or suggestion list).
+    func userWindow(of pid: pid_t, prefer: CGWindowID? = nil) -> CGWindowID? {
+        let agents = AgentDisplay.running.map(\.liveBounds)
+        let onScreen = WindowList.of(pid: pid, onScreenOnly: true).filter { w in
+            w.layer == 0 && w.alpha > 0 && w.bounds.width > 40 && !agents.contains { $0.intersects(w.bounds) }
+        }
+        let ids = Set(onScreen.map(\.id))
+        lock.lock()
+        let last = userFrontPid == pid ? userFrontWindow : nil
+        lock.unlock()
+        let axWindows = AX.windows(pid)
+        func standard(_ id: CGWindowID) -> Bool {
+            guard let ax = axWindows.first(where: { AX.windowID($0) == id }) else { return false }
+            return AX.string(ax, "AXSubrole") == "AXStandardWindow" && AX.bool(ax, "AXMinimized") != true
+        }
+        let candidates = [prefer, last].compactMap { $0 } + onScreen.map(\.id)
+        return candidates.first { ids.contains($0) && standard($0) }
+    }
+
+    /// Nothing the user types into `pid` now can land in an agent's window:
+    /// its key window (if it has one) isn't on an agent display. False when
+    /// that can't be told (the app isn't answering).
+    func keySafe(_ pid: pid_t) -> Bool {
+        let agents = AgentDisplay.running.map(\.liveBounds)
+        guard WindowList.of(pid: pid).contains(where: { w in agents.contains { $0.intersects(w.bounds) } }) else { return true }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.3)
+        var value: AnyObject?
+        let err = AXUIElementCopyAttributeValue(app, "AXFocusedWindow" as CFString, &value)
+        if err == .noValue { return true }
+        guard err == .success, let v = value, CFGetTypeID(v) == AXUIElementGetTypeID(),
+              let id = AX.windowID(unsafeBitCast(v, to: AXUIElement.self)) else { return false }
+        return !Self.onAgentDisplay(id)
     }
 
     private func taintCause(_ pid: pid_t) -> String {
@@ -382,7 +528,10 @@ public final class FocusGuard {
         restoreQueue.async {
             if pid != 0 {
                 if !immediate { status = BCUSetFrontProcess(pid, window, 0x200) }
-                if window != 0 { _ = BCUPostMakeKeyRecords(pid, window) }
+                // Not while an agent's window is key there for a swap: that
+                // would move key under the agent's keystrokes. The swap gives
+                // key back itself.
+                if window != 0 && !self.isSwapping(pid) { _ = BCUPostMakeKeyRecords(pid, window) }
                 let deadline = nowMs() + 500
                 while BCUFrontProcessPID() != pid && nowMs() < deadline { sleepMs(1) }
                 Log.info("guard: restore (\(reason)) setFront=\(status) call \(Int(t1 - t0)) ms, front back after \(Int(nowMs() - t0)) ms")
@@ -390,12 +539,9 @@ public final class FocusGuard {
             self.lock.lock()
             self.holding = false
             self.restoring = false
-            let swapping = self.swapHolds > 0
             self.lock.unlock()
-            if !swapping {
-                let n = self.drain()
-                if n > 0 { self.record("held \(n) of your key events during a focus change (\(reason)) and replayed them into your app") }
-            }
+            let n = self.drain()
+            if n > 0 { self.record("held \(n) of your key events during a focus change (\(reason)) and replayed them into your app") }
         }
     }
 
@@ -425,44 +571,64 @@ public final class FocusGuard {
                 CGAssociateMouseAndMouseCursorPosition(1)
             }
             if type != .mouseMoved {
-                lock.lock(); let pressHeld = held.contains { [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains($0.type) }; lock.unlock()
+                lock.lock(); let pressHeld = held.contains { Self.isMouseDown($0.type) }; lock.unlock()
                 if pressHeld { hold(event); return nil }
             }
             return event
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
-            lock.lock(); lastUserMouseDownMs = nowMs(); let swapping = swapHolds > 0 || draining; lock.unlock()
+            lock.lock(); lastUserMouseDownMs = nowMs(); let holdAll = !holdTokens.isEmpty || draining; let anySwap = !swapping.isEmpty; lock.unlock()
             if AgentDisplay.containing(event.location) != nil { return nil }
             // A click now would make the user's window key mid-swap; hold it.
-            if swapping { hold(event); return nil }
+            if holdAll { hold(event); return nil }
+            // Even in an app they weren't in: a click on its window would
+            // activate it and move key under the agent's keystrokes.
+            if anySwap, let pid = Self.windowOwner(at: event.location), isSwapping(pid) { hold(event); return nil }
             return event
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
-            lock.lock(); let swapping = swapHolds > 0 || draining || held.contains { [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains($0.type) }; lock.unlock()
-            if swapping { hold(event); return nil }
+            lock.lock(); let holdIt = !holdTokens.isEmpty || draining || held.contains { Self.isMouseDown($0.type) }; lock.unlock()
+            if holdIt { hold(event); return nil }
             return event
         case .scrollWheel:
             if AgentDisplay.containing(event.location) != nil { return nil }
             return event
         case .keyDown, .keyUp, .flagsChanged:
+            let cmdTab = type != .flagsChanged && event.flags.contains(.maskCommand) && event.getIntegerValueField(.keyboardEventKeycode) == 48
             if type == .keyDown {
                 lock.lock()
                 lastUserKeyMs = nowMs()
-                if event.flags.contains(.maskCommand) && event.getIntegerValueField(.keyboardEventKeycode) == 48 { lastUserSwitchKeyMs = nowMs() }
+                if cmdTab { lastUserSwitchKeyMs = nowMs() }
                 lock.unlock()
             }
             lock.lock()
-            let alreadyHolding = holding || swapHolds > 0 || draining
+            let alreadyHolding = holding || !holdTokens.isEmpty || draining || !held.isEmpty
+            let anySwap = !swapping.isEmpty || !pidHeld.isEmpty
             let now = nowMs()
-            let anyTaint = taints.values.contains { $0.until >= now }
+            let anyTaint = taints.values.contains { $0.count > 0 || $0.until >= now }
             lock.unlock()
             if alreadyHolding {
                 hold(event)
                 return nil
             }
+            // Keys for an app whose key window is an agent's right now wait
+            // for it to be the user's again. Modifier changes carry no text,
+            // and cmd+Tab goes to the app switcher, not the app.
+            if anySwap && type != .flagsChanged && !cmdTab {
+                let front = BCUFrontProcessPID()
+                lock.lock()
+                let mid = swapping[front] != nil || pidHeld[front] != nil
+                if mid, let copy = event.copy() {
+                    var p = pidHeld[front] ?? (nowMs(), [])
+                    p.events.append(copy)
+                    pidHeld[front] = p
+                }
+                lock.unlock()
+                if mid { return nil }
+            }
             // Nothing to protect against unless the agent is mid-action.
             guard anyTaint else { return event }
             let front = BCUFrontProcessPID()
             if front != 0 && front != userFront && agentCaused(front) {
-                lock.lock(); holding = true; lock.unlock()
+                lock.lock(); if !holding { holding = true; holdingSinceMs = nowMs() }; lock.unlock()
                 hold(event)
                 restoreUserFront(reason: "keystroke")
                 return nil
@@ -473,48 +639,177 @@ public final class FocusGuard {
         }
     }
 
+    private static func isMouseDown(_ t: CGEventType) -> Bool {
+        t == .leftMouseDown || t == .rightMouseDown || t == .otherMouseDown
+    }
+
+    private static func isKey(_ t: CGEventType) -> Bool {
+        t == .keyDown || t == .keyUp || t == .flagsChanged
+    }
+
+    /// The app whose window is on top at a global point (not this app's
+    /// click-through covers).
+    static func windowOwner(at p: CGPoint) -> pid_t? {
+        let me = getpid()
+        return WindowList.all(onScreenOnly: true).first { w in
+            w.pid != me && w.alpha > 0 && w.layer < Int(CGWindowLevelForKey(.mainMenuWindow)) && w.bounds.contains(p)
+        }?.pid
+    }
+
     /// Hold the user's keys and clicks until `endHold`, then replay them in
     /// order. Used while the agent briefly owns an app's key window, so
     /// nothing the user types lands in the agent's window and no click of
-    /// theirs moves key focus mid-swap.
-    public func beginHold() {
-        lock.lock(); swapHolds += 1; lock.unlock()
+    /// theirs moves key focus mid-swap. Never longer than `maxHoldMs` in all.
+    public func beginHold() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        if holdTokens.isEmpty { holdSinceMs = nowMs() }
+        let token = nextHoldToken
+        nextHoldToken += 1
+        holdTokens.insert(token)
+        return token
     }
 
-    public func endHold() {
+    public func endHold(_ token: Int) {
         lock.lock()
-        swapHolds = max(0, swapHolds - 1)
-        guard swapHolds == 0, !holding else { lock.unlock(); return }
+        holdTokens.remove(token)
+        let last = holdTokens.isEmpty && !holding
         lock.unlock()
+        guard last else { return }
         let n = drain()
         if n > 0 { Log.info("guard: replayed \(n) held events after a key-window swap") }
     }
 
+    /// Release any hold older than `maxHoldMs`, and keys held for an app
+    /// mid-swap after `maxPidHoldMs`: a hung app or a stuck step must never
+    /// leave the user's keyboard and mouse dead.
+    private func watchHolds() {
+        let now = nowMs()
+        lock.lock()
+        var what: [String] = []
+        if !holdTokens.isEmpty && now - holdSinceMs > Self.maxHoldMs { holdTokens.removeAll(); what.append("a key swap") }
+        if holding && now - holdingSinceMs > Self.maxHoldMs { holding = false; what.append("a focus change") }
+        let stale = !held.isEmpty && !draining && now - heldSinceMs > Self.maxHoldMs
+        let stalePids = pidHeld.filter { now - $0.value.sinceMs > Self.maxPidHoldMs }.map(\.key)
+        lock.unlock()
+        if !what.isEmpty { record("released your input after \(Int(Self.maxHoldMs)) ms held for \(what.joined(separator: " and "))") }
+        if !what.isEmpty || stale { drain(force: true) }
+        for pid in stalePids {
+            lock.lock()
+            let p = pidHeld.removeValue(forKey: pid)
+            let still = swapping[pid] != nil
+            if let p, !still {
+                if held.isEmpty { heldSinceMs = p.sinceMs }
+                held.insert(contentsOf: p.events, at: 0)
+            }
+            lock.unlock()
+            if still, let p {
+                // The app has been mid-swap all this time (it isn't answering).
+                record("COULD NOT give key back in pid \(pid) within \(Int(Self.maxPidHoldMs)) ms: dropped \(p.events.count) of your key events rather than type them into an agent's window")
+            } else {
+                drain(force: true)
+            }
+        }
+    }
+
     /// Replay held events in order, about 1 ms apart. Events the user makes
-    /// meanwhile queue up behind them, so nothing is reordered.
+    /// meanwhile queue up behind them, so nothing is reordered. A key goes
+    /// on only once the front app's key window is the user's (never an
+    /// agent's), and a click on an app mid-swap waits for the swap. `force`
+    /// (the watchdog): clicks go on regardless, and keys that still can't go
+    /// to the user's window are dropped rather than typed into an agent's.
     @discardableResult
-    private func drain() -> Int {
+    private func drain(force: Bool = false) -> Int {
         lock.lock()
         if draining { lock.unlock(); return 0 }
         draining = true
         lock.unlock()
-        var n = 0
+        var n = 0, dropped = 0
+        var safeFor: pid_t = -1
+        var retry = false
         while true {
             lock.lock()
-            if held.isEmpty || holding || swapHolds > 0 { draining = false; lock.unlock(); break }
-            let e = held.removeFirst()
+            if held.isEmpty || holding || !holdTokens.isEmpty { draining = false; lock.unlock(); break }
+            let e = held[0]
+            let swappingNow = swapping
             lock.unlock()
+            if Self.isKey(e.type) && e.type != .flagsChanged {
+                let front = BCUFrontProcessPID()
+                if swappingNow[front] != nil {
+                    // That app's key window is an agent's for now; its swap
+                    // replays these when it ends.
+                    lock.lock()
+                    held.removeFirst()
+                    var p = pidHeld[front] ?? (nowMs(), [])
+                    p.events.append(e)
+                    pidHeld[front] = p
+                    lock.unlock()
+                    continue
+                }
+                if safeFor != front {
+                    if !keySafe(front) {
+                        // Reclaim, but without waiting on a swap that may be stuck.
+                        if Engine.inputLock.lock(before: Date().addingTimeInterval(0.05)) {
+                            if !isSwapping(front) { reclaimKey(front) }
+                            Engine.inputLock.unlock()
+                        }
+                    }
+                    if !keySafe(front) {
+                        if !force { retry = true; lock.lock(); draining = false; lock.unlock(); break }
+                        lock.lock(); held.removeFirst(); lock.unlock()
+                        dropped += 1
+                        continue
+                    }
+                    safeFor = front
+                }
+            } else if Self.isMouseDown(e.type) {
+                let owner = Self.windowOwner(at: e.location)
+                if !force, let owner, swappingNow[owner] != nil {
+                    lock.lock(); draining = false; lock.unlock()
+                    break
+                }
+                lock.lock(); held.removeFirst(); lock.unlock()
+                e.setIntegerValueField(.eventSourceUserData, value: FocusGuard.replayMarker)
+                e.post(tap: .cghidEventTap)
+                n += 1
+                // A click can switch apps and move key: keys typed after it
+                // go on once that has happened, to where it put them.
+                if let owner, owner != BCUFrontProcessPID(), NSRunningApplication(processIdentifier: owner)?.activationPolicy == .regular {
+                    let deadline = nowMs() + 300
+                    while BCUFrontProcessPID() != owner && nowMs() < deadline { usleep(2000) }
+                }
+                safeFor = -1
+                usleep(1000)
+                continue
+            }
+            lock.lock(); held.removeFirst(); lock.unlock()
             e.setIntegerValueField(.eventSourceUserData, value: FocusGuard.replayMarker)
             e.post(tap: .cghidEventTap)
             n += 1
             usleep(1000)
         }
+        if dropped > 0 {
+            record("COULD NOT give key back to your window in time: dropped \(dropped) of your key events rather than type them into an agent's window")
+        }
+        if retry { scheduleDrain() }
         return n
+    }
+
+    private func scheduleDrain() {
+        lock.lock()
+        if drainRetryScheduled { lock.unlock(); return }
+        drainRetryScheduled = true
+        lock.unlock()
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + .milliseconds(100)) {
+            self.lock.lock(); self.drainRetryScheduled = false; self.lock.unlock()
+            self.drain()
+        }
     }
 
     private func hold(_ event: CGEvent) {
         guard let copy = event.copy() else { return }
         lock.lock()
+        if held.isEmpty { heldSinceMs = nowMs() }
         held.append(copy)
         lock.unlock()
     }

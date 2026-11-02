@@ -14,15 +14,34 @@ import CPrivate
 /// included, in borderless click-through panels: the window's right above
 /// it, so windows above it stay above (and are cut out of it), and the menu
 /// bar's (status items included, they dim too) in front of the status items.
-/// They come off once the window and the menu bar look as they did before.
+/// They come off once the window's and the menu bar's chrome (traffic
+/// lights, the focus ring, the app menus) look as they did before; content
+/// that changes on its own (a video, a spinner, the clock) doesn't count.
+///
+/// Panels are shown and removed on the main thread, but nothing here waits
+/// on it for long while the user's input is held: if it's busy, the step
+/// goes without a cover, and removal never blocks.
 final class ScreenFreeze {
-    private struct Cover {
+    fileprivate struct Cover {
         let panel: NSPanel
         let windowID: CGWindowID
         /// The window's own pixels before.
         let own: CGImage
-        /// The same, small, to tell when it's back.
+        /// Window-local rects (points) that tell active from inactive; nil
+        /// for the whole image.
+        let chrome: [CGRect]?
+        /// The window's size in points, to map `chrome` onto its pixels.
+        let size: CGSize
+        /// The chrome, small, to tell when it's back.
         var before: [UInt8] = []
+    }
+
+    /// Panels being put up on the main thread. If that takes too long the
+    /// caller gives up and the main thread takes them down again.
+    private final class Showing {
+        let lock = NSLock()
+        var cancelled = false
+        var panels: [NSPanel] = []
     }
 
     private var covers: [Cover] = []
@@ -35,6 +54,8 @@ final class ScreenFreeze {
     /// Long enough for WindowServer to put the copies on screen (one frame at
     /// 60 Hz is 16.7 ms) before anything under them changes.
     private static let showMs: Double = 30
+    /// How long to wait for the main thread to put the copies up.
+    private static let mainDeadlineMs: Double = 150
 
     /// Cover `userWindow` (the app's key window, on the user's display) and
     /// the menu bar above it. Nil when neither is on screen.
@@ -48,7 +69,8 @@ final class ScreenFreeze {
         guard count == 1 else { return nil }
         let screen = CGDisplayBounds(display)
         let bars = menuBars()
-        var shots: [(image: CGImage, own: CGImage, rect: CGRect, id: CGWindowID, level: NSWindow.Level)] = []
+        var shots: [(image: CGImage, own: CGImage, rect: CGRect, id: CGWindowID, level: NSWindow.Level, chrome: [CGRect]?, size: CGSize)] = []
+        let windowChrome = chrome(of: userWindow, pid: info.pid, frame: info.bounds)
 
         // The window as the screen shows it, with its shadow and rim (which
         // change too, and aren't in the window's own pixels), but not the
@@ -67,51 +89,83 @@ final class ScreenFreeze {
             let holes = (infront.filter { !$0.bounds.contains(screen) }.map(\.bounds)
                 + notifications(in: infront.filter { $0.bounds.contains(screen) })).map { $0.insetBy(dx: -40, dy: -40) }
             if let around = capture(display, screen: screen, area), let image = cutOut(holes, from: around, area: area, window: own, frame: info.bounds) {
-                shots.append((image, own, area, userWindow, .normal))
+                shots.append((image, own, area, userWindow, .normal, windowChrome, info.bounds.size))
             } else if let inner = crop(own, from: info.bounds, to: info.bounds.insetBy(dx: 1, dy: 1)) {
                 // No screen copy: the window's own pixels, inside its rim.
-                shots.append((inner, own, info.bounds.insetBy(dx: 1, dy: 1), userWindow, .normal))
+                shots.append((inner, own, info.bounds.insetBy(dx: 1, dy: 1), userWindow, .normal, windowChrome, info.bounds.size))
             }
         }
         // Every menu bar on the user's displays (which one dims depends on the
         // Spaces setup), status items included: they dim with it.
         for (bar, barDisplay) in bars {
             guard let own = BCUCaptureWindow(bar.id) else { continue }
+            // Only the app menus tell: the status items (the clock) change on their own.
+            let menus = appMenus(of: bar)
+            let menuChrome = menus.map { [$0.offsetBy(dx: -bar.bounds.minX, dy: -bar.bounds.minY)] }
             if let image = capture(barDisplay, screen: CGDisplayBounds(barDisplay), bar.bounds) {
-                shots.append((image, own, bar.bounds, bar.id, .statusBar))
-            } else if let menus = appMenus(of: bar), let image = crop(own, from: bar.bounds, to: menus) {
+                shots.append((image, own, bar.bounds, bar.id, .statusBar, menuChrome, bar.bounds.size))
+            } else if let menus, let image = crop(own, from: bar.bounds, to: menus) {
                 // No screen copy: the menu bar's own pixels hold the app
                 // menus but not the status items, which are windows of their own.
-                shots.append((image, own, menus, bar.id, .statusBar))
+                shots.append((image, own, menus, bar.id, .statusBar, menuChrome, bar.bounds.size))
             }
         }
         guard !shots.isEmpty else { return nil }
         let t1 = nowMs()
         let freeze = ScreenFreeze()
-        onMain {
-            for (image, own, rect, id, level) in shots {
+        let showing = Showing()
+        let shown = DispatchSemaphore(value: 0)
+        let put = {
+            showing.lock.lock()
+            if showing.cancelled { showing.lock.unlock(); return }
+            showing.lock.unlock()
+            var panels: [NSPanel] = []
+            for shot in shots {
                 let panel = pool.popLast() ?? makePanel()
-                panel.level = level
-                panel.setFrame(cocoaRect(rect), display: false)
-                panel.contentView?.layer?.contents = image
+                panel.level = shot.level
+                panel.setFrame(cocoaRect(shot.rect), display: false)
+                panel.contentView?.layer?.contents = shot.image
                 // Right above the window it copies: windows above that stay
                 // above. The menu bar's copy goes in front of the status items.
-                if level == .normal { panel.order(.above, relativeTo: Int(id)) } else { panel.orderFrontRegardless() }
-                freeze.covers.append(Cover(panel: panel, windowID: id, own: own))
+                if shot.level == .normal { panel.order(.above, relativeTo: Int(shot.id)) } else { panel.orderFrontRegardless() }
+                panels.append(panel)
             }
             CATransaction.flush()
+            showing.lock.lock()
+            let late = showing.cancelled
+            showing.panels = panels
+            showing.lock.unlock()
+            if late { remove(panels) } else { shown.signal() }
+        }
+        if Thread.isMainThread { put() } else { DispatchQueue.main.async(execute: put) }
+        if !Thread.isMainThread && shown.wait(timeout: .now() + .milliseconds(Int(mainDeadlineMs))) == .timedOut {
+            showing.lock.lock()
+            showing.cancelled = true
+            let up = showing.panels
+            showing.lock.unlock()
+            // Up just now: take them down (on main, whenever it gets there).
+            if !up.isEmpty { DispatchQueue.main.async { remove(up) } }
+            Log.info("freeze: the main thread didn't put the copies up within \(Int(mainDeadlineMs)) ms; going without them")
+            return nil
+        }
+        showing.lock.lock()
+        let panels = showing.panels
+        showing.lock.unlock()
+        for (shot, panel) in zip(shots, panels) {
+            freeze.covers.append(Cover(panel: panel, windowID: shot.id, own: shot.own, chrome: shot.chrome, size: shot.size))
         }
         freeze.shownMs = nowMs() - t0
         freeze.captureMs = t1 - t0
         // While WindowServer puts them on screen.
-        let shown = nowMs()
-        for i in freeze.covers.indices { freeze.covers[i].before = thumbnail(freeze.covers[i].own) }
-        sleepMs(showMs - (nowMs() - shown))
+        let up = nowMs()
+        for i in freeze.covers.indices { freeze.covers[i].before = freeze.covers[i].print(freeze.covers[i].own) }
+        sleepMs(showMs - (nowMs() - up))
         return freeze
     }
 
     /// Take the copies off once the windows under them look as they did, or
     /// after `timeoutMs` (the window may have changed for its own reasons).
+    /// Doesn't wait for the main thread to take them down.
     func end(timeoutMs: Double = 500) {
         guard !covers.isEmpty else { return }
         let start = nowMs()
@@ -121,7 +175,7 @@ final class ScreenFreeze {
         while !waiting.isEmpty && nowMs() < deadline {
             waiting.removeAll { cover in
                 guard let now = BCUCaptureWindow(cover.windowID) else { return true }
-                let d = Self.difference(Self.thumbnail(now), cover.before)
+                let d = Self.difference(cover.print(now), cover.before)
                 worst[cover.windowID] = d
                 return d <= Self.allowedDifference
             }
@@ -132,21 +186,47 @@ final class ScreenFreeze {
         sleepMs(17)
         let panels = covers.map(\.panel)
         covers.removeAll()
-        Self.onMain {
-            for p in panels {
-                p.orderOut(nil)
-                p.contentView?.layer?.contents = nil
-                Self.pool.append(p)
-            }
-            CATransaction.flush()
+        if Thread.isMainThread { Self.remove(panels) } else { DispatchQueue.main.async { Self.remove(panels) } }
+    }
+
+    /// Main thread.
+    private static func remove(_ panels: [NSPanel]) {
+        for p in panels {
+            p.orderOut(nil)
+            p.contentView?.layer?.contents = nil
+            pool.append(p)
         }
+        CATransaction.flush()
+    }
+
+    /// The parts of a window that change when it loses key: its traffic
+    /// lights and the focus ring of its focused element (a band just around
+    /// it, not the text inside). Window-local points; nil when neither is
+    /// found, so the whole window is compared.
+    private static func chrome(of id: CGWindowID, pid: pid_t, frame: CGRect) -> [CGRect]? {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.1)
+        guard let win = AX.elements(app, "AXWindows").first(where: { AX.windowID($0) == id }) else { return nil }
+        var rects: [CGRect] = []
+        let buttons = ["AXCloseButton", "AXMinimizeButton", "AXZoomButton"].compactMap { AX.element(win, $0).flatMap(AX.frame) }
+        if let first = buttons.first {
+            rects.append(buttons.dropFirst().reduce(first) { $0.union($1) }.insetBy(dx: -4, dy: -4))
+        }
+        if let el = AX.element(app, "AXFocusedUIElement"), let w = AX.element(el, "AXWindow"), AX.windowID(w) == id,
+           let f = AX.frame(el), f.width > 4, f.height > 4, f.width < frame.width * 0.98 || f.height < frame.height * 0.9 {
+            let band: CGFloat = 5
+            rects += [CGRect(x: f.minX - band, y: f.minY - band, width: f.width + band * 2, height: band + 1),
+                      CGRect(x: f.minX - band, y: f.maxY - 1, width: f.width + band * 2, height: band + 1),
+                      CGRect(x: f.minX - band, y: f.minY, width: band + 1, height: f.height),
+                      CGRect(x: f.maxX - 1, y: f.minY, width: band + 1, height: f.height)]
+        }
+        let local = rects.map { $0.offsetBy(dx: -frame.minX, dy: -frame.minY) }
+            .map { $0.intersection(CGRect(origin: .zero, size: frame.size)) }
+            .filter { !$0.isNull && $0.width >= 1 && $0.height >= 1 }
+        return local.isEmpty ? nil : local
     }
 
     // MARK: Helpers
-
-    private static func onMain(_ work: () -> Void) {
-        if Thread.isMainThread { work() } else { DispatchQueue.main.sync(execute: work) }
-    }
 
     private static func makePanel() -> NSPanel {
         let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 10, height: 10), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -253,7 +333,7 @@ final class ScreenFreeze {
 
     /// A copy at about half size, for comparing: fine enough that a 2 px
     /// focus ring or the traffic lights changing shows.
-    private static func thumbnail(_ image: CGImage) -> [UInt8] {
+    fileprivate static func thumbnail(_ image: CGImage) -> [UInt8] {
         let w = max(1, min(1024, image.width / 2)), h = max(1, image.height * w / max(1, image.width))
         var buf = [UInt8](repeating: 0, count: w * h * 4)
         buf.withUnsafeMutableBytes { raw in
@@ -266,8 +346,8 @@ final class ScreenFreeze {
     }
 
     /// How many thumbnail pixels may differ for it to be the same picture: a
-    /// blinking caret can differ, a window drawn inactive can't.
-    private static let allowedDifference = 24
+    /// stray pixel can differ, a window drawn inactive can't.
+    private static let allowedDifference = 12
 
     private static func difference(_ a: [UInt8], _ b: [UInt8]) -> Int {
         guard a.count == b.count else { return Int.max }
@@ -280,5 +360,21 @@ final class ScreenFreeze {
             i += 4
         }
         return differing
+    }
+}
+
+private extension ScreenFreeze.Cover {
+    /// What's compared of a capture of this cover's window: its chrome, or
+    /// all of it.
+    func print(_ image: CGImage) -> [UInt8] {
+        guard let chrome, size.width > 0, size.height > 0 else { return ScreenFreeze.thumbnail(image) }
+        let sx = CGFloat(image.width) / size.width, sy = CGFloat(image.height) / size.height
+        var out: [UInt8] = []
+        for r in chrome {
+            let px = CGRect(x: r.minX * sx, y: r.minY * sy, width: r.width * sx, height: r.height * sy).integral
+            guard let part = image.cropping(to: px) else { continue }
+            out += ScreenFreeze.thumbnail(part)
+        }
+        return out
     }
 }

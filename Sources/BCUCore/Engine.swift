@@ -62,8 +62,15 @@ public final class Engine {
     private var lastActionMs: [CGWindowID: Double] = [:]
     private var enhancedPids: Set<pid_t> = []
     /// The text element that had focus in each window the last time it was
-    /// key, for typing into it later without making the window key.
-    private var focusedText: [CGWindowID: AXUIElement] = [:]
+    /// key, for typing into it later without making the window key, with
+    /// its selection and value then: a window that isn't key may not report
+    /// its selection (after cmd+A, typing should replace, not append).
+    private struct TextFocus {
+        let element: AXUIElement
+        var range: CFRange?
+        var value: String
+    }
+    private var focusedText: [CGWindowID: TextFocus] = [:]
     /// Steps that take key focus in the app the user is in wait for a pause
     /// in their input (see `QuietWait`), within this session's budget.
     private let waitBudget = WaitBudget()
@@ -330,7 +337,13 @@ public final class Engine {
         return try dispatch(tool: tool, args: args)
     }
 
+    /// Maintenance and test tools (`admin_*`) work only when the app was
+    /// started with BCU_ADMIN_TOOLS=1. They can type into and close any
+    /// app's windows, so no agent gets them in a normal run.
+    public static let adminToolsEnabled = ProcessInfo.processInfo.environment["BCU_ADMIN_TOOLS"] == "1"
+
     private func dispatch(tool: String, args: Args) throws -> ToolResult {
+        if tool.hasPrefix("admin_") && !Self.adminToolsEnabled { throw ToolError("unknown tool \(tool)") }
         switch tool {
         case "status": return status(args)
         case "list_apps": return listApps()
@@ -599,8 +612,20 @@ public final class Engine {
             waitBudget.reset()
             return ToolResult(text: "reset")
         case "admin_user_sim":
+            let also = ((args.raw["also_pids"] as? [Any]) ?? []).compactMap { ($0 as? NSNumber).map { pid_t($0.intValue) } }
             return UserSim.shared.start((args.raw["script"] as? [JSONObject]) ?? [], pid: pid_t(try args.requireInt("pid")),
-                                         window: CGWindowID(args.int("window_id") ?? 0), title: args.string("title"))
+                                         window: CGWindowID(args.int("window_id") ?? 0), title: args.string("title"), also: also)
+        case "admin_chaos":
+            return Chaos.shared.start((args.raw["ops"] as? [JSONObject]) ?? [], guard: focusGuard)
+        case "admin_chaos_status":
+            return Chaos.shared.status()
+        case "admin_chaos_stop":
+            return Chaos.shared.stop()
+        case "admin_guard_events":
+            // Test: the guard's recent events, cleared after.
+            let events = focusGuard.recentEvents.map(\.summary)
+            if args.bool("clear") ?? true { focusGuard.clearEvents() }
+            return ToolResult(text: events.joined(separator: "\n"))
         case "admin_user_sim_status":
             return UserSim.shared.status()
         case "admin_user_sim_stop":
@@ -682,7 +707,11 @@ public final class Engine {
     /// Before that, while the user is in the app, it waits for a pause in
     /// their input (unless the step passed `priority: "now"`), and in a batch
     /// the cover stays up across back-to-back steps like this.
-    private func keyed<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) throws -> T {
+    ///
+    /// `body` gets a check to call right before it posts anything: it throws
+    /// unless the agent's window is still the app's key window and the user
+    /// hasn't switched to the app since, so input never goes anywhere else.
+    private func keyed<T>(_ w: AgentWindow, cause: String, _ body: (_ check: () throws -> Void) throws -> T) throws -> T {
         if paused { throw ToolError("paused by the user") }
         if userInControl { throw ToolError("the user took over your display") }
         if let c = cover, !(c.pid == w.pid && userIsIn(w.pid) && nowMs() - c.lastUsedMs < Self.coverGapMs
@@ -690,78 +719,141 @@ public final class Engine {
             closeCover()
         }
         if cover == nil && userIsIn(w.pid) && !priorityNow {
-            awaitUser(w, cause: cause)
-            if paused { throw ToolError("paused by the user") }
-            if userInControl { throw ToolError("the user took over your display") }
+            try awaitUser(w, cause: cause)
         }
         Self.inputLock.lock()
         defer { Self.inputLock.unlock() }
         focusGuard.beginAction(pid: w.pid, cause: cause)
         windows.noteBefore(pid: w.pid)
         defer { focusGuard.endAction(pid: w.pid) }
-        if cover == nil && userIsIn(w.pid) { openCover(w, cause: cause) } else if cover != nil { UserSim.shared.coverUsed(cause) }
+        let shared = userIsIn(w.pid)
+        if cover == nil && shared { openCover(w, cause: cause) } else if cover != nil { UserSim.shared.coverUsed(cause) }
         defer {
             if batching { cover?.lastUsedMs = nowMs() } else { closeCover() }
         }
+        // From here until key is back, the guard holds keys typed into this
+        // app and clicks on it, even if the user wasn't in it.
+        focusGuard.beginSwap(w.pid)
+        defer { focusGuard.endSwap(w.pid) }
         // Key must be the user's going in, or the swap wouldn't give it back.
-        if cover != nil { focusGuard.reclaimKey(w.pid) }
-        let scope = try KeyScope.enter(pid: w.pid, window: w.id)
-        defer {
-            scope.exit()
-            if userIsIn(w.pid) { focusGuard.reclaimKey(w.pid) }
+        let userWindow = shared ? (cover?.userWindow ?? focusGuard.userWindow(of: w.pid)) : nil
+        if shared { focusGuard.reclaimKey(w.pid, prefer: userWindow) }
+        let scope: KeyScope
+        do {
+            scope = try KeyScope.enter(pid: w.pid, window: w.id, giveBackTo: userWindow)
+        } catch {
+            focusGuard.scheduleReclaim(w.pid)
+            throw error
         }
-        let result = try body()
+        defer { handBack(scope, w) }
+        let wasFront = BCUFrontProcessPID() == w.pid
+        let check = { [self] in
+            let key = AX.focusedWindowID(w.pid)
+            if let key, key != w.id {
+                throw ToolError("\(w.appName)'s key window changed to window \(key) (\(FocusGuard.onAgentDisplay(key) ? "another agent window" : "the user's")), so nothing more was sent")
+            }
+            if key == nil {
+                throw ToolError("\(w.appName) has no key window now (or isn't answering), so nothing more was sent")
+            }
+            if !wasFront && BCUFrontProcessPID() == w.pid && !focusGuard.agentCaused(w.pid) {
+                throw ToolError("the user switched to \(w.appName), so nothing more was sent")
+            }
+        }
+        let result = try body(check)
+        // Let focus moves (Tab, a click) land before noting the focused field.
+        sleepMs(30)
         rememberFocusedText(in: w)
         return result
+    }
+
+    /// Give key back after a swap, and while the user is in the app, make
+    /// sure it's on their window before their held input goes on: retry for
+    /// up to a second (the guard holds their keys until it is).
+    private func handBack(_ scope: KeyScope, _ w: AgentWindow) {
+        let t0 = nowMs()
+        let confirmed = scope.exit()
+        guard userIsIn(w.pid) else {
+            if !confirmed { focusGuard.scheduleReclaim(w.pid) }
+            return
+        }
+        var safe = false
+        while true {
+            focusGuard.reclaimKey(w.pid, prefer: scope.previous)
+            safe = focusGuard.keySafe(w.pid)
+            if safe || nowMs() - t0 > 1000 { break }
+            sleepMs(50)
+        }
+        if !safe {
+            Log.info("swap: COULD NOT give key back in \(w.appName) after \(Int(nowMs() - t0)) ms (key is \(AX.focusedWindowID(w.pid).map(String.init) ?? "unknown")); the user's keys stay held")
+        } else if !confirmed {
+            Log.info("swap: key back in \(w.appName) after a retry (\(Int(nowMs() - t0)) ms)")
+        }
     }
 
     private struct SwapCover {
         let pid: pid_t
         let freeze: ScreenFreeze?
+        let hold: Int
+        /// The user's window in the app, which gets key back.
+        let userWindow: CGWindowID?
         let openedMs: Double
         var lastUsedMs: Double
     }
 
     /// A batch keeps the cover up for the next step only if it starts this
     /// soon, and never longer than this in all, since the user's input is
-    /// held the whole time.
+    /// held the whole time. Typing ends a swap after `typeChunkMs`, so a
+    /// step started inside `coverMaxMs` ends well inside the guard's own
+    /// limit (`FocusGuard.maxHoldMs`).
     private static let coverGapMs = 500.0
-    private static let coverMaxMs = 1500.0
+    private static let coverMaxMs = 1000.0
     private static let inFlightMs = 60.0
+    /// Keystroke typing goes in swaps of at most this many characters and this long.
+    private static let typeChunk = 16
+    private static let typeChunkMs = 400.0
 
     /// Hold the user's input and cover their window, which is about to be
     /// drawn inactive for a moment.
     private func openCover(_ w: AgentWindow, cause: String) {
-        focusGuard.beginHold()
+        let hold = focusGuard.beginHold()
         // A key the user pressed just before the hold is still being drawn:
         // let it land first, or the copy would never match their window
         // again and stay up until it times out.
         let sinceInput = nowMs() - focusGuard.activity.snapshot.lastInputMs
         if sinceInput < Self.inFlightMs { sleepMs(Self.inFlightMs - sinceInput) }
+        focusGuard.reclaimKey(w.pid)
         var freeze: ScreenFreeze?
-        if let userWindow = AX.focusedWindowID(w.pid), userWindow != w.id {
-            freeze = ScreenFreeze.begin(userWindow: userWindow)
+        var userWindow: CGWindowID?
+        if let key = AX.focusedWindowID(w.pid), key != w.id, !FocusGuard.onAgentDisplay(key) {
+            userWindow = key
+            freeze = ScreenFreeze.begin(userWindow: key)
         }
-        cover = SwapCover(pid: w.pid, freeze: freeze, openedMs: nowMs(), lastUsedMs: nowMs())
+        cover = SwapCover(pid: w.pid, freeze: freeze, hold: hold, userWindow: userWindow ?? focusGuard.userWindow(of: w.pid),
+                          openedMs: nowMs(), lastUsedMs: nowMs())
         UserSim.shared.coverOpened(cause)
     }
 
+    /// Let the user's input go on (the guard replays it once key is theirs),
+    /// then take the copy off once their window looks as before.
     private func closeCover() {
         guard let c = cover else { return }
         cover = nil
+        focusGuard.endHold(c.hold)
         c.freeze?.end()
-        focusGuard.endHold()
         UserSim.shared.coverClosed()
     }
 
     /// Wait for a moment the user won't notice their window freezing, and
-    /// note it for the step's result.
-    private func awaitUser(_ w: AgentWindow, cause: String) {
+    /// note it for the step's result. Throws if they paused the agent or
+    /// took over meanwhile, or if they have a menu open in the app at the
+    /// cap (the step would close it).
+    private func awaitUser(_ w: AgentWindow, cause: String) throws {
         let caps = waitBudget.caps
         let startMs = nowMs()
         stateLock.lock(); let busy = _busy; stateLock.unlock()
         var shown = false
-        let r = QuietWait.wait(focusGuard.activity, softMs: caps.softMs, hardMs: caps.hardMs) {
+        let r = QuietWait.wait(focusGuard.activity, pid: w.pid, softMs: caps.softMs, hardMs: caps.hardMs,
+                               stop: { self.paused || self.userInControl }) {
             shown = true
             stateLock.lock(); _busy = "Waiting for you to pause"; stateLock.unlock()
             changed()
@@ -771,10 +863,18 @@ public final class Engine {
             stateLock.lock(); _busy = busy; stateLock.unlock()
             changed()
         }
+        if paused { throw ToolError("paused by the user") }
+        if userInControl { throw ToolError("the user took over your display") }
+        if r.outcome == .menu {
+            let note = "waited \(String(format: "%.1f", r.waitedMs / 1000)) s in \(w.appName) before \(cause), but the user has a menu open there"
+            UserSim.shared.waited(fromMs: startMs, note)
+            Log.info("defer: \(note); failed the step")
+            throw ToolError("the user has a menu open in \(w.appName), and \(cause) would close it, so nothing was sent. Wait a few seconds and retry.")
+        }
         guard r.waitedMs >= 20 else { return }
         var note = "waited \(String(format: "%.1f", r.waitedMs / 1000)) s for \(r.reason ?? "the user to pause") in \(w.appName) before \(cause)"
         switch r.outcome {
-        case .quiet: break
+        case .quiet, .menu, .stopped: break
         case .gap: note += ", then went in a short gap in their input"
         case .cap: note += ", then went anyway (their input was held and replayed)"
         }
@@ -850,8 +950,8 @@ public final class Engine {
         // A new window becomes its app's key window until it's handed back;
         // hold the user's input meanwhile if they're in that app.
         let shared = (try windows.resolveApp(app).running).map { userIsIn($0.processIdentifier) } ?? false
-        if shared { focusGuard.beginHold() }
-        defer { if shared { focusGuard.endHold() } }
+        let hold = shared ? focusGuard.beginHold() : nil
+        defer { if let hold { focusGuard.endHold(hold) } }
         let result = try windows.open(app: app, placement: WindowManager.Placement(name: args.string("placement")), trigger: args.string("trigger"))
         let w = result.window
         let frame = WindowList.info(w.id)?.bounds ?? .zero
@@ -1110,7 +1210,7 @@ public final class Engine {
             if button == .left && count == 1 && n.actions.contains("AXPress") {
                 let err = guarded(w, cause: "pressing an element") { AX.perform(n.element, "AXPress") }
                 if err == .success {
-                    if Self.textRoles.contains(n.role) { focusedText[w.id] = n.element }
+                    if Self.textRoles.contains(n.role) { focusedText[w.id] = TextFocus(element: n.element, range: nil, value: AX.string(n.element, "AXValue") ?? "") }
                     return ToolResult(text: "Pressed element \(n.index) (\(n.role)) through accessibility.")
                 }
             }
@@ -1119,12 +1219,12 @@ public final class Engine {
                 if err == .success { return ToolResult(text: "Opened the context menu of element \(n.index). Call get_window_state to see it.") }
             }
             let p = n.frame.center
-            try keyed(w, cause: "clicking") { try Input.click(pid: w.pid, windowID: w.id, at: p, button: button, count: count) }
+            try keyed(w, cause: "clicking") { check in try Input.click(pid: w.pid, windowID: w.id, at: p, button: button, count: count, check: check) }
             return ToolResult(text: "Clicked element \(n.index) at its center.")
         }
         let p = try globalPoint(args, window: ax)
         point(p, .click)
-        try keyed(w, cause: "clicking") { try Input.click(pid: w.pid, windowID: w.id, at: p, button: button, count: count) }
+        try keyed(w, cause: "clicking") { check in try Input.click(pid: w.pid, windowID: w.id, at: p, button: button, count: count, check: check) }
         return ToolResult(text: "Clicked at (\(Int(args.double("x") ?? 0)), \(Int(args.double("y") ?? 0))).")
     }
 
@@ -1182,10 +1282,15 @@ public final class Engine {
                 AX.set(n.element, "AXFocused", kCFBooleanTrue)
                 return AX.set(n.element, "AXSelectedText", text as CFString)
             }
-            sleepMs(80)
-            let after = AX.string(n.element, "AXValue") ?? ""
-            if err == .success && after != before && after.contains(text) {
-                return ToolResult(text: "Inserted the text into element \(n.index) through accessibility.")
+            if err == .success {
+                // It changed: it took the text, maybe its own way (a mask, a
+                // length limit). Typing it again would put it in twice.
+                _ = waitForValue(n.element, ms: 300) { $0 != before }
+                let after = AX.string(n.element, "AXValue") ?? ""
+                if after != before {
+                    if after.contains(text) { return ToolResult(text: "Inserted the text into element \(n.index) through accessibility.") }
+                    return ToolResult(text: "Inserted the text into element \(n.index) through accessibility; the field changed it and now reads \"\(after.prefix(200))\".")
+                }
             }
         }
         if let n = target {
@@ -1196,15 +1301,41 @@ public final class Engine {
         return ToolResult(text: "Typed \(text.count) characters with keystrokes.")
     }
 
+    /// Type with keystrokes, in short swaps (each holds the user's input if
+    /// they're in the app, so keep that short). Before every character the
+    /// agent's window must still be key; if the user switched to the app
+    /// partway, it stops rather than guess where the rest would go.
     private func typeKeys(_ w: AgentWindow, _ text: String) throws {
-        // While the user is in the same app their input is held during each
-        // swap, so type in short bursts to keep that delay small.
-        let chunk = userIsIn(w.pid) ? 16 : Int.max
+        let total = text.count
+        let startedIn = userIsIn(w.pid)
+        var typed = 0
         var rest = Substring(text)
+        func stopped(_ why: String) -> ToolError {
+            let more = typed == 0 ? "Nothing was typed." : "Typed \(typed) of \(total) characters (\"\(text.prefix(typed).suffix(40))\"), nothing after that."
+            return ToolError("stopped typing: \(why). \(more) Read the window, then type what's missing.")
+        }
         while !rest.isEmpty {
-            let piece = rest.prefix(chunk)
-            rest = rest.dropFirst(piece.count)
-            try keyed(w, cause: "typing") { try Input.typeText(pid: w.pid, String(piece)) }
+            if !startedIn && userIsIn(w.pid) { throw stopped("the user switched to \(w.appName)") }
+            let piece = String(rest.prefix(Self.typeChunk))
+            var sent = 0
+            do {
+                try keyed(w, cause: "typing") { check in
+                    let start = nowMs()
+                    let n = try Input.typeText(pid: w.pid, piece) { i in
+                        sent = i
+                        // Keep each swap short: the user's input may be held meanwhile.
+                        if i > 0 && nowMs() - start > Self.typeChunkMs { return false }
+                        try check()
+                        return true
+                    }
+                    sent = n
+                }
+            } catch {
+                typed += sent
+                throw stopped("\(error)")
+            }
+            typed += sent
+            rest = rest.dropFirst(sent)
             if !rest.isEmpty { closeCover(); sleepMs(40) }
         }
     }
@@ -1229,12 +1360,23 @@ public final class Engine {
         if !run.isEmpty { parts.append(run) }
         var viaAX = 0, viaKeys = 0
         var focused = target == nil
+        var changedTo: String?
         for part in parts {
             let isKey = part == "\n" || part == "\r" || part == "\t"
-            if !isKey, let el = element, guarded(w, cause: "typing", { axInsert(el, part) }) {
-                viaAX += part.count
-                focusedText[w.id] = el
-                continue
+            if !isKey, let el = element {
+                switch guarded(w, cause: "typing", { axInsert(el, part, in: w) }) {
+                case .exact:
+                    viaAX += part.count
+                    changedTo = nil
+                    continue
+                case .changed(let now):
+                    // The field took it its own way: don't type it again.
+                    viaAX += part.count
+                    changedTo = now
+                    continue
+                case .failed:
+                    break
+                }
             }
             // Keys go to the window's focused element: make that the target first.
             if !focused, let el = element {
@@ -1246,13 +1388,14 @@ public final class Engine {
             viaKeys += part.count
         }
         let into = target.map { " into element \($0.index)" } ?? ""
+        let changed = changedTo.map { " The field changed the text as it went in; it now reads \"\($0.prefix(200))\"." } ?? ""
         if viaKeys == 0 {
-            return ToolResult(text: "Typed \(viaAX) characters\(into) through accessibility (the user is using \(w.appName), so no keystrokes).")
+            return ToolResult(text: "Typed \(viaAX) characters\(into) through accessibility (the user is using \(w.appName), so no keystrokes).\(changed)")
         }
         if viaAX == 0 {
             return ToolResult(text: "Typed \(viaKeys) characters\(into) with keystrokes.")
         }
-        return ToolResult(text: "Typed \(viaAX) characters\(into) through accessibility and \(viaKeys) (Return/Tab) with keystrokes.")
+        return ToolResult(text: "Typed \(viaAX) characters\(into) through accessibility and \(viaKeys) (Return/Tab) with keystrokes.\(changed)")
     }
 
     private static let textRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
@@ -1267,57 +1410,85 @@ public final class Engine {
            let n = snap.nodes.values.first(where: { AX.bool($0.element, "AXFocused") == true && $0.role != "AXWebArea" }) {
             return Self.textRoles.contains(n.role) ? n.element : nil
         }
-        if let el = focusedText[w.id], AX.string(el, "AXRole") != nil { return el }
+        if let f = focusedText[w.id], AX.string(f.element, "AXRole") != nil { return f.element }
         return nil
     }
 
-    /// Note the window's focused text element while the window is key.
+    /// Note the window's focused text element, its selection and value,
+    /// while the window is key. Something else focused: forget the field.
     private func rememberFocusedText(in w: AgentWindow) {
         guard let el = AX.element(AX.app(w.pid), "AXFocusedUIElement"),
-              Self.textRoles.contains(AX.string(el, "AXRole") ?? ""),
               let win = AX.element(el, "AXWindow"), AX.windowID(win) == w.id else { return }
-        focusedText[w.id] = el
+        guard Self.textRoles.contains(AX.string(el, "AXRole") ?? "") else { focusedText[w.id] = nil; return }
+        focusedText[w.id] = TextFocus(element: el, range: AX.range(el, "AXSelectedTextRange"), value: AX.string(el, "AXValue") ?? "")
+    }
+
+    private enum Insert {
+        /// The field reads exactly as typing would have left it.
+        case exact
+        /// It changed, but not to that (a mask, a length limit, autocomplete):
+        /// the text went in its own way, so it mustn't be typed again.
+        case changed(String)
+        /// Nothing changed: type it.
+        case failed
     }
 
     /// Insert `text` at the element's selection through accessibility, and
-    /// check that the field reads exactly as typing would have left it.
+    /// check that the field reads as typing would have left it.
     /// Single-line fields get their value rewritten with the text spliced in
     /// at the selection: web fields in a window without key focus take only
     /// that, and Chromium's address bar inserts AXSelectedText at an older
     /// selection and then ignores Return. Text areas, which can hold
     /// formatting, take AXSelectedText (AppKit text views do); a rewrite only
     /// when they're empty.
-    private func axInsert(_ el: AXUIElement, _ text: String) -> Bool {
+    private func axInsert(_ el: AXUIElement, _ text: String, in w: AgentWindow) -> Insert {
         let role = AX.string(el, "AXRole") ?? ""
-        guard Self.textRoles.contains(role), AX.string(el, "AXSubrole") != "AXSecureTextField" else { return false }
+        guard Self.textRoles.contains(role), AX.string(el, "AXSubrole") != "AXSecureTextField" else { return .failed }
         let before = AX.string(el, "AXValue") ?? ""
         let old = before as NSString
-        // At the selection if the field has focus, else at the end, where
-        // clicking into it would put the caret.
+        func usable(_ s: CFRange) -> Bool { s.location >= 0 && s.length >= 0 && s.location + s.length <= old.length }
+        // At the selection: live if the field has focus, else as it was when
+        // the window was last key (if the field hasn't changed since), else
+        // at the end, where clicking into it would put the caret.
         var r = NSRange(location: old.length, length: 0)
-        if AX.bool(el, "AXFocused") == true, let s = AX.range(el, "AXSelectedTextRange"),
-           s.location >= 0, s.length >= 0, s.location + s.length <= old.length {
+        if AX.bool(el, "AXFocused") == true, let s = AX.range(el, "AXSelectedTextRange"), usable(s) {
+            r = NSRange(location: s.location, length: s.length)
+        } else if let f = focusedText[w.id], CFEqual(f.element, el), f.value == before, let s = f.range, usable(s) {
             r = NSRange(location: s.location, length: s.length)
         }
         let expected = old.replacingCharacters(in: r, with: text)
-        func rewrite() -> Bool {
-            guard AX.isSettable(el, "AXValue"), AX.set(el, "AXValue", expected as CFString) == .success,
-                  waitForValue(el, ms: 300, { $0 == expected }) else { return false }
-            var caret = CFRange(location: r.location + (text as NSString).length, length: 0)
-            if let v = AXValueCreate(.cfRange, &caret) { AX.set(el, "AXSelectedTextRange", v) }
-            return true
+        let caret = r.location + (text as NSString).length
+        func outcome() -> Insert {
+            // Whatever it reads now, the text is in: remember it as typed.
+            let now = AX.string(el, "AXValue") ?? ""
+            if now == expected {
+                focusedText[w.id] = TextFocus(element: el, range: CFRange(location: caret, length: 0), value: now)
+                return .exact
+            }
+            if now != before {
+                focusedText[w.id] = TextFocus(element: el, range: nil, value: now)
+                return .changed(now)
+            }
+            return .failed
+        }
+        func rewrite() -> Insert {
+            guard AX.isSettable(el, "AXValue"), AX.set(el, "AXValue", expected as CFString) == .success else { return .failed }
+            _ = waitForValue(el, ms: 300) { $0 == expected }
+            let result = outcome()
+            if case .exact = result {
+                var c = CFRange(location: caret, length: 0)
+                if let v = AXValueCreate(.cfRange, &c) { AX.set(el, "AXSelectedTextRange", v) }
+            }
+            return result
         }
         if role != "AXTextArea" { return rewrite() }
-        if AX.isSettable(el, "AXSelectedText"), AX.set(el, "AXSelectedText", text as CFString) == .success,
-           waitForValue(el, ms: 150, { $0 == expected }) {
-            return true
+        if AX.isSettable(el, "AXSelectedText"), AX.set(el, "AXSelectedText", text as CFString) == .success {
+            _ = waitForValue(el, ms: 300) { $0 == expected }
+            let result = outcome()
+            if case .failed = result {} else { return result }
         }
-        let now = AX.string(el, "AXValue") ?? ""
-        if now != before {
-            // It went in some other way: count it typed rather than type it twice.
-            return now.contains(text)
-        }
-        return before.isEmpty && rewrite()
+        // Didn't go in (and nothing changed): an empty area can take a rewrite.
+        return before.isEmpty ? rewrite() : .failed
     }
 
     private func waitForValue(_ el: AXUIElement, ms: Double, _ ok: (String) -> Bool) -> Bool {
@@ -1333,7 +1504,8 @@ public final class Engine {
         let (w, _) = try agentWindow(args)
         let key = try args.requireString("key")
         let mods = args.strings("modifiers") ?? []
-        try keyed(w, cause: "pressing \((mods + [key]).joined(separator: "+"))") {
+        try keyed(w, cause: "pressing \((mods + [key]).joined(separator: "+"))") { check in
+            try check()
             try Input.pressKey(pid: w.pid, key: key, modifiers: mods)
         }
         return ToolResult(text: "Pressed \((mods + [key]).joined(separator: "+")).")
@@ -1364,7 +1536,10 @@ public final class Engine {
               let tx = args.double("to_x"), let ty = args.double("to_y") else { throw ToolError("give from_x, from_y, to_x, to_y") }
         let from = CGPoint(x: f.minX + fx, y: f.minY + fy), to = CGPoint(x: f.minX + tx, y: f.minY + ty)
         point(from, .drag(to: to))
-        try keyed(w, cause: "dragging") { try Input.drag(pid: w.pid, windowID: w.id, from: from, to: to) }
+        try keyed(w, cause: "dragging") { check in
+            try check()
+            try Input.drag(pid: w.pid, windowID: w.id, from: from, to: to)
+        }
         return ToolResult(text: "Dragged from (\(Int(fx)),\(Int(fy))) to (\(Int(tx)),\(Int(ty))).")
     }
 
@@ -1386,7 +1561,8 @@ public final class Engine {
         }
         guard let target = item else { throw ToolError("empty path") }
         if AX.bool(target, "AXEnabled") == false { throw ToolError("\"\(path.last!)\" is disabled right now") }
-        let err = try keyed(w, cause: "choosing \(path.joined(separator: " > "))") { () -> AXError in
+        let err = try keyed(w, cause: "choosing \(path.joined(separator: " > "))") { check -> AXError in
+            try check()
             let e = AX.perform(target, "AXPress")
             sleepMs(200)
             return e

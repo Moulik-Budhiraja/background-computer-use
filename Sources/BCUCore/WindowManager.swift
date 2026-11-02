@@ -276,7 +276,6 @@ public final class WindowManager {
     /// Open a new window of a running app and put it on the agent display.
     private func openNewWindow(pid: pid_t, name: String, bundleID: String?, placement: Placement = .auto, trigger: String? = nil) throws -> OpenResult {
         let before = Set(WindowList.of(pid: pid).map(\.id))
-        let previousKey = AX.focusedWindowID(pid)
         let catcher = WindowCatcher(pid: pid, before: before, manager: self)
         Self.openLock.lock()
         focusGuard.beginAction(pid: pid, cause: "opening a \(name) window")
@@ -301,7 +300,13 @@ public final class WindowManager {
         // key is handed back.
         Engine.inputLock.lock()
         var holdingInput = true
-        defer { if holdingInput { Engine.inputLock.unlock() } }
+        // Keys typed into the app while its key window is moving are held,
+        // even if the user wasn't in it.
+        focusGuard.beginSwap(pid)
+        defer { if holdingInput { focusGuard.endSwap(pid); Engine.inputLock.unlock() } }
+        // Read under the lock: another session's swap may have an agent
+        // window key until it's done.
+        let previousKey = AX.focusedWindowID(pid)
         var scope: KeyScope?
         if placement.contains(.anchor), let anchor = anchorWindow(pid: pid) {
             scope = try? KeyScope.enter(pid: pid, window: anchor)
@@ -343,9 +348,13 @@ public final class WindowManager {
         scope?.exit()
         if let id = caught, let previousKey, previousKey != id, WindowList.info(previousKey) != nil, AX.focusedWindowID(pid) == id {
             KeyScope.postRecords(pid: pid, from: id, to: previousKey)
+            KeyScope.awaitKey(pid: pid, target: previousKey, budgetMs: 300)
         }
+        focusGuard.endSwap(pid)
         Engine.inputLock.unlock()
         holdingInput = false
+        // The app the user is in must end with their window key.
+        if BCUFrontProcessPID() == pid { focusGuard.reclaimWhenSafe(pid) }
         // Keep watching a moment in case the app moves or resizes the window back.
         sleepMs(250)
         catcher.stop()

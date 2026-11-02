@@ -57,6 +57,11 @@ final class MCPServer {
         case "tools/call":
             let name = params["name"] as? String ?? ""
             let arguments = params["arguments"] as? JSONObject ?? [:]
+            // Maintenance and test tools are for `bcu call` on a debug run only.
+            if name.hasPrefix("admin_") {
+                reply(id, result: ["content": [["type": "text", "text": "unknown tool \(name)"]], "isError": true])
+                return
+            }
             reply(id, result: callTool(name, arguments))
         default:
             replyError(id, code: -32601, message: "method not found: \(method)")

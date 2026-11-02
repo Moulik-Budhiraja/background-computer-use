@@ -15,6 +15,11 @@ final class UserSim {
     private var stopping = false
     /// Only ever post input while this app is in front.
     private var onlyPid: pid_t = 0
+    /// Or one of these (test fixtures the user switches between).
+    private var alsoPids: Set<pid_t> = []
+    /// Held while posting one event, so `Chaos` can switch apps between
+    /// events and never under one.
+    let postLock = NSLock()
     /// And, if set, only while this window is that app's key window.
     private var onlyWindow: CGWindowID = 0
     /// And, if set, only while that window's title contains this (a
@@ -55,10 +60,11 @@ final class UserSim {
 
     // MARK: Script
 
-    func start(_ script: [JSONObject], pid: pid_t, window: CGWindowID = 0, title: String? = nil) -> ToolResult {
+    func start(_ script: [JSONObject], pid: pid_t, window: CGWindowID = 0, title: String? = nil, also: [pid_t] = []) -> ToolResult {
         lock.lock()
         if running { lock.unlock(); return .error("already running") }
         onlyPid = pid
+        alsoPids = Set(also)
         onlyWindow = window
         onlyTitle = title
         running = true
@@ -85,9 +91,13 @@ final class UserSim {
     /// Stop when asked, or the moment another app is in front, so input
     /// never reaches anything but the test's app.
     private var shouldStop: Bool {
-        lock.lock(); let stop = stopping; let pid = onlyPid; let window = onlyWindow; let title = onlyTitle; lock.unlock()
+        lock.lock(); let stop = stopping; let pid = onlyPid; let window = onlyWindow; let title = onlyTitle; let also = alsoPids; lock.unlock()
         if stop { return true }
-        let front = BCUFrontProcessPID()
+        var front = BCUFrontProcessPID()
+        // Chaos put this app in front for a moment: wait for it to end.
+        let waitUntil = nowMs() + 3000
+        while front == getpid() && Chaos.shared.flipping && nowMs() < waitUntil { sleepMs(5); front = BCUFrontProcessPID() }
+        if also.contains(front) { return false }
         var why: String?
         if front != pid {
             why = "\(NSRunningApplication(processIdentifier: front)?.localizedName ?? "pid \(front)") is in front"
@@ -147,6 +157,31 @@ final class UserSim {
                        momentum: a.int("momentum") ?? 30, dy: Int32(a.int("dy") ?? 6))
             case "menu":
                 openMenu(a.string("title") ?? "Format")
+            case "activate":
+                // Switch to a test fixture app, the way a click on it would.
+                let pid = pid_t(a.int("pid") ?? 0)
+                lock.lock(); let ok = pid == onlyPid || alsoPids.contains(pid); lock.unlock()
+                guard ok else { note("activate: pid \(pid) isn't allowed"); break }
+                note("activate \(pid)")
+                _ = BCUSetFrontProcess(pid, CGWindowID(a.int("window_id") ?? 0), 0x200)
+                if let wid = a.int("window_id") { _ = BCUPostMakeKeyRecords(pid, CGWindowID(wid)) }
+                let deadline = nowMs() + 1000
+                while BCUFrontProcessPID() != pid && nowMs() < deadline { sleepMs(5) }
+            case "cmd_tab":
+                // To the app used before this one (the test sets that up).
+                note("cmd_tab")
+                let cmd = CGEventFlags.maskCommand
+                func post(_ code: CGKeyCode, _ down: Bool, _ flags: CGEventFlags, _ type: CGEventType? = nil) {
+                    guard let e = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: down) else { return }
+                    if let type { e.type = type }
+                    e.flags = flags
+                    postLock.lock(); e.post(tap: .cghidEventTap); postLock.unlock()
+                }
+                post(55, true, cmd, .flagsChanged); sleepMs(40)
+                post(48, true, cmd); sleepMs(50)
+                post(48, false, cmd); sleepMs(60)
+                post(55, false, [], .flagsChanged)
+                sleepMs(a.double("settle_ms") ?? 300)
             case "watch_menu":
                 watchMenu(ms: a.double("ms") ?? 3000)
             default:
@@ -162,7 +197,7 @@ final class UserSim {
             e.keyboardSetUnicodeString(stringLength: u.count, unicodeString: u)
         }
         e.flags = []
-        e.post(tap: .cghidEventTap)
+        postLock.lock(); e.post(tap: .cghidEventTap); postLock.unlock()
     }
 
     /// `jitterMs`: up to this much extra before each key; `wordPauseMs`: up
@@ -185,14 +220,15 @@ final class UserSim {
     private func mouse(_ type: CGEventType, _ p: CGPoint, state: Int64) {
         guard let e = CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: p, mouseButton: .left) else { return }
         e.setIntegerValueField(.mouseEventClickState, value: state)
-        e.post(tap: .cghidEventTap)
+        postLock.lock(); e.post(tap: .cghidEventTap); postLock.unlock()
     }
 
     private func click(_ p: CGPoint, count: Int, holdMs: Double, menuBar: Bool = false) {
         // Only where the test app's own window is on top.
         let me = getpid()
         let top = WindowList.all(onScreenOnly: true).first { $0.pid != me && $0.layer >= 0 && $0.layer < 20 && $0.alpha > 0 && $0.bounds.contains(p) }
-        if !menuBar && (top?.pid != onlyPid || (onlyWindow != 0 && top?.id != onlyWindow)) {
+        let allowed = top.map { $0.pid == onlyPid ? (onlyWindow == 0 || $0.id == onlyWindow) : alsoPids.contains($0.pid) } ?? false
+        if !menuBar && !allowed {
             note("stopped: \(top?.owner ?? "nothing") is on top at \(Int(p.x)),\(Int(p.y))")
             lock.lock(); stopping = true; lock.unlock()
             return
