@@ -58,6 +58,20 @@ public final class FocusGuard {
     private var holdTokens: Set<Int> = []
     private var nextHoldToken = 1
     private var holdSinceMs = 0.0
+    /// Each user key event is captured and replayed at most once. Copies keep
+    /// the event's timestamp, and every real event has its own, so a key
+    /// seen twice by either path is skipped (and logged, naming the path).
+    private struct KeyID: Hashable {
+        let timestamp: CGEventTimestamp
+        let type: UInt32
+        let code: Int64
+        init(_ e: CGEvent) {
+            timestamp = e.timestamp
+            type = e.type.rawValue
+            code = e.getIntegerValueField(.keyboardEventKeycode)
+        }
+    }
+    private var captured: [KeyID: Double] = [:]
     /// Keys whose key-down reached the app (passed or replayed) and whose
     /// key-up hasn't yet: that key-up goes straight on, never held, so a
     /// key's down and up are never split (a key held down that long is
@@ -68,6 +82,7 @@ public final class FocusGuard {
     /// so a key typed meanwhile could otherwise reach the app first.
     private var replaysInFlight = 0
     private var replaysInFlightSinceMs = 0.0
+    private var replayed: [KeyID: Double] = [:]
     /// A drain is due again (it found key on an agent window).
     private var drainRetryScheduled = false
     /// Replaying held events; anything new queues behind them to keep order.
@@ -648,9 +663,11 @@ public final class FocusGuard {
                 lock.lock()
                 let mid = swapping[front] != nil || pidHeld[front] != nil
                 if mid, let copy = event.copy() {
-                    var p = pidHeld[front] ?? (nowMs(), [])
-                    p.events.append(copy)
-                    pidHeld[front] = p
+                    if firstCapture(copy, "held for an app mid-swap") {
+                        var p = pidHeld[front] ?? (nowMs(), [])
+                        p.events.append(copy)
+                        pidHeld[front] = p
+                    }
                 }
                 lock.unlock()
                 if mid { return nil }
@@ -687,6 +704,14 @@ public final class FocusGuard {
             downDelivered[code] = n > 1 ? n - 1 : nil
         }
         lock.unlock()
+    }
+
+    private static func chars(_ e: CGEvent) -> String {
+        var buf = [UniChar](repeating: 0, count: 4)
+        var len = 0
+        e.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &len, unicodeString: &buf)
+        let s = String(utf16CodeUnits: buf, count: len)
+        return s == " " ? "␣" : (s.isEmpty ? "#\(e.getIntegerValueField(.keyboardEventKeycode))" : s)
     }
 
     private static func isMouseDown(_ t: CGEventType) -> Bool {
@@ -854,7 +879,8 @@ public final class FocusGuard {
                 usleep(1000)
                 continue
             }
-            lock.lock(); removeHeld(e); lock.unlock()
+            lock.lock(); removeHeld(e); let first = firstReplay(e, "drain"); lock.unlock()
+            guard first else { continue }
             e.setIntegerValueField(.eventSourceUserData, value: FocusGuard.replayMarker)
             if Self.isKey(e.type) {
                 lock.lock()
@@ -871,6 +897,34 @@ public final class FocusGuard {
         }
         if retry { scheduleDrain() }
         return n
+    }
+
+    /// Lock held. False if this key event was captured already (by `path`).
+    private func firstCapture(_ e: CGEvent, _ path: String) -> Bool {
+        // Unstamped events (timestamp 0) can't be told apart: never skip them.
+        guard Self.isKey(e.type) && e.type != .flagsChanged && e.timestamp != 0 else { return true }
+        let id = KeyID(e), now = nowMs()
+        if captured.count > 2000 { captured = captured.filter { now - $0.value < 10_000 } }
+        if let first = captured[id] {
+            Log.info("guard: skipped a second capture of one key event (\(path)): \(e.type == .keyDown ? "down" : "up") \(Self.chars(e)) ts \(e.timestamp), first captured \(Int(now - first)) ms ago")
+            return false
+        }
+        captured[id] = now
+        return true
+    }
+
+    /// Lock held. False if this key event was replayed already.
+    private func firstReplay(_ e: CGEvent, _ path: String) -> Bool {
+        // Unstamped events (timestamp 0) can't be told apart: never skip them.
+        guard Self.isKey(e.type) && e.type != .flagsChanged && e.timestamp != 0 else { return true }
+        let id = KeyID(e), now = nowMs()
+        if replayed.count > 2000 { replayed = replayed.filter { now - $0.value < 10_000 } }
+        if let first = replayed[id] {
+            Log.info("guard: skipped replaying one key event a second time (\(path)): \(e.type == .keyDown ? "down" : "up") \(Self.chars(e)) ts \(e.timestamp), first replayed \(Int(now - first)) ms ago")
+            return false
+        }
+        replayed[id] = now
+        return true
     }
 
     /// Take `e` out of the queue once it's replayed or moved. By identity,
@@ -894,6 +948,7 @@ public final class FocusGuard {
         guard let copy = event.copy() else { return }
         let front = Self.isKey(event.type) ? BCUFrontProcessPID() : 0
         lock.lock()
+        guard firstCapture(copy, "held") else { lock.unlock(); return }
         if held.isEmpty { heldSinceMs = nowMs() }
         held.append((copy, front))
         lock.unlock()
