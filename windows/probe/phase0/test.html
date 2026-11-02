@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>BCU probe page</title>
+<style>
+  body { font: 16px system-ui; margin: 20px; }
+  #clock { font: bold 64px monospace; }
+  input, textarea { font-size: 18px; width: 420px; }
+  #log { font: 14px monospace; white-space: pre-wrap; border: 1px solid #999; padding: 6px; height: 260px; overflow: auto; }
+</style>
+</head>
+<body>
+  <div id="clock" aria-label="clock">0</div>
+  <p><button id="inc" onclick="bump()">Increment</button> <span id="count" aria-live="polite">count 0</span></p>
+  <p><input id="q" aria-label="Probe input" placeholder="type here"></p>
+  <p><textarea id="t" aria-label="Probe textarea" rows="3"></textarea></p>
+  <div id="log" role="log" aria-label="Event log"></div>
+<script>
+  // A clock that changes every frame, so a screenshot shows whether the window is still drawing.
+  const clock = document.getElementById('clock');
+  (function tick() { clock.textContent = Math.floor(performance.now()); requestAnimationFrame(tick); })();
+  let n = 0;
+  function bump() { n++; document.getElementById('count').textContent = 'count ' + n; }
+  const log = document.getElementById('log');
+  function add(s) { log.textContent = (s + '\n' + log.textContent).slice(0, 3000); }
+  const mods = e => (e.ctrlKey ? 'ctrl+' : '') + (e.altKey ? 'alt+' : '') + (e.shiftKey ? 'shift+' : '') + (e.metaKey ? 'win+' : '');
+  addEventListener('keydown', e => add('keydown ' + mods(e) + e.key + ' target=' + (e.target.id || e.target.tagName)), true);
+  addEventListener('mousedown', e => add('mousedown button=' + e.button + ' at ' + e.clientX + ',' + e.clientY + ' target=' + (e.target.id || e.target.tagName)), true);
+  addEventListener('click', e => add('click at ' + e.clientX + ',' + e.clientY + ' target=' + (e.target.id || e.target.tagName)), true);
+  addEventListener('focus', () => add('window focus'));
+  addEventListener('blur', () => add('window blur'));
+  document.addEventListener('visibilitychange', () => add('visibility ' + document.visibilityState));
+</script>
+</body>
+</html>

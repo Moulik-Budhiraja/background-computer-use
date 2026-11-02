@@ -1,0 +1,8 @@
+[package]
+name = "bcu"
+version = "0.1.0"
+edition = "2024"
+description = "Command-line front end for Background Computer Use on Windows: `bcu mcp` is the MCP server agents run."
+
+[dependencies]
+serde_json.workspace = true

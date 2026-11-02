@@ -27,6 +27,8 @@ let package = Package(
         .target(
             name: "BCUShared",
             path: "Sources/BCUShared",
+            // A symlink to shared/tools.json, which the Windows app reads too.
+            resources: [.embedInCode("tools.json")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // Display, input, accessibility, capture, window management and the focus guard.
