@@ -661,10 +661,11 @@ private struct SessionTile: View {
                             .allowsHitTesting(false)
                     }
                 }
-                .contentShape(Rectangle())
-                .onTapGesture { model.openViewer() }
-                .onHover { hovering = $0 }
-                .help("Expand \(model.engine.label)'s display")
+                .overlay {
+                    ClickCatcher(help: "Expand \(model.engine.label)'s display",
+                                 onHover: { hovering = $0 },
+                                 action: { model.openViewer() })
+                }
             if model.handoffReason != nil {
                 HandoffBanner(model: model)
             }
@@ -686,6 +687,55 @@ private struct SessionTile: View {
         .padding(.horizontal, 7)
         .frame(height: 22)
         .background(Capsule().fill(Color.black.opacity(0.55)))
+    }
+}
+
+/// A clear AppKit layer that takes a click on the first try. A SwiftUI tap
+/// over the live frame (an AppKit view) can lose the click, and since this
+/// app never activates, the popover's first click can go to activating it.
+private struct ClickCatcher: NSViewRepresentable {
+    let help: String
+    let onHover: (Bool) -> Void
+    let action: () -> Void
+
+    func makeNSView(context: Context) -> ClickCatcherView {
+        let v = ClickCatcherView()
+        updateNSView(v, context: context)
+        return v
+    }
+
+    func updateNSView(_ v: ClickCatcherView, context: Context) {
+        v.toolTip = help
+        v.onHover = onHover
+        v.action = action
+    }
+}
+
+final class ClickCatcherView: NSView {
+    var onHover: (Bool) -> Void = { _ in }
+    var action: () -> Void = {}
+    private var tracking: NSTrackingArea?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        // activeAlways: the popover's app is never active.
+        let t = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(t)
+        tracking = t
+    }
+
+    override func mouseEntered(with event: NSEvent) { onHover(true) }
+    override func mouseExited(with event: NSEvent) { onHover(false) }
+
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {
+        guard bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
+        // The popover closes, so no exit event comes.
+        onHover(false)
+        action()
     }
 }
 
