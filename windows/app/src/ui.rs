@@ -888,7 +888,7 @@ fn more_menu(hwnd: HWND, anchor: R) {
                 let _ = DestroyWindow(hwnd);
                 crate::tray::update_action();
             }
-            M_QUIT => PostQuitMessage(0),
+            M_QUIT => crate::tray::request_quit(),
             _ => {}
         }
     }

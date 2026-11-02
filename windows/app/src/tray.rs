@@ -244,7 +244,7 @@ unsafe fn show_menu(hwnd: HWND) {
                 std::thread::spawn(|| setup::run(false));
             }
             ID_UPDATE => update_action(),
-            ID_QUIT => PostQuitMessage(0),
+            ID_QUIT => request_quit(),
             _ => {}
         }
     }
@@ -281,8 +281,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_CLOSE => {
                 // Close the agents' windows (and give borrowed ones back) before quitting.
-                engine::stop(None);
-                std::thread::sleep(Duration::from_millis(500));
+                engine::stop_for_quit(Duration::from_secs(10));
                 PostQuitMessage(0);
                 LRESULT(0)
             }

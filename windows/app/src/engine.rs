@@ -96,8 +96,15 @@ enum Job {
     Call(Request),
     /// The user is done with the window the agent handed them.
     HandBack,
-    /// Close the session's windows.
-    Stop,
+    /// Close the session's windows, then say so on the channel if there is one.
+    Stop(Option<mpsc::Sender<()>>),
+}
+
+/// Set when the app is quitting: batches stop between steps and waits end early.
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn quitting() -> bool {
+    QUITTING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Every session's queue, by session id.
@@ -133,7 +140,28 @@ fn send(session: Option<&str>, job: impl Fn() -> Job) {
 
 /// The tray's Stop: close the windows of one session, or all.
 pub fn stop(session: Option<&str>) {
-    send(session, || Job::Stop);
+    send(session, || Job::Stop(None));
+}
+
+/// Before the app quits (Quit, or an update): stop every session's call at the
+/// next step, close their windows and give borrowed ones back, and wait for
+/// that, `limit` at most.
+pub fn stop_for_quit(limit: Duration) {
+    QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (tx, rx) = mpsc::channel();
+    let mut sent = 0;
+    for q in queues().values() {
+        if q.send(Job::Stop(Some(tx.clone()))).is_ok() {
+            sent += 1;
+        }
+    }
+    let deadline = Instant::now() + limit;
+    for _ in 0..sent {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if rx.recv_timeout(left).is_err() {
+            break;
+        }
+    }
 }
 
 /// The tray's Done on a handoff: the window goes back to the agent.
@@ -213,9 +241,12 @@ fn run_session(id: String, rx: mpsc::Receiver<Job>) {
                     v.last_call = Some(Instant::now());
                 });
             }
-            Ok(Job::Stop) => {
+            Ok(Job::Stop(done)) => {
                 engine.stop_all();
                 engine.publish(|_| {});
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
             }
             Ok(Job::HandBack) => {
                 engine.hand_back();
@@ -298,13 +329,21 @@ impl Engine {
 
     /// Stop from the tray: close the windows agents opened, return borrowed ones.
     pub fn stop_all(&mut self) {
+        // Ask every opened window to close first, so they close together.
+        for w in self.windows.values().filter(|w| w.kind == Kind::Opened) {
+            unsafe {
+                let _ = PostMessageW(Some(w.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
         let ids: Vec<u64> = self.windows.keys().copied().collect();
         for id in ids {
             let mut args = Map::new();
             args.insert("window_id".into(), json!(id));
             let _ = self.release_window(&Args(&args));
         }
-        monitor::release(&self.id);
+        if self.windows.is_empty() {
+            monitor::release(&self.id);
+        }
     }
 
     /// The user is done with what the agent handed them: back to the agent's monitor.
@@ -686,12 +725,29 @@ impl Engine {
         Ok(POINT { x: f.left + x.round() as i32, y: f.top + y.round() as i32 })
     }
 
-    /// An element's center, if it's inside the window where a posted click lands.
+    /// An element's center, if it's inside the window or one of its popups,
+    /// where a posted click lands.
     fn element_point(&self, id: u64, n: &Node) -> Option<POINT> {
-        let f = win::frame(self.windows[&id].hwnd);
         let r = n.rect;
         let p = POINT { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 };
-        (r.right > r.left && r.bottom > r.top && p.x > f.left && p.x < f.right && p.y > f.top && p.y < f.bottom).then_some(p)
+        (r.right > r.left && r.bottom > r.top && self.target(id, p).is_some()).then_some(p)
+    }
+
+    /// The window a posted click at screen point `p` should go to: the topmost
+    /// of the agent's window and its app's popups (menus, dropdowns, which are
+    /// windows of their own) that has `p` inside. None if `p` misses them all.
+    fn target(&self, id: u64, p: POINT) -> Option<HWND> {
+        let w = &self.windows[&id];
+        let inside = |h: HWND| {
+            let f = win::frame(h);
+            p.x > f.left && p.x < f.right && p.y > f.top && p.y < f.bottom
+        };
+        // EnumWindows lists top-level windows from the top of the z-order down.
+        win::top_level_windows()
+            .into_iter()
+            .take_while(|h| *h != w.hwnd)
+            .find(|h| win::is_visible(*h) && win::pid_tid(*h).0 == w.pid && !win::is_app_window(*h) && inside(*h))
+            .or_else(|| inside(w.hwnd).then_some(w.hwnd))
     }
 
     fn click(&mut self, args: &Args) -> Fallible<ToolResult> {
@@ -706,7 +762,7 @@ impl Engine {
             // window when an element is invoked.
             if let Some(p) = self.element_point(id, &n) {
                 self.point_at(p);
-                input::click(hwnd, p, button, count)?;
+                input::click(self.target(id, p).unwrap_or(hwnd), p, button, count)?;
                 return Ok(ToolResult::ok(format!("Clicked element {} ({}) at its center.", n.index, snapshot::role_name(n.control_type))));
             }
             if button == input::Button::Left && count == 1
@@ -722,7 +778,7 @@ impl Engine {
         }
         let p = self.point(id, args)?;
         self.point_at(p);
-        input::click(hwnd, p, button, count)?;
+        input::click(self.target(id, p).unwrap_or(hwnd), p, button, count)?;
         Ok(ToolResult::ok(format!("Clicked at ({}, {}).", args.num("x").unwrap_or(0.0) as i64, args.num("y").unwrap_or(0.0) as i64)))
     }
 
@@ -736,7 +792,7 @@ impl Engine {
             let n = self.node(id, args)?;
             let p = self.element_point(id, &n).ok_or_else(|| format!("element {} is outside the visible window. Scroll it into view first.", n.index))?;
             self.point_at(p);
-            input::click(hwnd, p, input::Button::Left, 1)?;
+            input::click(self.target(id, p).unwrap_or(hwnd), p, input::Button::Left, 1)?;
             input::press_key(hwnd, input::key_for("end")?, &[input::modifier_for("ctrl")?])?;
         }
         input::type_text(hwnd, &text)?;
@@ -779,7 +835,7 @@ impl Engine {
             return Err("give dx or dy (lines; positive dy scrolls down)".into());
         }
         self.point_at(p);
-        input::scroll(hwnd, p, dx, dy)?;
+        input::scroll(self.target(id, p).unwrap_or(hwnd), p, dx, dy)?;
         Ok(ToolResult::ok(format!("Scrolled dx={dx} dy={dy}.")))
     }
 
@@ -851,17 +907,31 @@ impl Engine {
 
     fn release_window(&mut self, args: &Args) -> Fallible<ToolResult> {
         let id = args.need_int("window_id")? as u64;
-        let w = self.windows.remove(&id).ok_or_else(|| format!("window {id} isn't one of yours"))?;
+        let w = self.windows.get(&id).ok_or_else(|| format!("window {id} isn't one of yours"))?;
+        let keep = args.bool("keep_open").unwrap_or(false);
+        if w.kind == Kind::Opened && !keep {
+            // The app may ask first (unsaved changes): the window stays the
+            // agent's until it's really gone, so the agent can answer.
+            let hwnd = w.hwnd;
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            let t = Instant::now();
+            while win::exists(hwnd) && win::is_visible(hwnd) && t.elapsed() < Duration::from_millis(2000) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if win::exists(hwnd) && win::is_visible(hwnd) {
+                self.last_action.insert(id, Instant::now());
+                return Err(format!(
+                    "window {id} didn't close; the app may be asking something, like whether to save. Read it with get_window_state, answer, and call release_window again."
+                ));
+            }
+        }
+        let w = self.windows.remove(&id).unwrap();
         self.snapshots.remove(&id);
         guard::remove_agent_window(w.hwnd);
-        let keep = args.bool("keep_open").unwrap_or(false);
         let text = match w.kind {
-            Kind::Opened if !keep => {
-                unsafe {
-                    let _ = PostMessageW(Some(w.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-                }
-                format!("Closed window {id}.")
-            }
+            Kind::Opened if !keep => format!("Closed window {id}."),
             Kind::Borrowed => {
                 if let Some(r) = w.home {
                     unsafe {
@@ -910,9 +980,17 @@ impl Engine {
             if let Some(w) = Args(&step_args).int("window_id") {
                 last_window = Some(w);
             }
+            if quitting() {
+                lines.push(format!("Stopped before action {}: the app is quitting.", i + 1));
+                failed = true;
+                break;
+            }
             if tool == "wait" {
                 let ms = Args(&step_args).num("ms").unwrap_or(500.0).clamp(0.0, 5000.0);
-                std::thread::sleep(Duration::from_millis(ms as u64));
+                let until = Instant::now() + Duration::from_millis(ms as u64);
+                while Instant::now() < until && !quitting() {
+                    std::thread::sleep(Duration::from_millis(50).min(until - Instant::now()));
+                }
                 lines.push(format!("{}. wait: {} ms", i + 1, ms as u64));
                 continue;
             }
