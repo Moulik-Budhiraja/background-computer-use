@@ -58,6 +58,11 @@ public final class FocusGuard {
     private var holdTokens: Set<Int> = []
     private var nextHoldToken = 1
     private var holdSinceMs = 0.0
+    /// Keys whose key-down reached the app (passed or replayed) and whose
+    /// key-up hasn't yet: that key-up goes straight on, never held, so a
+    /// key's down and up are never split (a key held down that long is
+    /// what the system and the app see, and a key-up carries no text).
+    private var downDelivered: [Int64: Int] = [:]
     /// A drain is due again (it found key on an agent window).
     private var drainRetryScheduled = false
     /// Replaying held events; anything new queues behind them to keep order.
@@ -562,6 +567,7 @@ public final class FocusGuard {
             return event
         }
         if event.getIntegerValueField(.eventSourceUserData) == FocusGuard.replayMarker {
+            if type == .keyDown || type == .keyUp { noteDelivered(event, type) }
             return event
         }
         activity.note(type, event)
@@ -603,6 +609,15 @@ public final class FocusGuard {
                 if cmdTab { lastUserSwitchKeyMs = nowMs() }
                 lock.unlock()
             }
+            if type == .keyUp {
+                let code = event.getIntegerValueField(.keyboardEventKeycode)
+                lock.lock()
+                let isDown = { (e: CGEvent) in e.type == .keyDown && e.getIntegerValueField(.keyboardEventKeycode) == code }
+                let waiting = held.contains { isDown($0.event) } || pidHeld.values.contains { $0.events.contains(where: isDown) }
+                let delivered = (downDelivered[code] ?? 0) > 0 && !waiting
+                lock.unlock()
+                if delivered { return passKey(event, type) }
+            }
             lock.lock()
             let alreadyHolding = holding || !holdTokens.isEmpty || draining || !held.isEmpty
             let anySwap = !swapping.isEmpty || !pidHeld.isEmpty
@@ -629,7 +644,7 @@ public final class FocusGuard {
                 if mid { return nil }
             }
             // Nothing to protect against unless the agent is mid-action.
-            guard anyTaint else { return event }
+            guard anyTaint else { return passKey(event, type) }
             let front = BCUFrontProcessPID()
             if front != 0 && front != userFront && agentCaused(front) {
                 lock.lock(); if !holding { holding = true; holdingSinceMs = nowMs() }; lock.unlock()
@@ -637,10 +652,29 @@ public final class FocusGuard {
                 restoreUserFront(reason: "keystroke")
                 return nil
             }
-            return event
+            return passKey(event, type)
         default:
             return event
         }
+    }
+
+    /// A key event goes on to the app now.
+    private func passKey(_ event: CGEvent, _ type: CGEventType) -> CGEvent {
+        if type == .keyDown || type == .keyUp { noteDelivered(event, type) }
+        return event
+    }
+
+    private func noteDelivered(_ event: CGEvent, _ type: CGEventType) {
+        // Autorepeats of a key that's down add nothing to undo.
+        if type == .keyDown && event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return }
+        let code = event.getIntegerValueField(.keyboardEventKeycode)
+        lock.lock()
+        if type == .keyDown {
+            downDelivered[code, default: 0] += 1
+        } else if let n = downDelivered[code] {
+            downDelivered[code] = n > 1 ? n - 1 : nil
+        }
+        lock.unlock()
     }
 
     private static func isMouseDown(_ t: CGEventType) -> Bool {
