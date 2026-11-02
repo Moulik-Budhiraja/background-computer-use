@@ -148,7 +148,8 @@ final class UserSim {
             case "key":
                 if let (code, _) = try? KeyMap.code(for: a.string("key") ?? "escape") {
                     note("key \(a.string("key") ?? "")")
-                    key(code, down: true); sleepMs(a.double("hold_ms") ?? 60); key(code, down: false)
+                    let flags = KeyMap.flags(a.strings("modifiers") ?? [])
+                    key(code, down: true, flags: flags); sleepMs(a.double("hold_ms") ?? 60); key(code, down: false, flags: flags)
                 }
             case "click":
                 click(CGPoint(x: a.double("x") ?? 0, y: a.double("y") ?? 0), count: a.int("count") ?? 1, holdMs: a.double("hold_ms") ?? 70)
@@ -182,6 +183,7 @@ final class UserSim {
                 post(48, false, cmd); sleepMs(60)
                 post(55, false, [], .flagsChanged)
                 sleepMs(a.double("settle_ms") ?? 300)
+                note("front \(BCUFrontProcessPID())")
             case "watch_menu":
                 watchMenu(ms: a.double("ms") ?? 3000)
             default:
@@ -190,13 +192,13 @@ final class UserSim {
         }
     }
 
-    private func key(_ code: CGKeyCode, down: Bool, char: String? = nil) {
+    private func key(_ code: CGKeyCode, down: Bool, char: String? = nil, flags: CGEventFlags = []) {
         guard let e = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: down) else { return }
         if let char {
             let u = Array(char.utf16)
             e.keyboardSetUnicodeString(stringLength: u.count, unicodeString: u)
         }
-        e.flags = []
+        e.flags = flags
         postLock.lock(); e.post(tap: .cghidEventTap); postLock.unlock()
     }
 
@@ -207,9 +209,13 @@ final class UserSim {
         for ch in text {
             if shouldStop { break }
             note("key down")
-            key(0, down: true, char: String(ch))
+            // The key a person would press for it, so the system sees one
+            // physical key per character (and shift where it takes one).
+            let (code, shift) = (try? KeyMap.code(for: String(ch))) ?? (0, false)
+            let flags: CGEventFlags = shift ? .maskShift : []
+            key(code, down: true, char: String(ch), flags: flags)
             sleepMs(holdMs)
-            key(0, down: false, char: String(ch))
+            key(code, down: false, char: String(ch), flags: flags)
             var gap = max(0, intervalMs - holdMs) + Double.random(in: 0...max(0, jitterMs))
             if ch == " " { gap += Double.random(in: 0...max(0, wordPauseMs)) }
             sleepMs(gap)
