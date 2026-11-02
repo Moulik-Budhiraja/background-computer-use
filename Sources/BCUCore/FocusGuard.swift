@@ -193,10 +193,10 @@ public final class FocusGuard {
     /// Returns whether the cursor is near the agent display.
     @discardableResult
     private func checkCursor() -> Bool {
-        let displays = AgentDisplay.running
-        guard !displays.isEmpty, let p = CGEvent(source: nil)?.location else { return false }
-        guard let agent = displays.first(where: { $0.liveBounds.contains(p) })?.liveBounds else {
-            return displays.contains { $0.liveBounds.insetBy(dx: -400, dy: -400).contains(p) }
+        let fenced = AgentDisplay.fencedBounds
+        guard !fenced.isEmpty, let p = CGEvent(source: nil)?.location else { return false }
+        guard let agent = fenced.first(where: { $0.contains(p) }) else {
+            return fenced.contains { $0.insetBy(dx: -400, dy: -400).contains(p) }
         }
         let q = nearestUserPoint(p, agent: agent)
         CGWarpMouseCursorPosition(q)
@@ -669,7 +669,7 @@ public final class FocusGuard {
         switch type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .tabletPointer:
             let p = event.location
-            if let agent = AgentDisplay.containing(p)?.liveBounds {
+            if let agent = AgentDisplay.fenced(at: p) {
                 let q = nearestUserPoint(p, agent: agent)
                 event.location = q
                 CGWarpMouseCursorPosition(q)
@@ -682,7 +682,7 @@ public final class FocusGuard {
             return event
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             lock.lock(); lastUserMouseDownMs = nowMs(); let holdAll = !holdTokens.isEmpty || draining; let anySwap = !swapping.isEmpty; lock.unlock()
-            if AgentDisplay.containing(event.location) != nil { return nil }
+            if AgentDisplay.fenced(at: event.location) != nil { return nil }
             // A click now would make the user's window key mid-swap; hold it.
             if holdAll { hold(event); return nil }
             // Even in an app they weren't in: a click on its window would
@@ -694,7 +694,7 @@ public final class FocusGuard {
             if holdIt { hold(event); return nil }
             return event
         case .scrollWheel:
-            if AgentDisplay.containing(event.location) != nil { return nil }
+            if AgentDisplay.fenced(at: event.location) != nil { return nil }
             return event
         case .keyDown, .keyUp, .flagsChanged:
             let cmdTab = type != .flagsChanged && event.flags.contains(.maskCommand) && event.getIntegerValueField(.keyboardEventKeycode) == 48
@@ -1036,7 +1036,7 @@ public final class FocusGuard {
     private func nearestUserPoint(_ p: CGPoint, agent: CGRect) -> CGPoint {
         var best = p
         var bestDistance = CGFloat.infinity
-        let agents = AgentDisplay.running.map(\.liveBounds)
+        let agents = AgentDisplay.fencedBounds
         for id in AgentDisplay.userDisplayIDs() {
             let r = CGDisplayBounds(id)
             // Skip any display that overlaps the agent's (mirroring, mid-rearrangement).
@@ -1048,8 +1048,10 @@ public final class FocusGuard {
             if d < bestDistance { bestDistance = d; best = q }
         }
         if bestDistance == .infinity {
-            let main = CGDisplayBounds(CGMainDisplayID())
-            return CGPoint(x: main.midX, y: main.midY)
+            // Not the main display: with the user's asleep, that can be an agent's.
+            guard let id = AgentDisplay.userDisplayIDs().first else { return p }
+            let r = CGDisplayBounds(id)
+            return CGPoint(x: r.midX, y: r.midY)
         }
         return best
     }

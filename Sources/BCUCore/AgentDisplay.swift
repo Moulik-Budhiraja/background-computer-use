@@ -51,6 +51,52 @@ public final class AgentDisplay {
         running.first { $0.liveBounds.contains(p) }
     }
 
+    // MARK: Stray displays
+
+    /// What every BCU virtual display reports to macOS (see VirtualDisplay.m).
+    static let vendorID: UInt32 = 0xBC0F
+    static let productID: UInt32 = 0xBC01
+
+    static func isBCUDisplay(_ id: CGDirectDisplayID) -> Bool {
+        CGDisplayVendorNumber(id) == vendorID && CGDisplayModelNumber(id) == productID
+    }
+
+    private static var strayCache: (atMs: Double, ids: [CGDirectDisplayID]) = (-1, [])
+
+    /// BCU displays this process didn't make: left behind by a copy of the
+    /// app that crashed (macOS can keep them with no owner until logout).
+    /// They're as invisible to the user as ours, so the cursor is fenced
+    /// off them too. Cached briefly: the input tap asks on every mouse move.
+    public static var strayIDs: [CGDirectDisplayID] {
+        let now = nowMs()
+        registryLock.lock()
+        if now - strayCache.atMs < 250 { let ids = strayCache.ids; registryLock.unlock(); return ids }
+        let ours = Set(registry.compactMap { $0.display?.displayID })
+        registryLock.unlock()
+        let ids = onlineDisplayIDs().filter { !ours.contains($0) && isBCUDisplay($0) }
+        registryLock.lock()
+        strayCache = (now, ids)
+        registryLock.unlock()
+        return ids
+    }
+
+    /// Every display the cursor must stay off: ours and strays.
+    public static var fencedBounds: [CGRect] {
+        running.map(\.liveBounds) + strayIDs.map { CGDisplayBounds($0) }
+    }
+
+    /// The fenced display a global point is on.
+    public static func fenced(at p: CGPoint) -> CGRect? {
+        fencedBounds.first { $0.contains(p) }
+    }
+
+    private static func onlineDisplayIDs() -> [CGDirectDisplayID] {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 32)
+        var count: UInt32 = 0
+        CGGetOnlineDisplayList(32, &ids, &count)
+        return Array(ids.prefix(Int(count)))
+    }
+
     private static var callbackInstalled = false
 
     // MARK: How many at once
@@ -143,7 +189,20 @@ public final class AgentDisplay {
         guard display == nil else { return }
         self.slot = slot
         let name = slot == 0 ? "Agent Display" : "Agent Display \(slot + 1)"
-        guard let vd = BCUVirtualDisplay(name: name, width: UInt32(width), height: UInt32(height), ppi: 110, serial: 0x4243_5532 + UInt32(slot)) else {
+        // macOS refuses a second display with a serial that's still online,
+        // which a stray display from a crashed copy can hold until logout.
+        // Spare serials sit past every slot's own.
+        let base: UInt32 = 0x4243_5532
+        let serials = [base + UInt32(slot)] + (1...8).map { base + UInt32(slot) + UInt32($0) * 16 }
+        var made: BCUVirtualDisplay?
+        for serial in serials {
+            made = BCUVirtualDisplay(name: name, width: UInt32(width), height: UInt32(height), ppi: 110, serial: serial)
+            if made != nil {
+                if serial != serials[0] { Log.info("agent display serial \(String(serials[0], radix: 16)) taken; used \(String(serial, radix: 16))") }
+                break
+            }
+        }
+        guard let vd = made else {
             throw ToolError("could not create the virtual display")
         }
         display = vd
@@ -153,6 +212,7 @@ public final class AgentDisplay {
         Self.registryLock.lock()
         Self.registry.removeAll { $0.display == nil || $0.display === self }
         Self.registry.append(Ref(self))
+        Self.strayCache.atMs = -1
         if !Self.callbackInstalled {
             Self.callbackInstalled = true
             CGDisplayRegisterReconfigurationCallback(reconfigurationCallback, nil)
@@ -190,6 +250,7 @@ public final class AgentDisplay {
         bounds = .zero
         Self.registryLock.lock()
         Self.registry.removeAll { $0.display == nil || $0.display === self }
+        Self.strayCache.atMs = -1
         Self.registryLock.unlock()
         Log.info("agent display \(slot + 1) (\(id)) removed")
         // The ones after it move up the staircase.
@@ -201,23 +262,39 @@ public final class AgentDisplay {
         Self.userDisplayIDs()
     }
 
+    /// The user's real displays: every active display that isn't a BCU
+    /// one. While all of them sleep none is active, so then the online ones,
+    /// which keep their places.
     public static func userDisplayIDs() -> [CGDirectDisplayID] {
-        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var ids = [CGDirectDisplayID](repeating: 0, count: 32)
         var count: UInt32 = 0
-        CGGetActiveDisplayList(16, &ids, &count)
+        CGGetActiveDisplayList(32, &ids, &count)
         let agents = Set(running.map(\.displayID))
-        return Array(ids.prefix(Int(count))).filter { !agents.contains($0) }
+        let active = Array(ids.prefix(Int(count))).filter { !agents.contains($0) && !isBCUDisplay($0) }
+        if !active.isEmpty { return active }
+        return onlineDisplayIDs().filter { !agents.contains($0) && !isBCUDisplay($0) }
     }
 
     /// Where this display goes: at the bottom-right corner of the agent
     /// display before it, or of the user's displays for the first.
-    private func anchor() -> CGPoint {
+    /// Stray displays sitting on the staircase are stepped over. nil when
+    /// there's nowhere to put it (no user display at all).
+    private func anchor() -> CGPoint? {
+        var corner: CGPoint
         if let before = Self.running.filter({ $0.slot < slot && $0 !== self }).last {
             let b = CGDisplayBounds(before.displayID)
-            return CGPoint(x: b.maxX, y: b.maxY)
+            corner = CGPoint(x: b.maxX, y: b.maxY)
+        } else {
+            let user = computeUserBounds()
+            guard !user.isNull, user.maxX.isFinite, user.maxY.isFinite else { return nil }
+            corner = CGPoint(x: user.maxX, y: user.maxY)
         }
-        let user = computeUserBounds()
-        return CGPoint(x: user.maxX, y: user.maxY)
+        var strays = Self.strayIDs.filter { $0 != displayID }.map { CGDisplayBounds($0) }
+        while let i = strays.firstIndex(where: { $0.origin == corner }) {
+            corner = CGPoint(x: strays[i].maxX, y: strays[i].maxY)
+            strays.remove(at: i)
+        }
+        return corner
     }
 
     private func computeUserBounds() -> CGRect {
@@ -243,9 +320,14 @@ public final class AgentDisplay {
 
     fileprivate func place() {
         userBounds = computeUserBounds()
+        guard let origin = anchor(), abs(origin.x) < 1e6, abs(origin.y) < 1e6 else {
+            // Placed once a user display shows up (see `reconfigured`).
+            bounds = CGDisplayBounds(displayID)
+            Log.info("agent display not placed: no user display")
+            return
+        }
         var config: CGDisplayConfigRef?
         CGBeginDisplayConfiguration(&config)
-        let origin = anchor()
         CGConfigureDisplayOrigin(config, displayID, Int32(origin.x), Int32(origin.y))
         let err = CGCompleteDisplayConfiguration(config, .forSession)
         if err != .success { Log.info("configure display origin failed: \(err.rawValue)") }
@@ -260,7 +342,7 @@ public final class AgentDisplay {
         let user = computeUserBounds()
         let b = CGDisplayBounds(displayID)
         let wanted = anchor()
-        if user != userBounds || b.origin != wanted {
+        if user != userBounds || wanted == nil || b.origin != wanted {
             place()
             Log.info("agent display re-placed at \(bounds.short)")
         }
