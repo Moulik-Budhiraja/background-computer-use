@@ -1339,7 +1339,7 @@ public final class Engine {
             do {
                 try keyed(w, cause: "typing") { check in
                     let start = nowMs()
-                    let n = try Input.typeText(pid: w.pid, piece) { i in
+                    let n = try Input.typeText(pid: w.pid, piece, windowID: w.id) { i in
                         sent = i
                         // Keep each swap short: the user's input may be held meanwhile.
                         if i > 0 && nowMs() - start > Self.typeChunkMs { return false }
@@ -1524,7 +1524,7 @@ public final class Engine {
         let mods = args.strings("modifiers") ?? []
         try keyed(w, cause: "pressing \((mods + [key]).joined(separator: "+"))") { check in
             try check()
-            try Input.pressKey(pid: w.pid, key: key, modifiers: mods)
+            try Input.pressKey(pid: w.pid, key: key, modifiers: mods, windowID: w.id)
         }
         return ToolResult(text: "Pressed \((mods + [key]).joined(separator: "+")).")
     }
