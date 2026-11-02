@@ -808,6 +808,9 @@ public final class Engine {
     private static let coverGapMs = 500.0
     private static let coverMaxMs = 1000.0
     private static let inFlightMs = 60.0
+    /// Captures of the user's window before going without a copy, when
+    /// they keep typing through each one.
+    private static let captureTries = 3
     /// Keystroke typing goes in swaps of at most this many characters and this long.
     private static let typeChunk = 16
     private static let typeChunkMs = 400.0
@@ -815,20 +818,35 @@ public final class Engine {
     /// Hold the user's input and cover their window, which is about to be
     /// drawn inactive for a moment.
     private func openCover(_ w: AgentWindow, cause: String) {
-        let hold = focusGuard.beginHold()
-        // A key the user pressed just before the hold is still being drawn:
-        // let it land first, or the copy would never match their window
-        // again and stay up until it times out.
-        let sinceInput = nowMs() - focusGuard.activity.snapshot.lastInputMs
-        if sinceInput < Self.inFlightMs { sleepMs(Self.inFlightMs - sinceInput) }
-        focusGuard.reclaimKey(w.pid)
+        // Capture the copy before holding the user's input, not after: a
+        // capture can keep WindowServer busy for 100 ms or more on a busy
+        // machine, and their input shouldn't wait on that. If they type
+        // during the capture, the copy is out of date, so capture again
+        // (or go without one).
+        var hold: Int?
         var freeze: ScreenFreeze?
         var userWindow: CGWindowID?
-        if let key = AX.focusedWindowID(w.pid), key != w.id, !FocusGuard.onAgentDisplay(key) {
+        for _ in 0..<Self.captureTries {
+            // A key the user pressed just now is still being drawn: let it
+            // land first, or the copy would never match their window again
+            // and stay up until it times out.
+            let sinceInput = nowMs() - focusGuard.activity.snapshot.lastInputMs
+            if sinceInput < Self.inFlightMs { sleepMs(Self.inFlightMs - sinceInput) }
+            focusGuard.reclaimKey(w.pid)
+            guard let key = AX.focusedWindowID(w.pid), key != w.id, !FocusGuard.onAgentDisplay(key) else { break }
             userWindow = key
-            freeze = ScreenFreeze.begin(userWindow: key)
+            let start = nowMs()
+            let shots = ScreenFreeze.capture(userWindow: key)
+            let h = focusGuard.beginHold()
+            if focusGuard.activity.snapshot.lastInputMs < start {
+                hold = h
+                if let shots { freeze = ScreenFreeze.show(shots) }
+                break
+            }
+            focusGuard.endHold(h)
         }
-        cover = SwapCover(pid: w.pid, freeze: freeze, hold: hold, userWindow: userWindow ?? focusGuard.userWindow(of: w.pid),
+        let held = hold ?? focusGuard.beginHold()
+        cover = SwapCover(pid: w.pid, freeze: freeze, hold: held, userWindow: userWindow ?? focusGuard.userWindow(of: w.pid),
                           openedMs: nowMs(), lastUsedMs: nowMs())
         UserSim.shared.coverOpened(cause)
     }

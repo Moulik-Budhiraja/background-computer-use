@@ -57,9 +57,24 @@ final class ScreenFreeze {
     /// How long to wait for the main thread to put the copies up.
     private static let mainDeadlineMs: Double = 150
 
+    /// The copies `show` puts up, captured beforehand.
+    struct Shots {
+        fileprivate let shots: [(image: CGImage, own: CGImage, rect: CGRect, id: CGWindowID, level: NSWindow.Level, chrome: [CGRect]?, size: CGSize)]
+        fileprivate let startMs: Double
+        let captureMs: Double
+    }
+
     /// Cover `userWindow` (the app's key window, on the user's display) and
     /// the menu bar above it. Nil when neither is on screen.
     static func begin(userWindow: CGWindowID) -> ScreenFreeze? {
+        guard let shots = capture(userWindow: userWindow) else { return nil }
+        return show(shots)
+    }
+
+    /// Capture the user's window and the menu bars. This is WindowServer
+    /// work that usually takes 15-45 ms but can take over a second on a
+    /// busy machine, so callers do it before holding the user's input.
+    static func capture(userWindow: CGWindowID) -> Shots? {
         let t0 = nowMs()
         guard let info = WindowList.info(userWindow), info.onScreen, info.alpha > 0,
               !AgentDisplay.running.contains(where: { $0.liveBounds.intersects(info.bounds) }) else { return nil }
@@ -111,7 +126,13 @@ final class ScreenFreeze {
             }
         }
         guard !shots.isEmpty else { return nil }
-        let t1 = nowMs()
+        return Shots(shots: shots, startMs: t0, captureMs: nowMs() - t0)
+    }
+
+    /// Put captured copies up over the windows they show.
+    static func show(_ captured: Shots) -> ScreenFreeze? {
+        let shots = captured.shots
+        let t0 = captured.startMs
         let freeze = ScreenFreeze()
         let showing = Showing()
         let shown = DispatchSemaphore(value: 0)
@@ -155,7 +176,7 @@ final class ScreenFreeze {
             freeze.covers.append(Cover(panel: panel, windowID: shot.id, own: shot.own, chrome: shot.chrome, size: shot.size))
         }
         freeze.shownMs = nowMs() - t0
-        freeze.captureMs = t1 - t0
+        freeze.captureMs = captured.captureMs
         // While WindowServer puts them on screen.
         let up = nowMs()
         for i in freeze.covers.indices { freeze.covers[i].before = freeze.covers[i].print(freeze.covers[i].own) }
