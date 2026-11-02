@@ -6,3 +6,6 @@ jobs:
   release:
     uses: Moulik-Budhiraja/app-hosting/.github/workflows/release-mac.yml@main
     secrets: inherit
+  windows:
+    uses: Moulik-Budhiraja/app-hosting/.github/workflows/release-windows.yml@main
+    secrets: inherit

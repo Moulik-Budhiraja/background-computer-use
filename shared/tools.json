@@ -1,0 +1,506 @@
+[
+  {
+    "name": "status",
+    "description": "Display size, the user's default browser, permissions, pause state and your open windows.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "list_apps",
+    "description": {
+      "macos": "Running apps with their pid, bundle id and window count.",
+      "windows": "Running apps with their pid, executable name and window count."
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "open_window",
+    "description": "Open a NEW window of an app on your virtual display and return its window_id. Launches the app if needed. The user's existing windows are untouched. For browsers this is a new window in the user's own profile, signed in to the user's accounts. Open only apps and sites whose accounts the user has allowed for this task.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "app": {
+          "type": "string",
+          "description": {
+            "macos": "App name (e.g. \"Helium\", \"Notes\") or bundle id.",
+            "windows": "App name (e.g. \"Helium\", \"Notepad\") or executable name (e.g. \"notepad.exe\")."
+          }
+        }
+      },
+      "required": [
+        "app"
+      ]
+    }
+  },
+  {
+    "name": "list_windows",
+    "description": "Your windows. With `app`, also lists that app's other windows so you can pick one to borrow.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "app": {
+          "type": "string",
+          "description": {
+            "macos": "Optional app name or bundle id.",
+            "windows": "Optional app name or executable name."
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "borrow_window",
+    "description": "Move one of the user's existing windows onto your display. Use only for single-window apps whose accounts the user has allowed for this task; release_window puts it back exactly where it was.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "window_id": {
+          "type": "integer",
+          "description": "Window id from list_windows."
+        }
+      },
+      "required": [
+        "window_id"
+      ]
+    }
+  },
+  {
+    "name": "release_window",
+    "description": "Finish with a window: closes windows you opened, returns borrowed ones to the user.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "keep_open": {
+          "type": "boolean",
+          "description": "Leave an opened window open on your display instead of closing it."
+        },
+        "window_id": {
+          "type": "integer",
+          "description": "Your window."
+        }
+      },
+      "required": [
+        "window_id"
+      ]
+    }
+  },
+  {
+    "name": "get_window_state",
+    "description": "Accessibility tree of your window with numbered elements, plus a screenshot. An element keeps its number while it exists. After the first read of a window this lists only what changed since your last read (- removed, + added, ~ changed) unless you pass full=true; when most elements are new (another page) it lists everything and numbering restarts. Waits for the window to settle after an action.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "full": {
+          "type": "boolean",
+          "description": "List every element instead of the changes (default false)."
+        },
+        "max_elements": {
+          "type": "integer",
+          "description": "Cap on listed elements (default 250)."
+        },
+        "screenshot": {
+          "type": "boolean",
+          "description": "Include a screenshot (default true)."
+        },
+        "window_id": {
+          "type": "integer",
+          "description": "Your window."
+        }
+      },
+      "required": [
+        "window_id"
+      ]
+    }
+  },
+  {
+    "name": "screenshot",
+    "description": "Screenshot of one of your windows, or of your whole display when window_id is omitted.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "window_id": {
+          "type": "integer",
+          "description": "Optional window."
+        }
+      }
+    }
+  },
+  {
+    "name": "click",
+    "description": {
+      "macos": "Click an element (by number) or a point (x, y in window points). Element clicks use accessibility actions when the element supports them. A point click takes key focus in the app for a moment, so while the user is in that app it first waits for a pause in their input (see priority).",
+      "windows": "Click an element (by number) or a point (x, y in window points). Element clicks use accessibility actions when the element supports them."
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "button": {
+          "type": "string",
+          "description": "left (default) or right."
+        },
+        "count": {
+          "type": "integer",
+          "description": "1 (default) or 2 for double-click."
+        },
+        "element": {
+          "type": "integer",
+          "description": "Element number from get_window_state."
+        },
+        "priority": {
+          "type": "string",
+          "description": {
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.",
+            "windows": "Ignored on Windows, where steps never wait for the user."
+          }
+        },
+        "window_id": {
+          "type": "integer",
+          "description": "Your window."
+        },
+        "x": {
+          "type": "number",
+          "description": "Window-relative x, if no element."
+        },
+        "y": {
+          "type": "number",
+          "description": "Window-relative y, if no element."
+        }
+      },
+      "required": [
+        "window_id"
+      ]
+    }
+  },
+  {
+    "name": "set_value",
+    "description": "Replace the value of a text field, slider or similar element through accessibility. Never touches keyboard focus.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "element": {
+          "type": "integer",
+          "description": "Element number."
+        },
+        "value": {
+          "type": "string",
+          "description": "New value."
+        },
+        "window_id": {
+          "type": "integer",
+          "description": "Your window."
+        }
+      },
+      "required": [
+        "window_id",
+        "element",
+        "value"
+      ]
+    }
+  },
+  {
+    "name": "perform_action",
+    "description": {
+      "macos": "Perform a named accessibility action on an element, e.g. AXPress, AXShowMenu, AXConfirm, AXIncrement, AXDecrement, AXRaise, AXCancel.",
+      "windows": "Perform a named UI Automation action on an element, e.g. Invoke, Toggle, Expand, Collapse, Select, ScrollIntoView, Focus."
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "Action name from the element's action list."
+        },
+        "element": {
+          "type": "integer",
+          "description": "Element number."
+        },
+        "window_id": {
+          "type": "integer",
+          "description": "Your window."
+        }
+      },
+      "required": [
+        "window_id",
+        "element",
+        "action"
+      ]
+    }
+  },
+  {
+    "name": "type_text",
+    "description": "Type text into your window. With `element`, that element is focused first. Uses accessibility insertion when it works, otherwise keystrokes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "element": {
+          "type": "integer",
+          "description": "Optional element to focus first."
+        },
+        "priority": {
+          "type": "string",
+          "description": {
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.",
+            "windows": "Ignored on Windows, where steps never wait for the user."
+          }
+        },
+        "text": {
+          "type": "string",
+          "description": "Text to type. \\n presses Return."
+        },
+        "window_id": {
+          "type": "integer",
+          "description": "Your window."
+        }
+      },
+      "required": [
+        "window_id",
+        "text"
+      ]
+    }
+  },
+  {
+    "name": "press_key",
+    "description": {
+      "macos": "Press a key or shortcut in your window, e.g. key \"return\", or key \"l\" with modifiers [\"cmd\"]. While the user is in the same app it first waits for a pause in their input (see priority).",
+      "windows": "Press a key or shortcut in your window, e.g. key \"return\", or key \"l\" with modifiers [\"ctrl\"]."
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "Key name: a letter or digit, return, tab, space, escape, delete, forward_delete, up, down, left, right, home, end, page_up, page_down, f1-f12, or a punctuation character."
+        },
+        "modifiers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": {
+            "macos": "Any of cmd, shift, option, ctrl, fn.",
+            "windows": "Any of ctrl, shift, alt, win."
+          }
+        },
+        "priority": {
+          "type": "string",
+          "description": {
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.",
+            "windows": "Ignored on Windows, where steps never wait for the user."
+          }
+        },
+        "window_id": {
+          "type": "integer",
+          "description": "Your window."
+        }
+      },
+      "required": [
+        "window_id",
+        "key"
+      ]
+    }
+  },
+  {
+    "name": "scroll",
+    "description": "Scroll in your window at an element or point. Positive dy scrolls down.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "dx": {
+          "type": "integer",
+          "description": "Horizontal lines (positive = right)."
+        },
+        "dy": {
+          "type": "integer",
+          "description": "Vertical lines (positive = down)."
+        },
+        "element": {
+          "type": "integer",
+          "description": "Optional element to scroll at."
+        },
+        "window_id": {
+          "type": "integer",
+          "description": "Your window."
+        },
+        "x": {
+          "type": "number",
+          "description": "Window-relative x."
+        },
+        "y": {
+          "type": "number",
+          "description": "Window-relative y."
+        }
+      },
+      "required": [
+        "window_id"
+      ]
+    }
+  },
+  {
+    "name": "drag",
+    "description": "Drag from one window point to another.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "from_x": {
+          "type": "number"
+        },
+        "from_y": {
+          "type": "number"
+        },
+        "priority": {
+          "type": "string",
+          "description": {
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.",
+            "windows": "Ignored on Windows, where steps never wait for the user."
+          }
+        },
+        "to_x": {
+          "type": "number"
+        },
+        "to_y": {
+          "type": "number"
+        },
+        "window_id": {
+          "type": "integer",
+          "description": "Your window."
+        }
+      },
+      "required": [
+        "window_id",
+        "from_x",
+        "from_y",
+        "to_x",
+        "to_y"
+      ]
+    }
+  },
+  {
+    "name": "press_menu_item",
+    "description": "Choose a menu bar item of the window's app, applied to your window, e.g. path [\"File\", \"Save…\"].",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Menu titles from the menu bar down."
+        },
+        "priority": {
+          "type": "string",
+          "description": {
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.",
+            "windows": "Ignored on Windows, where steps never wait for the user."
+          }
+        },
+        "window_id": {
+          "type": "integer",
+          "description": "Your window."
+        }
+      },
+      "required": [
+        "window_id",
+        "path"
+      ]
+    }
+  },
+  {
+    "name": "handoff",
+    "description": {
+      "macos": "Ask the user to take over a window (a sign-in, a password or 2FA code, a decision). Moves it onto the user's screen without activating it and shows your reason in the menu bar. Stop after calling this.",
+      "windows": "Ask the user to take over a window (a sign-in, a password or 2FA code, a decision). Moves it onto the user's screen without activating it and shows your reason in the tray. Stop after calling this."
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "description": "One sentence for the user."
+        },
+        "window_id": {
+          "type": "integer",
+          "description": "Your window."
+        }
+      },
+      "required": [
+        "window_id",
+        "reason"
+      ]
+    }
+  },
+  {
+    "name": "take_back",
+    "description": "Move a handed-off window back onto your display once the user is done.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "window_id": {
+          "type": "integer",
+          "description": "Your window."
+        }
+      },
+      "required": [
+        "window_id"
+      ]
+    }
+  },
+  {
+    "name": "batch",
+    "description": {
+      "macos": "Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {\"tool\": \"click\", \"element\": 6}, {\"tool\": \"type_text\", \"text\": \"example.com\\n\"}, {\"tool\": \"wait\", \"ms\": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, wait. Element numbers refer to your last get_window_state. Steps that take key focus in an app the user is in wait for a pause in their input once, and back-to-back steps like that then run together.",
+      "windows": "Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {\"tool\": \"click\", \"element\": 6}, {\"tool\": \"type_text\", \"text\": \"example.com\\n\"}, {\"tool\": \"wait\", \"ms\": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, wait. Element numbers refer to your last get_window_state."
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "actions": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Up to 40 actions: {\"tool\": name, ...that tool's arguments}."
+        },
+        "full": {
+          "type": "boolean",
+          "description": "List every element in that state instead of the changes (default false)."
+        },
+        "priority": {
+          "type": "string",
+          "description": {
+            "macos": "\"now\" for every action that doesn't set its own priority: no waiting for the user. Only for steps that can't wait.",
+            "windows": "Ignored on Windows, where steps never wait for the user."
+          }
+        },
+        "screenshot": {
+          "type": "boolean",
+          "description": "Include a screenshot with that state (default false)."
+        },
+        "state": {
+          "type": "boolean",
+          "description": "Read the window's state after the actions (default true)."
+        },
+        "window_id": {
+          "type": "integer",
+          "description": "Window for every action that doesn't set its own window_id."
+        }
+      },
+      "required": [
+        "actions"
+      ]
+    }
+  },
+  {
+    "name": "guard_report",
+    "description": "Focus-guard events: anything that touched the user's focus, cursor or screen, with the action that caused it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  }
+]

@@ -1,0 +1,15 @@
+[package]
+name = "background-computer-use"
+version = "0.1.0"
+edition = "2024"
+description = "The tray app. Owns the agent monitor, the agents' windows and the focus guard, and serves tool calls over a named pipe."
+
+[[bin]]
+name = "BackgroundComputerUse"
+path = "src/main.rs"
+
+[dependencies]
+windows.workspace = true
+png.workspace = true
+serde_json.workspace = true
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }

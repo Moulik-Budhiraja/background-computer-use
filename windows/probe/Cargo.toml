@@ -1,0 +1,9 @@
+[package]
+name = "bcu-probe"
+version = "0.1.0"
+edition = "2024"
+description = "Measures what Windows allows for background computer use, before the app is built on it."
+
+[dependencies]
+windows.workspace = true
+png.workspace = true
