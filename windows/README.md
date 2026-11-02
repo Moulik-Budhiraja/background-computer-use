@@ -35,7 +35,13 @@ End to end (`probe/phase0/e2e.ps1`): with a simulated user typing three sentence
 
 Built: the MCP server (`bcu.exe mcp`), the pipe between it and the app, the UI Automation listing and diff, posted click/type/key/scroll/drag, set_value, perform_action, batch, screenshots, open_window, borrow_window, release_window, handoff/take_back, the focus guard, a monitor and thread per agent session, the tray icon and its live preview, and a first-run setup (one prompt, then the driver install with Windows' admin prompt, `bcu connect` for Claude Code and Codex, and start at sign-in).
 
-Not yet: taking over an agent's monitor from the expanded view, `press_menu_item`, sound, crash cleanup, testing on a real PC with a real agent, updates and releases. A fifth agent at once shares a monitor with another.
+Not yet: taking over an agent's monitor from the expanded view, `press_menu_item`, sound, crash cleanup, testing on a real PC with a real agent. A fifth agent at once shares a monitor with another.
+
+## Install, updates and releases
+
+- **Installer.** `BackgroundComputerUse-Setup-X.Y.Z.exe` (`setup/`) installs for the current user, with no admin prompt, in `%LOCALAPPDATA%\Programs\Background Computer Use`, with a Start menu shortcut and an entry in Settings > Apps. It closes a running copy first, and moves a file that's in use (an agent's `bcu.exe`) aside instead of failing. Uninstalling removes the app but leaves the monitor driver.
+- **Updates.** Like the Mac app: the app checks app-hosting's `appcast-windows.xml` an hour apart, downloads a newer installer, checks its Ed25519 signature against the same key the Mac app's Sparkle uses, and installs it once no agent has a window or a call in the last minute. The tray menus have "Check for updates" and, when one is ready, "Restart to update".
+- **Releases.** A `vX.Y.Z` tag releases both apps: `apps.json` `builds.windows` runs `build.ps1` on app-hosting's Windows runner, which builds, signs the exes with Artifact Signing, and packs the installer; the workflow signs and publishes it. Pull requests that touch the Windows app build it the same way on GitHub's runner (`.github/workflows/windows.yml`).
 
 ## Build
 

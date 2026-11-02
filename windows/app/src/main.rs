@@ -18,6 +18,7 @@ mod setup;
 mod snapshot;
 mod tray;
 mod ui;
+mod updater;
 mod win;
 
 use windows::Win32::Foundation::{HWND, RECT};
@@ -46,8 +47,13 @@ fn main() {
         }
         return;
     }
+    if args.first().map(String::as_str) == Some("--uninstall") {
+        setup::uninstall(args.iter().any(|a| a == "--silent"));
+        return;
+    }
     guard::start();
     gfx::startup();
+    updater::start(tray::request_quit);
     println!("serving {}", pipe::pipe_name());
     std::thread::spawn(move || {
         if let Err(e) = pipe::serve() {

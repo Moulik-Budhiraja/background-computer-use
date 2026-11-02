@@ -1,0 +1,12 @@
+[package]
+name = "bcu-setup"
+version = "0.1.0"
+edition = "2024"
+description = "The installer: installs the app for the current user, and updates it in place."
+
+[[bin]]
+name = "BackgroundComputerUse-Setup"
+path = "src/main.rs"
+
+[dependencies]
+windows.workspace = true

@@ -122,3 +122,59 @@ fn start_at_sign_in() {
         );
     }
 }
+
+/// Where the installer puts the app, under %LOCALAPPDATA%\Programs.
+const INSTALL_DIR_NAME: &str = "Background Computer Use";
+const UNINSTALL_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\BackgroundComputerUse");
+
+/// Uninstall (from Settings > Apps): quit the running app, remove the
+/// shortcut, sign-in entry and uninstall entry, then the app's folder once
+/// this process has exited. The agent monitors' driver stays installed.
+pub fn uninstall(silent: bool) {
+    if !silent {
+        let answer = unsafe { MessageBoxW(None, w!("Uninstall Background Computer Use?"), w!("Background Computer Use"), MB_OKCANCEL | MB_ICONINFORMATION) };
+        if answer != IDOK {
+            return;
+        }
+    }
+    quit_running();
+    set_start_at_sign_in(false);
+    unsafe {
+        let _ = windows::Win32::System::Registry::RegDeleteTreeW(HKEY_CURRENT_USER, UNINSTALL_KEY);
+    }
+    if let Some(start_menu) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        let _ = std::fs::remove_file(start_menu.join(r"Microsoft\Windows\Start Menu\Programs\Background Computer Use.lnk"));
+    }
+    let dir = exe_dir();
+    // Only the installed copy deletes its folder.
+    if dir.file_name().is_some_and(|n| n == INSTALL_DIR_NAME) {
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        let _ = std::process::Command::new("cmd")
+            .raw_arg(format!("/c ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{}\"", dir.display()))
+            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+            .current_dir(std::env::temp_dir())
+            .spawn();
+    }
+}
+
+/// Ask another running copy of the app to quit, and wait for it (10 s at most).
+fn quit_running() {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId, PostMessageW, WM_CLOSE};
+    unsafe {
+        let Ok(hwnd) = FindWindowW(w!("BackgroundComputerUseTray"), PCWSTR::null()) else { return };
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == std::process::id() {
+            return;
+        }
+        let process = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, pid).ok();
+        let _ = PostMessageW(Some(hwnd), WM_CLOSE, Default::default(), Default::default());
+        if let Some(p) = process {
+            if WaitForSingleObject(p, 10_000) != WAIT_OBJECT_0 {
+                let _ = TerminateProcess(p, 0);
+            }
+            let _ = CloseHandle(p);
+        }
+    }
+}

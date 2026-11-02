@@ -851,6 +851,7 @@ unsafe extern "system" fn popover_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
 const M_LOGIN: usize = 1;
 const M_SETUP: usize = 2;
 const M_QUIT: usize = 3;
+const M_UPDATE: usize = 4;
 
 /// ⋯: open at sign-in, setup, quit.
 fn more_menu(hwnd: HWND, anchor: R) {
@@ -859,6 +860,14 @@ fn more_menu(hwnd: HWND, anchor: R) {
         let login = setup::starts_at_sign_in();
         let _ = AppendMenuW(menu, MF_STRING | if login { MF_CHECKED } else { MF_UNCHECKED }, M_LOGIN, w!("Open at sign-in"));
         let _ = AppendMenuW(menu, MF_STRING, M_SETUP, w!("Set up…"));
+        let update: Vec<u16> = match crate::updater::pending() {
+            Some(v) => format!("Restart to update to {v}"),
+            None => "Check for updates".into(),
+        }
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+        let _ = AppendMenuW(menu, MF_STRING, M_UPDATE, PCWSTR(update.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let size: Vec<u16> = "Agent screens 1600 × 1000".encode_utf16().chain(std::iter::once(0)).collect();
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(size.as_ptr()));
@@ -874,6 +883,10 @@ fn more_menu(hwnd: HWND, anchor: R) {
             M_SETUP => {
                 let _ = DestroyWindow(hwnd);
                 std::thread::spawn(|| setup::run(false));
+            }
+            M_UPDATE => {
+                let _ = DestroyWindow(hwnd);
+                crate::tray::update_action();
             }
             M_QUIT => PostQuitMessage(0),
             _ => {}

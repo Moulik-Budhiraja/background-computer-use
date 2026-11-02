@@ -13,7 +13,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::gfx::{Canvas, rgb};
-use crate::{engine, sessions, setup, ui};
+use crate::{engine, sessions, setup, ui, updater};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_APP_REFRESH: u32 = WM_APP + 2;
@@ -21,6 +21,7 @@ const ID_PAUSE: usize = 1;
 const ID_STOP: usize = 2;
 const ID_QUIT: usize = 3;
 const ID_SETUP: usize = 4;
+const ID_UPDATE: usize = 5;
 const ICON_TIMER: usize = 1;
 
 /// What the icon shows. Like the Mac's menu bar icon: one display shape with a
@@ -57,6 +58,11 @@ fn tooltip(icon: Icon) -> &'static str {
 
 static HWND_SLOT: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
 static SHOWN: std::sync::Mutex<Option<(Icon, bool)>> = std::sync::Mutex::new(None);
+
+/// Quit cleanly (from any thread): the installer and the updater ask for this.
+pub fn request_quit() {
+    post(WM_CLOSE);
+}
 
 fn post(msg: u32) {
     if let Some(h) = *HWND_SLOT.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -216,6 +222,14 @@ unsafe fn show_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, MF_STRING, ID_STOP, w!("Stop agents"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_SETUP, w!("Set up…"));
+        let update: Vec<u16> = match updater::pending() {
+            Some(v) => format!("Restart to update to {v}"),
+            None => "Check for updates".into(),
+        }
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+        let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, PCWSTR(update.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING, ID_QUIT, w!("Quit"));
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
@@ -229,9 +243,19 @@ unsafe fn show_menu(hwnd: HWND) {
             ID_SETUP => {
                 std::thread::spawn(|| setup::run(false));
             }
+            ID_UPDATE => update_action(),
             ID_QUIT => PostQuitMessage(0),
             _ => {}
         }
+    }
+}
+
+/// "Check for updates", or install the one that's ready.
+pub fn update_action() {
+    if updater::pending().is_some() {
+        updater::install_now();
+    } else {
+        updater::check_now();
     }
 }
 
@@ -253,6 +277,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_TIMER => {
                 refresh(hwnd, false);
+                LRESULT(0)
+            }
+            WM_CLOSE => {
+                // Close the agents' windows (and give borrowed ones back) before quitting.
+                engine::stop(None);
+                std::thread::sleep(Duration::from_millis(500));
+                PostQuitMessage(0);
                 LRESULT(0)
             }
             WM_SETTINGCHANGE => {

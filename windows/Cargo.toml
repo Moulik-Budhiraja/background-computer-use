@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["app", "bcu", "probe"]
+members = ["app", "bcu", "probe", "setup"]
 
 [workspace.dependencies]
 windows = { version = "0.62", features = [
@@ -17,6 +17,7 @@ windows = { version = "0.62", features = [
   "Win32_System_Pipes",
   "Win32_Storage_Xps",
   "Win32_System_Com",
+  "Win32_System_Com_Urlmon",
   "Win32_System_Ole",
   "Win32_System_Registry",
   "Win32_System_SystemServices",
