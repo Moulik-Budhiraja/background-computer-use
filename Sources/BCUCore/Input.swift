@@ -13,6 +13,12 @@ import CPrivate
 public enum Input {
     public enum Button { case left, right }
 
+    /// Field 58 ("click group") for mouse downs and ups. Keep it small: Chromium
+    /// renderers crash on some clicks when it's large (measured on Helium:
+    /// 1-100 fine, 1000 and up crashed the tab), and leaving it out stops
+    /// clicks from registering. Real HID clicks don't need it.
+    static let clickGroup: Int64 = 1
+
     private static func source() -> CGEventSource? {
         CGEventSource(stateID: .hidSystemState)
     }
@@ -39,7 +45,7 @@ public enum Input {
                              check: () throws -> Void = {}) throws {
         try check()
         guard let src = source() else { throw ToolError("could not create an event source") }
-        let group = Int64(DispatchTime.now().uptimeNanoseconds & 0x7fff_ffff)
+        let group = clickGroup
         let offScreen = CGPoint(x: -1, y: -1)
         let (downType, upType, cgButton, buttonNumber): (CGEventType, CGEventType, CGMouseButton, Int64) =
             button == .left ? (.leftMouseDown, .leftMouseUp, .left, 0) : (.rightMouseDown, .rightMouseUp, .right, 1)
@@ -99,7 +105,7 @@ public enum Input {
     /// Press, move in steps, release.
     public static func drag(pid: pid_t, windowID: CGWindowID, from: CGPoint, to: CGPoint, steps: Int = 20, durationMs: Double = 300) throws {
         guard let src = source() else { throw ToolError("could not create an event source") }
-        let group = Int64(DispatchTime.now().uptimeNanoseconds & 0x7fff_ffff)
+        let group = clickGroup
         func post(_ type: CGEventType, _ at: CGPoint, phase: Int64, state: Int64) {
             guard let e = CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: at, mouseButton: .left) else { return }
             stampMouse(e, pid: pid, windowID: windowID, phase: phase, clickState: state, button: 0, group: group, location: at)
