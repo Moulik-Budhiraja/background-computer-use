@@ -586,9 +586,17 @@ struct PopoverView: View {
 
     private var tileWidth: CGFloat { columns == 1 ? 440 : 320 }
 
+    /// The previews set the popover's width. The header fits inside it, so a
+    /// long status (like a handoff reason) truncates instead of widening it.
+    private var contentWidth: CGFloat {
+        guard !menu.permissionsMissing, !menu.sessions.isEmpty else { return 440 }
+        return CGFloat(columns) * tileWidth + CGFloat(columns - 1) * 10
+    }
+
     var body: some View {
         VStack(spacing: 10) {
             MenuHeader(menu: menu)
+                .frame(width: contentWidth)
             if menu.permissionsMissing {
                 Placeholder(kind: .setup(screenRecording: menu.screenRecordingMissing), openSettings: menu.openSettings)
                     .frame(width: 440, height: 275)
