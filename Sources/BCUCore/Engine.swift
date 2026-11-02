@@ -64,6 +64,18 @@ public final class Engine {
     /// The text element that had focus in each window the last time it was
     /// key, for typing into it later without making the window key.
     private var focusedText: [CGWindowID: AXUIElement] = [:]
+    /// Steps that take key focus in the app the user is in wait for a pause
+    /// in their input (see `QuietWait`), within this session's budget.
+    private let waitBudget = WaitBudget()
+    /// The current step passed `priority: "now"`: no waiting for the user.
+    private var priorityNow = false
+    /// Waits for the user during the current call, for its result.
+    private var waitNotes: [String] = []
+    /// The still copy over the user's window and the hold on their input,
+    /// kept across back-to-back key-focus steps in a batch so the user gets
+    /// one short freeze instead of several.
+    private var cover: SwapCover?
+    private var batching = false
     private var _activity: [ActivityItem] = []
     private var _paused = false
     private var _userInControl = false
@@ -266,9 +278,15 @@ public final class Engine {
             }
             let monitored = !readOnly.contains(tool) || tool == "get_window_state"
             let startMs = nowMs()
+            waitNotes = []
+            waitBudget.step()
             if monitored { focusGuard.startMonitor() }
             do {
                 var result = try run(tool: tool, args: Args(args))
+                if !waitNotes.isEmpty {
+                    result.text += "\n[user first] " + waitNotes.map(Self.sentence).joined(separator: " ") + " That's expected: the step ran, don't repeat it."
+                    waitNotes = []
+                }
                 if monitored, let focusNote = focusGuard.stopMonitor() {
                     focusGuard.record("\(tool): \(focusNote)")
                     result.text += "\n[focus guard] \(focusNote)"
@@ -299,6 +317,9 @@ public final class Engine {
     }
 
     private func run(tool: String, args: Args) throws -> ToolResult {
+        let outerPriority = priorityNow
+        priorityNow = args.string("priority")?.lowercased() == "now"
+        defer { priorityNow = outerPriority }
         defer {
             if Self.batchable.contains(tool), tool != "wait", let id = args.int("window_id") {
                 lastActionMs[CGWindowID(id)] = nowMs()
@@ -541,10 +562,55 @@ public final class Engine {
                 }
             }
             return ToolResult(text: "pressed")
+        case "admin_screen":
+            // Test: what the main display shows.
+            let b = CGDisplayBounds(CGMainDisplayID())
+            guard let img = BCUCaptureDisplayRect(CGMainDisplayID(), CGRect(origin: .zero, size: b.size)), let png = pngImage(img) else { throw ToolError("capture failed") }
+            return ToolResult(text: "main display", images: [png])
+        case "admin_raise":
+            // Test setup: bring a user window to the front of its app and the app to the front.
+            let pid = pid_t(try args.requireInt("pid"))
+            let wid = CGWindowID(try args.requireInt("window_id"))
+            guard let win = AX.window(pid: pid, id: wid) else { throw ToolError("no window") }
+            _ = AX.perform(win, "AXRaise")
+            _ = BCUSetFrontProcess(pid, wid, 0x200)
+            _ = BCUPostMakeKeyRecords(pid, wid)
+            AX.set(AX.app(pid), "AXFocusedWindow", win)
+            sleepMs(300)
+            return ToolResult(text: "front=\(BCUFrontProcessPID()) keyWindow=\(AX.focusedWindowID(pid).map(String.init) ?? "none")")
+        case "admin_discard_window":
+            // Test cleanup: close any app's window, answering "Delete" / "Don't Save" if it asks.
+            let pid = pid_t(try args.requireInt("pid"))
+            let wid = CGWindowID(try args.requireInt("window_id"))
+            guard let win = AX.window(pid: pid, id: wid) else { throw ToolError("no window") }
+            if let close = AX.element(win, "AXCloseButton") { _ = AX.perform(close, "AXPress") }
+            sleepMs(400)
+            func press(_ el: AXUIElement, _ depth: Int) -> Bool {
+                if depth > 8 { return false }
+                if AX.string(el, "AXRole") == "AXButton", ["Delete", "Don’t Save", "Don't Save"].contains(AX.string(el, "AXTitle") ?? "") {
+                    return AX.perform(el, "AXPress") == .success
+                }
+                return AX.children(el).contains { press($0, depth + 1) }
+            }
+            let pressed = press(win, 0)
+            sleepMs(300)
+            return ToolResult(text: "\(pressed ? "answered the sheet" : "no sheet"); window \(WindowList.info(wid) == nil ? "closed" : "still open")")
+        case "admin_reset_wait_budget":
+            waitBudget.reset()
+            return ToolResult(text: "reset")
+        case "admin_user_sim":
+            return UserSim.shared.start((args.raw["script"] as? [JSONObject]) ?? [], pid: pid_t(try args.requireInt("pid")),
+                                         window: CGWindowID(args.int("window_id") ?? 0), title: args.string("title"))
+        case "admin_user_sim_status":
+            return UserSim.shared.status()
+        case "admin_user_sim_stop":
+            return UserSim.shared.stop()
         case "admin_type_status":
             return TestHarness.shared.typingStatus()
         case "admin_read_text":
-            return try TestHarness.read(app: try args.requireString("app"), windows: windows)
+            return try TestHarness.read(app: try args.requireString("app"), windows: windows,
+                                        windowID: args.int("window_id").map { CGWindowID($0) }, all: args.bool("all") ?? false,
+                                        set: args.string("set"))
         default: throw ToolError("unknown tool \(tool)")
         }
     }
@@ -613,27 +679,107 @@ public final class Engine {
     /// of them land in the agent's window, and a still copy of their window
     /// and the menu bar covers the moment their window is drawn inactive.
     /// Typing avoids this altogether where it can (see `typeText`).
+    /// Before that, while the user is in the app, it waits for a pause in
+    /// their input (unless the step passed `priority: "now"`), and in a batch
+    /// the cover stays up across back-to-back steps like this.
     private func keyed<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) throws -> T {
         if paused { throw ToolError("paused by the user") }
         if userInControl { throw ToolError("the user took over your display") }
+        if let c = cover, !(c.pid == w.pid && userIsIn(w.pid) && nowMs() - c.lastUsedMs < Self.coverGapMs
+                             && nowMs() - c.openedMs < Self.coverMaxMs) {
+            closeCover()
+        }
+        if cover == nil && userIsIn(w.pid) && !priorityNow {
+            awaitUser(w, cause: cause)
+            if paused { throw ToolError("paused by the user") }
+            if userInControl { throw ToolError("the user took over your display") }
+        }
         Self.inputLock.lock()
         defer { Self.inputLock.unlock() }
         focusGuard.beginAction(pid: w.pid, cause: cause)
         windows.noteBefore(pid: w.pid)
         defer { focusGuard.endAction(pid: w.pid) }
-        let shared = userIsIn(w.pid)
-        if shared { focusGuard.beginHold() }
-        defer { if shared { focusGuard.endHold() } }
-        var freeze: ScreenFreeze?
-        if shared, let userWindow = AX.focusedWindowID(w.pid), userWindow != w.id {
-            freeze = ScreenFreeze.begin(userWindow: userWindow)
+        if cover == nil && userIsIn(w.pid) { openCover(w, cause: cause) } else if cover != nil { UserSim.shared.coverUsed(cause) }
+        defer {
+            if batching { cover?.lastUsedMs = nowMs() } else { closeCover() }
         }
-        defer { freeze?.end() }
         let scope = try KeyScope.enter(pid: w.pid, window: w.id)
         defer { scope.exit() }
         let result = try body()
         rememberFocusedText(in: w)
         return result
+    }
+
+    private struct SwapCover {
+        let pid: pid_t
+        let freeze: ScreenFreeze?
+        let openedMs: Double
+        var lastUsedMs: Double
+    }
+
+    /// A batch keeps the cover up for the next step only if it starts this
+    /// soon, and never longer than this in all, since the user's input is
+    /// held the whole time.
+    private static let coverGapMs = 500.0
+    private static let coverMaxMs = 1500.0
+    private static let inFlightMs = 60.0
+
+    /// Hold the user's input and cover their window, which is about to be
+    /// drawn inactive for a moment.
+    private func openCover(_ w: AgentWindow, cause: String) {
+        focusGuard.beginHold()
+        // A key the user pressed just before the hold is still being drawn:
+        // let it land first, or the copy would never match their window
+        // again and stay up until it times out.
+        let sinceInput = nowMs() - focusGuard.activity.snapshot.lastInputMs
+        if sinceInput < Self.inFlightMs { sleepMs(Self.inFlightMs - sinceInput) }
+        var freeze: ScreenFreeze?
+        if let userWindow = AX.focusedWindowID(w.pid), userWindow != w.id {
+            freeze = ScreenFreeze.begin(userWindow: userWindow)
+        }
+        cover = SwapCover(pid: w.pid, freeze: freeze, openedMs: nowMs(), lastUsedMs: nowMs())
+        UserSim.shared.coverOpened(cause)
+    }
+
+    private func closeCover() {
+        guard let c = cover else { return }
+        cover = nil
+        c.freeze?.end()
+        focusGuard.endHold()
+        UserSim.shared.coverClosed()
+    }
+
+    /// Wait for a moment the user won't notice their window freezing, and
+    /// note it for the step's result.
+    private func awaitUser(_ w: AgentWindow, cause: String) {
+        let caps = waitBudget.caps
+        let startMs = nowMs()
+        stateLock.lock(); let busy = _busy; stateLock.unlock()
+        var shown = false
+        let r = QuietWait.wait(focusGuard.activity, softMs: caps.softMs, hardMs: caps.hardMs) {
+            shown = true
+            stateLock.lock(); _busy = "Waiting for you to pause"; stateLock.unlock()
+            changed()
+        }
+        waitBudget.add(r.waitedMs)
+        if shown {
+            stateLock.lock(); _busy = busy; stateLock.unlock()
+            changed()
+        }
+        guard r.waitedMs >= 20 else { return }
+        var note = "waited \(String(format: "%.1f", r.waitedMs / 1000)) s for \(r.reason ?? "the user to pause") in \(w.appName) before \(cause)"
+        switch r.outcome {
+        case .quiet: break
+        case .gap: note += ", then went in a short gap in their input"
+        case .cap: note += ", then went anyway (their input was held and replayed)"
+        }
+        waitNotes.append(note)
+        UserSim.shared.waited(fromMs: startMs, note)
+        Log.info("defer: \(note) (caps \(Int(caps.softMs))/\(Int(caps.hardMs)) ms; \(Int(waitBudget.share * 100))% of recent working time spent waiting)")
+    }
+
+    private static func sentence(_ s: String) -> String {
+        (s.prefix(1).uppercased() + s.dropFirst()) + "."
     }
 
     private func guarded<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) rethrows -> T {
@@ -835,6 +981,16 @@ public final class Engine {
     private static let batchable: Set<String> = ["click", "set_value", "perform_action", "type_text", "press_key",
                                                  "scroll", "drag", "press_menu_item", "wait"]
 
+    /// Steps that may take key focus in their app (see `keyed`).
+    private static func mayTakeKey(_ tool: String, _ a: Args) -> Bool {
+        switch tool {
+        case "press_key", "drag", "press_menu_item": return true
+        case "click": return a.int("element") == nil
+        case "type_text": return (a.string("text") ?? "").contains { $0 == "\n" || $0 == "\r" || $0 == "\t" }
+        default: return false
+        }
+    }
+
     /// Run several actions on a window in one call, in order, stopping at the
     /// first failure, then optionally read the window's state once.
     private func batch(_ args: Args) throws -> ToolResult {
@@ -856,12 +1012,25 @@ public final class Engine {
         var lines: [String] = []
         var lastWindow = defaultWindow
         var failed = false
+        func argsOf(_ i: Int) -> JSONObject {
+            var a = steps[i]
+            a["tool"] = nil
+            if a["window_id"] == nil, let d = defaultWindow { a["window_id"] = d }
+            if a["priority"] == nil, let p = args.string("priority") { a["priority"] = p }
+            return a
+        }
+        batching = true
+        defer { closeCover(); batching = false }
+        var waitedNotes = 0
         for (i, step) in steps.enumerated() {
             let tool = step["tool"] as! String
-            var stepArgs = step
-            stepArgs["tool"] = nil
-            if stepArgs["window_id"] == nil, let d = defaultWindow { stepArgs["window_id"] = d }
+            let stepArgs = argsOf(i)
             if let wid = Args(stepArgs).int("window_id") { lastWindow = wid }
+            defer {
+                // Keep the user's window covered only into a next step that
+                // takes key focus too.
+                if i + 1 >= steps.count || !Self.mayTakeKey(steps[i + 1]["tool"] as? String ?? "", Args(argsOf(i + 1))) { closeCover() }
+            }
             if tool == "wait" {
                 let ms = min(max(Args(stepArgs).double("ms") ?? 500, 0), 5000)
                 sleepMs(ms)
@@ -870,15 +1039,22 @@ public final class Engine {
             }
             do {
                 let r = try run(tool: tool, args: Args(stepArgs))
-                lines.append("\(i + 1). \(tool): \(r.text.split(separator: "\n").first.map(String.init) ?? "done")")
+                var line = "\(i + 1). \(tool): \(r.text.split(separator: "\n").first.map(String.init) ?? "done")"
+                if !waitNotes.isEmpty { line += " (\(waitNotes.joined(separator: "; ")))"; waitedNotes += waitNotes.count; waitNotes = [] }
+                lines.append(line)
             } catch {
                 lines.append("\(i + 1). \(tool) FAILED: \(error)")
+                waitNotes = []
                 if i + 2 == steps.count { lines.append("Stopped; action \(i + 2) didn't run.") }
                 if i + 2 < steps.count { lines.append("Stopped; actions \(i + 2)–\(steps.count) didn't run.") }
                 failed = true
                 break
             }
         }
+        if waitedNotes > 0 {
+            lines.append("[user first] Steps that waited for the user to pause ran then; that's expected, don't repeat them.")
+        }
+        closeCover()
         var images: [ToolImage] = []
         if args.bool("state") ?? true, let wid = lastWindow, windows.window(CGWindowID(wid)) != nil {
             var stateArgs: JSONObject = ["window_id": wid, "screenshot": args.bool("screenshot") ?? false]
@@ -1024,7 +1200,7 @@ public final class Engine {
             let piece = rest.prefix(chunk)
             rest = rest.dropFirst(piece.count)
             try keyed(w, cause: "typing") { try Input.typeText(pid: w.pid, String(piece)) }
-            if !rest.isEmpty { sleepMs(40) }
+            if !rest.isEmpty { closeCover(); sleepMs(40) }
         }
     }
 

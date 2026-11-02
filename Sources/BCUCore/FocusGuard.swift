@@ -21,6 +21,8 @@ public struct GuardEvent {
 /// and watches the front app for every session.
 public final class FocusGuard {
     public var onEvent: ((GuardEvent) -> Void)?
+    /// The user's recent input, for waiting until they pause (see `QuietWait`).
+    public let activity = UserActivity()
 
     private let lock = NSLock()
     /// strict: the user is driving the app from the expanded view, so their
@@ -321,6 +323,11 @@ public final class FocusGuard {
         }
     }
 
+    static func onAgentDisplay(_ id: CGWindowID) -> Bool {
+        guard let info = WindowList.info(id) else { return false }
+        return AgentDisplay.running.contains { $0.liveBounds.intersects(info.bounds) }
+    }
+
     private func taintCause(_ pid: pid_t) -> String {
         lock.lock(); defer { lock.unlock() }
         return taints[pid]?.cause ?? "an agent action"
@@ -378,6 +385,7 @@ public final class FocusGuard {
         if event.getIntegerValueField(.eventSourceUserData) == FocusGuard.replayMarker {
             return event
         }
+        activity.note(type, event)
         switch type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .tabletPointer:
             let p = event.location

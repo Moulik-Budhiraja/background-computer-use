@@ -43,6 +43,8 @@ Prefer, in order:
 
 When the user is in another window of the same app, `type_text` writes the text into the field through accessibility, without keystrokes; only Return and Tab are pressed as keys. Pass `element` when you know the field. Keystrokes and pixel clicks make your window its app's key window for a moment, then give it back. This works while the user types in another window of the same app: their input is held for that moment and replayed.
 
+The user comes first. When they're in the app you're working in, a step that takes key focus (`press_key`, Return or Tab, a click at x and y, `drag`, `press_menu_item`) first waits for a pause in their typing, clicking or scrolling, or for a menu they have open to close. The wait is 3 seconds at most and usually far less, and the result says how long it was and why, for example "Waited 1.4 s for the user to stop typing". That's expected: the step ran, so don't repeat it. In a `batch`, back-to-back steps like that wait once and run together, so batch them when you can. Pass `"priority": "now"` only when a step can't wait: a dialog or toast that closes on its own, a hover followed by a click, a code about to expire. It runs at once even mid-typing, which the user feels.
+
 To open a URL in a browser, press `cmd+l` (or click the address bar) and `type_text` the URL followed by `\n`.
 
 In `type_text`, `\n` presses Return. In a chat or email composer, Return usually sends the message. For a line break inside a message, press `return` with `["shift"]`, and check with `get_window_state` before anything is sent.
