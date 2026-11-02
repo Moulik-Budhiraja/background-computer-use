@@ -126,7 +126,6 @@ public final class RemoteControl {
     private let dragLock = NSLock()
     private var latestDrag: (type: CGEventType, point: CGPoint, flags: CGEventFlags)?
     private var dragQueued = false
-    private var clickGroup: Int64 = 0
     private var cache: (ms: Double, windows: [WindowInfo]) = (0, [])
     private var lastMove: CGPoint?
 
@@ -191,7 +190,6 @@ public final class RemoteControl {
                 press = nil
             }
             guard let (w, mode) = target(at: point, button: button) else { return }
-            clickGroup = Int64(DispatchTime.now().uptimeNanoseconds & 0x7fff_ffff)
             // Popups (menus, suggestion lists) aren't key windows; keys keep
             // going to the window that opened them.
             if w.layer == 0 { makeKey(w) }
@@ -577,7 +575,7 @@ public final class RemoteControl {
         guard let src = CGEventSource(stateID: .hidSystemState),
               let e = CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: point, mouseButton: cgButton) else { return }
         Input.stampMouse(e, pid: w.pid, windowID: w.id, phase: phase, clickState: state, button: button,
-                         group: type == .mouseMoved ? 0 : clickGroup, location: point)
+                         group: type == .mouseMoved ? 0 : Input.clickGroup, location: point)
         e.flags = flags
         BCUPostEventToPid(w.pid, e, false)
     }
