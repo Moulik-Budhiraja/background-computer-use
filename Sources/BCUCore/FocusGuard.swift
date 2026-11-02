@@ -50,7 +50,9 @@ public final class FocusGuard {
     private var lastUserKeyMs = 0.0
     private var holding = false
     private var holdingSinceMs = 0.0
-    private var held: [CGEvent] = []
+    /// With the app that was in front when each came: a key goes back to
+    /// that app, not to whatever took the front meanwhile.
+    private var held: [(event: CGEvent, front: pid_t)] = []
     private var heldSinceMs = 0.0
     /// Holds of all the user's input in progress (see `beginHold`).
     private var holdTokens: Set<Int> = []
@@ -71,6 +73,8 @@ public final class FocusGuard {
     /// No hold of all the user's input lasts longer than this, whatever the
     /// agent is stuck on (a hung app, a busy main thread).
     public static let maxHoldMs = 2000.0
+    /// How long a held key waits for the app it was typed into to be back in front.
+    static let frontBackMs = 500.0
     /// Keys typed into an app mid-swap are held at most this long.
     static let maxPidHoldMs = 5000.0
     fileprivate static weak var shared: FocusGuard?
@@ -261,7 +265,7 @@ public final class FocusGuard {
         lock.lock()
         if let p = pidHeld.removeValue(forKey: pid), !p.events.isEmpty {
             if held.isEmpty { heldSinceMs = p.sinceMs }
-            held.insert(contentsOf: p.events, at: 0)
+            held.insert(contentsOf: p.events.map { ($0, pid) }, at: 0)
         }
         lock.unlock()
         drain()
@@ -571,7 +575,7 @@ public final class FocusGuard {
                 CGAssociateMouseAndMouseCursorPosition(1)
             }
             if type != .mouseMoved {
-                lock.lock(); let pressHeld = held.contains { Self.isMouseDown($0.type) }; lock.unlock()
+                lock.lock(); let pressHeld = held.contains { Self.isMouseDown($0.event.type) }; lock.unlock()
                 if pressHeld { hold(event); return nil }
             }
             return event
@@ -585,7 +589,7 @@ public final class FocusGuard {
             if anySwap, let pid = Self.windowOwner(at: event.location), isSwapping(pid) { hold(event); return nil }
             return event
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
-            lock.lock(); let holdIt = !holdTokens.isEmpty || draining || held.contains { Self.isMouseDown($0.type) }; lock.unlock()
+            lock.lock(); let holdIt = !holdTokens.isEmpty || draining || held.contains { Self.isMouseDown($0.event.type) }; lock.unlock()
             if holdIt { hold(event); return nil }
             return event
         case .scrollWheel:
@@ -700,7 +704,7 @@ public final class FocusGuard {
             let still = swapping[pid] != nil
             if let p, !still {
                 if held.isEmpty { heldSinceMs = p.sinceMs }
-                held.insert(contentsOf: p.events, at: 0)
+                held.insert(contentsOf: p.events.map { ($0, pid) }, at: 0)
             }
             lock.unlock()
             if still, let p {
@@ -727,19 +731,32 @@ public final class FocusGuard {
         var n = 0, dropped = 0
         var safeFor: pid_t = -1
         var retry = false
+        var gaveUp: Set<pid_t> = []
         while true {
             lock.lock()
             if held.isEmpty || holding || !holdTokens.isEmpty { draining = false; lock.unlock(); break }
-            let e = held[0]
+            let (e, typedInto) = held[0]
             let swappingNow = swapping
             lock.unlock()
+            if Self.isKey(e.type) {
+                // Typed into an app that has since lost the front for a
+                // moment (a system alert, a self-activation the guard is
+                // undoing): wait for it to be back.
+                let front = BCUFrontProcessPID()
+                if typedInto != 0 && front != typedInto && !gaveUp.contains(typedInto) {
+                    let deadline = nowMs() + Self.frontBackMs
+                    while BCUFrontProcessPID() != typedInto && nowMs() < deadline { usleep(2000) }
+                    // Let it finish activating before keys reach it.
+                    if BCUFrontProcessPID() == typedInto { usleep(30_000) } else { gaveUp.insert(typedInto) }
+                }
+            }
             if Self.isKey(e.type) && e.type != .flagsChanged {
                 let front = BCUFrontProcessPID()
                 if swappingNow[front] != nil {
                     // That app's key window is an agent's for now; its swap
                     // replays these when it ends.
                     lock.lock()
-                    held.removeFirst()
+                    removeHeld(e)
                     var p = pidHeld[front] ?? (nowMs(), [])
                     p.events.append(e)
                     pidHeld[front] = p
@@ -756,7 +773,7 @@ public final class FocusGuard {
                     }
                     if !keySafe(front) {
                         if !force { retry = true; lock.lock(); draining = false; lock.unlock(); break }
-                        lock.lock(); held.removeFirst(); lock.unlock()
+                        lock.lock(); removeHeld(e); lock.unlock()
                         dropped += 1
                         continue
                     }
@@ -768,7 +785,7 @@ public final class FocusGuard {
                     lock.lock(); draining = false; lock.unlock()
                     break
                 }
-                lock.lock(); held.removeFirst(); lock.unlock()
+                lock.lock(); removeHeld(e); lock.unlock()
                 e.setIntegerValueField(.eventSourceUserData, value: FocusGuard.replayMarker)
                 e.post(tap: .cghidEventTap)
                 n += 1
@@ -782,7 +799,7 @@ public final class FocusGuard {
                 usleep(1000)
                 continue
             }
-            lock.lock(); held.removeFirst(); lock.unlock()
+            lock.lock(); removeHeld(e); lock.unlock()
             e.setIntegerValueField(.eventSourceUserData, value: FocusGuard.replayMarker)
             e.post(tap: .cghidEventTap)
             n += 1
@@ -793,6 +810,12 @@ public final class FocusGuard {
         }
         if retry { scheduleDrain() }
         return n
+    }
+
+    /// Take `e` out of the queue once it's replayed or moved. By identity,
+    /// not position: a swap ending meanwhile puts its held keys in front.
+    private func removeHeld(_ e: CGEvent) {
+        if let i = held.firstIndex(where: { $0.event === e }) { held.remove(at: i) }
     }
 
     private func scheduleDrain() {
@@ -808,9 +831,10 @@ public final class FocusGuard {
 
     private func hold(_ event: CGEvent) {
         guard let copy = event.copy() else { return }
+        let front = Self.isKey(event.type) ? BCUFrontProcessPID() : 0
         lock.lock()
         if held.isEmpty { heldSinceMs = nowMs() }
-        held.append(copy)
+        held.append((copy, front))
         lock.unlock()
     }
 
