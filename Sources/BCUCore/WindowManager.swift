@@ -487,6 +487,7 @@ public final class WindowManager {
             unregister(id)
             return "window \(id) is already gone"
         }
+        focusGuard.unpark(w.pid, window: id, reason: "window released")
         noteBefore(pid: w.pid)
         focusGuard.beginAction(pid: w.pid, cause: "releasing a window")
         defer { focusGuard.endAction(pid: w.pid) }
@@ -520,6 +521,7 @@ public final class WindowManager {
 
     public func handoff(_ id: CGWindowID, reason: String) throws {
         guard let w = window(id), let ax = AX.window(pid: w.pid, id: id) else { throw ToolError("window \(id) isn't one of yours") }
+        focusGuard.unpark(w.pid, window: id, reason: "window handed to the user")
         let main = CGDisplayBounds(CGMainDisplayID())
         let size = AX.size(ax) ?? CGSize(width: 1000, height: 700)
         let w2 = min(size.width, main.width - 80), h2 = min(size.height, main.height - 120)

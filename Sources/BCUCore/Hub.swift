@@ -14,9 +14,14 @@ public final class Hub {
     public static let defaultSession = "default"
     /// A display with no windows and no calls for this long is removed.
     public static let idleTeardownMs: Double = 60_000
+    /// The same, while another agent is waiting for a display.
+    public static let busyTeardownMs: Double = 5_000
 
     private let lock = NSLock()
     private var byID: [String: Engine] = [:]
+    /// Each subagent session's parent: the session of the connection it
+    /// came in on (see `bcu mcp`).
+    private var parentOf: [String: String] = [:]
     private var order: [String] = []
     private var timer: Timer?
     private var ticks = 0
@@ -44,9 +49,15 @@ public final class Hub {
         byID[id] = e
         order.append(id)
         lock.unlock()
-        Log.info("session \(id.prefix(8)) started: \(label)")
+        Log.info("session \(Self.short(id)) started: \(label)")
         changed()
         return e
+    }
+
+    /// A session ID for the log: its first 8 characters, and a subagent's own part.
+    static func short(_ id: String) -> String {
+        let parts = id.split(separator: "/", maxSplits: 1)
+        return parts.count == 2 ? "\(parts[0].prefix(8))/\(parts[1].prefix(8))" : String(id.prefix(8))
     }
 
     /// "Claude Code", "Codex", or the client's own name; numbered when two
@@ -65,12 +76,34 @@ public final class Hub {
         return "\(base) \(n)"
     }
 
-    /// A tool call from the socket. `_session` and `_client` say which session it's for.
+    /// A tool call from the socket. `_session` and `_client` say which
+    /// session it's for; `_parent`, that it's a subagent's of that session.
     public func call(tool: String, args: JSONObject) -> ToolResult {
         var args = args
         let id = (args.removeValue(forKey: "_session") as? String) ?? Self.defaultSession
         let client = args.removeValue(forKey: "_client") as? String
-        return engine(for: id, client: client).call(tool: tool, args: args)
+        let parent = args.removeValue(forKey: "_parent") as? String
+        if let parent {
+            lock.lock(); parentOf[id] = parent; lock.unlock()
+        }
+        let caller = engine(for: id, client: client)
+        // An agent can hand a window to its subagent (or back): the call goes
+        // to the session that owns the window, on that session's display.
+        if let windowID = (args["window_id"] as? NSNumber)?.uint32Value, caller.windows.window(windowID) == nil,
+           let owner = relative(of: id, owning: windowID) {
+            return owner.call(tool: tool, args: args)
+        }
+        return caller.call(tool: tool, args: args)
+    }
+
+    /// The session in the same agent family as `id` (its parent, its
+    /// subagents, their siblings) that has this window.
+    private func relative(of id: String, owning window: CGWindowID) -> Engine? {
+        lock.lock()
+        let root = parentOf[id] ?? id
+        let family = byID.filter { $0.key != id && ($0.key == root || parentOf[$0.key] == root) }.map(\.value)
+        lock.unlock()
+        return family.first { $0.windows.window(window) != nil }
     }
 
     /// Main thread.
@@ -92,6 +125,10 @@ public final class Hub {
             self.ticks += 1
             self.changed()
             self.routeAudio()
+            if AgentDisplay.someoneWaiting {
+                // Another agent needs a display: one with no windows goes sooner.
+                for e in self.engines { e.tearDownIfIdle(idleMs: Self.busyTeardownMs) }
+            }
             if self.ticks % 5 == 0 {
                 for e in self.engines { e.tearDownIfIdle(idleMs: Self.idleTeardownMs) }
                 self.forgetDormant()
@@ -123,10 +160,10 @@ public final class Hub {
     private func forgetDormant() {
         lock.lock()
         let gone = byID.filter { $0.key != Self.defaultSession && $0.value.isDormant(idleMs: Self.idleTeardownMs * 2) }.map(\.key)
-        for id in gone { byID[id]?.audio.end(); byID[id] = nil }
+        for id in gone { byID[id]?.audio.end(); byID[id] = nil; parentOf[id] = nil }
         order.removeAll { gone.contains($0) }
         lock.unlock()
-        for id in gone { Log.info("session \(id.prefix(8)) ended") }
+        for id in gone { Log.info("session \(Self.short(id)) ended") }
         if !gone.isEmpty { changed() }
     }
 

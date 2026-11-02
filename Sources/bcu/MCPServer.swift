@@ -4,12 +4,26 @@ import BCUShared
 /// Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0). Tool calls
 /// are forwarded to the running app, which holds the permissions and the display.
 final class MCPServer {
-    private var client: SocketClient?
     private let out = FileHandle.standardOutput
+    private let outLock = NSLock()
+    /// One per session on this connection: its calls run in order on its
+    /// own connection to the app, so one agent waiting (for a free display,
+    /// or for another agent to finish typing in the same app) never holds
+    /// up another's calls.
+    private final class Lane {
+        let queue: DispatchQueue
+        var client: SocketClient?
+        init(_ session: String) { queue = DispatchQueue(label: "bcu.mcp.\(session)") }
+    }
+    private var lanes: [String: Lane] = [:]
     /// This agent's session: its own display and windows in the app.
     private let sessionID = UUID().uuidString
     /// The agent's name from `initialize` (e.g. "claude-code"), for the menu bar.
     private var clientName: String?
+    /// Claude Code subagents share this connection; this tells their calls apart.
+    private let subagents = SubagentLookup()
+    /// The first Codex thread seen on this connection: the main agent's.
+    private var mainThread: String?
 
     /// bcu lives in the app's Contents/MacOS, so the main bundle is the app.
     static let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
@@ -25,7 +39,9 @@ final class MCPServer {
     private func send(_ object: JSONObject) {
         guard var data = try? JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes]) else { return }
         data.append(0x0A)
+        outLock.lock()
         out.write(data)
+        outLock.unlock()
     }
 
     private func reply(_ id: Any, result: JSONObject) {
@@ -57,21 +73,40 @@ final class MCPServer {
         case "tools/call":
             let name = params["name"] as? String ?? ""
             let arguments = params["arguments"] as? JSONObject ?? [:]
+            let caller = callerSession(params["_meta"] as? JSONObject ?? [:])
             // Maintenance and test tools are for `bcu call` on a debug run only.
             if name.hasPrefix("admin_") {
                 reply(id, result: ["content": [["type": "text", "text": "unknown tool \(name)"]], "isError": true])
                 return
             }
-            reply(id, result: callTool(name, arguments))
+            let lane = lanes[caller] ?? Lane(caller)
+            lanes[caller] = lane
+            lane.queue.async {
+                self.reply(id, result: self.callTool(name, arguments, session: caller, lane: lane))
+            }
         default:
             replyError(id, code: -32601, message: "method not found: \(method)")
         }
     }
 
-    private func callTool(_ name: String, _ arguments: JSONObject) -> JSONObject {
+    /// The session a call belongs to. Every agent gets its own (its own
+    /// display and windows), subagents included: a subagent's session is
+    /// this connection's with its ID added.
+    private func callerSession(_ meta: JSONObject) -> String {
+        if let toolUse = meta["claudecode/toolUseId"] as? String, let agent = subagents?.agent(for: toolUse) {
+            return "\(sessionID)/\(agent)"
+        }
+        if let thread = meta["threadId"] as? String {
+            if mainThread == nil { mainThread = thread }
+            if thread != mainThread { return "\(sessionID)/\(thread)" }
+        }
+        return sessionID
+    }
+
+    private func callTool(_ name: String, _ arguments: JSONObject, session: String, lane: Lane) -> JSONObject {
         var result: ToolResult
         do {
-            result = try callWithReconnect(name, arguments)
+            result = try callWithReconnect(name, arguments, session: session, lane: lane)
         } catch {
             result = .error("\(error). Open \(BCUPaths.appName) from Applications and grant its permissions.")
         }
@@ -82,16 +117,17 @@ final class MCPServer {
         return ["content": content, "isError": result.isError]
     }
 
-    private func callWithReconnect(_ name: String, _ arguments: JSONObject) throws -> ToolResult {
+    private func callWithReconnect(_ name: String, _ arguments: JSONObject, session: String, lane: Lane) throws -> ToolResult {
         for attempt in 0..<2 {
             do {
-                if client == nil { client = try connect() }
+                if lane.client == nil { lane.client = try connect() }
                 var args = arguments
-                args["_session"] = sessionID
+                args["_session"] = session
+                if session != sessionID { args["_parent"] = sessionID }
                 if let clientName { args["_client"] = clientName }
-                return try client!.call(tool: name, args: args)
+                return try lane.client!.call(tool: name, args: args)
             } catch {
-                client = nil
+                lane.client = nil
                 if attempt == 1 { throw error }
             }
         }

@@ -78,6 +78,9 @@ public final class Engine {
     private var priorityNow = false
     /// Waits for the user during the current call, for its result.
     private var waitNotes: [String] = []
+    /// Waits for other agents (a free display, their turn at an app's key
+    /// window) during the current call, for its result.
+    private var agentWaitNotes: [String] = []
     /// The still copy over the user's window and the hold on their input,
     /// kept across back-to-back key-focus steps in a batch so the user gets
     /// one short freeze instead of several.
@@ -94,6 +97,14 @@ public final class Engine {
     /// Input to apps (key-window swaps, clicks, keys) from any session goes
     /// one at a time: two sessions in the same app would fight over its key window.
     public static let inputLock = NSRecursiveLock()
+    /// How long `open_window` waits for a free display when all are taken.
+    /// Under Codex's default 60 s tool timeout.
+    static let displayWaitS: TimeInterval = 45
+    /// Another agent's window keeps its app's key for this long after that
+    /// agent last touched it (`awaitAgentTurn`), but no one waits longer
+    /// than `agentWaitMaxMs` for it.
+    static let agentLeaseMs = 6000.0
+    static let agentWaitMaxMs = 20000.0
 
     public init(sessionID: String, label: String, focusGuard: FocusGuard, width: Int = AgentDisplay.defaultWidth, height: Int = AgentDisplay.defaultHeight) {
         self.sessionID = sessionID
@@ -109,6 +120,21 @@ public final class Engine {
     public func ensureDisplay() throws {
         guard !display.isRunning else { return }
         func onMain(_ work: () -> Void) { if Thread.isMainThread { work() } else { DispatchQueue.main.sync(execute: work) } }
+        let waitStart = nowMs()
+        stateLock.lock(); let busy = _busy; stateLock.unlock()
+        let got = display.reserve(timeout: Self.displayWaitS) {
+            stateLock.lock(); _busy = "Waiting for a display"; stateLock.unlock()
+            changed()
+            log("All \(AgentDisplay.maxDisplays) agent displays are in use; waiting for one")
+        }
+        guard got else {
+            throw ToolError("all \(AgentDisplay.maxDisplays) agent displays are in use by other agents, and none freed up in \(Int(Self.displayWaitS)) s. Wait a minute and try again.")
+        }
+        if nowMs() - waitStart > 100 {
+            stateLock.lock(); _busy = busy; stateLock.unlock()
+            changed()
+            agentWaitNotes.append("waited \(String(format: "%.0f", (nowMs() - waitStart) / 1000)) s for a free display, since \(AgentDisplay.maxDisplays) other agents were using theirs")
+        }
         var failure: Error?
         onMain { do { try self.display.start() } catch { failure = error } }
         if let failure { throw failure }
@@ -286,6 +312,7 @@ public final class Engine {
             let monitored = !readOnly.contains(tool) || tool == "get_window_state"
             let startMs = nowMs()
             waitNotes = []
+            agentWaitNotes = []
             waitBudget.step()
             if monitored { focusGuard.startMonitor() }
             do {
@@ -293,6 +320,10 @@ public final class Engine {
                 if !waitNotes.isEmpty {
                     result.text += "\n[user first] " + waitNotes.map(Self.sentence).joined(separator: " ") + " That's expected: the step ran, don't repeat it."
                     waitNotes = []
+                }
+                if !agentWaitNotes.isEmpty {
+                    result.text += "\n[other agents] " + agentWaitNotes.map(Self.sentence).joined(separator: " ") + " That's expected: the step ran, don't repeat it."
+                    agentWaitNotes = []
                 }
                 if monitored, let focusNote = focusGuard.stopMonitor() {
                     focusGuard.record("\(tool): \(focusNote)")
@@ -331,6 +362,8 @@ public final class Engine {
             if Self.batchable.contains(tool), tool != "wait", let id = args.int("window_id") {
                 lastActionMs[CGWindowID(id)] = nowMs()
             }
+            // Still at work in that window: it keeps its app's key a while longer.
+            if let id = args.int("window_id") { focusGuard.touchParked(window: CGWindowID(id)) }
         }
         // Opening or borrowing a window is what needs a display.
         if tool == "open_window" || tool == "borrow_window" { try ensureDisplay() }
@@ -721,7 +754,15 @@ public final class Engine {
         if cover == nil && userIsIn(w.pid) && !priorityNow {
             try awaitUser(w, cause: cause)
         }
-        Self.inputLock.lock()
+        // Another agent mid-task in this app goes first. Checked again under
+        // the input lock: it may have started a step while this one waited.
+        let turnStart = nowMs()
+        while true {
+            if !userIsIn(w.pid) { try awaitAgentTurn(w, cause: cause, since: turnStart) }
+            Self.inputLock.lock()
+            if userIsIn(w.pid) || leaseHolder(w.pid, window: w.id) == nil || nowMs() - turnStart > Self.agentWaitMaxMs { break }
+            Self.inputLock.unlock()
+        }
         defer { Self.inputLock.unlock() }
         focusGuard.beginAction(pid: w.pid, cause: cause)
         windows.noteBefore(pid: w.pid)
@@ -745,6 +786,9 @@ public final class Engine {
             focusGuard.scheduleReclaim(w.pid)
             throw error
         }
+        // Key is this window's now, whoever had it parked before; other
+        // agents wait while this step runs too.
+        focusGuard.park(w.pid, window: w.id, owner: sessionID)
         defer { handBack(scope, w) }
         let wasFront = BCUFrontProcessPID() == w.pid
         let check = { [self] in
@@ -771,6 +815,13 @@ public final class Engine {
     /// up to a second (the guard holds their keys until it is).
     private func handBack(_ scope: KeyScope, _ w: AgentWindow) {
         let t0 = nowMs()
+        // The user isn't in the app: the window keeps key until the agent's
+        // next step (see `FocusGuard.park`).
+        if !userIsIn(w.pid) && scope.keepKey() {
+            focusGuard.park(w.pid, window: w.id, owner: sessionID)
+            return
+        }
+        focusGuard.forgetParked(w.pid)
         let confirmed = scope.exit()
         guard userIsIn(w.pid) else {
             if !confirmed { focusGuard.scheduleReclaim(w.pid) }
@@ -859,6 +910,55 @@ public final class Engine {
         focusGuard.endHold(c.hold)
         c.freeze?.end()
         UserSim.shared.coverClosed()
+    }
+
+    /// When another agent's window has key in this app and that agent did
+    /// something there within `agentLeaseMs`, it's probably mid-way through
+    /// a form: taking key now would blur the field it's in. Wait for it to
+    /// go quiet, up to `agentWaitMaxMs`. The user never waits for this.
+    private func awaitAgentTurn(_ w: AgentWindow, cause: String, since: Double) throws {
+        try awaitAgentTurn(pid: w.pid, window: w.id, appName: w.appName, cause: cause, since: since)
+    }
+
+    /// Another agent's window that has key in `pid` and that agent did
+    /// something there within `agentLeaseMs`.
+    private func leaseHolder(_ pid: pid_t, window: CGWindowID?) -> FocusGuard.ParkedKey? {
+        guard let p = focusGuard.parkedKey(pid), p.owner != sessionID, p.window != window,
+              nowMs() - p.lastUsedMs < Self.agentLeaseMs, AX.focusedWindowID(pid) == p.window else { return nil }
+        return p
+    }
+
+    private func awaitAgentTurn(pid: pid_t, window: CGWindowID?, appName: String, cause: String, since start: Double = nowMs()) throws {
+        var waited = false
+        stateLock.lock(); let busy = _busy; stateLock.unlock()
+        defer {
+            if waited {
+                stateLock.lock(); _busy = busy; stateLock.unlock()
+                changed()
+            }
+        }
+        while let p = leaseHolder(pid, window: window) {
+            if paused { throw ToolError("paused by the user") }
+            if userInControl { throw ToolError("the user took over your display") }
+            if userIsIn(pid) { break }
+            if nowMs() - start > Self.agentWaitMaxMs {
+                agentWaitNotes.append("waited \(Int(Self.agentWaitMaxMs / 1000)) s for another agent working in \(appName), then went ahead with \(cause)")
+                Log.info("lease: \(label) waited \(Int(nowMs() - start)) ms for window \(p.window) in \(appName), then took key anyway")
+                return
+            }
+            if !waited {
+                waited = true
+                stateLock.lock(); _busy = "Waiting for another agent"; stateLock.unlock()
+                changed()
+            }
+            sleepMs(100)
+        }
+        if waited {
+            let s = (nowMs() - start) / 1000
+            agentWaitNotes.removeAll { $0.contains("for another agent") }
+            agentWaitNotes.append("waited \(String(format: "%.1f", s)) s for another agent to finish in \(appName) before \(cause)")
+            Log.info("lease: \(label) waited \(Int(nowMs() - start)) ms for another agent in \(appName) before \(cause)")
+        }
     }
 
     /// Wait for a moment the user won't notice their window freezing, and
@@ -968,6 +1068,11 @@ public final class Engine {
         // A new window becomes its app's key window until it's handed back;
         // hold the user's input meanwhile if they're in that app.
         let shared = (try windows.resolveApp(app).running).map { userIsIn($0.processIdentifier) } ?? false
+        // A new window takes its app's key: let another agent at work in
+        // that app finish its step first.
+        if !shared, let running = try windows.resolveApp(app).running {
+            try awaitAgentTurn(pid: running.processIdentifier, window: nil, appName: running.localizedName ?? app, cause: "opening a window")
+        }
         let hold = shared ? focusGuard.beginHold() : nil
         defer { if let hold { focusGuard.endHold(hold) } }
         let result = try windows.open(app: app, placement: WindowManager.Placement(name: args.string("placement")), trigger: args.string("trigger"))

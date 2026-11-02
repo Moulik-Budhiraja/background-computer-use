@@ -18,12 +18,12 @@ public enum ToolCatalog {
     after an action it waits (up to 5 s) for the window to settle, so you don't need to sleep.
     4. Prefer `click` on an element and `set_value`: they work through accessibility. While the user is in \
     the same app, `type_text` writes into the field through accessibility too (pass `element` when you know \
-    the field); only Return and Tab go as keys. Keys and pixel clicks make your window its app's key window \
-    for a moment and then hand key focus straight back; this works even while the user is using the same app \
-    (the user's input is held for that moment and replayed). When the user is in that app, such a step first \
+    the field); only Return and Tab go as keys. Keys and pixel clicks make your window its app's key window. \
+    In an app the user isn't in, your window keeps key focus between steps; when the user is in it, key goes \
+    straight back to them (their input is held for that moment and replayed). When the user is in that app, such a step first \
     waits (3 s at most, usually much less) for a pause in their typing, clicking or scrolling, and the result \
     says how long; that's expected, don't repeat the step. If the user has a menu open in that app, the step \
-    fails instead of closing it: retry in a few seconds. Keystroke typing stops if the user switches to that \
+    fails instead of closing it: retry in a few seconds. If another agent is mid-task in that app, the step waits its turn too. Keystroke typing stops if the user switches to that \
     app partway; the error says how much was typed, so type the rest. Pass priority="now" only when the step \
     can't wait (a dialog or toast about to close, a hover then a click, a code about to expire).
     Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's \

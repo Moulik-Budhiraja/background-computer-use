@@ -79,6 +79,15 @@ public final class KeyScope {
         throw ToolError("could not make window \(target) the app's key window without activating it (the app's key window is \(current.map(String.init) ?? "none")), so no keys were sent. Use accessibility actions (set_value, click on an element) instead.")
     }
 
+    /// End the scope leaving key on the target, in an app the user isn't
+    /// in (see `FocusGuard.park`). Returns false, doing nothing, if the app
+    /// is in front now or the target lost key: then call `exit`.
+    public func keepKey() -> Bool {
+        guard !exited, BCUFrontProcessPID() != pid, AX.focusedWindowID(pid) == target else { return false }
+        exited = true
+        return true
+    }
+
     /// Give key back to the window that had it. Returns whether that was
     /// confirmed (accessibility names it the key window again).
     @discardableResult

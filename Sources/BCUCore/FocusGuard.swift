@@ -40,6 +40,9 @@ public final class FocusGuard {
     /// Apps whose key window an agent has moved to one of its windows right
     /// now (see `beginSwap`), with nesting counts.
     private var swapping: [pid_t: Int] = [:]
+    /// Apps the user isn't in whose key window was left on an agent's
+    /// window after its step (see `park`).
+    private var parked: [pid_t: ParkedKey] = [:]
     /// Keys the user typed into an app while it was mid-swap, held until key
     /// is back on their window. With when the first one came.
     private var pidHeld: [pid_t: (sinceMs: Double, events: [CGEvent])] = [:]
@@ -432,6 +435,7 @@ public final class FocusGuard {
             // Off the main thread: AX calls into Electron apps can be slow.
             DispatchQueue.global(qos: .userInitiated).async {
                 self.reclaimWhenSafe(pid)
+                self.unpark(pid, reason: "the user switched to it")
                 self.noteUserFront(pid)
             }
         }
@@ -440,6 +444,70 @@ public final class FocusGuard {
     static func onAgentDisplay(_ id: CGWindowID) -> Bool {
         guard let info = WindowList.info(id) else { return false }
         return AgentDisplay.running.contains { $0.liveBounds.intersects(info.bounds) }
+    }
+
+    // MARK: Parked key
+
+    public struct ParkedKey {
+        public let window: CGWindowID
+        /// The agent session whose window it is.
+        public let owner: String
+        /// When that agent last did anything in the window.
+        public var lastUsedMs: Double
+    }
+
+    /// Leave key on the agent's window after its step, in an app the user
+    /// isn't in. Giving it up would blur the page: a web form takes that as
+    /// leaving the field (a dropdown closes, a combobox clears what was
+    /// typed), so the agent's next step would find it reset. The user always
+    /// comes first: keys they type into the app are held from the moment
+    /// they switch to it until key is on their window (`activated`).
+    public func park(_ pid: pid_t, window: CGWindowID, owner: String) {
+        lock.lock()
+        parked[pid] = ParkedKey(window: window, owner: owner, lastUsedMs: nowMs())
+        lock.unlock()
+    }
+
+    public func parkedKey(_ pid: pid_t) -> ParkedKey? {
+        lock.lock(); defer { lock.unlock() }
+        return parked[pid]
+    }
+
+    /// The agent did something in this window: if it holds its app's key,
+    /// it keeps it a while longer before another agent may take it.
+    public func touchParked(window: CGWindowID) {
+        lock.lock()
+        for (pid, p) in parked where p.window == window { parked[pid]?.lastUsedMs = nowMs() }
+        lock.unlock()
+    }
+
+    /// An agent took key from this app's parked window (or gave it back).
+    public func forgetParked(_ pid: pid_t) {
+        lock.lock(); parked[pid] = nil; lock.unlock()
+    }
+
+    /// Stop holding key on an agent window in `pid`. If the user is in the
+    /// app, key goes to their window; otherwise the agent's window resigns
+    /// it so the app counts itself inactive again. Then the user's held keys
+    /// for the app go on. `window`: only if that's the parked one.
+    public func unpark(_ pid: pid_t, window: CGWindowID? = nil, reason: String) {
+        Engine.inputLock.lock()
+        defer { Engine.inputLock.unlock() }
+        lock.lock()
+        guard let p = parked[pid], window == nil || p.window == window else { lock.unlock(); return }
+        parked[pid] = nil
+        lock.unlock()
+        if !isSwapping(pid) {
+            if BCUFrontProcessPID() == pid {
+                reclaimKey(pid)
+                // No window of theirs to take key: at least not the agent's.
+                if AX.focusedWindowID(pid) == p.window { _ = BCUPostFocusRecord(pid, p.window, false) }
+            } else if AX.focusedWindowID(pid) == p.window {
+                _ = BCUPostFocusRecord(pid, p.window, false)
+            }
+        }
+        Log.info("guard: gave up key on agent window \(p.window) in pid \(pid): \(reason)")
+        releasePidHeld(pid)
     }
 
     /// `reclaimKey`, but never in the middle of a key swap: a swap in any
@@ -647,7 +715,7 @@ public final class FocusGuard {
             }
             lock.lock()
             let alreadyHolding = holding || !holdTokens.isEmpty || draining || !held.isEmpty || replaysInFlight > 0
-            let anySwap = !swapping.isEmpty || !pidHeld.isEmpty
+            let anySwap = !swapping.isEmpty || !pidHeld.isEmpty || !parked.isEmpty
             let now = nowMs()
             let anyTaint = taints.values.contains { $0.count > 0 || $0.until >= now }
             lock.unlock()
@@ -661,7 +729,9 @@ public final class FocusGuard {
             if anySwap && type != .flagsChanged && !cmdTab {
                 let front = BCUFrontProcessPID()
                 lock.lock()
-                let mid = swapping[front] != nil || pidHeld[front] != nil
+                // Or one left on an agent's window: the user just switched
+                // to the app, and key moves to their window in a moment.
+                let mid = swapping[front] != nil || pidHeld[front] != nil || parked[front] != nil
                 if mid, let copy = event.copy() {
                     if firstCapture(copy, "held for an app mid-swap") {
                         var p = pidHeld[front] ?? (nowMs(), [])
@@ -760,6 +830,15 @@ public final class FocusGuard {
     /// leave the user's keyboard and mouse dead.
     private func watchHolds() {
         let now = nowMs()
+        // The user is in an app whose key is parked on an agent's window but
+        // its activation went unnoticed: give key to them now.
+        let front = BCUFrontProcessPID()
+        lock.lock()
+        let parkedFront = parked[front] != nil && swapping[front] == nil
+        lock.unlock()
+        if parkedFront {
+            DispatchQueue.global(qos: .userInteractive).async { self.unpark(front, reason: "the user is in it") }
+        }
         lock.lock()
         var what: [String] = []
         if !holdTokens.isEmpty && now - holdSinceMs > Self.maxHoldMs { holdTokens.removeAll(); what.append("a key swap") }

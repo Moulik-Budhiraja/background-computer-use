@@ -53,6 +53,71 @@ public final class AgentDisplay {
 
     private static var callbackInstalled = false
 
+    // MARK: How many at once
+
+    /// At most this many agent displays exist at once. An agent that needs
+    /// one when they're all taken waits its turn (see `reserve`).
+    /// BCU_MAX_DISPLAYS at launch changes it (for tests).
+    public static let maxDisplays = max(1, Int(ProcessInfo.processInfo.environment["BCU_MAX_DISPLAYS"] ?? "") ?? 4)
+    private static let gate = NSCondition()
+    private static var reservations = 0
+    /// Agents waiting for a display, first come first served.
+    private static var waiting: [Int] = []
+    private static var nextTicket = 0
+    private var reserved = false
+
+    /// Take one of the `maxDisplays` places for this display, waiting up to
+    /// `timeout` for another agent's display to go away. `onWait` runs once
+    /// if it has to wait. Never call it on the main thread. Returns false
+    /// on a timeout.
+    public func reserve(timeout: TimeInterval, onWait: () -> Void) -> Bool {
+        let g = Self.gate
+        g.lock()
+        if reserved { g.unlock(); return true }
+        let ticket = Self.nextTicket
+        Self.nextTicket += 1
+        Self.waiting.append(ticket)
+        let deadline = Date().addingTimeInterval(timeout)
+        var told = false
+        while !(Self.waiting.first == ticket && Self.reservations < Self.maxDisplays) {
+            if !told {
+                told = true
+                g.unlock(); onWait(); g.lock()
+                continue
+            }
+            if !g.wait(until: deadline) {
+                Self.waiting.removeAll { $0 == ticket }
+                g.broadcast()
+                g.unlock()
+                return false
+            }
+        }
+        Self.waiting.removeFirst()
+        Self.reservations += 1
+        reserved = true
+        g.broadcast()
+        g.unlock()
+        return true
+    }
+
+    /// An agent is waiting for a display.
+    public static var someoneWaiting: Bool {
+        gate.lock(); defer { gate.unlock() }
+        return !waiting.isEmpty
+    }
+
+    /// Give the place back (`stop` does).
+    private func unreserve() {
+        let g = Self.gate
+        g.lock()
+        if reserved {
+            reserved = false
+            Self.reservations -= 1
+            g.broadcast()
+        }
+        g.unlock()
+    }
+
     public static let defaultWidth = 1600
     public static let defaultHeight = 1000
 
@@ -116,6 +181,7 @@ public final class AgentDisplay {
 
     /// Main thread.
     public func stop() {
+        defer { unreserve() }
         guard display != nil else { return }
         display?.invalidate()
         display = nil
