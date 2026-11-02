@@ -703,8 +703,13 @@ public final class Engine {
         defer {
             if batching { cover?.lastUsedMs = nowMs() } else { closeCover() }
         }
+        // Key must be the user's going in, or the swap wouldn't give it back.
+        if cover != nil { focusGuard.reclaimKey(w.pid) }
         let scope = try KeyScope.enter(pid: w.pid, window: w.id)
-        defer { scope.exit() }
+        defer {
+            scope.exit()
+            if userIsIn(w.pid) { focusGuard.reclaimKey(w.pid) }
+        }
         let result = try body()
         rememberFocusedText(in: w)
         return result

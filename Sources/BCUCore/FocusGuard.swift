@@ -238,7 +238,8 @@ public final class FocusGuard {
         userFrontPid = pid
         userFrontWindow = nil
         lock.unlock()
-        let window = AX.focusedWindowID(pid)
+        var window = AX.focusedWindowID(pid)
+        if let w = window, Self.onAgentDisplay(w) { window = nil }
         lock.lock()
         guard userFrontPid == pid else { lock.unlock(); return }
         userFrontWindow = window
@@ -319,13 +320,41 @@ public final class FocusGuard {
             if BCUFrontProcessPID() == pid { restoreUserFront(reason: "activation") }
         } else {
             // Off the main thread: AX calls into Electron apps can be slow.
-            DispatchQueue.global(qos: .userInitiated).async { self.noteUserFront(pid) }
+            DispatchQueue.global(qos: .userInitiated).async {
+                if !self.midAction(pid) { self.reclaimKey(pid) }
+                self.noteUserFront(pid)
+            }
         }
+    }
+
+    private func midAction(_ pid: pid_t) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return taints[pid]?.until == .infinity
     }
 
     static func onAgentDisplay(_ id: CGWindowID) -> Bool {
         guard let info = WindowList.info(id) else { return false }
         return AgentDisplay.running.contains { $0.liveBounds.intersects(info.bounds) }
+    }
+
+    /// The user's front app must never have an agent's window as its key
+    /// window outside a swap: their typing would go there. It can happen
+    /// when the app comes back to the front just as a swap ends (a system
+    /// alert took the front for a moment, say), because AppKit makes the
+    /// window that was key last key again. Hand key to the app's frontmost
+    /// window on the user's screens. Returns whether it had to.
+    @discardableResult
+    public func reclaimKey(_ pid: pid_t) -> Bool {
+        guard BCUFrontProcessPID() == pid, let key = AX.focusedWindowID(pid), Self.onAgentDisplay(key) else { return false }
+        let agents = AgentDisplay.running.map(\.liveBounds)
+        guard let user = WindowList.of(pid: pid, onScreenOnly: true).first(where: { w in
+            w.layer == 0 && w.alpha > 0 && w.bounds.width > 40 && !agents.contains { $0.intersects(w.bounds) }
+        }) else { return false }
+        _ = KeyScope.postRecords(pid: pid, from: key, to: user.id, settle: 5)
+        KeyScope.awaitKey(pid: pid, target: user.id, budgetMs: 250)
+        let ok = AX.focusedWindowID(pid) == user.id
+        record("\(NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)") was in front with an agent window (\(key)) as its key window; \(ok ? "gave key back to" : "COULD NOT give key back to") the user's window \(user.id)")
+        return true
     }
 
     private func taintCause(_ pid: pid_t) -> String {
