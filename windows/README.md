@@ -31,6 +31,32 @@ The probe that measured these is `probe/` (`bcu-probe.exe`), with the scripts in
 
 End to end (`probe/phase0/e2e.ps1`): with a simulated user typing three sentences into Notepad in front, the agent opened Edge on its monitor, typed a URL, clicked, typed into fields, pressed Ctrl+A and Ctrl+L, set a value through UI Automation, scrolled, batched, took a screenshot and closed the window. Edge took the foreground once (on the UI Automation write) and the guard gave it back in 0.3–0.5 ms. All 174 characters landed in Notepad and nothing else did, in two runs out of two. A raw MCP session over `bcu mcp` worked too.
 
+## Over Remote Desktop
+
+A Remote Desktop session only has Remote Desktop's own displays. The agent monitors belong to the computer's own session, so the app can't see them there. Agents get hidden screens instead: areas the size of an agent monitor, starting at (-30000, -30000), off every display.
+
+Measured over Remote Desktop into a Hyper-V VM (Windows 11 26300, Edge 156):
+
+| Question | Result |
+| --- | --- |
+| Edge off every display | Draws nothing with its occlusion check on (no frames in 5 s, `visibilityState` hidden). Started with `--disable-features=CalculateNativeWinOcclusion` it draws ~32 frames a second, and PrintWindow captures it live. |
+| The "Calculate window occlusion on Windows" flag instead | Edge 156 drops it from Local State when it starts and still draws nothing. Chrome 156 doesn't have it. |
+| Notepad and File Explorer off every display | Draw normally. Posted typing reaches Notepad. Calculator (UWP) can't be moved off. |
+| Menus, dropdowns and the address bar's suggestions | Windows puts them on a display. A context menu moved back over its window still draws and takes posted input. With the guard moving them, a context menu was on the user's screen for under 5 ms; the suggestions and a `<select>`'s list weren't seen there. |
+| Remote Desktop client minimized | Windows still draw. |
+| Disconnected | Pages keep running, but captures freeze at the last frame. |
+| Disconnected, then `tscon <session> /dest:console` | Windows draw again, also once the session is locked. Locking before `tscon` doesn't hold: `tscon` unlocks the session. |
+| Clicking the address bar of a hidden Edge window | Doesn't focus it (Edge doesn't activate the window), so the agent instructions say Ctrl+L. Clicking page fields and typing works. |
+| Keys to an Edge window while another Edge window has its thread's focus | Ignored. All of Edge's windows share one thread. |
+
+What the app does there:
+
+- **Browsers.** When a Chromium browser isn't running, the app starts it with the switch. When it's running without it (the app reads its command line), `open_window` and `borrow_window` fail and tell the agent to ask the user to quit the browser.
+- **Menus.** The guard moves an agent's menus, dropdowns and dialogs over its window when they show.
+- **Screen changes.** A window Windows moves onto the user's screen goes back to its hidden screen within 500 ms. On reconnecting, the agent's window was on the user's screen for 45 ms.
+- **Disconnecting.** Setup registers a task, "Background Computer Use keep drawing", that runs as SYSTEM when a session disconnects. If the app runs in that session and nobody is signed in at the computer, it moves the session onto the computer's display with `tscon`. The app locks the session when it arrives there (a console connect within 30 s of a remote disconnect). Measured: the session was moved 3.1 s after the disconnect and locked, and screenshots stayed live. Between `tscon` and the lock, the session is unlocked on the computer's display; that moment wasn't measured. The task's script is in `%ProgramFiles%\Background Computer Use`, where only admins can change it.
+- **Tray preview.** Composed from each window's own capture, since a hidden screen has no pixels to copy.
+
 ## Status
 
 Built: the MCP server (`bcu.exe mcp`), the pipe between it and the app, the UI Automation listing and diff, posted click/type/key/scroll/drag, set_value, perform_action, batch, screenshots, open_window, borrow_window, release_window, handoff/take_back, the focus guard, a monitor and thread per agent session, the tray icon and its live preview, and a first-run setup (one prompt, then the driver install with Windows' admin prompt, `bcu connect` for Claude Code and Codex, and start at sign-in).

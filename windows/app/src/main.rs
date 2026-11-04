@@ -6,6 +6,7 @@
 //!   BackgroundComputerUse.exe --snapshot <hwnd> [max]
 
 mod apps;
+mod browser;
 mod capture;
 mod engine;
 mod gfx;

@@ -249,14 +249,9 @@ fn paused_circle(r: R) -> (f32, f32) {
     (r.cx(), r.cy() - (44.0 + 10.0 + 15.0) / 2.0 + 22.0)
 }
 
-/// The agent screens are installed, but this is a Remote Desktop session,
-/// which can't show them. Setting up again wouldn't help.
-fn remote_only() -> bool {
-    !monitor::installed() && monitor::remote_session() && monitor::driver_installed()
-}
-
+/// No agent monitor, and not over Remote Desktop (where agents get hidden screens).
 fn needs_setup() -> bool {
-    !monitor::installed() && !remote_only()
+    !monitor::installed() && !monitor::hidden_mode()
 }
 
 fn setup_button(p: R) -> R {
@@ -447,10 +442,10 @@ impl Paint<'_> {
         if monitor::installed() {
             c.glyph(G_MONITOR, p.cx(), p.cy() - 12.0, 20.0, rgba(0xFFFFFF, 0.45));
             c.text("Nothing running", p.cx(), p.cy() + 14.0, p.w - 20.0, Font::Semibold, 12.0, rgba(0xFFFFFF, 0.45), Align::Center);
-        } else if remote_only() {
-            c.glyph(G_HIDDEN, p.cx(), p.cy() - 26.0, 20.0, rgba(0xFFFFFF, 0.45));
-            c.text("Agent screens don't show over Remote Desktop", p.cx(), p.cy() + 2.0, p.w - 20.0, Font::Semibold, 13.0, rgba(0xFFFFFF, 0.88), Align::Center);
-            c.text("Agents can use them once you're back at the computer", p.cx(), p.cy() + 24.0, p.w - 20.0, Font::Semibold, 12.0, rgba(0xFFFFFF, 0.45), Align::Center);
+        } else if monitor::hidden_mode() {
+            c.glyph(G_MONITOR, p.cx(), p.cy() - 22.0, 20.0, rgba(0xFFFFFF, 0.45));
+            c.text("Nothing running", p.cx(), p.cy() + 4.0, p.w - 20.0, Font::Semibold, 12.0, rgba(0xFFFFFF, 0.45), Align::Center);
+            c.text("Over Remote Desktop, agents work in hidden windows", p.cx(), p.cy() + 24.0, p.w - 20.0, Font::Semibold, 11.0, rgba(0xFFFFFF, 0.35), Align::Center);
         } else {
             c.glyph(G_HIDDEN, p.cx(), p.cy() - 26.0, 20.0, rgba(0xFFFFFF, 0.45));
             c.text("Agent screens aren't set up", p.cx(), p.cy() + 2.0, p.w - 20.0, Font::Semibold, 13.0, rgba(0xFFFFFF, 0.88), Align::Center);
@@ -465,8 +460,7 @@ impl Paint<'_> {
 fn header_text(views: &[View]) -> String {
     let shown: Vec<&View> = views.iter().filter(|v| v.visible()).collect();
     match shown.len() {
-        0 if remote_only() => "Remote Desktop".into(),
-        0 if !monitor::installed() => "Setup needed".into(),
+        0 if needs_setup() => "Setup needed".into(),
         0 => "Idle".into(),
         1 => shown[0].status_text(),
         n => {
@@ -667,7 +661,7 @@ fn tick() {
     for (id, w, h) in wanted {
         let has_windows = views.iter().any(|v| v.id == id && v.windows > 0);
         if let (true, Some(m)) = (has_windows, monitors.get(&id))
-            && let Some(f) = gfx::capture_screen(*m, w, h)
+            && let Some(f) = if monitor::on_screen(m) { gfx::capture_screen(*m, w, h) } else { gfx::capture_windows(*m, w, h) }
         {
             frames.insert(id, f);
         }

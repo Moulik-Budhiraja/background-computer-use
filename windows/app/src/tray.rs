@@ -2,18 +2,21 @@
 //! monitor); right-click for Pause, Stop and Quit. Runs on the main thread's
 //! message loop, which also runs the popover and the expanded view.
 
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification};
+use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::gfx::{Canvas, rgb};
-use crate::{engine, sessions, setup, ui, updater};
+use crate::{engine, monitor, sessions, setup, ui, updater};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_APP_REFRESH: u32 = WM_APP + 2;
@@ -98,6 +101,7 @@ pub fn run() {
         .expect("tray window");
         *HWND_SLOT.lock().unwrap() = Some(hwnd.0 as usize);
         sessions::on_change(|| post(WM_APP_REFRESH));
+        let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
         add_icon(hwnd);
         // The working state lasts a few seconds past each call; check it runs out.
         SetTimer(Some(hwnd), ICON_TIMER, 500, None);
@@ -285,6 +289,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 PostQuitMessage(0);
                 LRESULT(0)
             }
+            WM_WTSSESSION_CHANGE => {
+                session_changed(wparam.0 as u32);
+                LRESULT(0)
+            }
             WM_SETTINGCHANGE => {
                 // The light/dark switch arrives as "ImmersiveColorSet".
                 std::thread::sleep(Duration::from_millis(50));
@@ -300,6 +308,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
         }
+    }
+}
+
+/// When Remote Desktop disconnects, the keep-drawing task (install-monitor.ps1)
+/// moves the session onto the computer's own display so agents' windows keep
+/// drawing. Lock it the moment it arrives: agents keep working on a locked
+/// session (measured), and nobody at the computer can use it.
+fn session_changed(event: u32) {
+    const CONSOLE_CONNECT: u32 = 1;
+    const REMOTE_CONNECT: u32 = 3;
+    const REMOTE_DISCONNECT: u32 = 4;
+    static DISCONNECTED: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut disconnected = DISCONNECTED.lock().unwrap_or_else(|e| e.into_inner());
+    match event {
+        REMOTE_DISCONNECT => *disconnected = Some(Instant::now()),
+        // The task acts a few seconds after the disconnect. Someone signing in
+        // at the computer comes later, through the sign-in screen.
+        CONSOLE_CONNECT if disconnected.take().is_some_and(|t| t.elapsed() < Duration::from_secs(30)) => unsafe {
+            let _ = LockWorkStation();
+        },
+        REMOTE_CONNECT => *disconnected = None,
+        _ => {}
+    }
+    // The screens changed: place the agent monitors again if they're back.
+    if matches!(event, CONSOLE_CONNECT | REMOTE_CONNECT) {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(2));
+            monitor::arrange();
+        });
     }
 }
 

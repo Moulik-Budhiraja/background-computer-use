@@ -44,8 +44,8 @@ after an action it waits (up to 5 s) for the window to settle, so you don't need
 keyboard focus. `type_text`, `press_key` and pixel clicks are sent to your window in the background; \
 the user's input is never interrupted.
 Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's \
-elements in `get_window_state`; click their rows by number. In a browser, to go to a URL: click the \
-address bar, then `type_text` the URL followed by \"\\n\".
+elements in `get_window_state`; click their rows by number. In a browser, to go to a URL: press ctrl+l \
+(modifiers [\"ctrl\"]), then `type_text` the URL followed by \"\\n\".
 5. When you already know the next few steps (fill a form and submit, type a URL and press Enter), send \
 them in one `batch` call: it runs them in order, stops at the first failure, and returns the window's \
 state at the end. Otherwise check the result with `get_window_state` after each meaningful step.

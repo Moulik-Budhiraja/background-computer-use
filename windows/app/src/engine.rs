@@ -16,7 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::BSTR;
 
 use crate::snapshot::{self, Node, Snapshot};
-use crate::{apps, capture, guard, input, monitor, sessions, win};
+use crate::{apps, browser, capture, guard, input, monitor, sessions, win};
 
 pub struct Image {
     pub mime: String,
@@ -255,6 +255,9 @@ fn run_session(id: String, rx: mpsc::Receiver<Job>) {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        // Every turn (at most 500 ms apart), so a window Windows moved onto
+        // the user's screen doesn't stay there.
+        engine.keep_on_screen();
         if last_check.elapsed() > Duration::from_secs(2) {
             last_check = Instant::now();
             // Windows the user or the app closed.
@@ -322,9 +325,44 @@ impl Engine {
         });
     }
 
-    /// Where the agent points now, for the preview's cursor.
+    /// Where the agent points now, for the preview's cursor and for placing
+    /// the menus it opens on a hidden screen.
     fn point_at(&self, p: POINT) {
         sessions::update(&self.id, |v| v.pointer = Some((p, Instant::now())));
+        guard::note_point(p);
+    }
+
+    /// The screens can change under the windows: Remote Desktop connecting
+    /// takes the agent monitors away, and Windows moves their windows onto
+    /// the user's screen. Put any window that ended up there back on the
+    /// session's screen. (Measured: back within 45 ms of reconnecting.)
+    fn keep_on_screen(&self) {
+        if self.windows.is_empty() {
+            return;
+        }
+        let Some(m) = monitor::of_session(&self.id) else { return };
+        for (n, w) in self.windows.values().enumerate() {
+            if w.handed_off() || w.kind == Kind::Adopted || win::is_minimized(w.hwnd) || !monitor::on_user_screen(&win::frame(w.hwnd)) {
+                continue;
+            }
+            apps::place(w.hwnd, m.rect, n);
+        }
+    }
+
+    /// On a hidden screen a Chromium browser has to run with its occlusion
+    /// check off, or its windows come out blank. The switch to start the
+    /// browser with, if it isn't running yet.
+    fn browser_switch(&self, exe: &str, name: &str) -> Fallible<Option<&'static str>> {
+        if !monitor::hidden_mode() || !browser::is_chromium(exe) {
+            return Ok(None);
+        }
+        match browser::state(exe) {
+            browser::State::Ready => Ok(None),
+            browser::State::NotRunning => Ok(Some(browser::SWITCH)),
+            browser::State::NeedsRestart => Err(format!(
+                "{name} is running with a setting that makes it stop drawing windows nobody can see. This is a Remote Desktop session, so your windows are off-screen and would come out blank. Ask the user to quit {name} completely (every window), then call this again: BCU starts it with that setting off. Or use another app."
+            )),
+        }
     }
 
     /// Stop from the tray: close the windows agents opened, return borrowed ones.
@@ -364,9 +402,11 @@ impl Engine {
         }
         // Activations of the app the agent acts on are the agent's doing: the
         // guard gives the foreground straight back to the user.
-        let pid = args.int("window_id").and_then(|id| self.windows.get(&(id as u64))).map(|w| w.pid);
-        if acting && let Some(pid) = pid {
-            guard::begin_action(pid);
+        let window = args.int("window_id").and_then(|id| self.windows.get(&(id as u64)));
+        let pid = window.map(|w| w.pid);
+        if acting && let Some(w) = window {
+            guard::begin_action(w.pid);
+            guard::note_target(w.hwnd);
         }
         let mut result = self.dispatch(tool, &args).unwrap_or_else(ToolResult::error);
         if acting && let Some(pid) = pid {
@@ -434,10 +474,11 @@ impl Engine {
         let name = args.need_str("app")?;
         let app = apps::resolve(name)?;
         let mon = self.agent_monitor()?;
+        let switch = if std::path::Path::new(&app.launch).is_absolute() { self.browser_switch(&app.launch, &app.name)? } else { None };
         let index = self.windows.len();
         let (hwnd, notes) = {
             let _one_at_a_time = OPENING.lock().unwrap_or_else(|e| e.into_inner());
-            apps::open(&app, mon, index)?
+            apps::open(&app, mon, index, switch)?
         };
         let pid = win::pid_tid(hwnd).0;
         let id = win::id(hwnd);
@@ -468,6 +509,10 @@ impl Engine {
             return Err(format!("the user is using window {id} right now. Pick another, or wait."));
         }
         let mon = self.agent_monitor()?;
+        // Its browser is running, so this only checks that it keeps drawing.
+        if let Some(exe) = win::exe_path(win::pid_tid(hwnd).0) {
+            self.browser_switch(&exe, &win::app_name(win::pid_tid(hwnd).0))?;
+        }
         let mut home = RECT::default();
         unsafe {
             let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut home);
@@ -527,7 +572,13 @@ impl Engine {
 
     fn status(&self, _args: &Args) -> ToolResult {
         let mut lines = Vec::new();
-        match monitor::of_session(&self.id).or_else(|| monitor::all().into_iter().next()) {
+        match monitor::of_session(&self.id).or_else(monitor::first) {
+            Some(m) if monitor::hidden_mode() => lines.push(format!(
+                "Your monitor: {}x{} pixels ({}). This is a Remote Desktop session, so your windows are kept off-screen instead of on an agent monitor; they work the same.",
+                m.rect.right - m.rect.left,
+                m.rect.bottom - m.rect.top,
+                monitor::name(&m)
+            )),
             Some(m) => {
                 lines.push(format!("Your monitor: {}x{} pixels ({}).", m.rect.right - m.rect.left, m.rect.bottom - m.rect.top, monitor::name(&m)))
             }

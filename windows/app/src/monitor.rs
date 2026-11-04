@@ -9,6 +9,13 @@
 //! start, before any agent has a window. The monitors sit in a row touching the
 //! user's screens only at their bottom-right corner, so the pointer can't drift
 //! onto them along an edge; the guard fences them off.
+//!
+//! A Remote Desktop session can't see the agent monitors: they belong to the
+//! computer's own session. There, agents get hidden screens instead: areas of
+//! the same size far off every screen. Windows there keep drawing (Chromium
+//! browsers only with their occlusion check off, see browser.rs), screenshots
+//! read them from the compositor, and the guard moves their menus off the
+//! user's screen.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -31,6 +38,69 @@ pub struct Monitor {
     /// e.g. \\.\DISPLAY2
     pub device: Vec<u16>,
     pub rect: RECT,
+}
+
+/// Hidden screens: as big as an agent monitor, in a row far above every
+/// screen (Windows treats -32000 as "minimized", so they stay clear of it).
+const HIDDEN_W: i32 = 1600;
+const HIDDEN_H: i32 = 1000;
+const HIDDEN_ORIGIN: i32 = -30000;
+
+fn hidden() -> Vec<Monitor> {
+    (0..WANTED as i32)
+        .map(|i| {
+            let left = HIDDEN_ORIGIN + i * (HIDDEN_W + 100);
+            Monitor {
+                device: format!("hidden screen {}", i + 1).encode_utf16().chain(std::iter::once(0)).collect(),
+                rect: RECT { left, top: HIDDEN_ORIGIN, right: left + HIDDEN_W, bottom: HIDDEN_ORIGIN + HIDDEN_H },
+            }
+        })
+        .collect()
+}
+
+/// Agents use hidden screens now: no agent monitor is on and this is a Remote
+/// Desktop session.
+pub fn hidden_mode() -> bool {
+    all().is_empty() && remote_session()
+}
+
+/// The screens agents get now: the agent monitors, or hidden screens.
+fn usable() -> Vec<Monitor> {
+    let ms = all();
+    if ms.is_empty() && remote_session() { hidden() } else { ms }
+}
+
+/// Whether any part of `r` is on one of the user's screens (a display that
+/// isn't an agent monitor).
+pub fn on_user_screen(r: &RECT) -> bool {
+    unsafe extern "system" fn each(m: HMONITOR, _: HDC, _: *mut RECT, data: windows::Win32::Foundation::LPARAM) -> windows::core::BOOL {
+        let (agents, r, hit) = unsafe { &mut *(data.0 as *mut (Vec<RECT>, RECT, bool)) };
+        let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        unsafe {
+            let _ = GetMonitorInfoW(m, &mut info);
+        }
+        let s = info.rcMonitor;
+        if !agents.contains(&s) && r.left < s.right && s.left < r.right && r.top < s.bottom && s.top < r.bottom {
+            *hit = true;
+        }
+        true.into()
+    }
+    let mut data: (Vec<RECT>, RECT, bool) = (all().iter().map(|m| m.rect).collect(), *r, false);
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(each), windows::Win32::Foundation::LPARAM(&mut data as *mut _ as isize));
+    }
+    data.2
+}
+
+/// The first screen an agent would get.
+pub fn first() -> Option<Monitor> {
+    usable().into_iter().next()
+}
+
+/// Whether any part of `r` is on a display: the user's screens or an agent
+/// monitor, not a hidden screen.
+pub fn on_screen(r: &RECT) -> bool {
+    unsafe { !MonitorFromRect(r, MONITOR_DEFAULTTONULL).is_invalid() }
 }
 
 fn wide_to_string(w: &[u16]) -> String {
@@ -195,8 +265,9 @@ pub fn ensure_count() {
 pub fn arrange() -> Vec<Monitor> {
     let mut ms = all();
     if ms.is_empty() {
+        // Nothing to fence: the pointer can't reach a hidden screen.
         guard::set_fence(None);
-        return ms;
+        return if remote_session() { hidden() } else { ms };
     }
     let user = user_bounds(&ms.iter().map(|m| m.rect).collect::<Vec<_>>());
     let mut x = user.right;
@@ -239,9 +310,6 @@ static SLOTS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 pub fn for_session(session: &str) -> Result<Monitor, String> {
     let ms = arrange();
     if ms.is_empty() {
-        if remote_session() && driver_installed() {
-            return Err("The agent monitor isn't available over Remote Desktop: Windows only shows it at the computer itself. Agents can use it once the user is back at the computer.".into());
-        }
         return Err("The agent monitor isn't available: the Virtual Display Driver isn't installed or its monitor is off. Open Background Computer Use's setup to install it.".into());
     }
     let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -263,7 +331,7 @@ pub fn for_session(session: &str) -> Result<Monitor, String> {
 /// The monitor the session has, if any, without claiming one.
 pub fn of_session(session: &str) -> Option<Monitor> {
     let index = *SLOTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(session)?;
-    all().into_iter().nth(index)
+    usable().into_iter().nth(index)
 }
 
 /// The session is done with its monitor.
@@ -279,7 +347,7 @@ pub fn name(m: &Monitor) -> String {
 
 /// Every session's monitor rect, in one pass.
 pub fn slots() -> Vec<(String, RECT)> {
-    let ms = all();
+    let ms = usable();
     let slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
     slots
         .as_ref()

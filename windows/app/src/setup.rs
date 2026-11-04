@@ -10,7 +10,7 @@ use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW};
 use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
-use windows::Win32::UI::WindowsAndMessaging::{IDOK, MB_ICONINFORMATION, MB_OK, MB_OKCANCEL, MessageBoxW, SW_HIDE};
+use windows::Win32::UI::WindowsAndMessaging::{IDOK, MB_ICONINFORMATION, MB_OKCANCEL, MessageBoxW, SW_HIDE};
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::monitor;
@@ -31,12 +31,48 @@ fn declined_marker() -> PathBuf {
     support_dir().join("setup-declined")
 }
 
-/// Ask on first launch if the monitor isn't there.
+fn keep_drawing_declined_marker() -> PathBuf {
+    support_dir().join("keep-drawing-declined")
+}
+
+/// Whether the task that keeps agents working after Remote Desktop
+/// disconnects is there. Users can't query a SYSTEM task, so this checks for
+/// its script, which install-monitor.ps1 writes once the task is registered.
+pub fn keep_drawing_installed() -> bool {
+    std::env::var_os("ProgramFiles").is_some_and(|p| PathBuf::from(p).join("Background Computer Use").join("keep-drawing.ps1").exists())
+}
+
+/// Ask on first launch if the monitor isn't there. Over Remote Desktop,
+/// also offer the task that keeps agents working after a disconnect, once.
 pub fn offer_on_launch() {
-    if monitor::installed() || monitor::driver_installed() || declined_marker().exists() {
+    if !monitor::installed() && !monitor::driver_installed() {
+        if !declined_marker().exists() {
+            std::thread::spawn(|| run(true));
+        }
         return;
     }
-    std::thread::spawn(|| run(true));
+    if monitor::remote_session() && !keep_drawing_declined_marker().exists() {
+        std::thread::spawn(|| {
+            if keep_drawing_installed() {
+                return;
+            }
+            let answer = unsafe {
+                MessageBoxW(
+                    None,
+                    w!("Keep agents working after you disconnect?\n\nWhen Remote Desktop disconnects, Windows stops drawing your session, so agents can't see their windows. Background Computer Use can move your session to this computer's own screen and lock it there, so they keep working.\n\nWindows will ask for permission once."),
+                    w!("Background Computer Use"),
+                    MB_OKCANCEL | MB_ICONINFORMATION,
+                )
+            };
+            if answer != IDOK {
+                let _ = std::fs::create_dir_all(support_dir());
+                let _ = std::fs::write(keep_drawing_declined_marker(), b"");
+            } else if !RUNNING.swap(true, Ordering::SeqCst) {
+                install_monitor();
+                RUNNING.store(false, Ordering::SeqCst);
+            }
+        });
+    }
 }
 
 /// Set while setup runs, so a second click doesn't install a second driver.
@@ -68,23 +104,15 @@ fn run_once(ask: bool) {
         }
     }
     let _ = std::fs::remove_file(declined_marker());
-    if !monitor::installed() {
-        // Installing it again would add a second driver, not turn the first on.
-        if !monitor::driver_installed() {
-            install_monitor();
-        }
-        if monitor::remote_session() && monitor::driver_installed() {
-            unsafe {
-                MessageBoxW(
-                    None,
-                    w!("Agent screens are set up, but Windows only shows them at the computer itself, not over Remote Desktop.\n\nAgents can use them once you're back at the computer."),
-                    w!("Background Computer Use"),
-                    MB_OK | MB_ICONINFORMATION,
-                );
-            }
-        } else {
-            monitor::ensure_count();
-        }
+    let _ = std::fs::remove_file(keep_drawing_declined_marker());
+    // The admin part: the driver and the keep-drawing task. It skips a driver
+    // that's already there (installing it again would add a second one).
+    if !monitor::driver_installed() || !keep_drawing_installed() {
+        install_monitor();
+    }
+    // Over Remote Desktop the agent monitors can't show; agents get hidden screens.
+    if !monitor::installed() && !monitor::remote_session() {
+        monitor::ensure_count();
     }
     // bcu.exe lives next to the app.
     let _ = std::process::Command::new(exe_dir().join("bcu.exe")).arg("connect").creation_flags(CREATE_NO_WINDOW).status();
@@ -155,7 +183,9 @@ const UNINSTALL_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Uni
 
 /// Uninstall (from Settings > Apps): quit the running app, remove the
 /// shortcut, sign-in entry and uninstall entry, then the app's folder once
-/// this process has exited. The agent monitors' driver stays installed.
+/// this process has exited. The agent monitors' driver and the keep-drawing
+/// task stay installed (removing them needs admin); the task does nothing
+/// without the app.
 pub fn uninstall(silent: bool) {
     if !silent {
         let answer = unsafe { MessageBoxW(None, w!("Uninstall Background Computer Use?"), w!("Background Computer Use"), MB_OKCANCEL | MB_ICONINFORMATION) };

@@ -100,12 +100,15 @@ pub fn resolve(name: &str) -> Result<App, String> {
     Ok(App { launch: name.into(), exe: Some(format!("{wanted}.exe")), name: name.into() })
 }
 
-fn launch(target: &str) -> Result<(), String> {
+/// Start `target`, with `args` if given.
+fn launch(target: &str, args: Option<&str>) -> Result<(), String> {
     let file = HSTRING::from(target);
+    let params = args.map(HSTRING::from);
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC,
         lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: params.as_ref().map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr())),
         nShow: SW_SHOWNOACTIVATE.0,
         ..Default::default()
     };
@@ -134,7 +137,7 @@ pub fn place(hwnd: HWND, monitor: RECT, n: usize) {
     }
 }
 
-fn on_monitor(hwnd: HWND, monitor: &RECT) -> bool {
+pub fn on_monitor(hwnd: HWND, monitor: &RECT) -> bool {
     let f = win::frame(hwnd);
     f.left >= monitor.left - 8 && f.top >= monitor.top - 8 && f.right <= monitor.right + 8 && f.bottom <= monitor.bottom + 8
 }
@@ -160,8 +163,9 @@ pub fn show_in_taskbar(hwnd: HWND) {
 }
 
 /// Open a new window of `app` and move it to the agent monitor as soon as it shows.
+/// `args` go to the app if it starts now (a browser that isn't running yet).
 /// Returns the window and notes on what happened.
-pub fn open(app: &App, monitor: RECT, index: usize) -> Result<(HWND, Vec<String>), String> {
+pub fn open(app: &App, monitor: RECT, index: usize, args: Option<&str>) -> Result<(HWND, Vec<String>), String> {
     let known: HashSet<usize> = win::top_level_windows().into_iter().map(|h| h.0 as usize).collect();
     let mut notes = Vec::new();
     let t = Instant::now();
@@ -177,7 +181,7 @@ pub fn open(app: &App, monitor: RECT, index: usize) -> Result<(HWND, Vec<String>
         guard::begin_action(*pid);
     }
     let result = (|| {
-        launch(&app.launch)?;
+        launch(&app.launch, args)?;
         let deadline = t + Duration::from_secs(15);
         let mut found: Option<(HWND, Instant)> = None;
         loop {

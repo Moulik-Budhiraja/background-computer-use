@@ -153,6 +153,72 @@ pub fn capture_screen(src: RECT, w: i32, h: i32) -> Option<Frame> {
     }
 }
 
+/// A hidden screen isn't on any display, so there's nothing to copy: draw
+/// each window on it from its own surface (as screenshots do), bottom first,
+/// then scale to w x h.
+pub fn capture_windows(src: RECT, w: i32, h: i32) -> Option<Frame> {
+    let (sw, sh) = (src.right - src.left, src.bottom - src.top);
+    if w <= 0 || h <= 0 || sw <= 0 || sh <= 0 {
+        return None;
+    }
+    let mut canvas = vec![0u8; (sw * sh * 4) as usize];
+    // EnumWindows lists the top first.
+    for hwnd in crate::win::top_level_windows().into_iter().rev() {
+        if !crate::win::is_visible(hwnd) || crate::win::is_minimized(hwnd) {
+            continue;
+        }
+        let f = crate::win::frame(hwnd);
+        if f.right <= src.left || f.left >= src.right || f.bottom <= src.top || f.top >= src.bottom {
+            continue;
+        }
+        let std::result::Result::Ok(img) = crate::capture::window(hwnd, f) else { continue };
+        let (ox, oy) = (f.left - src.left, f.top - src.top);
+        for y in 0..img.height as i32 {
+            let cy = oy + y;
+            if cy < 0 || cy >= sh {
+                continue;
+            }
+            let x0 = ox.max(0);
+            let x1 = (ox + img.width as i32).min(sw);
+            if x1 <= x0 {
+                continue;
+            }
+            let from = ((y * img.width as i32 + (x0 - ox)) * 4) as usize;
+            let to = ((cy * sw + x0) * 4) as usize;
+            let n = ((x1 - x0) * 4) as usize;
+            canvas[to..to + n].copy_from_slice(&img.bgra[from..from + n]);
+        }
+    }
+    unsafe {
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(Some(screen));
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, ..Default::default() },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let std::result::Result::Ok(bmp) = CreateDIBSection(Some(mem), &info, DIB_RGB_COLORS, &mut bits, None, 0) else {
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+            return None;
+        };
+        let old = SelectObject(mem, bmp.into());
+        let src_info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: sw, biHeight: -sh, biPlanes: 1, biBitCount: 32, ..Default::default() },
+            ..Default::default()
+        };
+        SetStretchBltMode(mem, HALFTONE);
+        let _ = SetBrushOrgEx(mem, 0, 0, None);
+        let ok = StretchDIBits(mem, 0, 0, w, h, 0, 0, sw, sh, Some(canvas.as_ptr() as *const _), &src_info, DIB_RGB_COLORS, SRCCOPY) != 0;
+        let frame = ok.then(|| Frame { w, h, bits: std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize).to_vec() });
+        SelectObject(mem, old);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+        frame
+    }
+}
+
 /// A drawing surface. Coordinates are logical pixels; `scale` is the DPI scale.
 pub struct Canvas {
     pub w: i32,

@@ -9,6 +9,13 @@
 //!   is held, the user's window is put back, and the key is replayed into it.
 //!   Nothing the user types lands in the agent's window.
 //! - Cursor fence: the pointer is kept off the agent monitors.
+//! - Menus off the user's screen: a window on a hidden screen (Remote
+//!   Desktop) opens its menus, dropdowns, dialogs and tooltips on the user's
+//!   screen, because Windows keeps them on a display. They're moved over the
+//!   agent's window as soon as they show. Measured in Edge: a moved context
+//!   menu still draws and takes posted input; the context menu was on the
+//!   user's screen for under 5 ms, and the address bar's suggestions and a
+//!   <select>'s list weren't seen there at all.
 //!
 //! The hooks and the foreground watcher run on their own thread with a message
 //! loop and do almost nothing in their callbacks, so the user's input is never
@@ -25,7 +32,7 @@ use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::win;
+use crate::{monitor, win};
 
 /// Marks the keys we replay, so the hook lets them through.
 const REPLAY_TAG: usize = 0x4243_5552; // "BCUR"
@@ -48,6 +55,12 @@ struct State {
     events: Vec<String>,
     /// Foreground changes during actions, by the process acted on, for the tool result.
     action_notes: Vec<(u32, String)>,
+    /// The agent window last acted on in each process, for menus with no owner.
+    targets: Vec<(u32, usize)>,
+    /// Where an agent last clicked, for placing the menu it opened.
+    last_point: Option<(POINT, Instant)>,
+    /// Menus moved off the user's screen, watched in case the app moves them back.
+    moved: HashSet<usize>,
 }
 
 // HWND isn't Send; the guard only stores it as a value and uses it on its own thread.
@@ -71,6 +84,9 @@ fn state() -> std::sync::MutexGuard<'static, State> {
                 last_user_switch: None,
                 events: Vec::new(),
                 action_notes: Vec::new(),
+                targets: Vec::new(),
+                last_point: None,
+                moved: HashSet::new(),
             })
         })
         .lock()
@@ -112,6 +128,21 @@ pub fn start() {
             }
         })
         .expect("guard thread");
+    // Menus of agent windows on hidden screens. Its own thread, so the
+    // keyboard and mouse hooks never wait on it.
+    std::thread::Builder::new()
+        .name("menu-watch".into())
+        .spawn(|| unsafe {
+            let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+            let _ = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, None, Some(on_menu_event), 0, 0, flags);
+            let _ = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, None, Some(on_menu_event), 0, 0, flags);
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        })
+        .expect("menu watch thread");
     // The fence's backstop: anything that put the cursor on the agent monitor
     // without a mouse event (another app warping it, monitors rearranged).
     std::thread::Builder::new()
@@ -147,6 +178,19 @@ pub fn remove_agent_window(hwnd: HWND) {
 /// Whether any agent has this window.
 pub fn is_agent_window(hwnd: HWND) -> bool {
     state().agent_windows.contains(&(hwnd.0 as usize))
+}
+
+/// The agent is acting on this window: menus its app opens without an owner are its.
+pub fn note_target(hwnd: HWND) {
+    let pid = win::pid_tid(hwnd).0;
+    let mut s = state();
+    s.targets.retain(|(p, _)| *p != pid);
+    s.targets.push((pid, hwnd.0 as usize));
+}
+
+/// Where an agent clicked, in screen pixels.
+pub fn note_point(p: POINT) {
+    state().last_point = Some((p, Instant::now()));
 }
 
 /// The agent is about to act on `pid`. Activations of it count as the agent's until `end_action` + a grace period.
@@ -389,6 +433,76 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+unsafe extern "system" fn on_menu_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, object: i32, _: i32, _: u32, _: u32) {
+    // Only windows themselves (location changes also come for the caret and cursor).
+    if hwnd.0.is_null() || object != OBJID_WINDOW.0 {
+        return;
+    }
+    // Location changes come for every window that moves; only follow the menus already moved.
+    if event == EVENT_OBJECT_LOCATIONCHANGE && !state().moved.contains(&(hwnd.0 as usize)) {
+        return;
+    }
+    move_menu(hwnd);
+}
+
+/// The agent window a menu belongs to, if it's an agent's: its owner, or with
+/// no owner, the window the agent is acting on in that app.
+fn menu_owner(s: &State, menu: HWND) -> Option<HWND> {
+    let owner = unsafe { GetAncestor(menu, GA_ROOTOWNER) };
+    if owner != menu && !owner.0.is_null() {
+        return s.agent_windows.contains(&(owner.0 as usize)).then_some(owner);
+    }
+    let pid = win::pid_tid(menu).0;
+    let now = Instant::now();
+    let user_recent = s.last_user_switch.is_some_and(|t| now.duration_since(t) < Duration::from_millis(300));
+    let acting = s.acting.iter().any(|(p, until)| *p == pid && until.is_none_or(|u| u > now));
+    let target = s.targets.iter().find(|(p, _)| *p == pid).map(|(_, h)| HWND(*h as *mut _))?;
+    (acting && !user_recent && s.agent_windows.contains(&(target.0 as usize))).then_some(target)
+}
+
+/// If `menu` is an agent's menu on a display while its window is on a hidden
+/// screen, move it over the window: at the agent's last click if that's in
+/// the window, else near its top-left corner.
+fn move_menu(menu: HWND) {
+    unsafe {
+        if GetAncestor(menu, GA_ROOT) != menu || !win::is_visible(menu) || win::is_app_window(menu) {
+            return;
+        }
+    }
+    let mut r = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(menu, &mut r);
+    }
+    if !monitor::on_screen(&r) {
+        return;
+    }
+    let (owner, last_point) = {
+        let s = state();
+        if s.agent_windows.contains(&(menu.0 as usize)) {
+            return;
+        }
+        (menu_owner(&s, menu), s.last_point)
+    };
+    let Some(owner) = owner else { return };
+    let f = win::frame(owner);
+    if monitor::on_screen(&f) {
+        return;
+    }
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    let p = match last_point {
+        Some((p, t)) if t.elapsed() < Duration::from_secs(5) && inside(&f, p) => p,
+        _ => POINT { x: f.left + 40, y: f.top + 80 },
+    };
+    let x = p.x.min(f.right - w).max(f.left);
+    let y = p.y.min(f.bottom - h).max(f.top);
+    unsafe {
+        let _ = SetWindowPos(menu, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    let mut s = state();
+    s.moved.retain(|h| win::exists(HWND(*h as *mut _)));
+    s.moved.insert(menu.0 as usize);
 }
 
 fn inside(r: &RECT, p: POINT) -> bool {
