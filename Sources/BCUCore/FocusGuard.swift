@@ -51,6 +51,12 @@ public final class FocusGuard {
     private var lastUserMouseDownMs = 0.0
     private var lastUserSwitchKeyMs = 0.0
     private var lastUserKeyMs = 0.0
+    /// The user's last key that could open or switch to an app: Return or
+    /// Enter (a launcher, Terminal `open`, a link) or a shortcut with
+    /// command, control or option held. Plain typing can't.
+    private var lastUserOpenKeyMs = 0.0
+    /// When the guard last put the user's app back in front of each app.
+    private var restoredAwayMs: [pid_t: Double] = [:]
     private var holding = false
     private var holdingSinceMs = 0.0
     /// With the app that was in front when each came: a key goes back to
@@ -319,25 +325,33 @@ public final class FocusGuard {
         return now - lastUserMouseDownMs < withinMs || now - lastUserSwitchKeyMs < withinMs
     }
 
-    /// Whether `pid` becoming frontmost right now is the agent's doing.
-    /// While an action on it is running: yes, unless the user clicked or
-    /// switched apps. In the grace period after: only if the user hasn't
-    /// pressed any key or clicked either (launchers, Terminal `open`, links).
     func debugCause(_ pid: pid_t) -> String {
         lock.lock(); defer { lock.unlock() }
         let now = nowMs()
         let until = taints[pid].map { $0.count > 0 ? "running" : "\(Int($0.until - now))ms left" } ?? "none"
-        return "taint=\(until) key=\(Int(now - lastUserKeyMs))ms click=\(Int(now - lastUserMouseDownMs))ms"
+        let restored = restoredAwayMs[pid].map { " restored=\(Int(now - $0))ms" } ?? ""
+        return "taint=\(until) key=\(Int(now - lastUserKeyMs))ms openKey=\(Int(now - lastUserOpenKeyMs))ms click=\(Int(now - lastUserMouseDownMs))ms\(restored)"
     }
 
+    /// Whether `pid` becoming frontmost right now is the agent's doing.
+    /// While an action on it is running: yes, unless the user clicked or
+    /// switched apps. In the grace period after: only if the user hasn't
+    /// clicked or pressed a key that could open an app either (launchers,
+    /// Terminal `open`, links). Typing in another app doesn't count: Chromium
+    /// can take the front again well after the step, and taking that for the
+    /// user switching left the app in front of them. Nor does anything just
+    /// after the guard put the user's app back in front of `pid`: that's the
+    /// app taking the front again, too soon for anyone to have switched.
     func agentCaused(_ pid: pid_t) -> Bool {
         lock.lock(); defer { lock.unlock() }
         let now = nowMs()
-        guard let t = taints[pid], t.count > 0 || t.until >= now else { return false }
-        let click = !t.strict && now - lastUserMouseDownMs < 400
+        let reasserting = restoredAwayMs[pid].map { now - $0 < 1000 } ?? false
+        guard reasserting || taints[pid].map({ $0.count > 0 || $0.until >= now }) == true else { return false }
+        let strict = taints[pid]?.strict ?? false
+        let click = !strict && now - lastUserMouseDownMs < 400
         let clickOrSwitch = click || now - lastUserSwitchKeyMs < 400
-        if t.count > 0 { return !clickOrSwitch }
-        return !clickOrSwitch && (t.strict || now - lastUserKeyMs >= 1500)
+        if reasserting || (taints[pid]?.count ?? 0) > 0 { return !clickOrSwitch }
+        return !clickOrSwitch && (strict || now - lastUserOpenKeyMs >= 1500)
     }
 
     func record(_ summary: String) {
@@ -399,7 +413,7 @@ public final class FocusGuard {
                     // Restore here rather than waiting for NSWorkspace's
                     // notification, which arrives ~25 ms later.
                     if agent {
-                        self.restoreUserFront(reason: "self-activation", immediate: true)
+                        self.restoreUserFront(from: pid, reason: "self-activation", immediate: true)
                     }
                 }
                 usleep(1000)
@@ -436,7 +450,7 @@ public final class FocusGuard {
         if pid == getpid() { return }
         if agentCaused(pid) && pid != userFront {
             // The monitor thread usually restored already; this is the backup path.
-            if BCUFrontProcessPID() == pid { restoreUserFront(reason: "activation") }
+            if BCUFrontProcessPID() == pid { restoreUserFront(from: pid, reason: "activation") }
         } else {
             // Off the main thread: AX calls into Electron apps can be slow.
             DispatchQueue.global(qos: .userInitiated).async {
@@ -615,12 +629,16 @@ public final class FocusGuard {
     /// `immediate`: issue the SkyLight call on the calling thread (the 1 ms
     /// monitor), with the user's app and window captured before the action,
     /// so the user's app is back in front as fast as WindowServer allows.
-    func restoreUserFront(reason: String, immediate: Bool = false) {
+    func restoreUserFront(from agent: pid_t, reason: String, immediate: Bool = false, again: Bool = false) {
         lock.lock()
         if restoring { lock.unlock(); return }
         restoring = true
         let pid = userFrontPid
         let window = userFrontWindow ?? 0
+        if agent != 0 && agent != pid {
+            restoredAwayMs = restoredAwayMs.filter { nowMs() - $0.value < 5000 }
+            restoredAwayMs[agent] = nowMs()
+        }
         lock.unlock()
 
         let t0 = nowMs()
@@ -643,6 +661,13 @@ public final class FocusGuard {
             self.holding = false
             self.restoring = false
             self.lock.unlock()
+            // The app may have taken the front again meanwhile (Chromium often
+            // does it twice), when a restore was already under way.
+            let front = BCUFrontProcessPID()
+            if !again && pid != 0 && front != 0 && front != pid && front != getpid() && self.agentCaused(front) {
+                self.restoreUserFront(from: front, reason: "\(reason), again", immediate: true, again: true)
+                return
+            }
             let n = self.drain()
             if n > 0 { self.record("held \(n) of your key events during a focus change (\(reason)) and replayed them into your app") }
         }
@@ -705,8 +730,11 @@ public final class FocusGuard {
         case .keyDown, .keyUp, .flagsChanged:
             let cmdTab = type != .flagsChanged && event.flags.contains(.maskCommand) && event.getIntegerValueField(.keyboardEventKeycode) == 48
             if type == .keyDown {
+                let code = event.getIntegerValueField(.keyboardEventKeycode)
+                let opens = code == 36 || code == 76 || !event.flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty
                 lock.lock()
                 lastUserKeyMs = nowMs()
+                if opens { lastUserOpenKeyMs = nowMs() }
                 if cmdTab { lastUserSwitchKeyMs = nowMs() }
                 lock.unlock()
             }
@@ -754,7 +782,7 @@ public final class FocusGuard {
             if front != 0 && front != userFront && agentCaused(front) {
                 lock.lock(); if !holding { holding = true; holdingSinceMs = nowMs() }; lock.unlock()
                 hold(event)
-                restoreUserFront(reason: "keystroke")
+                restoreUserFront(from: front, reason: "keystroke")
                 return nil
             }
             return passKey(event, type)

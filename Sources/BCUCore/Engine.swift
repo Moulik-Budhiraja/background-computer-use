@@ -746,7 +746,10 @@ public final class Engine {
 
     /// Is the user in this app right now (so its key window is theirs)?
     private func userIsIn(_ pid: pid_t) -> Bool {
-        BCUFrontProcessPID() == pid || NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+        guard BCUFrontProcessPID() == pid || NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return false }
+        // Not when the app put itself in front because of an agent's step:
+        // the guard is putting the user's app back.
+        return pid == focusGuard.userFront || !focusGuard.agentCaused(pid)
     }
 
     /// Run `body` with the window as its app's key window, under the guard.
