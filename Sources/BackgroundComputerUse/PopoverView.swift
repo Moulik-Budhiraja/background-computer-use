@@ -21,6 +21,13 @@ final class PopoverModel: ObservableObject {
     @Published var apps: [AgentApp] = []
     @Published var handoffReason: String?
     @Published var handedOffApp: String?
+    /// The window the agent handed to the user, and whether it's on their screen yet.
+    @Published var handoffWindow: CGWindowID?
+    @Published var handoffWithUser = false
+    /// The popover's tiles preview only a handed-off window; the expanded view keeps the whole display.
+    var previewsHandoff = false
+    /// Brings the handed-off window to the user.
+    var openHandoff: (() -> Void)?
     @Published var paused = false
     @Published var hasWindows = false
     @Published var permissionsMissing = false
@@ -84,9 +91,16 @@ final class PopoverModel: ObservableObject {
             return AgentApp(id: w.pid, name: w.appName, icon: NSRunningApplication(processIdentifier: w.pid)?.icon)
         }
         hasWindows = !apps.isEmpty
-        let handedOff = engine.windows.windows.first(where: { $0.handedOff })
+        let handedOff = engine.handoffWindow
         handoffReason = handedOff?.handoffReason
         handedOffApp = handedOff?.appName
+        if handoffWindow != handedOff?.id { handoffWindow = handedOff?.id }
+        if handoffWithUser != (handedOff?.withUser ?? false) { handoffWithUser = handedOff?.withUser ?? false }
+        if previewsHandoff {
+            stream.window = handedOff?.id ?? 0
+            // Nothing for the agent's pointer to point at in a lone window.
+            frame.cursor.hidden = controlling || handedOff != nil
+        }
         paused = engine.paused
         screenRecordingMissing = !Capture.hasPermission
         permissionsMissing = !AX.isTrusted || screenRecordingMissing
@@ -383,7 +397,7 @@ struct PreviewPane: View {
                 RemoteSurface(model: model, remote: remote)
             }
             if !model.permissionsMissing {
-                if let app = model.handedOffApp, !model.controlling {
+                if let app = model.handedOffApp, model.handoffWithUser, !model.controlling {
                     handoffMarker(app).allowsHitTesting(false)
                 } else if model.paused && !model.controlling {
                     pausedScrim
@@ -503,6 +517,8 @@ final class MenuModel: ObservableObject {
     let openSettings: () -> Void
     /// Expand a session's display; `true` goes straight into take-over.
     let openViewer: (Engine, Bool) -> Void
+    /// Bring a session's handed-off window to the user.
+    let openHandoff: (Engine) -> Void
 
     @Published var sessions: [PopoverModel] = []
     @Published var statusText = "Idle"
@@ -513,10 +529,11 @@ final class MenuModel: ObservableObject {
     private var previewing = false
     let moreMenu: MoreMenu
 
-    init(hub: Hub, openSettings: @escaping () -> Void, openViewer: @escaping (Engine, Bool) -> Void) {
+    init(hub: Hub, openSettings: @escaping () -> Void, openViewer: @escaping (Engine, Bool) -> Void, openHandoff: @escaping (Engine) -> Void) {
         self.hub = hub
         self.openSettings = openSettings
         self.openViewer = openViewer
+        self.openHandoff = openHandoff
         moreMenu = MoreMenu(openSettings: openSettings)
     }
 
@@ -532,6 +549,8 @@ final class MenuModel: ObservableObject {
             } else {
                 let m = PopoverModel(engine: e, openSettings: openSettings, openViewer: { [weak self] in self?.openViewer(e, false) })
                 m.takeOver = { [weak self] in self?.openViewer(e, true) }
+                m.previewsHandoff = true
+                m.openHandoff = { [weak self] in self?.openHandoff(e) }
                 next.append(m)
             }
         }
@@ -670,9 +689,15 @@ private struct SessionTile: View {
                     }
                 }
                 .overlay {
-                    ClickCatcher(help: "Expand \(model.engine.label)'s display",
-                                 onHover: { hovering = $0 },
-                                 action: { model.openViewer() })
+                    // While the agent waits on the user, expanding brings
+                    // them the window it needs them in instead.
+                    if let app = model.handedOffApp, let open = model.openHandoff {
+                        ClickCatcher(help: "Open \(app)", onHover: { hovering = $0 }, action: open)
+                    } else {
+                        ClickCatcher(help: "Expand \(model.engine.label)'s display",
+                                     onHover: { hovering = $0 },
+                                     action: { model.openViewer() })
+                    }
                 }
             if model.handoffReason != nil {
                 HandoffBanner(model: model)
@@ -701,7 +726,7 @@ private struct SessionTile: View {
 /// A clear AppKit layer that takes a click on the first try. A SwiftUI tap
 /// over the live frame (an AppKit view) can lose the click, and since this
 /// app never activates, the popover's first click can go to activating it.
-private struct ClickCatcher: NSViewRepresentable {
+struct ClickCatcher: NSViewRepresentable {
     let help: String
     let onHover: (Bool) -> Void
     let action: () -> Void

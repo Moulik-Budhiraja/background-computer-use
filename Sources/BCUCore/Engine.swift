@@ -283,6 +283,26 @@ public final class Engine {
         }
     }
 
+    /// The window the agent handed to the user, if any.
+    public var handoffWindow: AgentWindow? {
+        windows.windows.first { $0.handedOff }
+    }
+
+    /// The user asked for the handed-off window: bring it onto their screen
+    /// (`area`, global points, top-left origin) in front. Off the engine's
+    /// queue, so a call that's running doesn't hold it up.
+    public func bringHandoffToUser(area: CGRect) {
+        guard let w = handoffWindow else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try self.windows.bringToUser(w.id, area: area)
+                self.log("You opened \(w.appName) to take over")
+            } catch {
+                self.log("Couldn't bring \(w.appName) to you: \(error)", error: true)
+            }
+        }
+    }
+
     // MARK: Dispatch
 
     /// Called from socket threads. Blocks until the tool finishes.
@@ -1699,7 +1719,7 @@ public final class Engine {
         let reason = try args.requireString("reason")
         try windows.handoff(id, reason: reason)
         log("Handed off: \(reason)")
-        return ToolResult(text: "Window \(id) is on the user's screen with your reason shown in the menu bar. Stop and wait for the user; call take_back when they say they're done.")
+        return ToolResult(text: "The user was notified with your reason; the window comes onto their screen when they open it. Stop and wait for the user; call take_back when they say they're done.")
     }
 
     private func takeBack(_ args: Args) throws -> ToolResult {

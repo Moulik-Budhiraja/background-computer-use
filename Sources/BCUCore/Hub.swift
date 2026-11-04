@@ -150,7 +150,7 @@ public final class Hub {
             onAgent[w.pid] = (onAgent[w.pid] ?? true) && mine
         }
         for e in engines {
-            let pids = Set(e.windows.windows.filter { !$0.handedOff }.map(\.pid)).filter { onAgent[$0] == true }
+            let pids = Set(e.windows.windows.filter { !$0.withUser }.map(\.pid)).filter { onAgent[$0] == true }
             e.audio.route(pids.compactMap { NSRunningApplication(processIdentifier: $0) })
         }
     }

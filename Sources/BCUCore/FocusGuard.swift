@@ -305,6 +305,12 @@ public final class FocusGuard {
         return userFrontPid
     }
 
+    /// The user asked to switch apps from BCU's own UI (opening a window an
+    /// agent handed them), so the activation that follows is theirs.
+    public func noteUserSwitch() {
+        lock.lock(); lastUserSwitchKeyMs = nowMs(); lock.unlock()
+    }
+
     /// True when the user recently clicked or switched apps, so an activation
     /// right now is theirs.
     func userCausedRecently(withinMs: Double = 400) -> Bool {

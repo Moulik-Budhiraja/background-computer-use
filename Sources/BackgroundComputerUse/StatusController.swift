@@ -12,13 +12,22 @@ final class StatusController: NSObject, NSPopoverDelegate {
     private let model: MenuModel
     private var icon: Icon?
     private var clickMonitor: Any?
+    private var capsule: HandoffCapsule!
+    /// Handoffs already announced, by session and window.
+    private var announced: Set<String> = []
     var onRefresh: (() -> Void)?
 
     /// `openViewer(engine, takeOver)` expands one session's display.
     init(hub: Hub, openSettings: @escaping () -> Void, openViewer: @escaping (Engine, Bool) -> Void) {
         self.hub = hub
-        self.model = MenuModel(hub: hub, openSettings: openSettings, openViewer: openViewer)
+        var openHandoff: (Engine) -> Void = { _ in }
+        self.model = MenuModel(hub: hub, openSettings: openSettings, openViewer: openViewer, openHandoff: { openHandoff($0) })
         super.init()
+        openHandoff = { [weak self] in self?.openHandoff($0) }
+        capsule = HandoffCapsule { [weak self] in
+            // The status item's window spans the menu bar's height.
+            self?.item.button?.window?.frame
+        }
         item.button?.target = self
         item.button?.action = #selector(togglePopover)
         popover.behavior = .transient
@@ -36,6 +45,7 @@ final class StatusController: NSObject, NSPopoverDelegate {
     private func refresh() {
         if popover.isShown { model.refresh() }
         onRefresh?()
+        announceHandoffs()
         let next: Icon
         switch hub.status {
         case .paused, .userInControl: next = .paused
@@ -72,6 +82,40 @@ final class StatusController: NSObject, NSPopoverDelegate {
 
     func close() {
         popover.performClose(nil)
+    }
+
+    /// A notification out of the menu bar icon for each new handoff; one
+    /// that ended before it showed is dropped.
+    private func announceHandoffs() {
+        var live: Set<String> = []
+        for e in hub.engines {
+            guard let w = e.handoffWindow else { continue }
+            let key = "\(e.sessionID)/\(w.id)"
+            live.insert(key)
+            // Already with the user (they opened it from the popover).
+            if w.withUser { announced.insert(key); capsule.drop(key: key); continue }
+            guard announced.insert(key).inserted else { continue }
+            capsule.notify(.init(key: key,
+                                 title: "\(e.label) needs you",
+                                 body: w.handoffReason ?? "Take over \(w.appName)",
+                                 icon: NSRunningApplication(processIdentifier: w.pid)?.icon,
+                                 open: { [weak self, weak e] in if let e { self?.openHandoff(e) } }))
+        }
+        for key in announced.subtracting(live) { capsule.drop(key: key) }
+        announced.formIntersection(live)
+    }
+
+    /// Put the window the agent handed off in front of the user, on the
+    /// screen they're on.
+    private func openHandoff(_ engine: Engine) {
+        close()
+        let mouse = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main,
+              let primary = NSScreen.screens.first else { return }
+        // AppKit's bottom-left origin to the global top-left one.
+        let f = screen.visibleFrame
+        let area = CGRect(x: f.minX, y: primary.frame.maxY - f.maxY, width: f.width, height: f.height)
+        engine.bringHandoffToUser(area: area)
     }
 
     func popoverDidClose(_ notification: Notification) {

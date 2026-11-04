@@ -19,6 +19,13 @@ final class PreviewStream {
         set { lock.lock(); _excluded = newValue; lock.unlock() }
     }
 
+    private var _window: CGWindowID = 0
+    /// Show only this window (one handed to the user) instead of the display.
+    var window: CGWindowID {
+        get { lock.lock(); defer { lock.unlock() }; return _window }
+        set { lock.lock(); _window = newValue; lock.unlock() }
+    }
+
     init(engine: Engine, onFrame: @escaping (CGImage) -> Void) {
         self.engine = engine
         self.onFrame = onFrame
@@ -32,8 +39,14 @@ final class PreviewStream {
         t.schedule(deadline: .now(), repeating: 1.0 / Double(max(1, fps)), leeway: .milliseconds(2))
         t.setEventHandler { [weak self] in
             guard let self else { return }
-            let skip = self.excluded
-            guard let image = skip != 0 ? Capture.display(self.engine.display, excluding: skip) : Capture.display(self.engine.display) else { return }
+            let skip = self.excluded, only = self.window
+            let image: CGImage?
+            if only != 0 {
+                image = Capture.windowFrame(only)
+            } else {
+                image = skip != 0 ? Capture.display(self.engine.display, excluding: skip) : Capture.display(self.engine.display)
+            }
+            guard let image else { return }
             DispatchQueue.main.async { self.onFrame(image) }
         }
         t.resume()

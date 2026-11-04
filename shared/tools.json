@@ -413,7 +413,7 @@
   {
     "name": "handoff",
     "description": {
-      "macos": "Ask the user to take over a window (a sign-in, a password or 2FA code, a decision). Moves it onto the user's screen without activating it and shows your reason in the menu bar. Stop after calling this.",
+      "macos": "Ask the user to take over a window (a sign-in, a password or 2FA code, a decision). A notification from the menu bar shows your reason, and the window comes onto the user's screen when they open it. Stop after calling this.",
       "windows": "Ask the user to take over a window (a sign-in, a password or 2FA code, a decision). Moves it onto the user's screen without activating it and shows your reason in the tray. Stop after calling this."
     },
     "inputSchema": {

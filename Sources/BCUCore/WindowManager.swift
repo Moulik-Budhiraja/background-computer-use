@@ -13,6 +13,8 @@ public final class AgentWindow {
     public var originalFrame: CGRect?
     public var handedOff = false
     public var handoffReason: String?
+    /// The user brought the handed-off window onto their screen.
+    public var withUser = false
 
     init(id: CGWindowID, pid: pid_t, appName: String, bundleID: String?, kind: Kind, originalFrame: CGRect? = nil) {
         self.id = id
@@ -519,23 +521,42 @@ public final class WindowManager {
         }
     }
 
+    /// The window stays on the agent display until the user asks for it
+    /// (`bringToUser`), so nothing appears on their screen unasked.
     public func handoff(_ id: CGWindowID, reason: String) throws {
-        guard let w = window(id), let ax = AX.window(pid: w.pid, id: id) else { throw ToolError("window \(id) isn't one of yours") }
+        guard let w = window(id), AX.window(pid: w.pid, id: id) != nil else { throw ToolError("window \(id) isn't one of yours") }
         focusGuard.unpark(w.pid, window: id, reason: "window handed to the user")
-        let main = CGDisplayBounds(CGMainDisplayID())
-        let size = AX.size(ax) ?? CGSize(width: 1000, height: 700)
-        let w2 = min(size.width, main.width - 80), h2 = min(size.height, main.height - 120)
         w.handedOff = true
         w.handoffReason = reason
-        AX.setPosition(ax, CGPoint(x: main.midX - w2 / 2, y: main.midY - h2 / 2))
-        AX.setSize(ax, CGSize(width: w2, height: h2))
+        w.withUser = false
+    }
+
+    /// The user asked for a handed-off window: center it on `area` (global
+    /// points, top-left origin) and make it the front window.
+    public func bringToUser(_ id: CGWindowID, area: CGRect) throws {
+        guard let w = window(id), w.handedOff, let ax = AX.window(pid: w.pid, id: id) else { throw ToolError("window \(id) isn't handed off") }
+        if !w.withUser {
+            let size = AX.size(ax) ?? CGSize(width: 1000, height: 700)
+            let w2 = min(size.width, area.width - 80), h2 = min(size.height, area.height - 80)
+            // Shrink first, so AppKit doesn't push it back to a screen it fits.
+            AX.setSize(ax, CGSize(width: w2, height: h2))
+            AX.setPosition(ax, CGPoint(x: (area.midX - w2 / 2).rounded(), y: (area.midY - h2 / 2).rounded()))
+            w.withUser = true
+        }
+        // The user asked for it, so it takes the front.
+        focusGuard.noteUserSwitch()
+        _ = BCUSetFrontProcess(w.pid, id, 0x200)
+        _ = BCUPostMakeKeyRecords(w.pid, id)
+        AX.perform(ax, "AXRaise")
     }
 
     public func takeBack(_ id: CGWindowID) throws {
         guard let w = window(id), let ax = AX.window(pid: w.pid, id: id) else { throw ToolError("window \(id) isn't one of yours") }
+        let wasWithUser = w.withUser
         w.handedOff = false
         w.handoffReason = nil
-        moveToAgent(ax, size: AX.size(ax) ?? CGSize(width: 1200, height: 800))
+        w.withUser = false
+        if wasWithUser { moveToAgent(ax, size: AX.size(ax) ?? CGSize(width: 1200, height: 800)) }
     }
 
     /// Close opened windows and return borrowed ones.

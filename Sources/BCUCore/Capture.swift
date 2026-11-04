@@ -23,6 +23,12 @@ public enum Capture {
         return try result.get()
     }
 
+    /// One window through SkyLight only, for a live preview: no
+    /// ScreenCaptureKit fallback that could block.
+    public static func windowFrame(_ id: CGWindowID) -> CGImage? {
+        BCUCaptureWindow(id)
+    }
+
     public static func window(_ id: CGWindowID) throws -> CGImage {
         if let image = BCUCaptureWindow(id) { return image }
         return try blocking {
