@@ -221,7 +221,7 @@ fn hit(layout: &Layout, x: f32, y: f32, viewer: bool) -> Hit {
         return if viewer { Hit::Collapse } else { Hit::More };
     }
     if let Some(p) = layout.placeholder
-        && !monitor::installed()
+        && needs_setup()
         && setup_button(p).contains(x, y)
     {
         return Hit::Setup;
@@ -247,6 +247,16 @@ fn hit(layout: &Layout, x: f32, y: f32, viewer: bool) -> Hit {
 
 fn paused_circle(r: R) -> (f32, f32) {
     (r.cx(), r.cy() - (44.0 + 10.0 + 15.0) / 2.0 + 22.0)
+}
+
+/// The agent screens are installed, but this is a Remote Desktop session,
+/// which can't show them. Setting up again wouldn't help.
+fn remote_only() -> bool {
+    !monitor::installed() && monitor::remote_session() && monitor::driver_installed()
+}
+
+fn needs_setup() -> bool {
+    !monitor::installed() && !remote_only()
 }
 
 fn setup_button(p: R) -> R {
@@ -437,6 +447,10 @@ impl Paint<'_> {
         if monitor::installed() {
             c.glyph(G_MONITOR, p.cx(), p.cy() - 12.0, 20.0, rgba(0xFFFFFF, 0.45));
             c.text("Nothing running", p.cx(), p.cy() + 14.0, p.w - 20.0, Font::Semibold, 12.0, rgba(0xFFFFFF, 0.45), Align::Center);
+        } else if remote_only() {
+            c.glyph(G_HIDDEN, p.cx(), p.cy() - 26.0, 20.0, rgba(0xFFFFFF, 0.45));
+            c.text("Agent screens don't show over Remote Desktop", p.cx(), p.cy() + 2.0, p.w - 20.0, Font::Semibold, 13.0, rgba(0xFFFFFF, 0.88), Align::Center);
+            c.text("Agents can use them once you're back at the computer", p.cx(), p.cy() + 24.0, p.w - 20.0, Font::Semibold, 12.0, rgba(0xFFFFFF, 0.45), Align::Center);
         } else {
             c.glyph(G_HIDDEN, p.cx(), p.cy() - 26.0, 20.0, rgba(0xFFFFFF, 0.45));
             c.text("Agent screens aren't set up", p.cx(), p.cy() + 2.0, p.w - 20.0, Font::Semibold, 13.0, rgba(0xFFFFFF, 0.88), Align::Center);
@@ -451,6 +465,7 @@ impl Paint<'_> {
 fn header_text(views: &[View]) -> String {
     let shown: Vec<&View> = views.iter().filter(|v| v.visible()).collect();
     match shown.len() {
+        0 if remote_only() => "Remote Desktop".into(),
         0 if !monitor::installed() => "Setup needed".into(),
         0 => "Idle".into(),
         1 => shown[0].status_text(),
@@ -715,7 +730,7 @@ fn paint(hwnd: HWND, layout: &Layout, hover: Hit, views: &[View], viewer: bool) 
         let waiting = shown.iter().any(|v| v.handoff.is_some());
         let active = shown.iter().any(|v| v.active());
         let paused = all_paused;
-        tally(&c, PAD + 11.0, PAD + HEADER / 2.0, None, waiting, active, paused, shown.is_empty() && !monitor::installed());
+        tally(&c, PAD + 11.0, PAD + HEADER / 2.0, None, waiting, active, paused, shown.is_empty() && needs_setup());
         c.text(&header_text(views), PAD + 24.0, PAD + HEADER / 2.0, layout.pause.x - PAD - 30.0, Font::Semibold, 12.0, t.secondary, Align::Left);
     }
     let paused_here = if viewer { layout.tiles[0].view.paused } else { all_paused };

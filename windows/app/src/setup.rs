@@ -4,12 +4,13 @@
 
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW};
 use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
-use windows::Win32::UI::WindowsAndMessaging::{IDOK, MB_ICONINFORMATION, MB_OKCANCEL, MessageBoxW, SW_HIDE};
+use windows::Win32::UI::WindowsAndMessaging::{IDOK, MB_ICONINFORMATION, MB_OK, MB_OKCANCEL, MessageBoxW, SW_HIDE};
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::monitor;
@@ -32,14 +33,25 @@ fn declined_marker() -> PathBuf {
 
 /// Ask on first launch if the monitor isn't there.
 pub fn offer_on_launch() {
-    if monitor::installed() || declined_marker().exists() {
+    if monitor::installed() || monitor::driver_installed() || declined_marker().exists() {
         return;
     }
     std::thread::spawn(|| run(true));
 }
 
+/// Set while setup runs, so a second click doesn't install a second driver.
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
 /// Run setup. With `ask`, confirm first.
 pub fn run(ask: bool) {
+    if RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    run_once(ask);
+    RUNNING.store(false, Ordering::SeqCst);
+}
+
+fn run_once(ask: bool) {
     if ask {
         let answer = unsafe {
             MessageBoxW(
@@ -57,8 +69,22 @@ pub fn run(ask: bool) {
     }
     let _ = std::fs::remove_file(declined_marker());
     if !monitor::installed() {
-        install_monitor();
-        monitor::ensure_count();
+        // Installing it again would add a second driver, not turn the first on.
+        if !monitor::driver_installed() {
+            install_monitor();
+        }
+        if monitor::remote_session() && monitor::driver_installed() {
+            unsafe {
+                MessageBoxW(
+                    None,
+                    w!("Agent screens are set up, but Windows only shows them at the computer itself, not over Remote Desktop.\n\nAgents can use them once you're back at the computer."),
+                    w!("Background Computer Use"),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            }
+        } else {
+            monitor::ensure_count();
+        }
     }
     // bcu.exe lives next to the app.
     let _ = std::process::Command::new(exe_dir().join("bcu.exe")).arg("connect").creation_flags(CREATE_NO_WINDOW).status();

@@ -78,6 +78,54 @@ pub fn installed() -> bool {
     !all().is_empty()
 }
 
+/// Whether this is a Remote Desktop session rather than the computer's own
+/// screen. The agent monitors belong to the computer's own session, so a
+/// remote one can't see or use them.
+pub fn remote_session() -> bool {
+    use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_REMOTESESSION};
+    unsafe {
+        let mut ours = 0u32;
+        let console = WTSGetActiveConsoleSessionId();
+        GetSystemMetrics(SM_REMOTESESSION) != 0 || (ProcessIdToSessionId(GetCurrentProcessId(), &mut ours).is_ok() && console != u32::MAX && ours != console)
+    }
+}
+
+/// The driver's hardware ID, which its installer gives the device.
+const DRIVER_HWID: &str = r"Root\MttVDD";
+
+/// Whether the driver is installed, even when none of its monitors are on in
+/// this session (over Remote Desktop, or turned off in Display settings).
+pub fn driver_installed() -> bool {
+    use windows::Win32::System::Registry::*;
+    use windows::core::PWSTR;
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, w!(r"SYSTEM\CurrentControlSet\Enum\ROOT\DISPLAY"), Some(0), KEY_READ, &mut key).is_err() {
+            return false;
+        }
+        let mut found = false;
+        for i in 0.. {
+            let mut name = [0u16; 256];
+            let mut len = name.len() as u32;
+            if RegEnumKeyExW(key, i, Some(PWSTR(name.as_mut_ptr())), &mut len, None, None, None, None).is_err() {
+                break;
+            }
+            let mut ids = [0u16; 1024];
+            let mut size = (ids.len() * 2) as u32;
+            if RegGetValueW(key, PCWSTR(name.as_ptr()), w!("HardwareID"), RRF_RT_REG_MULTI_SZ, None, Some(ids.as_mut_ptr() as *mut _), Some(&mut size)).is_ok()
+                && String::from_utf16_lossy(&ids[..size as usize / 2]).split('\0').any(|id| id.eq_ignore_ascii_case(DRIVER_HWID))
+            {
+                found = true;
+                break;
+            }
+        }
+        let _ = RegCloseKey(key);
+        found
+    }
+}
+
 /// The primary monitor's rect.
 fn primary() -> RECT {
     unsafe {
@@ -116,7 +164,9 @@ fn user_bounds(agents: &[RECT]) -> RECT {
 /// agent if it has fewer. Changing the count reloads all of them.
 pub fn ensure_count() {
     let have = all().len();
-    if have == 0 || have >= WANTED {
+    // None on: only worth asking when the driver is installed and this is the
+    // computer's own session (its monitors are turned off).
+    if have >= WANTED || have == 0 && (remote_session() || !driver_installed()) {
         return;
     }
     let msg: Vec<u16> = format!("SETDISPLAYCOUNT {WANTED}").encode_utf16().chain(std::iter::once(0)).collect();
@@ -189,6 +239,9 @@ static SLOTS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 pub fn for_session(session: &str) -> Result<Monitor, String> {
     let ms = arrange();
     if ms.is_empty() {
+        if remote_session() && driver_installed() {
+            return Err("The agent monitor isn't available over Remote Desktop: Windows only shows it at the computer itself. Agents can use it once the user is back at the computer.".into());
+        }
         return Err("The agent monitor isn't available: the Virtual Display Driver isn't installed or its monitor is off. Open Background Computer Use's setup to install it.".into());
     }
     let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());

@@ -3,6 +3,12 @@
 # Follows the project's own "Community Scripts/silent-install.ps1".
 $ErrorActionPreference = "Stop"
 Write-Output "whoami: $(whoami /groups | Select-String 'Mandatory Label')"
+
+# Already installed: installing again adds a second device, not a fix.
+if (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Enum\ROOT\DISPLAY\*" -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains 'Root\MttVDD' }) {
+  Write-Output "already installed"
+  exit 0
+}
 $NefConURL = "https://github.com/nefarius/nefcon/releases/download/v1.14.0/nefcon_v1.14.0.zip"
 $DriverURL = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip"
 $SettingsURL = "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/master/Virtual%20Display%20Driver%20(HDR)/vdd_settings.xml"
