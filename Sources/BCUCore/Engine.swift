@@ -41,6 +41,11 @@ public final class Engine {
     public let windows: WindowManager
     /// Sound from apps only this session uses goes here instead of the speakers.
     public let audio: SessionAudio
+    /// Keeps what the display showed, for the history viewer.
+    let recorder: SessionRecorder
+
+    /// A frame of the live preview (the whole display), for the history.
+    public func recordPreview(_ image: CGImage) { recorder.previewFrame(image) }
 
     /// Called on the main thread whenever status, activity or windows change.
     public var onChange: (() -> Void)?
@@ -114,6 +119,7 @@ public final class Engine {
         windows = WindowManager(display: display, focusGuard: focusGuard, sessionKey: sessionID)
         let safe = label.replacingOccurrences(of: " ", with: "-").lowercased()
         audio = SessionAudio(name: "\(safe)-\(sessionID.prefix(8))")
+        recorder = SessionRecorder(sessionID: sessionID, label: label, display: display)
     }
 
     /// Create the session's display if it doesn't exist yet. Any thread.
@@ -146,6 +152,7 @@ public final class Engine {
             self.display.finishStart()
             self.windows.startWatchdog()
         }
+        recorder.start()
         log("Created \(display.slot == 0 ? "the agent display" : "agent display \(display.slot + 1)")")
     }
 
@@ -165,6 +172,7 @@ public final class Engine {
             let idle = self._busy == nil && nowMs() - self.lastCallMs > idleMs
             self.stateLock.unlock()
             guard idle else { return }
+            self.recorder.stop()
             DispatchQueue.main.sync {
                 self.windows.stopWatchdog()
                 self.display.stop()
@@ -189,6 +197,7 @@ public final class Engine {
     /// Main thread, after the windows are released, so nothing lands on the
     /// user's screen when the display goes away.
     public func finishShutdown() {
+        recorder.stop()
         windows.stopWatchdog()
         display.stop()
         audio.end()
@@ -240,6 +249,7 @@ public final class Engine {
         if _activity.count > 60 { _activity.removeFirst(_activity.count - 60) }
         stateLock.unlock()
         Log.info((error ? "error: " : "") + text)
+        recorder.note(text, error: error)
         changed()
     }
 
@@ -320,6 +330,7 @@ public final class Engine {
                 lastCallMs = nowMs()
                 stateLock.unlock()
                 changed()
+                recorder.captureSoon()
             }
             let readOnly: Set<String> = ["status", "guard_report", "list_apps", "list_windows", "release_window", "screenshot", "get_window_state"]
             // Closing a window the user is working in would pull it out from under them.
@@ -708,6 +719,7 @@ public final class Engine {
         stateLock.lock()
         if case .drag(let to) = kind { _lastPointer = to } else { _lastPointer = pointer.point }
         stateLock.unlock()
+        recorder.pointer(pointer)
         DispatchQueue.main.async {
             NotificationCenter.default.post(name: Self.pointerNotification, object: self, userInfo: ["pointer": pointer])
         }
@@ -1203,8 +1215,9 @@ public final class Engine {
         }
         snapshots[w.id] = snap
         var images: [ToolImage] = []
-        if args.bool("screenshot") ?? true, let img = try? Capture.windowInPoints(w.id, display: display.bounds), let png = pngImage(img) {
-            images.append(png)
+        if args.bool("screenshot") ?? true, let raw = try? Capture.window(w.id) {
+            recorder.windowShot(w.id, raw)
+            if let png = pngImage(Capture.inPoints(raw, id: w.id, display: display.bounds)) { images.append(png) }
         }
         let full = args.bool("full") ?? false
         if !full, let previous, let changes = AXSnapshot.diff(from: previous, to: snap) {
@@ -1290,7 +1303,11 @@ public final class Engine {
             }
             do {
                 let r = try run(tool: tool, args: Args(stepArgs))
-                var line = "\(i + 1). \(tool): \(r.text.split(separator: "\n").first.map(String.init) ?? "done")"
+                let first = r.text.split(separator: "\n").first.map(String.init) ?? "done"
+                // History gets each step, not just the whole batch at the end.
+                recorder.note("\(tool): \(first)", error: false)
+                recorder.captureSoon()
+                var line = "\(i + 1). \(tool): \(first)"
                 if !waitNotes.isEmpty { line += " (\(waitNotes.joined(separator: "; ")))"; waitedNotes += waitNotes.count; waitNotes = [] }
                 lines.append(line)
             } catch {
@@ -1337,7 +1354,9 @@ public final class Engine {
     private func screenshot(_ args: Args) throws -> ToolResult {
         if args.int("window_id") != nil {
             let (w, _) = try agentWindow(args)
-            let img = try Capture.windowInPoints(w.id, display: display.bounds)
+            let raw = try Capture.window(w.id)
+            recorder.windowShot(w.id, raw)
+            let img = Capture.inPoints(raw, id: w.id, display: display.bounds)
             guard let png = pngImage(img) else { throw ToolError("couldn't encode the screenshot") }
             return ToolResult(text: "Window \(w.id), \(img.width)x\(img.height)", images: [png])
         }

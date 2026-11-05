@@ -10,7 +10,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     init(engine: Engine) {
         model = SettingsModel(engine: engine)
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 560),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 640),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
         super.init()
         window.title = "Background Computer Use Settings"
@@ -40,7 +40,12 @@ final class SettingsModel: ObservableObject {
     @Published var screenRecording = false
     @Published var launchAtLogin = false
     @Published var copied: String?
+    @Published var historyLimitMB = Recordings.limitMB
+    @Published var historyUsedBytes: Int64 = 0
     private var timer: Timer?
+    private var ticks = 0
+
+    static let historyLimits = [100, 300, 1000, 3000, 10000]
 
     init(engine: Engine) { self.engine = engine }
 
@@ -60,6 +65,31 @@ final class SettingsModel: ObservableObject {
         accessibility = AX.isTrusted
         screenRecording = Capture.hasPermission
         launchAtLogin = LaunchAtLogin.isEnabled
+        // Adding up the recordings' size touches every file; every few seconds is plenty.
+        if ticks % 5 == 0 {
+            DispatchQueue.global(qos: .utility).async {
+                let used = Recordings.usedBytes()
+                DispatchQueue.main.async { self.historyUsedBytes = used }
+            }
+        }
+        ticks += 1
+    }
+
+    func setHistoryLimit(_ mb: Int) {
+        historyLimitMB = mb
+        Recordings.limitMB = mb
+        ticks = 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.refresh() }
+    }
+
+    static func size(_ mb: Int) -> String {
+        mb >= 1000 ? "\(mb / 1000) GB" : "\(mb) MB"
+    }
+
+    var historyUsedText: String {
+        let mb = Double(historyUsedBytes) / 1_000_000
+        let used = mb >= 1000 ? String(format: "%.1f GB", mb / 1000) : "\(Int(mb.rounded())) MB"
+        return "\(used) of \(Self.size(historyLimitMB))"
     }
 
     func startPolling() {
@@ -154,6 +184,22 @@ struct SettingsView: View {
                         commandWell(agent == .claude ? model.claudeCommand : model.codexConfig, label: agent.rawValue)
                     }
                     .padding(14)
+                }
+            }
+
+            section("History", trailing: model.historyUsedText) {
+                SettingsCard {
+                    HStack {
+                        Text("Space for recordings")
+                        Spacer()
+                        Picker("", selection: Binding(get: { model.historyLimitMB }, set: { model.setHistoryLimit($0) })) {
+                            ForEach(SettingsModel.historyLimits, id: \.self) { Text(SettingsModel.size($0)).tag($0) }
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+                    .generalRow()
                 }
             }
 

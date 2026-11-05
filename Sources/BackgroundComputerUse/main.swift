@@ -1,6 +1,14 @@
 import AppKit
 
 let app = NSApplication.shared
+if let i = CommandLine.arguments.firstIndex(of: "--history-selftest"), i + 1 < CommandLine.arguments.count {
+    app.setActivationPolicy(.prohibited)
+    HistorySelfTest.run(URL(fileURLWithPath: CommandLine.arguments[i + 1]))
+}
+if let i = CommandLine.arguments.firstIndex(of: "--history-render"), i + 1 < CommandLine.arguments.count {
+    app.setActivationPolicy(.prohibited)
+    HistorySelfTest.render(URL(fileURLWithPath: CommandLine.arguments[i + 1]))
+}
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)

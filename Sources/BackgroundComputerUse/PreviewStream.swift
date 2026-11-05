@@ -47,6 +47,9 @@ final class PreviewStream {
                 image = skip != 0 ? Capture.display(self.engine.display, excluding: skip) : Capture.display(self.engine.display)
             }
             guard let image else { return }
+            // The whole display, as the history records it: while someone
+            // watches, history gets every change without capturing again.
+            if only == 0, skip == 0 { self.engine.recordPreview(image) }
             DispatchQueue.main.async { self.onFrame(image) }
         }
         t.resume()

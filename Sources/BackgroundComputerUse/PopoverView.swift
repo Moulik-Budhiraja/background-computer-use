@@ -48,6 +48,8 @@ final class PopoverModel: ObservableObject {
     func excludeFromPreview(_ id: CGWindowID) { stream.excluded = id }
     /// What the take-over button does here.
     var takeOver: (() -> Void)?
+    /// Opens history at this session's newest frame (the expanded view sets it).
+    var openHistory: (() -> Void)?
     private var previewFPS = 8
     private var previewing = false
     private var pointerObserver: NSObjectProtocol?
@@ -366,6 +368,9 @@ struct HeaderBar: View {
                 } else if model.hasWindows, let takeOver = model.takeOver {
                     IconButton(symbol: "hand.raised.fill", help: "Take over: use the agent's windows yourself", action: takeOver)
                 }
+                if let openHistory = model.openHistory {
+                    IconButton(symbol: "clock.arrow.circlepath", help: "History: look back at what the agent did", action: openHistory)
+                }
                 Rectangle().fill(Theme.hairline).frame(width: 1, height: 14).padding(.leading, 2).padding(.trailing, 4)
                 IconButton(symbol: expandSymbol, help: "Expand", action: onExpand)
                 if showMore { MoreButton(menu: model.moreMenu, badge: model.permissionsMissing) }
@@ -519,6 +524,8 @@ final class MenuModel: ObservableObject {
     let openViewer: (Engine, Bool) -> Void
     /// Bring a session's handed-off window to the user.
     let openHandoff: (Engine) -> Void
+    /// Open history at the newest frame.
+    let openHistory: () -> Void
 
     @Published var sessions: [PopoverModel] = []
     @Published var statusText = "Idle"
@@ -529,11 +536,13 @@ final class MenuModel: ObservableObject {
     private var previewing = false
     let moreMenu: MoreMenu
 
-    init(hub: Hub, openSettings: @escaping () -> Void, openViewer: @escaping (Engine, Bool) -> Void, openHandoff: @escaping (Engine) -> Void) {
+    init(hub: Hub, openSettings: @escaping () -> Void, openViewer: @escaping (Engine, Bool) -> Void,
+         openHandoff: @escaping (Engine) -> Void, openHistory: @escaping () -> Void) {
         self.hub = hub
         self.openSettings = openSettings
         self.openViewer = openViewer
         self.openHandoff = openHandoff
+        self.openHistory = openHistory
         moreMenu = MoreMenu(openSettings: openSettings)
     }
 
@@ -659,6 +668,7 @@ private struct MenuHeader: View {
                     menu.hub.stopAll()
                 }
                 .disabled(menu.sessions.isEmpty)
+                IconButton(symbol: "clock.arrow.circlepath", help: "History: look back at what agents did", action: menu.openHistory)
                 Rectangle().fill(Theme.hairline).frame(width: 1, height: 14).padding(.leading, 2).padding(.trailing, 4)
                 MoreButton(menu: menu.moreMenu, badge: menu.permissionsMissing)
             }

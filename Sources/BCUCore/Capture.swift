@@ -6,11 +6,21 @@ import CPrivate
 /// Screenshots of the agent's windows and display.
 ///
 /// Everything goes through SkyLight's direct window capture first. It needs
-/// Screen Recording permission but starts no ScreenCaptureKit session, so
-/// macOS never shows its purple screen-sharing indicator. ScreenCaptureKit is
-/// only a fallback for a window SkyLight can't read.
+/// Screen Recording permission but starts no ScreenCaptureKit session, so a
+/// capture now and then shows no purple screen-sharing indicator. Captures
+/// every 2 s or so in the background do bring it on (see `lastCaptureMs`).
+/// ScreenCaptureKit is only a fallback for a window SkyLight can't read.
 public enum Capture {
     public static var hasPermission: Bool { CGPreflightScreenCaptureAccess() }
+
+    private static let clockLock = NSLock()
+    private static var _lastMs = 0.0
+    /// When the app last captured anything. macOS turns on its purple
+    /// screen-sharing indicator once captures come often enough (every 2 s
+    /// did it within 20 s; every 4 s didn't), so background captures (the
+    /// history recorder) wait until a few seconds have passed since the last one.
+    public static var lastCaptureMs: Double { clockLock.lock(); defer { clockLock.unlock() }; return _lastMs }
+    private static func mark() { clockLock.lock(); _lastMs = nowMs(); clockLock.unlock() }
 
     static func blocking<T>(_ op: @escaping () async throws -> T) throws -> T {
         let sem = DispatchSemaphore(value: 0)
@@ -26,10 +36,12 @@ public enum Capture {
     /// One window through SkyLight only, for a live preview: no
     /// ScreenCaptureKit fallback that could block.
     public static func windowFrame(_ id: CGWindowID) -> CGImage? {
-        BCUCaptureWindow(id)
+        mark()
+        return BCUCaptureWindow(id)
     }
 
     public static func window(_ id: CGWindowID) throws -> CGImage {
+        mark()
         if let image = BCUCaptureWindow(id) { return image }
         return try blocking {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -54,6 +66,7 @@ public enum Capture {
     /// app the user is in from the menu bar.
     public static func composite(display: AgentDisplay, width: Int? = nil, wholeDisplay: Bool = false) -> CGImage? {
         guard display.isRunning else { return nil }
+        mark()
         let b = display.bounds
         let outW = width ?? Int(b.width)
         let scale = CGFloat(outW) / b.width
@@ -97,6 +110,7 @@ public enum Capture {
     /// The whole agent display exactly as it looks, at its full pixel size.
     public static func display(_ display: AgentDisplay) -> CGImage? {
         guard display.isRunning else { return nil }
+        mark()
         if let f = displayImage, let image = f(display.displayID)?.takeRetainedValue() { return image }
         return composite(display: display, width: Int(display.bounds.width) * 2, wholeDisplay: true)
     }
@@ -111,6 +125,7 @@ public enum Capture {
     /// window in the preview, the preview draws it where it's going instead.
     public static func display(_ display: AgentDisplay, excluding id: CGWindowID) -> CGImage? {
         guard id != 0, display.isRunning, let f = imageFromArray else { return self.display(display) }
+        mark()
         let b = display.bounds
         var ids: [UnsafeRawPointer?] = WindowList.all(onScreenOnly: true, includeDesktop: true)
             .filter { b.intersects($0.bounds) && $0.id != id && $0.pid != getpid() }
@@ -152,7 +167,11 @@ public enum Capture {
     /// window-relative points the agent clicks at. The agent display is
     /// Retina, so raw captures are twice that size.
     public static func windowInPoints(_ id: CGWindowID, display: CGRect) throws -> CGImage {
-        let image = try window(id)
+        inPoints(try window(id), id: id, display: display)
+    }
+
+    /// `image`, a capture of window `id`, at 1 pixel per point.
+    public static func inPoints(_ image: CGImage, id: CGWindowID, display: CGRect) -> CGImage {
         guard let bounds = WindowList.info(id)?.bounds, bounds.width > 0, bounds.height > 0 else { return image }
         let size = coveredRect(image, bounds: bounds, display: display).size
         let w = Int(size.width.rounded()), h = Int(size.height.rounded())

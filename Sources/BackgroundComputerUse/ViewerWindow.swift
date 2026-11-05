@@ -3,13 +3,13 @@ import SwiftUI
 import BCUCore
 
 /// A borderless panel that can take Esc without activating the app.
-private final class OverlayPanel: NSPanel {
+final class OverlayPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     var onEscape: (() -> Void)?
     override func cancelOperation(_ sender: Any?) { onEscape?() }
 }
 
-private final class DimView: NSView {
+final class DimView: NSView {
     var onClick: (() -> Void)?
     override func mouseDown(with event: NSEvent) { onClick?() }
 }
@@ -25,7 +25,7 @@ final class ViewerWindowController {
     private var panel: OverlayPanel?
     private var resignObserver: NSObjectProtocol?
 
-    init(engine: Engine, openSettings: @escaping () -> Void) {
+    init(engine: Engine, openSettings: @escaping () -> Void, openHistory: @escaping (Engine) -> Void) {
         self.engine = engine
         var close: () -> Void = {}
         model = PopoverModel(engine: engine, openSettings: { close(); openSettings() }, openViewer: {})
@@ -33,6 +33,11 @@ final class ViewerWindowController {
         close = { [weak self] in self?.close() }
         model.remote = remote
         model.takeOver = { [weak model] in model?.beginControl() }
+        model.openHistory = { [weak self] in
+            guard let self else { return }
+            self.close()
+            openHistory(self.engine)
+        }
         model.onControlChange = { [weak self] on in self?.controlChanged(on) }
         model.onDragPoint = { [weak self] p in self?.dragMoved(to: p) }
         remote.onDrag = { [weak self] e in self?.dragChanged(e) }

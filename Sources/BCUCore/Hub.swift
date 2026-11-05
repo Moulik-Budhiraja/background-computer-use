@@ -113,6 +113,7 @@ public final class Hub {
         let recovered = WindowManager.recoverFromPreviousRun()
         if !recovered.isEmpty { Log.info("Cleaned up after the last run: " + recovered.joined(separator: "; ")) }
         focusGuard.start()
+        Recordings.maintain()
         // An app starting to play sound gets a new audio process object; route
         // it right away instead of on the next tick, so little reaches the speakers.
         var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyProcessObjectList,
@@ -129,6 +130,7 @@ public final class Hub {
                 // Another agent needs a display: one with no windows goes sooner.
                 for e in self.engines { e.tearDownIfIdle(idleMs: Self.busyTeardownMs) }
             }
+            if self.ticks % 3600 == 0 { Recordings.maintain() }
             if self.ticks % 5 == 0 {
                 for e in self.engines { e.tearDownIfIdle(idleMs: Self.idleTeardownMs) }
                 self.forgetDormant()

@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKeys: HotKeys?
     private var permissionTimer: Timer?
     private var updater: Updater?
+    private var history: HistoryWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // One instance only.
@@ -33,7 +34,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusController = StatusController(hub: hub,
                                             openSettings: { [weak self] in self?.showSettings() },
-                                            openViewer: { [weak self] engine, control in self?.showViewer(engine, control: control) })
+                                            openViewer: { [weak self] engine, control in self?.showViewer(engine, control: control) },
+                                            openHistory: { [weak self] in self?.showHistory() })
         statusController?.onRefresh = { [weak self] in self?.refreshViewers() }
         hotKeys = HotKeys(
             togglePause: { [weak self] in
@@ -67,7 +69,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func showViewer(_ engine: Engine, control: Bool = false) {
         statusController?.close()
         for (id, v) in viewers where id != engine.sessionID { v.close() }
-        let viewer = viewers[engine.sessionID] ?? ViewerWindowController(engine: engine, openSettings: { [weak self] in self?.showSettings() })
+        history?.close()
+        let viewer = viewers[engine.sessionID] ?? ViewerWindowController(engine: engine, openSettings: { [weak self] in self?.showSettings() },
+                                                                          openHistory: { [weak self] e in self?.showHistory(session: e.sessionID) })
         viewers[engine.sessionID] = viewer
         if control { viewer.showInControl() } else { viewer.toggle() }
     }
@@ -82,6 +86,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 viewers[id] = nil
             }
         }
+    }
+
+    /// History, on the newest frame (of `session`, if given). One viewer at a time.
+    func showHistory(session: String? = nil) {
+        statusController?.close()
+        for v in viewers.values { v.close() }
+        let h = history ?? HistoryWindowController()
+        history = h
+        h.show(session: session)
     }
 
     func showOnboarding() {

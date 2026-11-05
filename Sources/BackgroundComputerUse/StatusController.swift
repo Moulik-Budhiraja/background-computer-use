@@ -18,10 +18,11 @@ final class StatusController: NSObject, NSPopoverDelegate {
     var onRefresh: (() -> Void)?
 
     /// `openViewer(engine, takeOver)` expands one session's display.
-    init(hub: Hub, openSettings: @escaping () -> Void, openViewer: @escaping (Engine, Bool) -> Void) {
+    init(hub: Hub, openSettings: @escaping () -> Void, openViewer: @escaping (Engine, Bool) -> Void, openHistory: @escaping () -> Void) {
         self.hub = hub
         var openHandoff: (Engine) -> Void = { _ in }
-        self.model = MenuModel(hub: hub, openSettings: openSettings, openViewer: openViewer, openHandoff: { openHandoff($0) })
+        self.model = MenuModel(hub: hub, openSettings: openSettings, openViewer: openViewer, openHandoff: { openHandoff($0) },
+                               openHistory: openHistory)
         super.init()
         openHandoff = { [weak self] in self?.openHandoff($0) }
         capsule = HandoffCapsule { [weak self] in
