@@ -15,6 +15,7 @@ host app (Electron, say)
 
 - **One engine per Mac.** Two engines would fight: two focus guards putting different apps in front, two cursor fences, two sets of displays. The engine holds a lock (`engine.lock`, next to the socket) for as long as it runs. When `bcu serve` finds another engine running, either the Background Computer Use app's or another host's, it says so and exits, and the host uses that engine through the same socket. If the app is installed but not running, `bcu serve` starts it in the background and uses its engine, as long as the app has its permissions and speaks the same protocol (it records both in `app.json`, next to the lock). Otherwise the agents that use the app's own `bcu`, such as Claude Code's, would end up on the host's engine, where nothing shows them. `--own-engine` skips this. If the Background Computer Use app starts while a host's engine runs, it asks that engine to step aside (`yield`). The engine stops once no agent of its own has a window open or has made a call in the last 3 seconds. The app takes over from there, and the agents' `bcu mcp` connect to it on their next call.
 - **Sessions belong to a host.** `bcu mcp --host <id>` tags its session. While a host is subscribed with that ID, the menu bar app leaves those sessions out of its popover, previews, handoff notifications and pause/stop controls, so they show up in only one place. If the host isn't subscribed, the menu bar app shows them like any other session.
+- **Recordings are the host's.** The engine can record each agent display, as the menu bar app's history does. A host's sessions are recorded only after it asks with `recordings`, into a folder it picks, and it keeps that folder's size and age in check the same way. The menu bar app records only its own sessions, into its own folder. Neither sees the other's.
 - **Permissions are the host's.** macOS attributes a child process's Accessibility, Screen Recording and audio capture to the app that launched it. The host asks for these permissions under its own name, and `hello` reports whether it has them.
 
 ## Shipping it
@@ -54,6 +55,9 @@ await engine.takeOver(session.id)
 await engine.input(session.id, mouseInput(event, previewElement, session.display))
 await engine.takeOver(session.id, false)
 
+// Recording (off until you ask; the folder is yours to show and to clean up):
+await engine.setRecordings({ host: 'proactive-agent', directory: join(app.getPath('userData'), 'recordings') })
+
 // Handoff:
 await engine.openHandoff(session.id)   // the window comes onto the user's screen
 await engine.handBack(session.id)      // the user is done; the agent resumes
@@ -71,6 +75,7 @@ The engine reads and writes one JSON object per line on the socket (mode 0600, s
 | `catalog` | | the engine's `tools` and MCP `instructions` (`bcu mcp` uses these, so a host's `bcu` and an engine of another version agree) |
 | `subscribe` | `host` or `all: true` | pushes `sessions` (now, then on every change, at most every 50 ms) and `pointer` for those sessions. With `host`, the menu bar app leaves those sessions to this client until it disconnects. |
 | `unsubscribe` | | |
+| `recordings` | `host`, `directory` (absolute; leave it out to stop), `limit_mb` (300, at least 50), `retention_days` (7) | records the host's sessions into `directory`, one folder per agent display (the layout is in `Sources/BCUCore/Recorder.swift`). Off until a host asks. Lasts until the engine stops, so send it again after connecting to a new engine. |
 | `sessions` | `host` or `all` | the same list, once |
 | `pause` | `session`, `paused` | the agent's next action fails with "Paused by the user" |
 | `stop` | `session` | releases every window of the session |

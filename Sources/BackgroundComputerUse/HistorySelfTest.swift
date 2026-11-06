@@ -56,7 +56,8 @@ enum HistorySelfTest {
     static func run(_ out: URL) -> Never {
         let rec = out.appendingPathComponent("recordings")
         try? FileManager.default.removeItem(at: rec)
-        RecordingTest.useDirectory(rec)
+        AppRecordings.store = Recordings(directory: rec)
+        let store = AppRecordings.store
         let size = CGSize(width: 1600, height: 1000)
         let now = wallMs()
 
@@ -80,7 +81,7 @@ enum HistorySelfTest {
             if i % 10 == 0 { eventsA.append((t - 150, "type_text (310 ms): Typed 10 characters", CGPoint(x: 700, y: 400), false)) }
             t += 900 + Double(i % 7)
         }
-        RecordingTest.record(session: "11111111-aaaa", label: "Claude Code", size: size, frames: framesA, events: eventsA)
+        RecordingTest.record(into: store, session: "11111111-aaaa", label: "Claude Code", size: size, frames: framesA, events: eventsA)
 
         var framesB: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
         var eventsB: [(t: Double, text: String?, point: CGPoint?, click: Bool)] = []
@@ -90,13 +91,13 @@ enum HistorySelfTest {
             if i % 12 == 0 { eventsB.append((t - 100, "set_value (40 ms): Set the value of element 12", CGPoint(x: 600, y: 300), true)) }
             t += 1000 + Double(i % 7)
         }
-        RecordingTest.record(session: "22222222-bbbb", label: "Codex", size: size, frames: framesB, events: eventsB)
+        RecordingTest.record(into: store, session: "22222222-bbbb", label: "Codex", size: size, frames: framesB, events: eventsB)
 
         // Read every frame back, and check it's that frame's picture: closer
         // to its own source than to the frames either side of it.
         var sources: [Int64: CGImage] = [:]
         for f in framesA + framesB { sources[Int64(f.t)] = f.image }
-        let runs = Recordings.all()
+        let runs = store.all()
         var total = 0, ok = 0, wrong = 0, worst = 0.0, sum = 0.0
         for r in runs {
             let frames = r.frames
@@ -134,20 +135,20 @@ enum HistorySelfTest {
         snapshot(host, to: out.appendingPathComponent("history-zoomed-out.png"))
 
         // Retention: a run that ended 8 days ago goes; recent ones stay.
-        let old = Recordings.directory.appendingPathComponent("20200101-000000-old")
+        let old = store.directory.appendingPathComponent("20200101-000000-old")
         try? FileManager.default.createDirectory(at: old, withIntermediateDirectories: true)
         let meta: [String: Any] = ["v": 1, "session": "old", "label": "Agent", "start": now - 9 * 86_400_000, "end": now - 8 * 86_400_000, "w": 1600, "h": 1000]
         try? JSONSerialization.data(withJSONObject: meta).write(to: old.appendingPathComponent("meta.json"))
-        Recordings.maintain()
+        store.maintain()
         spin(1.0)
-        let kept = (try? FileManager.default.contentsOfDirectory(atPath: Recordings.directory.path)) ?? []
+        let kept = (try? FileManager.default.contentsOfDirectory(atPath: store.directory.path)) ?? []
         print("after cleanup: \(kept.sorted().joined(separator: ", ")) (old run \(kept.contains(old.lastPathComponent) ? "KEPT, wrong" : "deleted"))")
         // Size limit: squeeze to about half; the oldest chunks go, the newest run stays whole.
-        let before = Recordings.usedBytes()
-        let newest = Recordings.all().last.map { ($0.id, $0.frames.count) }
-        RecordingTest.applyLimit(bytes: before / 2)
-        let after = Recordings.usedBytes()
-        let left = Recordings.all()
+        let before = store.usedBytes()
+        let newest = store.all().last.map { ($0.id, $0.frames.count) }
+        RecordingTest.applyLimit(store, bytes: before / 2)
+        let after = store.usedBytes()
+        let left = store.all()
         let newestKept = left.last.map { ($0.id, $0.frames.count) }
         let firstLeft = left.first?.frames.first.map { HistoryModel.time($0.t, seconds: true) } ?? "-"
         var decodedAfter = 0
@@ -155,7 +156,7 @@ enum HistorySelfTest {
         let leftFrames = left.reduce(0) { $0 + $1.frames.count }
         let limitOK = after <= before / 2 && newestKept?.0 == newest?.0 && newestKept?.1 == newest?.1 && decodedAfter == leftFrames && leftFrames < total
         print("size limit: \(before / 1024) KB -> \(after / 1024) KB (limit \(before / 2048) KB), \(leftFrames) frames left from \(firstLeft), all decode: \(decodedAfter == leftFrames), newest run whole: \(newestKept?.1 == newest?.1) -> \(limitOK ? "ok" : "WRONG")")
-        RecordingTest.applyLimit(bytes: nil)
+        RecordingTest.applyLimit(store, bytes: nil)
         exit(ok == total && total > 0 && wrong == 0 && limitOK ? 0 : 1)
     }
 

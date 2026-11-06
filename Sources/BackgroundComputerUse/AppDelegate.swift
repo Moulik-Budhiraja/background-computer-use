@@ -75,6 +75,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startEngine() -> Bool {
         guard let lock = EngineLock.acquire(name: BCUPaths.appName, version: BCUVersion.current) else { return false }
         engineLock = lock
+        // This app records the sessions it shows; host apps choose for theirs.
+        hub.setRecordings(host: nil, AppRecordings.store)
         hub.start()
         let host = HostServer(hub: hub, ownerName: BCUPaths.appName, version: BCUVersion.current)
         let server = SocketServer { [hub] tool, args in hub.call(tool: tool, args: args) }

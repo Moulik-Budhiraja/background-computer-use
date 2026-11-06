@@ -14,6 +14,7 @@ import type {
   InputEvent,
   MenuEvent,
   PointerEvent,
+  RecordingsInfo,
   Rect,
   Session,
   SessionsEvent
@@ -199,6 +200,21 @@ export class EngineClient extends EventEmitter<Events> {
 
   unsubscribe(): Promise<void> {
     return this.request('unsubscribe').then(() => undefined)
+  }
+
+  // Record your sessions' agent displays into `directory` (yours to show
+  // and to delete), or stop with `directory: null`. Until you call this,
+  // your sessions aren't recorded. The menu bar app records only its own,
+  // into its own folder. Call it again after connecting to a new engine.
+  // Runs older than `retentionDays` (7) go, and the oldest go first past
+  // `limitMB` (300). The layout of a run is in Sources/BCUCore/Recorder.swift.
+  setRecordings(opts: { host: string; directory: string | null; limitMB?: number; retentionDays?: number }): Promise<RecordingsInfo> {
+    return this.request('recordings', {
+      host: opts.host,
+      ...(opts.directory ? { directory: opts.directory } : {}),
+      limit_mb: opts.limitMB,
+      retention_days: opts.retentionDays
+    })
   }
 
   sessions(opts: { host?: string; all?: boolean } = {}): Promise<{ engine: EngineInfo; sessions: Session[] }> {

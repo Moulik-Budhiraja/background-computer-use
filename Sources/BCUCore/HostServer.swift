@@ -133,6 +133,33 @@ public final class HostServer {
             schedulePush(now: true)
             return ["ok": true]
 
+        case "recordings":
+            // A host chooses whether its own sessions are recorded, and where.
+            // Until it does, they aren't.
+            guard let host = a.string("host"), !host.isEmpty else { throw ToolError("recordings needs host: your host ID") }
+            guard let dir = a.string("directory") else {
+                hub.setRecordings(host: host, nil)
+                return ["ok": true, "recording": false]
+            }
+            guard dir.hasPrefix("/") else { throw ToolError("directory must be an absolute path") }
+            let url = URL(fileURLWithPath: dir, isDirectory: true).standardizedFileURL
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            let limit = a.int("limit_mb") ?? Recordings.defaultLimitMB
+            let days = a.int("retention_days") ?? Recordings.defaultRetentionDays
+            // The same folder again (a reconnect, a new limit): keep recording into the runs under way.
+            let store: Recordings
+            if let current = hub.recordings(host: host), current.directory.standardizedFileURL == url {
+                store = current
+                store.retentionDays = days
+                store.limitMB = limit
+                store.maintain()
+            } else {
+                store = Recordings(directory: url, limitMB: limit, retentionDays: days)
+                hub.setRecordings(host: host, store)
+            }
+            return ["ok": true, "recording": true, "directory": store.directory.path,
+                    "limit_mb": store.limitMB, "retention_days": store.retentionDays]
+
         case "unsubscribe":
             lock.lock()
             c.subscribed = false

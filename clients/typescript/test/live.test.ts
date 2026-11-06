@@ -5,7 +5,7 @@
 // Calculator afterwards if it wasn't running before.
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -73,13 +73,18 @@ test('preview, take over and type into a real window', { skip: !live, timeout: 6
   c.on('sessions', (all) => (latest = all.find((s) => s.id === session)))
   c.on('pointer', (p) => pointers.push(p))
   await c.subscribe({ host: 'live' })
+  const recordings = join(home, 'live-recordings')
+  await c.setRecordings({ host: 'live', directory: recordings })
 
   const opened = await toolCall('open_window', { app: 'Calculator' })
-  assert.ok(opened.ok, opened.error ?? "open_window failed")
+  assert.ok(opened.ok, opened.error ?? 'open_window failed')
   const windowId = Number(/window[_ ]id[^0-9]*(\d+)/i.exec(opened.text ?? '')?.[1])
   assert.ok(windowId > 0, `a window id in: ${opened.text}`)
 
-  assert.ok(await until(() => !!latest?.display && latest.windows.some((w) => w.id === windowId && !!w.frame), 5000), 'the session shows its display and window')
+  assert.ok(
+    await until(() => !!latest?.display && latest.windows.some((w) => w.id === windowId && !!w.frame), 5000),
+    `the session shows its display and window ${windowId}: ${JSON.stringify(latest?.windows)}`
+  )
   const win = latest!.windows.find((w) => w.id === windowId)!
   assert.equal(win.app, 'Calculator')
 
@@ -114,6 +119,14 @@ test('preview, take over and type into a real window', { skip: !live, timeout: 6
   const state = await toolCall('get_window_state', { window_id: windowId, screenshot: false, full: true })
   assert.ok(state.ok, state.error ?? "get_window_state failed")
   assert.match(state.text ?? '', /\b42\b/, `the keys reached Calculator: ${state.text?.slice(0, 2000)}`)
+
+  // The session was recorded into this host's folder, and only there.
+  const runs = readdirSync(recordings)
+  assert.equal(runs.length, 1, `one run in ${recordings}: ${runs}`)
+  const meta = JSON.parse(readFileSync(join(recordings, runs[0], 'meta.json'), 'utf8'))
+  assert.equal(meta.session, session)
+  assert.ok(readFileSync(join(recordings, runs[0], 'frames.jsonl'), 'utf8').trim().length > 0, 'frames were kept')
+  assert.ok(!existsSync(join(home, 'recordings')), "nothing in the menu bar app's folder")
 
   stream.stop()
   const released = await toolCall('release_window', { window_id: windowId })

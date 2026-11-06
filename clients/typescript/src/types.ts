@@ -5,6 +5,11 @@
 export type Point = { x: number; y: number }
 export type Rect = { x: number; y: number; width: number; height: number }
 
+// The reply to `recordings`.
+export type RecordingsInfo =
+  | { recording: false }
+  | { recording: true; directory: string; limit_mb: number; retention_days: number }
+
 export type EngineInfo = {
   protocol: number
   version: string

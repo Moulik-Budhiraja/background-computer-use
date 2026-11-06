@@ -49,6 +49,10 @@ public final class Engine {
     /// A frame of the live preview (the whole display), for the history.
     public func recordPreview(_ image: CGImage) { recorder.previewFrame(image) }
 
+    /// Where this session is recorded, or nil for not at all. Set by `Hub`
+    /// from what the session's host chose (`Hub.setRecordings`).
+    func setRecordings(_ store: Recordings?) { recorder.setStore(store) }
+
     /// Called on the main thread whenever status, activity or windows change.
     public var onChange: (() -> Void)?
 

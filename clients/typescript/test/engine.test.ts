@@ -2,7 +2,7 @@
 // doesn't touch the engine you may have running. Build first: `swift build`.
 // BCU_BIN picks another binary.
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -100,6 +100,20 @@ test('a host sees its own sessions, with their host, ID and label', async () => 
   await assert.rejects(c.input('helper-1', { type: 'mousemove', x: 1, y: 1 }), /take over/)
   await assert.rejects(c.openHandoff('helper-1'), /handed a window off/)
   await assert.rejects(c.pause('missing'), /no session/)
+  c.close()
+})
+
+test('a host chooses whether its sessions are recorded, and where', async () => {
+  const c = await EngineClient.connect({ path })
+  await assert.rejects(c.request('recordings', { directory: join(home, 'rec') }), /host/)
+  await assert.rejects(c.setRecordings({ host: 'test-host', directory: 'relative/dir' }), /absolute/)
+  const dir = join(home, 'test-host-recordings')
+  const on = await c.setRecordings({ host: 'test-host', directory: dir, limitMB: 10, retentionDays: 2 })
+  assert.deepEqual(on, { recording: true, directory: dir, limit_mb: 50, retention_days: 2 })
+  assert.ok(existsSync(dir), 'the folder is made')
+  assert.deepEqual(await c.setRecordings({ host: 'test-host', directory: null }), { recording: false })
+  // Nothing goes to the menu bar app's folder.
+  assert.ok(!existsSync(join(home, 'recordings')))
   c.close()
 })
 
