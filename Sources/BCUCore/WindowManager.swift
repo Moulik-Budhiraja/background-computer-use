@@ -34,6 +34,11 @@ public final class WindowManager {
     let sessionKey: String
     private let lock = NSLock()
     private var registry: [CGWindowID: AgentWindow] = [:]
+    /// When each window was registered (`nowMs`).
+    private var registeredAt: [CGWindowID: Double] = [:]
+    /// The watchdog leaves a window this new alone: an app launched hidden
+    /// has windows accessibility sees before the window server lists them.
+    static let newWindowGraceMs = 5000.0
     /// The app's windows when this session last began acting on it, and when.
     private var knownBefore: [pid_t: (ids: Set<CGWindowID>, ms: Double)] = [:]
     private var nextSlot = 0
@@ -79,13 +84,13 @@ public final class WindowManager {
     }
 
     func register(_ w: AgentWindow) {
-        lock.lock(); registry[w.id] = w; lock.unlock()
+        lock.lock(); registry[w.id] = w; registeredAt[w.id] = nowMs(); lock.unlock()
         Self.sharedLock.lock(); Self.registeredAnywhere[w.id] = sessionKey; Self.sharedLock.unlock()
         persist()
     }
 
     func unregister(_ id: CGWindowID) {
-        lock.lock(); registry[id] = nil; lock.unlock()
+        lock.lock(); registry[id] = nil; registeredAt[id] = nil; lock.unlock()
         Self.sharedLock.lock()
         if Self.registeredAnywhere[id] == sessionKey { Self.registeredAnywhere[id] = nil }
         Self.sharedLock.unlock()
@@ -704,7 +709,8 @@ public final class WindowManager {
         }
 
         lock.lock()
-        let ids = Array(registry.keys)
+        let now = nowMs()
+        let ids = registry.keys.filter { now - (registeredAt[$0] ?? 0) >= Self.newWindowGraceMs }
         lock.unlock()
         for id in ids where WindowList.info(id) == nil { unregister(id) }
     }
