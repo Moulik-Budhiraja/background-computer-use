@@ -123,7 +123,9 @@ public final class UserActivity {
 enum QuietWait {
     /// `menu`: the hard cap came with a menu open in the target app, so the
     /// step mustn't run. `stopped`: the user paused the agent meanwhile.
-    enum Outcome { case quiet, gap, cap, menu, stopped }
+    /// `held`: the user still held a mouse button (a drag, say) at the cap;
+    /// taking key focus would interrupt it, so the step doesn't run.
+    enum Outcome { case quiet, gap, cap, menu, held, stopped }
 
     struct Result {
         var waitedMs: Double
@@ -195,7 +197,8 @@ enum QuietWait {
             if elapsed >= hard {
                 // Taking key focus in an app closes its open menu.
                 if menu.app { menu = menus(pid: pid); menuCheckedMs = nowMs() }
-                return done(menu.app ? .menu : .cap)
+                if menu.app { return done(.menu) }
+                return done(activity.snapshot.buttonsDown != 0 ? .held : .cap)
             }
             sleepMs(QuietRules.pollMs)
         }

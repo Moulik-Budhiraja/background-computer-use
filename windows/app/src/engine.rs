@@ -459,6 +459,7 @@ impl Engine {
             "handoff" => self.handoff(args),
             "take_back" => self.take_back(args),
             "press_menu_item" => Err("press_menu_item isn't built on Windows yet. Open the menu with click and pick the item from get_window_state.".into()),
+            "navigate" => Err("navigate isn't built on Windows yet. Click the address bar, type_text the URL and \"\\n\".".into()),
             _ => Err(format!("unknown tool {tool}")),
         }
     }

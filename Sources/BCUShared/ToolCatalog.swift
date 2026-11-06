@@ -27,8 +27,9 @@ public enum ToolCatalog {
     app partway; the error says how much was typed, so type the rest. Pass priority="now" only when the step \
     can't wait (a dialog or toast about to close, a hover then a click, a code about to expire).
     Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's \
-    elements in `get_window_state`; click their rows by number. In a browser, to go to a URL: click the \
-    address bar, then `type_text` the URL followed by "\\n".
+    elements in `get_window_state`; click their rows by number. In a browser, to go to a URL use \
+    `navigate` (it needs no key focus, so it never waits for the user); in a browser it doesn't support, \
+    click the address bar, then `type_text` the URL followed by "\\n".
     5. When you already know the next few steps (fill a form and submit, type a URL and press Return), send \
     them in one `batch` call: it runs them in order, stops at the first failure, and returns the window's \
     state at the end. Otherwise check the result with `get_window_state` after each meaningful step.

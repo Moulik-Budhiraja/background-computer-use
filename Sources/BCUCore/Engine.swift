@@ -433,6 +433,7 @@ public final class Engine {
         case "scroll": return try scroll(args)
         case "drag": return try drag(args)
         case "press_menu_item": return try pressMenuItem(args)
+        case "navigate": return try navigate(args)
         case "handoff": return try handoff(args)
         case "take_back": return try takeBack(args)
         case "guard_report": return guardReport()
@@ -1032,10 +1033,16 @@ public final class Engine {
             Log.info("defer: \(note); failed the step")
             throw ToolError("the user has a menu open in \(w.appName), and \(cause) would close it, so nothing was sent. Wait a few seconds and retry.")
         }
+        if r.outcome == .held {
+            let note = "waited \(String(format: "%.1f", r.waitedMs / 1000)) s in \(w.appName) before \(cause), but the user is holding a mouse button there"
+            UserSim.shared.waited(fromMs: startMs, note)
+            Log.info("defer: \(note); failed the step")
+            throw ToolError("the user is holding a mouse button in \(w.appName) (dragging, say), and \(cause) would interrupt it, so nothing was sent. Wait a few seconds and retry\(BrowserAutomation.isScriptableChromium(NSRunningApplication(processIdentifier: w.pid)?.bundleURL ?? URL(fileURLWithPath: "/")) ? ", or use navigate to load a URL without keys" : "").")
+        }
         guard r.waitedMs >= 20 else { return }
         var note = "waited \(String(format: "%.1f", r.waitedMs / 1000)) s for \(r.reason ?? "the user to pause") in \(w.appName) before \(cause)"
         switch r.outcome {
-        case .quiet, .menu, .stopped: break
+        case .quiet, .menu, .held, .stopped: break
         case .gap: note += ", then went in a short gap in their input"
         case .cap: note += ", then went anyway (their input was held and replayed)"
         }
@@ -1251,7 +1258,7 @@ public final class Engine {
     // MARK: Batch
 
     private static let batchable: Set<String> = ["click", "set_value", "perform_action", "type_text", "press_key",
-                                                 "scroll", "drag", "press_menu_item", "wait"]
+                                                 "scroll", "drag", "press_menu_item", "navigate", "wait"]
 
     /// Steps that may take key focus in their app (see `keyed`).
     private static func mayTakeKey(_ tool: String, _ a: Args) -> Bool {
@@ -1714,6 +1721,47 @@ public final class Engine {
             try Input.drag(pid: w.pid, windowID: w.id, from: from, to: to)
         }
         return ToolResult(text: "Dragged from (\(Int(fx)),\(Int(fy))) to (\(Int(tx)),\(Int(ty))).")
+    }
+
+    /// Load a URL in one of the agent's Chromium windows through AppleScript:
+    /// no keystrokes, so no key focus taken and nothing to wait for.
+    private func navigate(_ args: Args) throws -> ToolResult {
+        let (w, _) = try agentWindow(args)
+        guard let url = args.string("url")?.trimmingCharacters(in: .whitespaces), !url.isEmpty else { throw ToolError("give url") }
+        guard let app = NSRunningApplication(processIdentifier: w.pid), let bundleURL = app.bundleURL, let bundleID = app.bundleIdentifier,
+              BrowserAutomation.isScriptableChromium(bundleURL) else {
+            throw ToolError("navigate works in Chromium browsers only. In \(w.appName), click the address bar, type_text the URL and \"\\n\".")
+        }
+        switch BrowserAutomation.permission(bundleID) {
+        case .allowed: break
+        case .denied:
+            throw ToolError("the user hasn't allowed this app to control \(w.appName) (System Settings > Privacy & Security > Automation). Click the address bar and type_text the URL and \"\\n\" instead.")
+        case .notAsked:
+            BrowserAutomation.request(bundleID) { _ in }
+            throw ToolError("macOS is asking the user whether this app may control \(w.appName). Retry once they've answered, or click the address bar and type_text the URL and \"\\n\".")
+        }
+        guard let frame = WindowList.info(w.id)?.bounds else { throw ToolError("window \(w.id) is gone") }
+        // AppleScript knows the browser's windows by its own ids; find this
+        // one by its frame, which is the same in both.
+        func quoted(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
+        let b = "{\(Int(frame.minX.rounded())), \(Int(frame.minY.rounded())), \(Int(frame.maxX.rounded())), \(Int(frame.maxY.rounded()))}"
+        let script = """
+        with timeout of 5 seconds
+        tell application id \(quoted(bundleID))
+        repeat with w in windows
+        if bounds of w is \(b) then
+        set URL of active tab of w to \(quoted(url))
+        return
+        end if
+        end repeat
+        error "no window with bounds \(b)"
+        end tell
+        end timeout
+        """
+        guard WindowManager.runAppleScript(script) else {
+            throw ToolError("\(w.appName) didn't take the URL. Click the address bar, type_text the URL and \"\\n\".")
+        }
+        return ToolResult(text: "Loading \(url) in window \(w.id). Next: get_window_state window_id=\(w.id) (it waits for the page to settle).")
     }
 
     private func pressMenuItem(_ args: Args) throws -> ToolResult {
