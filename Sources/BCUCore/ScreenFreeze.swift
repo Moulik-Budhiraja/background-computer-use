@@ -32,6 +32,8 @@ final class ScreenFreeze {
         let chrome: [CGRect]?
         /// The window's size in points, to map `chrome` onto its pixels.
         let size: CGSize
+        /// A menu bar (Window Server's own window) rather than an app's.
+        let bar: Bool
         /// The chrome, small, to tell when it's back.
         var before: [UInt8] = []
     }
@@ -92,7 +94,7 @@ final class ScreenFreeze {
         // menu bar strip: that's covered separately. Windows in front of the
         // user's window are cut out, so translucent ones (the Dock, a
         // notification) keep showing what's really behind them.
-        if let own = BCUCaptureWindow(userWindow) {
+        if let own = ownPixels(userWindow, bar: false) {
             var area = info.bounds.insetBy(dx: -shadowMargin, dy: -shadowMargin).intersection(screen)
             if let bar = bars.first(where: { $0.bar.bounds.intersects(area) }), area.minY < bar.bar.bounds.maxY {
                 area = CGRect(x: area.minX, y: bar.bar.bounds.maxY, width: area.width, height: max(0, area.maxY - bar.bar.bounds.maxY))
@@ -113,7 +115,7 @@ final class ScreenFreeze {
         // Every menu bar on the user's displays (which one dims depends on the
         // Spaces setup), status items included: they dim with it.
         for (bar, barDisplay) in bars {
-            guard let own = BCUCaptureWindow(bar.id) else { continue }
+            guard let own = ownPixels(bar.id, bar: true) else { continue }
             // Only the app menus tell: the status items (the clock) change on their own.
             let menus = appMenus(of: bar)
             let menuChrome = menus.map { [$0.offsetBy(dx: -bar.bounds.minX, dy: -bar.bounds.minY)] }
@@ -173,7 +175,7 @@ final class ScreenFreeze {
         let panels = showing.panels
         showing.lock.unlock()
         for (shot, panel) in zip(shots, panels) {
-            freeze.covers.append(Cover(panel: panel, windowID: shot.id, own: shot.own, chrome: shot.chrome, size: shot.size))
+            freeze.covers.append(Cover(panel: panel, windowID: shot.id, own: shot.own, chrome: shot.chrome, size: shot.size, bar: shot.level == .statusBar))
         }
         freeze.shownMs = nowMs() - t0
         freeze.captureMs = captured.captureMs
@@ -195,7 +197,7 @@ final class ScreenFreeze {
         var worst: [CGWindowID: Int] = [:]
         while !waiting.isEmpty && nowMs() < deadline {
             waiting.removeAll { cover in
-                guard let now = BCUCaptureWindow(cover.windowID) else { return true }
+                guard let now = Self.ownPixels(cover.windowID, bar: cover.bar) else { return true }
                 let d = Self.difference(cover.print(now), cover.before)
                 worst[cover.windowID] = d
                 return d <= Self.allowedDifference
@@ -279,10 +281,21 @@ final class ScreenFreeze {
         return image.cropping(to: r)
     }
 
-    /// What the screen shows in `rect` (global points).
+    /// What the screen shows in `rect` (global points). Exactly, rims and
+    /// the menu bar's material included, while macOS's count of the app's
+    /// captures allows (see `Exact`); after that a ScreenCaptureKit copy,
+    /// the same but for those.
     private static func capture(_ display: CGDirectDisplayID, screen: CGRect, _ rect: CGRect) -> CGImage? {
         guard rect.width >= 1, rect.height >= 1 else { return nil }
-        return BCUCaptureDisplayRect(display, rect.offsetBy(dx: -screen.minX, dy: -screen.minY))
+        if Exact.take(), let exact = BCUCaptureDisplayRect(display, rect.offsetBy(dx: -screen.minX, dy: -screen.minY)) { return exact }
+        return Shot.display(display, rect: rect)
+    }
+
+    /// A window's own pixels, compared to tell when its chrome is back. The
+    /// menu bar is Window Server's, which macOS doesn't count reading, so
+    /// SkyLight reads it quickly; an app's window through ScreenCaptureKit.
+    fileprivate static func ownPixels(_ id: CGWindowID, bar: Bool) -> CGImage? {
+        bar ? BCUCaptureWindow(id) : Shot.window(id)
     }
 
     /// The screen copy `image` (of `area`) with `holes` (global rects) cut

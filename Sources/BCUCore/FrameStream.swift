@@ -4,9 +4,10 @@ import ImageIO
 import UniformTypeIdentifiers
 
 /// Live frames of one agent display, for any preview: the menu bar app's
-/// (in process) or a host app's (over the socket). Each frame is one capture
-/// of the whole display (no ScreenCaptureKit stream, so no screen-sharing
-/// indicator), or of one window.
+/// (in process) or a host app's (over the socket). Each frame is one
+/// ScreenCaptureKit screenshot of the whole display or of one window (no
+/// stream, and nothing macOS counts toward its screen-capture pill: see
+/// `Shot`).
 public final class FrameStream {
     private let engine: Engine
     private let onFrame: (CGImage) -> Void

@@ -5,58 +5,43 @@ import CPrivate
 
 /// Screenshots of the agent's windows and display.
 ///
-/// Everything goes through SkyLight's direct window capture first. It needs
-/// Screen Recording permission but starts no ScreenCaptureKit session, so a
-/// capture now and then shows no purple screen-sharing indicator. Captures
-/// every 2 s or so in the background do bring it on (see `lastCaptureMs`).
-/// ScreenCaptureKit is only a fallback for a window SkyLight can't read.
+/// Everything goes through one-shot ScreenCaptureKit screenshots (`Shot`):
+/// they're the only way of reading other apps' pixels that macOS doesn't
+/// count toward its purple screen-capture pill. SkyLight's window capture
+/// is only a fallback for a window ScreenCaptureKit can't read.
 public enum Capture {
     public static var hasPermission: Bool { CGPreflightScreenCaptureAccess() }
 
     private static let clockLock = NSLock()
     private static var _lastMs = 0.0
     /// When the app last captured anything. macOS turns on its purple
-    /// screen-sharing indicator once captures come often enough (every 2 s
-    /// did it within 20 s; every 4 s didn't), so background captures (the
-    /// history recorder) wait until a few seconds have passed since the last one.
+    /// screen-sharing indicator once counted captures come often enough
+    /// (see `Shot`), so background captures (the history recorder) wait
+    /// until a few seconds have passed since the last one.
     public static var lastCaptureMs: Double { clockLock.lock(); defer { clockLock.unlock() }; return _lastMs }
     private static func mark() { clockLock.lock(); _lastMs = nowMs(); clockLock.unlock() }
 
-    static func blocking<T>(_ op: @escaping () async throws -> T) throws -> T {
+    static func blocking<T>(timeoutMs: Double = 10_000, _ op: @escaping () async throws -> T) throws -> T {
         let sem = DispatchSemaphore(value: 0)
-        var result: Result<T, Error>!
+        let result = Locked<Result<T, Error>?>(nil)
         Task.detached {
-            do { result = .success(try await op()) } catch { result = .failure(error) }
+            do { result.value = .success(try await op()) } catch { result.value = .failure(error) }
             sem.signal()
         }
-        if sem.wait(timeout: .now() + 10) == .timedOut { throw ToolError("screen capture timed out") }
-        return try result.get()
+        if sem.wait(timeout: .now() + .milliseconds(Int(timeoutMs))) == .timedOut { throw ToolError("screen capture timed out") }
+        return try result.value!.get()
     }
 
-    /// One window through SkyLight only, for a live preview: no
-    /// ScreenCaptureKit fallback that could block.
+    /// One window, for a live preview: nothing macOS would count.
     public static func windowFrame(_ id: CGWindowID) -> CGImage? {
         mark()
-        return BCUCaptureWindow(id)
+        return Shot.window(id)
     }
 
     public static func window(_ id: CGWindowID) throws -> CGImage {
         mark()
-        if let image = BCUCaptureWindow(id) { return image }
-        return try blocking {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard let w = content.windows.first(where: { $0.windowID == id }) else {
-                throw ToolError("window \(id) is not capturable (closed, or Screen Recording permission missing)")
-            }
-            let filter = SCContentFilter(desktopIndependentWindow: w)
-            let config = SCStreamConfiguration()
-            let scale = CGFloat(filter.pointPixelScale)
-            config.width = max(1, Int(w.frame.width * scale))
-            config.height = max(1, Int(w.frame.height * scale))
-            config.showsCursor = false
-            config.ignoreShadowsSingleWindow = true
-            return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-        }
+        if let image = Shot.window(id) ?? BCUCaptureWindow(id) { return image }
+        throw ToolError("window \(id) is not capturable (closed, or Screen Recording permission missing)")
     }
 
     /// The agent display drawn from its windows, back to front, on a dark
@@ -86,69 +71,25 @@ public enum Capture {
             }
             return !systemOwners.contains($0.owner) && $0.layer != 24 && $0.layer != 25
         }
-        for w in windows.reversed() {
-            guard let image = w.layer < 0 ? desktopImage(w.id) : BCUCaptureWindow(w.id) else { continue }
-            let r = coveredRect(image, bounds: w.bounds, display: b)
-            let x = (r.minX - b.minX) * scale
-            let yTop = (r.minY - b.minY) * scale
-            let h = r.height * scale
-            ctx.draw(image, in: CGRect(x: x, y: CGFloat(outH) - yTop - h, width: r.width * scale, height: h))
-        }
+        // One screenshot of just those windows, over the dark background.
+        guard let image = Shot.display(display.displayID, including: windows.map(\.id)) else { return nil }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: outW, height: outH))
         return ctx.makeImage()
     }
 
-    private typealias DisplayImageFn = @convention(c) (UInt32) -> Unmanaged<CGImage>?
-    /// CGDisplayCreateImage, looked up at run time because the SDK no longer
-    /// declares it. It still works, takes about 18 ms for the whole Retina
-    /// agent display (stitching windows takes over 500 ms) and, being a
-    /// one-shot capture, starts no screen-sharing indicator.
-    private static let displayImage: DisplayImageFn? = {
-        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGDisplayCreateImage") else { return nil }
-        return unsafeBitCast(sym, to: DisplayImageFn.self)
-    }()
-
-    /// The whole agent display exactly as it looks, at its full pixel size.
+    /// The whole agent display as it looks, at its full pixel size.
     public static func display(_ display: AgentDisplay) -> CGImage? {
         guard display.isRunning else { return nil }
         mark()
-        if let f = displayImage, let image = f(display.displayID)?.takeRetainedValue() { return image }
-        return composite(display: display, width: Int(display.bounds.width) * 2, wholeDisplay: true)
+        return Shot.display(display.displayID)
     }
-
-    private typealias FromArrayFn = @convention(c) (CGRect, CFArray, UInt32) -> Unmanaged<CGImage>?
-    private static let imageFromArray: FromArrayFn? = {
-        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGWindowListCreateImageFromArray") else { return nil }
-        return unsafeBitCast(sym, to: FromArrayFn.self)
-    }()
 
     /// The whole agent display without one window: while the user drags a
     /// window in the preview, the preview draws it where it's going instead.
     public static func display(_ display: AgentDisplay, excluding id: CGWindowID) -> CGImage? {
-        guard id != 0, display.isRunning, let f = imageFromArray else { return self.display(display) }
+        guard id != 0, display.isRunning else { return self.display(display) }
         mark()
-        let b = display.bounds
-        var ids: [UnsafeRawPointer?] = WindowList.all(onScreenOnly: true, includeDesktop: true)
-            .filter { b.intersects($0.bounds) && $0.id != id && $0.pid != getpid() }
-            .map { UnsafeRawPointer(bitPattern: UInt($0.id)) }
-        guard let array = CFArrayCreate(nil, &ids, ids.count, nil),
-              let image = f(b, array, 1 << 3 /* best resolution */)?.takeRetainedValue() else { return self.display(display) }
-        return image
-    }
-
-    /// Wallpaper and desktop windows barely change, so they're captured at most every few seconds.
-    private static var desktopCache: [CGWindowID: (ms: Double, image: CGImage)] = [:]
-    private static let desktopLock = NSLock()
-
-    private static func desktopImage(_ id: CGWindowID) -> CGImage? {
-        desktopLock.lock()
-        if let hit = desktopCache[id], nowMs() - hit.ms < 3000 { desktopLock.unlock(); return hit.image }
-        desktopLock.unlock()
-        guard let image = BCUCaptureWindow(id) else { return nil }
-        desktopLock.lock()
-        desktopCache[id] = (nowMs(), image)
-        if desktopCache.count > 8 { desktopCache = desktopCache.filter { nowMs() - $0.value.ms < 3000 } }
-        desktopLock.unlock()
-        return image
+        return Shot.display(display.displayID, excluding: [id])
     }
 
     /// The part of a window, in global points, that a capture of it shows.

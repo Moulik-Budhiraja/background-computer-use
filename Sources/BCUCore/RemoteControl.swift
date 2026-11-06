@@ -265,7 +265,7 @@ public final class RemoteControl {
     }
 
     private func beginDrag(_ p: Press, _ kind: DragKind) {
-        let snapshot = kind == .move ? BCUCaptureWindow(p.window.id) : nil
+        let snapshot = kind == .move ? Capture.windowFrame(p.window.id) : nil
         let visual = DragVisual(windowID: p.window.id, kind: kind, start: p.frame, pressPoint: p.point, snapshot: snapshot)
         DispatchQueue.main.async { self.onDrag?(.began(visual)) }
     }
