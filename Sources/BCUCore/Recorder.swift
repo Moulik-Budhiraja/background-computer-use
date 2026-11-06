@@ -278,8 +278,13 @@ public enum Recordings {
     public static let defaultLimitMB = 300
     private static let limitKey = "historyLimitMB"
     public static var limitMB: Int {
-        get { (UserDefaults.standard.object(forKey: limitKey) as? Int).map { max(50, $0) } ?? defaultLimitMB }
-        set { UserDefaults.standard.set(newValue, forKey: limitKey); enforceLimit() }
+        get { (settings.object(forKey: limitKey) as? Int).map { max(50, $0) } ?? defaultLimitMB }
+        set { settings.set(newValue, forKey: limitKey); enforceLimit() }
+    }
+    /// The app's settings, also from a host app's `bcu serve`, so the limit
+    /// the user set holds whichever engine is running.
+    private static var settings: UserDefaults {
+        Bundle.main.bundleIdentifier == BCUPaths.bundleID ? .standard : UserDefaults(suiteName: BCUPaths.bundleID) ?? .standard
     }
 
     private static let limitQueue = DispatchQueue(label: "bcu.recordings.limit", qos: .utility)

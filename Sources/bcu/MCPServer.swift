@@ -17,7 +17,14 @@ final class MCPServer {
     }
     private var lanes: [String: Lane] = [:]
     /// This agent's session: its own display and windows in the app.
-    private let sessionID = UUID().uuidString
+    private let sessionID: String
+    /// The host app that shows this session in its own UI (`--host`).
+    private let host: String?
+    /// The session's name in the UI (`--label`), instead of the client's.
+    private let label: String?
+    /// The engine's own tool list and instructions, when it has them: a host
+    /// app's `bcu` may talk to an engine of another version.
+    private var catalog: (tools: [JSONObject], instructions: String)?
     /// The agent's name from `initialize` (e.g. "claude-code"), for the menu bar.
     private var clientName: String?
     /// Claude Code subagents share this connection; this tells their calls apart.
@@ -25,8 +32,13 @@ final class MCPServer {
     /// The first Codex thread seen on this connection: the main agent's.
     private var mainThread: String?
 
-    /// bcu lives in the app's Contents/MacOS, so the main bundle is the app.
-    static let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+    static let appVersion = BCUVersion.current
+
+    init(host: String?, session: String?, label: String?) {
+        self.host = host
+        self.label = label
+        sessionID = session ?? UUID().uuidString
+    }
 
     func run() {
         while let line = readLine(strippingNewline: true) {
@@ -60,16 +72,17 @@ final class MCPServer {
         case "initialize":
             clientName = (params["clientInfo"] as? JSONObject)?["name"] as? String
             let version = params["protocolVersion"] as? String ?? "2025-06-18"
+            catalog = Self.engineCatalog()
             reply(id, result: [
                 "protocolVersion": version,
                 "capabilities": ["tools": ["listChanged": false]],
                 "serverInfo": ["name": "background-computer-use", "version": Self.appVersion],
-                "instructions": ToolCatalog.serverInstructions,
+                "instructions": catalog?.instructions ?? ToolCatalog.serverInstructions,
             ])
         case "ping":
             reply(id, result: [:])
         case "tools/list":
-            reply(id, result: ["tools": ToolCatalog.tools])
+            reply(id, result: ["tools": catalog?.tools ?? ToolCatalog.tools])
         case "tools/call":
             let name = params["name"] as? String ?? ""
             let arguments = params["arguments"] as? JSONObject ?? [:]
@@ -108,13 +121,21 @@ final class MCPServer {
         do {
             result = try callWithReconnect(name, arguments, session: session, lane: lane)
         } catch {
-            result = .error("\(error). Open \(BCUPaths.appName) from Applications and grant its permissions.")
+            result = .error("\(error). Open \(ownerName) and grant its permissions.")
         }
         var content: [JSONObject] = [["type": "text", "text": result.text]]
         for image in result.images {
             content.append(["type": "image", "data": image.base64, "mimeType": image.mime])
         }
         return ["content": content, "isError": result.isError]
+    }
+
+    /// The running engine's tools and instructions, if it's up and new enough to say.
+    private static func engineCatalog() -> (tools: [JSONObject], instructions: String)? {
+        guard let client = try? SocketClient(), let reply = try? client.request(["op": "catalog"]),
+              reply["ok"] as? Bool == true, let tools = reply["tools"] as? [JSONObject],
+              let instructions = reply["instructions"] as? String else { return nil }
+        return (tools, instructions)
     }
 
     private func callWithReconnect(_ name: String, _ arguments: JSONObject, session: String, lane: Lane) throws -> ToolResult {
@@ -125,6 +146,8 @@ final class MCPServer {
                 args["_session"] = session
                 if session != sessionID { args["_parent"] = sessionID }
                 if let clientName { args["_client"] = clientName }
+                if let host { args["_host"] = host }
+                if let label { args["_label"] = label }
                 return try lane.client!.call(tool: name, args: args)
             } catch {
                 lane.client = nil

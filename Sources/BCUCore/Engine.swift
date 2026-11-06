@@ -36,6 +36,8 @@ public final class Engine {
     public let sessionID: String
     /// Shown in the menu bar, e.g. "Claude Code".
     public let label: String
+    /// The host app that shows this session in its own UI (`bcu mcp --host`), if any.
+    public let host: String?
     public let display: AgentDisplay
     public let focusGuard: FocusGuard
     public let windows: WindowManager
@@ -111,9 +113,11 @@ public final class Engine {
     static let agentLeaseMs = 6000.0
     static let agentWaitMaxMs = 20000.0
 
-    public init(sessionID: String, label: String, focusGuard: FocusGuard, width: Int = AgentDisplay.defaultWidth, height: Int = AgentDisplay.defaultHeight) {
+    public init(sessionID: String, label: String, focusGuard: FocusGuard, host: String? = nil,
+                width: Int = AgentDisplay.defaultWidth, height: Int = AgentDisplay.defaultHeight) {
         self.sessionID = sessionID
         self.label = label
+        self.host = host
         self.focusGuard = focusGuard
         display = AgentDisplay(width: width, height: height)
         windows = WindowManager(display: display, focusGuard: focusGuard, sessionKey: sessionID)

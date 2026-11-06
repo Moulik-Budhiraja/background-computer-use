@@ -1,0 +1,18 @@
+{
+  "name": "@background-computer-use/client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Run the Background Computer Use engine from a host app and show its agents' screens in your own UI",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./dom": "./src/dom.ts",
+    "./types": "./src/types.ts"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}

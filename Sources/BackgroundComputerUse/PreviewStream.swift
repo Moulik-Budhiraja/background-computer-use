@@ -3,63 +3,36 @@ import QuartzCore
 import SwiftUI
 import BCUCore
 
-/// Live view of the agent display. Each frame is one capture of the whole
-/// display (no ScreenCaptureKit stream, so no screen-sharing indicator),
-/// shown by setting a layer's contents so SwiftUI doesn't redraw per frame.
+/// Live view of the agent display, delivered on the main thread and shown
+/// by setting a layer's contents so SwiftUI doesn't redraw per frame. The
+/// capture loop is `FrameStream`, in core, which host apps use too.
 final class PreviewStream {
-    private let engine: Engine
-    private let onFrame: (CGImage) -> Void
-    private let queue = DispatchQueue(label: "bcu.preview", qos: .userInteractive)
-    private var timer: DispatchSourceTimer?
-    private let lock = NSLock()
-    private var _excluded: CGWindowID = 0
-    /// A window left out of the capture (one the user is dragging).
-    var excluded: CGWindowID {
-        get { lock.lock(); defer { lock.unlock() }; return _excluded }
-        set { lock.lock(); _excluded = newValue; lock.unlock() }
-    }
-
-    private var _window: CGWindowID = 0
-    /// Show only this window (one handed to the user) instead of the display.
-    var window: CGWindowID {
-        get { lock.lock(); defer { lock.unlock() }; return _window }
-        set { lock.lock(); _window = newValue; lock.unlock() }
-    }
+    private let core: FrameStream
 
     init(engine: Engine, onFrame: @escaping (CGImage) -> Void) {
-        self.engine = engine
-        self.onFrame = onFrame
+        core = FrameStream(engine: engine) { image in
+            DispatchQueue.main.async { onFrame(image) }
+        }
+    }
+
+    /// A window left out of the capture (one the user is dragging).
+    var excluded: CGWindowID {
+        get { core.excluded }
+        set { core.excluded = newValue }
+    }
+
+    /// Show only this window (one handed to the user) instead of the display.
+    var window: CGWindowID {
+        get { core.window }
+        set { core.window = newValue }
     }
 
     func start(fps: Int) {
-        guard timer == nil else { return }
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        // A serial queue: a frame that takes longer than the interval just
-        // delays the next one, so the rate tops out at what capture allows.
-        t.schedule(deadline: .now(), repeating: 1.0 / Double(max(1, fps)), leeway: .milliseconds(2))
-        t.setEventHandler { [weak self] in
-            guard let self else { return }
-            let skip = self.excluded, only = self.window
-            let image: CGImage?
-            if only != 0 {
-                image = Capture.windowFrame(only)
-            } else {
-                image = skip != 0 ? Capture.display(self.engine.display, excluding: skip) : Capture.display(self.engine.display)
-            }
-            guard let image else { return }
-            // The whole display, as the history records it: while someone
-            // watches, history gets every change without capturing again.
-            if only == 0, skip == 0 { self.engine.recordPreview(image) }
-            DispatchQueue.main.async { self.onFrame(image) }
-        }
-        t.resume()
-        timer = t
+        guard !core.isRunning else { return }
+        core.start(fps: fps)
     }
 
-    func stop() {
-        timer?.cancel()
-        timer = nil
-    }
+    func stop() { core.stop() }
 }
 
 /// A layer that shows the latest frame, scaled to fit, plus the window the
