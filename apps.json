@@ -11,7 +11,7 @@
       "kind": "native",
       "command": "./scripts/build-app.sh",
       "app": "build/Background Computer Use.app",
-      "entitlements": null,
+      "entitlements": "Resources/BackgroundComputerUse.entitlements",
       "dmgName": "BackgroundComputerUse"
     },
     "windows": {

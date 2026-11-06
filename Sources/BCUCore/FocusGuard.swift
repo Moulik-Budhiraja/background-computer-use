@@ -654,7 +654,18 @@ public final class FocusGuard {
                 // key back itself.
                 if window != 0 && !self.isSwapping(pid) { _ = BCUPostMakeKeyRecords(pid, window) }
                 let deadline = nowMs() + 500
-                while BCUFrontProcessPID() != pid && nowMs() < deadline { sleepMs(1) }
+                var lastCall = nowMs()
+                while BCUFrontProcessPID() != pid && nowMs() < deadline {
+                    // An app that activates again while the first call lands
+                    // (Chromium does, opening a window) keeps the front until
+                    // asked again. Only while it's still the agent's app in
+                    // front: an app the user switched to is left alone.
+                    if agent != 0 && BCUFrontProcessPID() == agent && nowMs() - lastCall >= 20 {
+                        status = BCUSetFrontProcess(pid, window, 0x200)
+                        lastCall = nowMs()
+                    }
+                    sleepMs(1)
+                }
                 Log.info("guard: restore (\(reason)) setFront=\(status) call \(Int(t1 - t0)) ms, front back after \(Int(nowMs() - t0)) ms")
             }
             self.lock.lock()

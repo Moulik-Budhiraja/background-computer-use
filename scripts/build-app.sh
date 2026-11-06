@@ -69,6 +69,7 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSHumanReadableCopyright</key><string>Background Computer Use</string>
+  <key>NSAppleEventsUsageDescription</key><string>New browser windows open straight on the agent's display instead of flashing on your screen.</string>
   <key>NSAudioCaptureUsageDescription</key><string>Sound from apps only the agent is using is kept off your speakers and saved to a file for the session.</string>
   <key>SUFeedURL</key><string>$FEED_URL</string>
   <key>SUPublicEDKey</key><string>$SPARKLE_PUBLIC_KEY</string>
@@ -100,7 +101,7 @@ sign "$FWV/Autoupdate"
 sign "$FWV/Updater.app"
 sign "$FW"
 sign "$OUT/Contents/MacOS/bcu"
-sign "$OUT"
+sign --entitlements Resources/BackgroundComputerUse.entitlements "$OUT"
 codesign --verify --deep --strict "$OUT"
 echo "built $OUT $VERSION ($BUILD), signed: $IDENTITY"
 

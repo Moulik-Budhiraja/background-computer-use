@@ -43,7 +43,7 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
 
 final class OnboardingModel: ObservableObject {
     enum Step: Int, CaseIterable {
-        case welcome, accessibility, screenRecording, connect, done
+        case welcome, accessibility, screenRecording, browser, connect, done
     }
 
     static let doneKey = "onboardingDone"
@@ -62,6 +62,11 @@ final class OnboardingModel: ObservableObject {
     @Published var connectError: String?
     @Published var copied = false
     @Published var openAtLogin = true
+    /// The default browser, when it's a Chromium one whose new windows can
+    /// open straight on the agent display once this app may control it.
+    @Published var browser: (name: String, bundleID: String, url: URL)?
+    @Published var browserPermission: BrowserAutomation.Permission = .notAsked
+    @Published var askingBrowser = false
 
     var onFinish: (() -> Void)?
     private var timer: Timer?
@@ -97,6 +102,8 @@ final class OnboardingModel: ObservableObject {
         accessibility = AX.isTrusted
         screenRecording = Capture.hasPermission
         screenRecordingOn = screenRecording || Self.screenRecordingSwitchedOn()
+        browser = BrowserAutomation.defaultBrowser()
+        if let b = browser, !askingBrowser { browserPermission = BrowserAutomation.permission(b.bundleID) }
         // ~/.claude.json can be several MB, so only read it where it's shown.
         if timer == nil || step == .connect || step == .done {
             installed = Set(AgentKind.allCases.filter(AgentSetup.isInstalled))
@@ -136,11 +143,41 @@ final class OnboardingModel: ObservableObject {
             guard let n = Step(rawValue: s.rawValue + 1) else { return }
             s = n
         } while (s == .accessibility && accessibility) || (s == .screenRecording && screenRecording)
+            || (s == .browser && !showsBrowserStep)
         go(s)
     }
 
+    /// Only for a Chromium default browser this app may not control yet.
+    var showsBrowserStep: Bool { browser != nil && browserPermission != .allowed }
+
+    /// The steps the dots count: done isn't one, nor a browser step that's skipped.
+    var dotSteps: [Step] { Step.allCases.filter { $0 != .done && ($0 != .browser || showsBrowserStep || step == .browser) } }
+
+    func requestBrowser() {
+        guard !askingBrowser else { return }
+        guard let b = browser else { next(); return }
+        if browserPermission == .denied {
+            open("x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")
+            return
+        }
+        askingBrowser = true
+        BrowserAutomation.request(b.bundleID, app: b.url) { [weak self] result in
+            guard let self else { return }
+            self.askingBrowser = false
+            self.browserPermission = result
+            if result == .allowed, self.step == .browser {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { if self.step == .browser { self.next() } }
+            }
+        }
+    }
+
     func back() {
-        if let s = Step(rawValue: step.rawValue - 1) { go(s) }
+        var s = step
+        repeat {
+            guard let p = Step(rawValue: s.rawValue - 1) else { return }
+            s = p
+        } while s == .browser && !showsBrowserStep
+        go(s)
     }
 
     func requestAccessibility() {
@@ -263,6 +300,8 @@ struct OnboardingView: View {
             PrivacyPaneArt(pane: .accessibility, isOn: model.accessibility)
         case .screenRecording:
             PrivacyPaneArt(pane: .screenRecording, isOn: model.screenRecordingOn)
+        case .browser:
+            PrivacyPaneArt(pane: .automation(browser: model.browser?.name ?? "Your browser"), isOn: model.browserPermission == .allowed)
         case .connect:
             ArtStage {
                 HStack(spacing: 16) {
@@ -287,6 +326,7 @@ struct OnboardingView: View {
         case .welcome: return "Your agents get their own screen"
         case .accessibility: return "Let agents use your apps"
         case .screenRecording: return needsRestart ? "Reopen the app" : "Let agents see their windows"
+        case .browser: return "Keep browser windows off your screen"
         case .connect: return "Connect your agents"
         case .done: return "You're ready"
         }
@@ -298,6 +338,7 @@ struct OnboardingView: View {
         case .accessibility: return "Turn on Background Computer Use in this list."
         case .screenRecording:
             return needsRestart ? "macOS won't let it record until it restarts." : "Same thing, but in the Screen Recording list."
+        case .browser: return "Allow it to control \(model.browser?.name ?? "your browser") so new windows open on the agent's screen."
         case .connect: return "Pick the agents you want to use this with."
         case .done: return "Ask an agent to use any app. You can watch it from the menu bar."
         }
@@ -325,6 +366,8 @@ struct OnboardingView: View {
             StatusLine(on: model.accessibility)
         case .screenRecording:
             StatusLine(on: model.screenRecordingOn)
+        case .browser:
+            StatusLine(on: model.browserPermission == .allowed)
         case .connect:
             if let error = model.connectError {
                 Text(error)
@@ -367,13 +410,18 @@ struct OnboardingView: View {
                 .buttonStyle(.plain)
                 .padding(.leading, 16)
             } else {
-                StepDots(current: model.step.rawValue, count: 4).padding(.leading, 16)
+                StepDots(current: model.dotSteps.firstIndex(of: model.step) ?? 0, count: model.dotSteps.count).padding(.leading, 16)
             }
             Spacer()
             if model.step != .welcome && model.step != .done && !needsRestart {
                 Button("Back", action: model.back)
                     .buttonStyle(QuietButtonStyle())
                     .disabled(model.connecting)
+            }
+            if model.step == .browser && model.browserPermission != .allowed {
+                Button("Skip", action: model.next)
+                    .buttonStyle(QuietButtonStyle())
+                    .disabled(model.askingBrowser)
             }
             Button(primaryTitle, action: primaryAction)
                 .buttonStyle(PrimaryButtonStyle())
@@ -391,6 +439,13 @@ struct OnboardingView: View {
         case .screenRecording:
             if needsRestart { return "Quit & Reopen" }
             return model.screenRecording ? "Continue" : "Open System Settings"
+        case .browser:
+            if model.askingBrowser { return "Waiting…" }
+            switch model.browserPermission {
+            case .allowed: return "Continue"
+            case .denied: return "Open System Settings"
+            case .notAsked: return "Allow"
+            }
         case .connect:
             if model.connecting { return "Connecting…" }
             return model.selected.isEmpty ? "Continue" : "Connect"
@@ -406,6 +461,7 @@ struct OnboardingView: View {
             if needsRestart { model.relaunch() }
             else if model.screenRecording { model.next() }
             else { model.requestScreenRecording() }
+        case .browser: model.browserPermission == .allowed ? model.next() : model.requestBrowser()
         case .connect: model.connect()
         case .done: model.finish()
         }

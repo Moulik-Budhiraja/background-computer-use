@@ -114,20 +114,30 @@ struct WelcomeArt: View {
 
 /// A small System Settings window showing the switch to turn on.
 struct PrivacyPaneArt: View {
-    enum Pane { case accessibility, screenRecording }
+    enum Pane: Equatable { case accessibility, screenRecording, automation(browser: String) }
     let pane: Pane
     let isOn: Bool
 
-    private var title: String { pane == .accessibility ? "Accessibility" : "Screen & System Audio Recording" }
+    private var title: String {
+        switch pane {
+        case .accessibility: return "Accessibility"
+        case .screenRecording: return "Screen & System Audio Recording"
+        case .automation: return "Automation"
+        }
+    }
     private var caption: String {
-        pane == .accessibility
-            ? "Allow the applications below to control your computer."
-            : "Allow the applications below to record the content of your screen and audio."
+        switch pane {
+        case .accessibility: return "Allow the applications below to control your computer."
+        case .screenRecording: return "Allow the applications below to record the content of your screen and audio."
+        case .automation: return "Allow the applications below to control other applications."
+        }
     }
     private var others: [(String, Color)] {
-        pane == .accessibility
-            ? [("Terminal", Color(hex: 0x3A3A3C)), ("Raycast", Color(hex: 0xFF6363))]
-            : [("Zoom", Color(hex: 0x2D8CFF)), ("CleanShot X", Color(hex: 0x1F2A44))]
+        switch pane {
+        case .accessibility: return [("Terminal", Color(hex: 0x3A3A3C)), ("Raycast", Color(hex: 0xFF6363))]
+        case .screenRecording: return [("Zoom", Color(hex: 0x2D8CFF)), ("CleanShot X", Color(hex: 0x1F2A44))]
+        case .automation: return [("Raycast", Color(hex: 0xFF6363)), ("Shortcuts", Color(hex: 0x5E5CE6))]
+        }
     }
 
     var body: some View {
@@ -205,11 +215,28 @@ struct PrivacyPaneArt: View {
         .background(RoundedRectangle(cornerRadius: 5).fill(selected ? Art.blue : .clear))
     }
 
-    private var ours: some View {
+    @ViewBuilder private var ours: some View {
         let ring = isOn ? Theme.live : Art.blue
-        return row("Background Computer Use", icon: AnyView(MiniAppIcon()), on: isOn, bold: true)
-            .background(RoundedRectangle(cornerRadius: 6).fill(ring.opacity(0.08)))
-            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(ring, lineWidth: 1.5))
+        if case .automation(let browser) = pane {
+            // Automation lists each app with the apps it may control under it.
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    MiniAppIcon().frame(width: 16, height: 16)
+                    Text("Background Computer Use").font(.system(size: 10.5, weight: .medium)).foregroundStyle(Color(hex: 0x1D1D1F))
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 10)
+                .frame(height: 26)
+                row(browser, icon: AnyView(Circle().fill(Color(hex: 0x4A8CF7)).padding(1)), on: isOn, bold: true)
+                    .padding(.leading, 22)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(ring.opacity(0.08)))
+                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(ring, lineWidth: 1.5))
+            }
+        } else {
+            row("Background Computer Use", icon: AnyView(MiniAppIcon()), on: isOn, bold: true)
+                .background(RoundedRectangle(cornerRadius: 6).fill(ring.opacity(0.08)))
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(ring, lineWidth: 1.5))
+        }
     }
 
     private func row(_ name: String, icon: AnyView, on: Bool, bold: Bool = false) -> some View {

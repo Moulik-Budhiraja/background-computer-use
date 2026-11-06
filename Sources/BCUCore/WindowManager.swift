@@ -329,8 +329,12 @@ public final class WindowManager {
         // Read under the lock: another session's swap may have an agent
         // window key until it's done.
         let previousKey = AX.focusedWindowID(pid)
+        // Apps that can be told where to build a new window (Chromium
+        // browsers) open it straight on the agent display, so no anchor is
+        // needed and nothing ever reaches the user's screen.
+        let scripted = trigger == nil || trigger == "script" ? Self.scriptedNewWindow(pid: pid, bundleID: bundleID) : nil
         var scope: KeyScope?
-        if placement.contains(.anchor), let anchor = anchorWindow(pid: pid) {
+        if scripted == nil, placement.contains(.anchor), let anchor = anchorWindow(pid: pid) {
             scope = try? KeyScope.enter(pid: pid, window: anchor)
             if scope != nil { notes.append("anchored on window \(anchor)") }
         }
@@ -357,7 +361,9 @@ public final class WindowManager {
         defer { if assigned { _ = BCUProcessAssignToSpace(pid, 0) } }
         catcher.start()
         var how = ""
-        if trigger != "key", let item = Self.newWindowMenuItem(pid: pid) {
+        if let scripted, Self.runAppleScript(scripted(nextFrame(size: CGSize(width: 1400, height: 900)))) {
+            how = "AppleScript, built at its place on the agent display"
+        } else if trigger != "key", let item = Self.newWindowMenuItem(pid: pid) {
             let err = AX.perform(item.element, "AXPress")
             how = "menu \"\(item.title)\"" + (err == .success ? "" : " (\(AX.errorName(err)))")
         } else {
@@ -398,6 +404,63 @@ public final class WindowManager {
         notes.insert("opened with \(how)", at: 0)
         notes.append(catcher.flashReport)
         return OpenResult(window: aw, notes: notes)
+    }
+
+    /// The AppleScript that makes the app build a new window at a given frame
+    /// (global points, top-left origin) before it shows it, for apps known to
+    /// honor that: Chromium browsers (`make new window with properties
+    /// {bounds:…}`). Most apps' scripting (Finder's, TextEdit's) places a new
+    /// window where it always would and applies the bounds after it's on
+    /// screen, which is no better than moving it. Nil for those.
+    static func scriptedNewWindow(pid: pid_t, bundleID: String?) -> ((CGRect) -> String)? {
+        guard let bundleID, let url = NSRunningApplication(processIdentifier: pid)?.bundleURL,
+              BrowserAutomation.isScriptableChromium(url), mayScript(bundleID, app: url) else { return nil }
+        func bounds(_ r: CGRect) -> String { "{\(Int(r.minX)), \(Int(r.minY)), \(Int(r.maxX)), \(Int(r.maxY))}" }
+        return { "with timeout of 5 seconds\ntell application id \"\(bundleID)\" to make new window with properties {bounds:\(bounds($0))}\nend timeout" }
+    }
+
+    private static let askedLock = NSLock()
+    private static var asked: Set<String> = []
+
+    /// Whether this app may control the browser. When the user hasn't been
+    /// asked (setup asks for their default browser), asks once in the
+    /// background (the window being opened now goes the usual way) and says
+    /// no for now.
+    static func mayScript(_ bundleID: String, app: URL) -> Bool {
+        switch BrowserAutomation.permission(bundleID) {
+        case .allowed: return true
+        case .denied: return false
+        case .notAsked:
+            askedLock.lock()
+            let first = asked.insert(bundleID).inserted
+            askedLock.unlock()
+            if first {
+                Log.info("asking to control \(bundleID), so its new windows can open on the agent display")
+                BrowserAutomation.request(bundleID, app: app) { _ in }
+            }
+            return false
+        }
+    }
+
+    /// Run AppleScript source; whether it finished without an error. The
+    /// first time for each app macOS asks the user whether this app may
+    /// control it (Automation); until they answer it times out.
+    static func runAppleScript(_ source: String, timeoutMs: Double = 6000) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = source.split(separator: "\n").flatMap { ["-e", String($0)] }
+        let err = Pipe()
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = err
+        do { try p.run() } catch { return false }
+        let deadline = nowMs() + timeoutMs
+        while p.isRunning && nowMs() < deadline { sleepMs(10) }
+        if p.isRunning { p.terminate(); Log.info("AppleScript timed out"); return false }
+        if p.terminationStatus != 0 {
+            Log.info("AppleScript failed: \(String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))")
+            return false
+        }
+        return true
     }
 
     /// A window of `pid` on an agent display to open the new window next to.
