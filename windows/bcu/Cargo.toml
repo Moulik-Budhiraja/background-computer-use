@@ -6,3 +6,4 @@ description = "Command-line front end for Background Computer Use on Windows: `b
 
 [dependencies]
 serde_json.workspace = true
+windows.workspace = true

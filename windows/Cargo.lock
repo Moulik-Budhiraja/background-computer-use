@@ -12,6 +12,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "background-computer-use"
 version = "0.1.0"
 dependencies = [
+ "bcu-hook",
  "ed25519-dalek",
  "png",
  "serde_json",
@@ -29,6 +30,14 @@ name = "bcu"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "windows",
+]
+
+[[package]]
+name = "bcu-hook"
+version = "0.1.0"
+dependencies = [
+ "windows",
 ]
 
 [[package]]

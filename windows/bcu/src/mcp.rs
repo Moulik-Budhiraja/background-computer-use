@@ -52,7 +52,7 @@ impl Server {
                     "protocolVersion": version,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "background-computer-use", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": tools::SERVER_INSTRUCTIONS,
+                    "instructions": tools::server_instructions(),
                 })
             }
             "ping" => json!({}),

@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 ./build-from-mac.sh >/dev/null
 OUT="$(mktemp -d)/bcu"
 mkdir -p "$OUT"
-cp target/x86_64-pc-windows-msvc/release/{bcu-probe,bcu,BackgroundComputerUse}.exe "$OUT/"
+cp target/x86_64-pc-windows-msvc/release/{bcu-probe,bcu,BackgroundComputerUse}.exe target/x86_64-pc-windows-msvc/release/bcu_hook.dll "$OUT/"
 cp probe/phase0/* "$OUT/"
 cp app/install-monitor.ps1 "$OUT/"
 mkdir -p "$OUT/skills"
