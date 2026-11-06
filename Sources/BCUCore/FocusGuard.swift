@@ -1144,3 +1144,35 @@ private func guardTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: 
     guard let out = g.handle(type: type, event: event) else { return nil }
     return Unmanaged.passUnretained(out)
 }
+
+/// A hold on the user's input (`FocusGuard.beginHold`) that starts only when
+/// something first needs it and ends once: after `end`, `start` does nothing.
+public final class InputHold {
+    private let focusGuard: FocusGuard
+    private let lock = NSLock()
+    private var token: Int?
+    private var sinceMs = 0.0
+    private var ended = false
+
+    public init(_ focusGuard: FocusGuard) { self.focusGuard = focusGuard }
+
+    public func start() {
+        lock.lock(); defer { lock.unlock() }
+        guard !ended, token == nil else { return }
+        token = focusGuard.beginHold()
+        sinceMs = nowMs()
+    }
+
+    /// Ends the hold; returns how long it lasted, or nil if it never started.
+    @discardableResult
+    public func end() -> Double? {
+        lock.lock()
+        ended = true
+        let t = token
+        token = nil
+        lock.unlock()
+        guard let t else { return nil }
+        focusGuard.endHold(t)
+        return nowMs() - sinceMs
+    }
+}

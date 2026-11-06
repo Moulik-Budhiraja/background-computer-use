@@ -29,9 +29,19 @@ public enum BrowserAutomation {
         return (name, id, url)
     }
 
+    private static let pendingLock = NSLock()
+    /// Browsers macOS is asking the user about right now, with everyone
+    /// waiting for the answer.
+    private static var pending: [String: [(Permission) -> Void]] = [:]
+
     /// Whether this app may control `bundleID`, without asking. macOS can only
-    /// tell while the app runs; otherwise `notAsked`.
+    /// tell while the app runs; otherwise `notAsked`. While macOS is asking
+    /// the user, also `notAsked`: checking then blocks until they answer.
     public static func permission(_ bundleID: String) -> Permission {
+        pendingLock.lock()
+        let asking = pending[bundleID] != nil
+        pendingLock.unlock()
+        if asking { return .notAsked }
         switch determine(bundleID, ask: false) {
         case noErr: return .allowed
         case OSStatus(errAEEventNotPermitted): return .denied
@@ -43,6 +53,12 @@ public enum BrowserAutomation {
     /// first if it isn't running, since macOS can only ask about a running app.
     /// Calls back on the main thread.
     public static func request(_ bundleID: String, app: URL? = nil, completion: @escaping (Permission) -> Void) {
+        pendingLock.lock()
+        let already = pending[bundleID] != nil
+        pending[bundleID, default: []].append(completion)
+        pendingLock.unlock()
+        // One prompt at a time per browser; everyone gets its answer.
+        if already { return }
         DispatchQueue.global(qos: .userInitiated).async {
             if NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty,
                let url = app ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
@@ -57,7 +73,10 @@ public enum BrowserAutomation {
             let status = determine(bundleID, ask: true)
             let result: Permission = status == noErr ? .allowed : (status == OSStatus(errAEEventNotPermitted) ? .denied : .notAsked)
             Log.info("control of \(bundleID): \(result)")
-            DispatchQueue.main.async { completion(result) }
+            pendingLock.lock()
+            let waiting = pending.removeValue(forKey: bundleID) ?? []
+            pendingLock.unlock()
+            DispatchQueue.main.async { waiting.forEach { $0(result) } }
         }
     }
 

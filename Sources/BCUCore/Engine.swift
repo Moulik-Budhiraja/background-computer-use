@@ -1007,19 +1007,30 @@ public final class Engine {
 
     /// Wait for a moment the user won't notice their window freezing, and
     /// note it for the step's result. Throws if they paused the agent or
-    /// took over meanwhile, or if they have a menu open in the app at the
-    /// cap (the step would close it).
+    /// took over meanwhile, or if at the cap they're still mid something
+    /// moving focus would break (a menu open, a button or key held).
     private func awaitUser(_ w: AgentWindow, cause: String) throws {
+        try awaitUser(pid: w.pid, appName: w.appName, cause: cause, anywhere: false)
+    }
+
+    /// `anywhere`: the step may bring its app to the front, which breaks a
+    /// drag or a menu in whatever app the user is in, so wait out those
+    /// (only those) wherever they are. Otherwise the step only moves focus
+    /// inside `pid`, the app the user is in: the full pause rules.
+    private func awaitUser(pid: pid_t, appName: String, cause: String, anywhere: Bool) throws {
         let caps = waitBudget.caps
         let startMs = nowMs()
         stateLock.lock(); let busy = _busy; stateLock.unlock()
         var shown = false
-        let r = QuietWait.wait(focusGuard.activity, pid: w.pid, softMs: caps.softMs, hardMs: caps.hardMs,
-                               stop: { self.paused || self.userInControl }) {
+        let willWait = {
             shown = true
-            stateLock.lock(); _busy = "Waiting for you to pause"; stateLock.unlock()
-            changed()
+            self.stateLock.lock(); self._busy = "Waiting for you to pause"; self.stateLock.unlock()
+            self.changed()
         }
+        let stop = { self.paused || self.userInControl }
+        let r = anywhere
+            ? QuietWait.waitAnywhere(focusGuard.activity, hardMs: caps.hardMs, stop: stop, willWait: willWait)
+            : QuietWait.wait(focusGuard.activity, pid: pid, softMs: caps.softMs, hardMs: caps.hardMs, stop: stop, willWait: willWait)
         waitBudget.add(r.waitedMs)
         if shown {
             stateLock.lock(); _busy = busy; stateLock.unlock()
@@ -1027,20 +1038,26 @@ public final class Engine {
         }
         if paused { throw ToolError("paused by the user") }
         if userInControl { throw ToolError("the user took over your display") }
+        let secs = String(format: "%.1f", r.waitedMs / 1000)
+        let where_ = anywhere ? "" : " in \(appName)"
+        // Opening a window can bring its app to the front, closing whatever menu
+        // is open and ending any drag, wherever the user is.
+        let effect = anywhere ? "\(cause) could bring \(appName) to the front and" : cause
         if r.outcome == .menu {
-            let note = "waited \(String(format: "%.1f", r.waitedMs / 1000)) s in \(w.appName) before \(cause), but the user has a menu open there"
+            let note = "waited \(secs) s\(where_) before \(cause), but the user has a menu open"
             UserSim.shared.waited(fromMs: startMs, note)
             Log.info("defer: \(note); failed the step")
-            throw ToolError("the user has a menu open in \(w.appName), and \(cause) would close it, so nothing was sent. Wait a few seconds and retry.")
+            throw ToolError("the user has a menu open\(where_), and \(effect) would close it, so nothing was done. Wait a few seconds and retry.")
         }
         if r.outcome == .held {
-            let note = "waited \(String(format: "%.1f", r.waitedMs / 1000)) s in \(w.appName) before \(cause), but the user is holding a mouse button there"
+            let note = "waited \(secs) s\(where_) before \(cause), but the user is holding a mouse button or key"
             UserSim.shared.waited(fromMs: startMs, note)
             Log.info("defer: \(note); failed the step")
-            throw ToolError("the user is holding a mouse button in \(w.appName) (dragging, say), and \(cause) would interrupt it, so nothing was sent. Wait a few seconds and retry\(BrowserAutomation.isScriptableChromium(NSRunningApplication(processIdentifier: w.pid)?.bundleURL ?? URL(fileURLWithPath: "/")) ? ", or use navigate to load a URL without keys" : "").")
+            let browser = BrowserAutomation.isScriptableChromium(NSRunningApplication(processIdentifier: pid)?.bundleURL ?? URL(fileURLWithPath: "/"))
+            throw ToolError("the user is holding a mouse button or key\(where_) (dragging, say), and \(effect) would interrupt it, so nothing was done. Wait a few seconds and retry\(browser && !anywhere ? ", or use navigate to load a URL without keys" : "").")
         }
         guard r.waitedMs >= 20 else { return }
-        var note = "waited \(String(format: "%.1f", r.waitedMs / 1000)) s for \(r.reason ?? "the user to pause") in \(w.appName) before \(cause)"
+        var note = "waited \(secs) s for \(r.reason ?? "the user to pause")\(anywhere ? "" : " in \(appName)") before \(cause)"
         switch r.outcome {
         case .quiet, .menu, .held, .stopped: break
         case .gap: note += ", then went in a short gap in their input"
@@ -1123,9 +1140,17 @@ public final class Engine {
         if !shared, let running = try windows.resolveApp(app).running {
             try awaitAgentTurn(pid: running.processIdentifier, window: nil, appName: running.localizedName ?? app, cause: "opening a window")
         }
-        let hold = shared ? focusGuard.beginHold() : nil
-        defer { if let hold { focusGuard.endHold(hold) } }
-        let result = try windows.open(app: app, placement: WindowManager.Placement(name: args.string("placement")), trigger: args.string("trigger"))
+        // Opening a window moves focus: never mid a drag, a menu or a held key.
+        // In the app the user is in, the new window takes key from theirs
+        // (the full pause rules); elsewhere it may bring its app to the front
+        // (Chromium does, launching does), which breaks those in any app.
+        if !priorityNow {
+            let target = try windows.resolveApp(app)
+            try awaitUser(pid: target.running?.processIdentifier ?? 0, appName: target.name, cause: "opening a window", anywhere: !shared)
+        }
+        let hold = shared ? InputHold(focusGuard) : nil
+        defer { _ = hold?.end() }
+        let result = try windows.open(app: app, placement: WindowManager.Placement(name: args.string("placement")), trigger: args.string("trigger"), hold: hold)
         let w = result.window
         let frame = WindowList.info(w.id)?.bounds ?? .zero
         let text = "Opened window \(w.id) of \(w.appName) on your display (\(Int(frame.width))x\(Int(frame.height))). Next: get_window_state window_id=\(w.id).\nNotes: \(result.notes.joined(separator: "; "))"

@@ -11,8 +11,16 @@ import os
 /// watching), not mid-drag or mid-scroll, not while a menu is open. Waits are
 /// kept short so the agent isn't slowed much: after `softCapMs` any short
 /// gap in the user's input will do, and after `hardCapMs` the step runs
-/// anyway (the guard still holds and replays the user's keys), except over
-/// a menu open in that app: the step would close it, so it fails instead.
+/// anyway (the guard still holds and replays the user's keys), except while
+/// the user is doing something that breaks when focus moves: a menu open, a
+/// mouse button held (a drag, a selection, a slider) or a key held. Then it
+/// fails instead and the agent retries.
+///
+/// The rule, for every agent step that can move focus: never while the user
+/// is mid such an action. In the app the user is in (a key swap, a new
+/// window there) the full pause rules apply; anywhere else, a step that may
+/// bring its app to the front (opening a window: Chromium does) waits only
+/// for those focus-sensitive moments, wherever the user is.
 public enum QuietRules {
     /// Typing: this long since the last key went down, and no key held.
     public static let typingMs = 500.0
@@ -123,8 +131,8 @@ public final class UserActivity {
 enum QuietWait {
     /// `menu`: the hard cap came with a menu open in the target app, so the
     /// step mustn't run. `stopped`: the user paused the agent meanwhile.
-    /// `held`: the user still held a mouse button (a drag, say) at the cap;
-    /// taking key focus would interrupt it, so the step doesn't run.
+    /// `held`: the user still held a mouse button (a drag, say) or a key at
+    /// the cap; moving focus would interrupt it, so the step doesn't run.
     enum Outcome { case quiet, gap, cap, menu, held, stopped }
 
     struct Result {
@@ -145,6 +153,40 @@ enum QuietWait {
         }
         if now - s.lastMouseUpMs < QuietRules.clickMs { return "the user's click to play out" }
         return nil
+    }
+
+    /// The user is mid something that moving focus would break: a key or
+    /// modifier held, a mouse button held, a menu open.
+    static func focusSensitive(_ s: UserActivity.Snapshot, menuOpen: Bool) -> String? {
+        if !s.keysDown.isEmpty || s.modifiersDown { return "the user to let go of a key" }
+        if s.buttonsDown != 0 { return "the user to let go of the mouse button" }
+        if menuOpen { return "the user to close a menu" }
+        return nil
+    }
+
+    /// Wait out the user's focus-sensitive moments in any app, for steps that
+    /// may bring their app to the front. `menu` or `held` if one outlasts
+    /// `hardMs`: the step mustn't run.
+    static func waitAnywhere(_ activity: UserActivity, hardMs hard: Double, stop: () -> Bool = { false },
+                             willWait: () -> Void = {}) -> Result {
+        let start = nowMs()
+        var menu = menus().any, menuCheckedMs = start
+        var time: [String: Double] = [:]
+        var last = start, first = true
+        while true {
+            let now = nowMs()
+            if now - menuCheckedMs >= QuietRules.menuPollMs { menu = menus().any; menuCheckedMs = nowMs() }
+            let why = focusSensitive(activity.snapshot, menuOpen: menu)
+            if let why { time[why, default: 0] += now - last }
+            last = now
+            let elapsed = now - start
+            func done(_ o: Outcome) -> Result { Result(waitedMs: elapsed, reason: time.max { $0.value < $1.value }?.key, outcome: o) }
+            if stop() { return done(.stopped) }
+            if why == nil { return done(.quiet) }
+            if first { first = false; willWait() }
+            if elapsed >= hard { return done(menu ? .menu : .held) }
+            sleepMs(QuietRules.pollMs)
+        }
     }
 
     /// A short gap is enough after the soft cap, but not with a key or
@@ -198,7 +240,7 @@ enum QuietWait {
                 // Taking key focus in an app closes its open menu.
                 if menu.app { menu = menus(pid: pid); menuCheckedMs = nowMs() }
                 if menu.app { return done(.menu) }
-                return done(activity.snapshot.buttonsDown != 0 ? .held : .cap)
+                return done(focusSensitive(activity.snapshot, menuOpen: false) != nil ? .held : .cap)
             }
             sleepMs(QuietRules.pollMs)
         }
