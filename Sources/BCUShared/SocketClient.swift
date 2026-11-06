@@ -37,9 +37,17 @@ public final class SocketClient {
     deinit { close(fd) }
 
     public func call(tool: String, args: JSONObject) throws -> ToolResult {
+        ToolResult(wire: try request(["tool": tool, "args": args]))
+    }
+
+    /// One request (a tool call, or a host `op`) and its reply. Not for a
+    /// connection that has subscribed to events.
+    public func request(_ object: JSONObject) throws -> JSONObject {
         let id = nextID
         nextID += 1
-        let line = WireCodec.encodeLine(["id": id, "tool": tool, "args": args])
+        var object = object
+        object["id"] = id
+        let line = WireCodec.encodeLine(object)
         try line.withUnsafeBytes { raw in
             var offset = 0
             while offset < raw.count {
@@ -52,7 +60,7 @@ public final class SocketClient {
         guard let object = WireCodec.decode(response) else {
             throw SocketError.message("bad response from app")
         }
-        return ToolResult(wire: object)
+        return object
     }
 
     private func readLine() throws -> Data {

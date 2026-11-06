@@ -37,9 +37,10 @@ final class HistoryModel: ObservableObject {
 
     private var observer: NSObjectProtocol?
     private var reloadPending = false
+    private let store = AppRecordings.store
 
     init() {
-        observer = NotificationCenter.default.addObserver(forName: Recordings.changed, object: nil, queue: .main) { [weak self] _ in
+        observer = NotificationCenter.default.addObserver(forName: Recordings.changed, object: store, queue: .main) { [weak self] _ in
             self?.scheduleReload()
         }
     }
@@ -51,7 +52,7 @@ final class HistoryModel: ObservableObject {
     /// Reads the recordings and opens at the latest frame (of `session`, if given).
     func load(session: String? = nil) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let runs = Recordings.all()
+            let runs = self.store.all()
             DispatchQueue.main.async {
                 self.apply(runs, keep: nil)
                 if let session, let last = self.items.lastIndex(where: { self.runs[$0.run].session == session }) {
@@ -78,7 +79,7 @@ final class HistoryModel: ObservableObject {
             let keep = self.current.map { (self.runs[$0.run].id, $0.frame.t) }
             let loaded = self.runs
             DispatchQueue.global(qos: .userInitiated).async {
-                let runs = Recordings.all(reusing: loaded)
+                let runs = self.store.all(reusing: loaded)
                 DispatchQueue.main.async {
                     self.apply(runs, keep: atEnd ? nil : keep)
                     if atEnd { self.index = max(0, self.items.count - 1) }

@@ -550,7 +550,7 @@ final class MenuModel: ObservableObject {
     private var fps: Int { sessions.count > 1 ? 10 : 15 }
 
     func refresh() {
-        let active = Array(hub.activeEngines.prefix(6))
+        let active = Array(hub.shownActiveEngines.prefix(6))
         var next: [PopoverModel] = []
         for e in active {
             if let m = sessions.first(where: { $0.engine === e }) {

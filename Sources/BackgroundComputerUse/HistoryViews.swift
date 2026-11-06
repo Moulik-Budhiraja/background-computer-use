@@ -333,7 +333,7 @@ final class HistoryTrackView: NSView {
         // Where the recordings start.
         let firstX = viewX(0)
         if firstX - spacing / 2 > 0 {
-            let text = "Recordings go back \(Recordings.retentionDays) days"
+            let text = "Recordings go back \(AppRecordings.store.retentionDays) days"
             let attrs = Self.attrs(11, .medium, .white.withAlphaComponent(0.32))
             let size = text.size(withAttributes: attrs)
             text.draw(at: CGPoint(x: firstX - 22 - size.width, y: midY - size.height / 2), withAttributes: attrs)

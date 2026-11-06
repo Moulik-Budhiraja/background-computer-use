@@ -51,7 +51,7 @@ final class StatusController: NSObject, NSPopoverDelegate {
         switch hub.status {
         case .paused, .userInControl: next = .paused
         case .waiting: next = .waiting
-        default: next = hub.isActive ? .working : .idle
+        default: next = hub.shownIsActive ? .working : .idle
         }
         if next != icon {
             icon = next
@@ -89,7 +89,7 @@ final class StatusController: NSObject, NSPopoverDelegate {
     /// that ended before it showed is dropped.
     private func announceHandoffs() {
         var live: Set<String> = []
-        for e in hub.engines {
+        for e in hub.shownEngines {
             guard let w = e.handoffWindow else { continue }
             let key = "\(e.sessionID)/\(w.id)"
             live.insert(key)

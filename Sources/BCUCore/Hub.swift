@@ -6,10 +6,23 @@ import BCUShared
 /// session and gets its own display, windows, pause and take-over; calls
 /// without a session (`bcu call`) share a default one. One focus guard
 /// watches over all of them.
+///
+/// A session can belong to a host app (`bcu mcp --host <id>`), which shows
+/// it in its own UI. While that host is connected and subscribed (see
+/// `HostServer`), the session is left out of `shownEngines`, which is what
+/// the menu bar app shows.
 public final class Hub {
     public let focusGuard = FocusGuard()
     /// Main thread: status, activity or sessions changed.
     public var onChange: (() -> Void)?
+    private var observers: [Int: () -> Void] = [:]
+    private var nextObserver = 0
+    /// Live subscriptions per host ID.
+    private var claims: [String: Int] = [:]
+    /// Where each host keeps its sessions' recordings, by host ID ("" for
+    /// sessions without a host: the menu bar app's). A host without one
+    /// isn't recorded.
+    private var recordings: [String: Recordings] = [:]
 
     public static let defaultSession = "default"
     /// A display with no windows and no calls for this long is removed.
@@ -40,12 +53,81 @@ public final class Hub {
         engines.filter { $0.display.isRunning || !$0.windows.windows.isEmpty }
     }
 
-    public func engine(for id: String, client: String?) -> Engine {
+    /// Sessions no connected host app shows itself: the menu bar app's.
+    public var shownEngines: [Engine] {
+        lock.lock(); defer { lock.unlock() }
+        return order.compactMap { byID[$0] }.filter { e in e.host.map { (claims[$0] ?? 0) == 0 } ?? true }
+    }
+
+    /// `activeEngines`, of the shown ones.
+    public var shownActiveEngines: [Engine] {
+        shownEngines.filter { $0.display.isRunning || !$0.windows.windows.isEmpty }
+    }
+
+    public func engine(id: String) -> Engine? {
+        lock.lock(); defer { lock.unlock() }
+        return byID[id]
+    }
+
+    /// The session a subagent's session came from, if it's a subagent's.
+    public func parent(of id: String) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return parentOf[id]
+    }
+
+    /// A host app shows its sessions itself until the returned release is called.
+    public func claim(host: String) -> () -> Void {
+        lock.lock(); claims[host, default: 0] += 1; lock.unlock()
+        changed()
+        var released = false
+        return { [weak self] in
+            guard let self, !released else { return }
+            released = true
+            self.lock.lock()
+            self.claims[host, default: 1] -= 1
+            if self.claims[host] == 0 { self.claims[host] = nil }
+            self.lock.unlock()
+            self.changed()
+        }
+    }
+
+    /// Record the sessions of `host` (nil: those without a host, which the
+    /// menu bar app shows) into `store` from now on, or stop recording them
+    /// (nil). Sessions already running switch too.
+    public func setRecordings(host: String?, _ store: Recordings?) {
+        lock.lock()
+        recordings[host ?? ""] = store
+        let affected = order.compactMap { byID[$0] }.filter { $0.host == host }
+        lock.unlock()
+        for e in affected { e.setRecordings(store) }
+        store?.maintain()
+    }
+
+    public func recordings(host: String?) -> Recordings? {
+        lock.lock(); defer { lock.unlock() }
+        return recordings[host ?? ""]
+    }
+
+    /// Called on the main thread on every change, like `onChange`, for as
+    /// long as the returned ID isn't removed.
+    public func addObserver(_ f: @escaping () -> Void) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        nextObserver += 1
+        observers[nextObserver] = f
+        return nextObserver
+    }
+
+    public func removeObserver(_ id: Int) {
+        lock.lock(); observers[id] = nil; lock.unlock()
+    }
+
+    public func engine(for id: String, client: String?, label wanted: String? = nil, host: String? = nil) -> Engine {
         lock.lock()
         if let e = byID[id] { lock.unlock(); return e }
-        let label = Self.label(for: client, taken: Set(byID.values.map(\.label)))
-        let e = Engine(sessionID: id, label: label, focusGuard: focusGuard)
+        let label = Self.label(for: wanted ?? client, taken: Set(byID.values.map(\.label)), exact: wanted != nil)
+        let e = Engine(sessionID: id, label: label, focusGuard: focusGuard, host: host)
         e.onChange = { [weak self] in self?.changed() }
+        e.setRecordings(recordings[host ?? ""])
         byID[id] = e
         order.append(id)
         lock.unlock()
@@ -62,11 +144,12 @@ public final class Hub {
 
     /// "Claude Code", "Codex", or the client's own name; numbered when two
     /// sessions would share one.
-    static func label(for client: String?, taken: Set<String>) -> String {
+    static func label(for client: String?, taken: Set<String>, exact: Bool = false) -> String {
         let name = client ?? ""
         let lower = name.lowercased()
         let base: String
-        if lower.contains("claude") { base = "Claude Code" }
+        if exact && !name.isEmpty { base = name }
+        else if lower.contains("claude") { base = "Claude Code" }
         else if lower.contains("codex") { base = "Codex" }
         else if name.isEmpty { base = "Agent" }
         else { base = name }
@@ -83,10 +166,12 @@ public final class Hub {
         let id = (args.removeValue(forKey: "_session") as? String) ?? Self.defaultSession
         let client = args.removeValue(forKey: "_client") as? String
         let parent = args.removeValue(forKey: "_parent") as? String
+        let label = args.removeValue(forKey: "_label") as? String
+        let host = (args.removeValue(forKey: "_host") as? String).flatMap { $0.isEmpty ? nil : $0 }
         if let parent {
             lock.lock(); parentOf[id] = parent; lock.unlock()
         }
-        let caller = engine(for: id, client: client)
+        let caller = engine(for: id, client: client, label: label, host: host)
         // An agent can hand a window to its subagent (or back): the call goes
         // to the session that owns the window, on that session's display.
         if let windowID = (args["window_id"] as? NSNumber)?.uint32Value, caller.windows.window(windowID) == nil,
@@ -113,7 +198,6 @@ public final class Hub {
         let recovered = WindowManager.recoverFromPreviousRun()
         if !recovered.isEmpty { Log.info("Cleaned up after the last run: " + recovered.joined(separator: "; ")) }
         focusGuard.start()
-        Recordings.maintain()
         // An app starting to play sound gets a new audio process object; route
         // it right away instead of on the next tick, so little reaches the speakers.
         var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyProcessObjectList,
@@ -130,7 +214,10 @@ public final class Hub {
                 // Another agent needs a display: one with no windows goes sooner.
                 for e in self.engines { e.tearDownIfIdle(idleMs: Self.busyTeardownMs) }
             }
-            if self.ticks % 3600 == 0 { Recordings.maintain() }
+            if self.ticks % 3600 == 0 {
+                self.lock.lock(); let stores = Array(self.recordings.values); self.lock.unlock()
+                for r in stores { r.maintain() }
+            }
             if self.ticks % 5 == 0 {
                 for e in self.engines { e.tearDownIfIdle(idleMs: Self.idleTeardownMs) }
                 self.forgetDormant()
@@ -178,33 +265,44 @@ public final class Hub {
         for e in all { e.finishShutdown() }
     }
 
+    /// The menu bar's pause and stop act on the sessions it shows; a host
+    /// app pauses and stops its own.
     public var allPaused: Bool {
-        let a = activeEngines
+        let a = shownActiveEngines
         return !a.isEmpty && a.allSatisfy(\.paused)
     }
 
     public func setPausedAll(_ value: Bool) {
-        for e in engines { e.setPaused(value) }
+        for e in shownEngines { e.setPaused(value) }
     }
 
     public func stopAll() {
-        for e in engines { e.stopAll() }
+        for e in shownEngines { e.stopAll() }
     }
 
+    /// Any session working, shown or not (for updates, which wait for every agent).
     public var isActive: Bool { engines.contains { $0.isActive } }
+
+    /// A session the menu bar shows is working.
+    public var shownIsActive: Bool { shownEngines.contains { $0.isActive } }
 
     /// For the menu bar icon: anything waiting on the user wins, then
     /// take-over, then work, then pause.
     public var status: EngineStatus {
-        let all = engines.map(\.status)
+        let all = shownEngines.map(\.status)
         if let w = all.first(where: { if case .waiting = $0 { return true }; return false }) { return w }
         if all.contains(.userInControl) { return .userInControl }
         if let w = all.first(where: { if case .working = $0 { return true }; return false }) { return w }
-        if !activeEngines.isEmpty && allPaused { return .paused }
+        if !shownActiveEngines.isEmpty && allPaused { return .paused }
         return .idle
     }
 
     private func changed() {
-        if Thread.isMainThread { onChange?() } else { DispatchQueue.main.async { self.onChange?() } }
+        func notify() {
+            onChange?()
+            lock.lock(); let all = Array(observers.values); lock.unlock()
+            for f in all { f() }
+        }
+        if Thread.isMainThread { notify() } else { DispatchQueue.main.async { notify() } }
     }
 }

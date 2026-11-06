@@ -209,28 +209,53 @@ private final class LineWriter {
     deinit { try? handle?.close() }
 }
 
-/// Every recording on disk, kept for `retentionDays`.
-public enum Recordings {
-    public static let retentionDays = 7
-    static var directoryOverride: URL?
-    public static var directory: URL {
-        directoryOverride ?? BCUPaths.supportDirectory.appendingPathComponent("recordings", isDirectory: true)
-    }
+/// One app's recordings: where they go, how long they're kept and how much
+/// room they may take. Each app that shows sessions (the menu bar app, or a
+/// host app such as Proactive Agent) decides whether its sessions are
+/// recorded and keeps its own, so no app sees another's (`Hub.setRecordings`).
+public final class Recordings {
+    public static let defaultRetentionDays = 7
+    /// The least `limitMB` takes.
+    public static let minLimitMB = 50
+    public static let defaultLimitMB = 300
 
-    /// Main thread: a live run got a frame or an event.
+    /// Main thread, with the store as object: a live run got a frame or an
+    /// event, or the size limit deleted some.
     public static let changed = Notification.Name("bcu.recordingChanged")
 
-    private static let lock = NSLock()
-    private static var live: [String: RecordedRun] = [:]
+    public let directory: URL
 
-    static func setLive(_ run: RecordedRun, _ on: Bool) {
+    private let lock = NSLock()
+    private var live: [String: RecordedRun] = [:]
+    private var _limitMB: Int
+    private var _retentionDays: Int
+    private let limitQueue = DispatchQueue(label: "bcu.recordings.limit", qos: .utility)
+    var limitBytesOverride: Int64?
+
+    public init(directory: URL, limitMB: Int = defaultLimitMB, retentionDays: Int = defaultRetentionDays) {
+        self.directory = directory
+        _retentionDays = max(1, retentionDays)
+        _limitMB = max(Self.minLimitMB, limitMB)
+    }
+
+    /// Runs that ended longer ago than this go at the next `maintain`.
+    public var retentionDays: Int {
+        get { lock.lock(); defer { lock.unlock() }; return _retentionDays }
+        set { lock.lock(); _retentionDays = max(1, newValue); lock.unlock() }
+    }
+
+    func setLive(_ run: RecordedRun, _ on: Bool) {
         lock.lock(); live[run.id] = on ? run : nil; lock.unlock()
+    }
+
+    func post() {
+        DispatchQueue.main.async { NotificationCenter.default.post(name: Self.changed, object: self) }
     }
 
     /// Every run, oldest first. Live ones are the recorder's own objects, so
     /// they keep growing.
     /// `reusing`: runs loaded before, kept as they are (finished runs don't change).
-    public static func all(reusing: [RecordedRun] = []) -> [RecordedRun] {
+    public func all(reusing: [RecordedRun] = []) -> [RecordedRun] {
         lock.lock(); let liveRuns = live; lock.unlock()
         let known = Dictionary(reusing.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         let dirs = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
@@ -244,11 +269,11 @@ public enum Recordings {
 
     /// Background: compact what a crash left in staging and delete runs that
     /// ended more than `retentionDays` ago.
-    public static func maintain() {
+    public func maintain() {
         DispatchQueue.global(qos: .utility).async {
-            let cutoff = wallMs() - Double(retentionDays) * 86_400_000
-            lock.lock(); let liveIDs = Set(live.keys); lock.unlock()
-            let dirs = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+            let cutoff = wallMs() - Double(self.retentionDays) * 86_400_000
+            self.lock.lock(); let liveIDs = Set(self.live.keys); self.lock.unlock()
+            let dirs = (try? FileManager.default.contentsOfDirectory(at: self.directory, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
             for d in dirs where d.hasDirectoryPath && !liveIDs.contains(d.lastPathComponent) {
                 guard let run = RecordedRun.load(d) else {
                     // No meta: half made. Gone once it's old.
@@ -258,40 +283,34 @@ public enum Recordings {
                 }
                 if run.end < cutoff {
                     try? FileManager.default.removeItem(at: d)
-                    Log.info("recordings: deleted \(run.id), older than \(retentionDays) days")
+                    Log.info("recordings: deleted \(run.id), older than \(self.retentionDays) days")
                     continue
                 }
                 let staged = run.frames.filter { f in !run.chunks.contains { f.t >= $0.from && f.t <= $0.to } }
                 if !staged.isEmpty {
-                    Compactor.compact(run, frames: staged)
+                    Compactor.compact(run, frames: staged, store: self)
                     run.writeMeta()
                 }
             }
-            enforceLimit()
+            self.enforceLimit()
         }
     }
 
     // MARK: Size limit
 
-    /// The most recordings may take on disk, in MB (Settings). Past it the
-    /// oldest go first.
-    public static let defaultLimitMB = 300
-    private static let limitKey = "historyLimitMB"
-    public static var limitMB: Int {
-        get { (UserDefaults.standard.object(forKey: limitKey) as? Int).map { max(50, $0) } ?? defaultLimitMB }
-        set { UserDefaults.standard.set(newValue, forKey: limitKey); enforceLimit() }
+    /// The most recordings may take on disk, in MB. Past it the oldest go first.
+    public var limitMB: Int {
+        get { lock.lock(); defer { lock.unlock() }; return _limitMB }
+        set { lock.lock(); _limitMB = max(Self.minLimitMB, newValue); lock.unlock(); enforceLimit() }
     }
 
-    private static let limitQueue = DispatchQueue(label: "bcu.recordings.limit", qos: .utility)
-    static var limitBytesOverride: Int64?
-
     /// Waits for size-limit passes already queued.
-    static func waitForLimit() { limitQueue.sync {} }
+    func waitForLimit() { limitQueue.sync {} }
 
     /// Bytes on disk for every recording.
-    public static func usedBytes() -> Int64 {
+    public func usedBytes() -> Int64 {
         let dirs = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-        return dirs.reduce(0) { $0 + size(of: $1) }
+        return dirs.reduce(0) { $0 + Self.size(of: $1) }
     }
 
     private static func size(of url: URL) -> Int64 {
@@ -311,13 +330,13 @@ public enum Recordings {
     /// oldest video chunks (and with them their frames), and whole runs once
     /// nothing of them is left. Frames still waiting in a live run's staging
     /// are the newest and stay.
-    public static func enforceLimit() {
+    public func enforceLimit() {
         limitQueue.async {
-            let limit = limitBytesOverride ?? Int64(limitMB) * 1_000_000
-            var used = usedBytes()
+            let limit = self.limitBytesOverride ?? Int64(self.limitMB) * 1_000_000
+            var used = self.usedBytes()
             guard used > limit else { return }
-            lock.lock(); let liveRuns = live; lock.unlock()
-            let dirs = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+            self.lock.lock(); let liveRuns = self.live; self.lock.unlock()
+            let dirs = (try? FileManager.default.contentsOfDirectory(at: self.directory, includingPropertiesForKeys: nil)) ?? []
             let runs = dirs.filter(\.hasDirectoryPath)
                 .compactMap { liveRuns[$0.lastPathComponent] ?? RecordedRun.load($0) }
                 .sorted { $0.start < $1.start }
@@ -326,24 +345,24 @@ public enum Recordings {
                 let isLive = liveRuns[run.id] != nil
                 for c in run.chunks where used > limit {
                     let url = run.dir.appendingPathComponent(c.file)
-                    let bytes = size(of: url)
+                    let bytes = Self.size(of: url)
                     try? FileManager.default.removeItem(at: url)
                     run.drop(c)
                     used -= bytes
                     freed += 1
                 }
                 if !isLive, used > limit || run.chunks.isEmpty {
-                    used -= size(of: run.dir)
+                    used -= Self.size(of: run.dir)
                     try? FileManager.default.removeItem(at: run.dir)
                 }
             }
-            Log.info("recordings: over the \(limit / 1_000_000) MB limit, deleted the oldest \(freed) chunks")
-            DispatchQueue.main.async { NotificationCenter.default.post(name: changed, object: nil) }
+            Log.info("recordings: over the \(limit / 1_000_000) MB limit in \(self.directory.path), deleted the oldest \(freed) chunks")
+            self.post()
         }
     }
 
     /// Deletes every recording that isn't being made right now.
-    public static func deleteAll() {
+    public func deleteAll() {
         lock.lock(); let liveIDs = Set(live.keys); lock.unlock()
         let dirs = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
         for d in dirs where !liveIDs.contains(d.lastPathComponent) { try? FileManager.default.removeItem(at: d) }
@@ -354,7 +373,7 @@ public enum Recordings {
 enum Compactor {
     /// Encodes `frames` (in time order, all staged) into one HEVC file, adds
     /// it to the run and deletes their JPEGs. Any thread; blocks.
-    static func compact(_ run: RecordedRun, frames: [RecordedFrame]) {
+    static func compact(_ run: RecordedRun, frames: [RecordedFrame], store: Recordings) {
         guard let first = frames.first, let last = frames.last else { return }
         guard let probe = CGImageSourceCreateWithURL(run.stagedURL(first.t) as CFURL, nil),
               let firstImage = CGImageSourceCreateImageAtIndex(probe, 0, nil) else { return }
@@ -428,7 +447,7 @@ enum Compactor {
         LineWriter(run.dir.appendingPathComponent("chunks.jsonl")).write(["f": name, "from": first.t, "to": last.t, "n": written.count])
         run.append(chunk)
         for f in frames { try? FileManager.default.removeItem(at: run.stagedURL(f.t)) }
-        Recordings.enforceLimit()
+        store.enforceLimit()
     }
 }
 
@@ -437,6 +456,7 @@ enum Compactor {
 /// Not thread-safe: the recorder calls it from its queue.
 final class RunWriter {
     let run: RecordedRun
+    private let store: Recordings
     private let frameLog: LineWriter
     private let eventLog: LineWriter
     private let compactQueue: DispatchQueue
@@ -446,8 +466,8 @@ final class RunWriter {
     static let chunkFrames = 120
     static let chunkMs = 60_000.0
 
-    init?(id: String, session: String, label: String, start: Double, size: CGSize, compactQueue: DispatchQueue) {
-        let dir = Recordings.directory.appendingPathComponent(id, isDirectory: true)
+    init?(store: Recordings, id: String, session: String, label: String, start: Double, size: CGSize, compactQueue: DispatchQueue) {
+        let dir = store.directory.appendingPathComponent(id, isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: dir.appendingPathComponent("staging"), withIntermediateDirectories: true)
         } catch {
@@ -460,7 +480,8 @@ final class RunWriter {
         frameLog = LineWriter(dir.appendingPathComponent("frames.jsonl"))
         eventLog = LineWriter(dir.appendingPathComponent("events.jsonl"))
         self.compactQueue = compactQueue
-        Recordings.setLive(run, true)
+        self.store = store
+        store.setLive(run, true)
     }
 
     /// Stages a frame already at its recorded size.
@@ -478,11 +499,11 @@ final class RunWriter {
         frameLog.write(line)
         staged.append(frame)
         if staged.count >= Self.chunkFrames || t - (staged.first?.t ?? t) >= Self.chunkMs {
-            let batch = staged, run = self.run
+            let batch = staged, run = self.run, store = self.store
             staged = []
-            compactQueue.async { Compactor.compact(run, frames: batch) }
+            compactQueue.async { Compactor.compact(run, frames: batch, store: store) }
         }
-        Self.post(run)
+        store.post()
     }
 
     func note(_ text: String, error: Bool, t: Double) {
@@ -491,7 +512,7 @@ final class RunWriter {
         var line: [String: Any] = ["t": t, "x": e.text ?? ""]
         if error { line["e"] = true }
         eventLog.write(line)
-        Self.post(run)
+        store.post()
     }
 
     /// `point` in display-relative points.
@@ -504,21 +525,19 @@ final class RunWriter {
 
     /// Packs what's left and marks the run finished. `done` runs after, on the compact queue.
     func finish(_ done: (() -> Void)? = nil) {
-        let rest = staged, run = self.run
+        let rest = staged, run = self.run, store = self.store
         staged = []
         compactQueue.async {
-            Compactor.compact(run, frames: rest)
+            Compactor.compact(run, frames: rest, store: store)
             run.setLive(false)
             run.writeMeta()
-            Recordings.setLive(run, false)
+            store.setLive(run, false)
+            store.post()
             if run.frames.isEmpty { try? FileManager.default.removeItem(at: run.dir) }
             done?()
         }
     }
 
-    private static func post(_ run: RecordedRun) {
-        DispatchQueue.main.async { NotificationCenter.default.post(name: Recordings.changed, object: run) }
-    }
 }
 
 /// Records one session's agent display while it exists: a frame whenever the
@@ -534,6 +553,9 @@ public final class SessionRecorder {
     private let compactQueue = DispatchQueue(label: "bcu.recorder.compact", qos: .background)
     private var timer: DispatchSourceTimer?
     private var writer: RunWriter?
+    /// Where this session's host keeps recordings; nil when it doesn't record.
+    private var store: Recordings?
+    private var displayUp = false
     private var lastThumb: [UInt8]?
     private var lastImage: CGImage?
     private var pendingForced = false
@@ -565,35 +587,56 @@ public final class SessionRecorder {
     /// The display just came up. Any thread.
     func start() {
         queue.async {
-            guard self.writer == nil else { return }
-            let size = self.display.bounds.size == .zero
-                ? CGSize(width: self.display.width, height: self.display.height) : self.display.bounds.size
-            guard let writer = RunWriter(id: Self.runID(session: self.sessionID, date: Date()), session: self.sessionID, label: self.label,
-                                         start: wallMs(), size: size, compactQueue: self.compactQueue) else { return }
-            self.writer = writer
-            self.lastThumb = nil
-            self.lastImage = nil
-            self.pendingForced = true
-            let t = DispatchSource.makeTimerSource(queue: self.queue)
-            t.schedule(deadline: .now() + 0.2, repeating: Self.sampleInterval, leeway: .milliseconds(50))
-            t.setEventHandler { self.tick() }
-            t.resume()
-            self.timer = t
+            self.displayUp = true
+            self.begin()
         }
     }
 
     /// The display is about to go away. Any thread.
     func stop() {
         queue.async {
-            guard let writer = self.writer else { return }
-            self.timer?.cancel()
-            self.timer = nil
-            self.pendingForced = true
-            self.tick()
-            self.writer = nil
-            self.lastImage = nil
-            writer.finish()
+            self.displayUp = false
+            self.finish()
         }
+    }
+
+    /// Record into `store` from now on, or stop recording (nil). A run under
+    /// way ends; with a new store and the display up, a new one starts there.
+    func setStore(_ store: Recordings?) {
+        queue.async {
+            guard store !== self.store else { return }
+            self.finish()
+            self.store = store
+            if self.displayUp { self.begin() }
+        }
+    }
+
+    private func begin() {
+        guard writer == nil, let store else { return }
+        let size = display.bounds.size == .zero
+            ? CGSize(width: display.width, height: display.height) : display.bounds.size
+        guard let writer = RunWriter(store: store, id: Self.runID(session: sessionID, date: Date()), session: sessionID, label: label,
+                                     start: wallMs(), size: size, compactQueue: compactQueue) else { return }
+        self.writer = writer
+        lastThumb = nil
+        lastImage = nil
+        pendingForced = true
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + 0.2, repeating: Self.sampleInterval, leeway: .milliseconds(50))
+        t.setEventHandler { self.tick() }
+        t.resume()
+        timer = t
+    }
+
+    private func finish() {
+        guard let writer else { return }
+        timer?.cancel()
+        timer = nil
+        pendingForced = true
+        tick()
+        self.writer = nil
+        lastImage = nil
+        writer.finish()
     }
 
     /// A line of the session's activity.
@@ -742,12 +785,12 @@ public final class SessionRecorder {
 /// Test support: records made-up frames through the real pipeline, with no
 /// display involved. `frames` gives each frame's picture, time, app and bundle.
 public enum RecordingTest {
-    public static func record(session: String, label: String, size: CGSize,
+    public static func record(into store: Recordings, session: String, label: String, size: CGSize,
                               frames: [(image: CGImage, t: Double, app: String, bundleID: String?)],
                               events: [(t: Double, text: String?, point: CGPoint?, click: Bool)]) {
         let q = DispatchQueue(label: "bcu.recorder.test")
         guard let first = frames.first,
-              let w = RunWriter(id: SessionRecorder.runID(session: session, date: Date(timeIntervalSince1970: first.t / 1000)),
+              let w = RunWriter(store: store, id: SessionRecorder.runID(session: session, date: Date(timeIntervalSince1970: first.t / 1000)),
                                 session: session, label: label, start: first.t - 500, size: size, compactQueue: q) else { return }
         var e = 0
         for f in frames {
@@ -764,14 +807,11 @@ public enum RecordingTest {
         done.wait()
     }
 
-    /// A size limit in bytes for a test, applied now; blocks until done. nil goes back to the setting.
-    public static func applyLimit(bytes: Int64?) {
-        Recordings.limitBytesOverride = bytes
-        Recordings.waitForLimit()
-        Recordings.enforceLimit()
-        Recordings.waitForLimit()
+    /// A size limit in bytes for a test, applied now; blocks until done. nil goes back to `limitMB`.
+    public static func applyLimit(_ store: Recordings, bytes: Int64?) {
+        store.limitBytesOverride = bytes
+        store.waitForLimit()
+        store.enforceLimit()
+        store.waitForLimit()
     }
-
-    /// Point recordings somewhere else (a test's own folder).
-    public static func useDirectory(_ url: URL) { Recordings.directoryOverride = url }
 }

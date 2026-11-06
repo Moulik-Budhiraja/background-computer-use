@@ -40,7 +40,7 @@ final class SettingsModel: ObservableObject {
     @Published var screenRecording = false
     @Published var launchAtLogin = false
     @Published var copied: String?
-    @Published var historyLimitMB = Recordings.limitMB
+    @Published var historyLimitMB = AppRecordings.store.limitMB
     @Published var historyUsedBytes: Int64 = 0
     private var timer: Timer?
     private var ticks = 0
@@ -68,7 +68,7 @@ final class SettingsModel: ObservableObject {
         // Adding up the recordings' size touches every file; every few seconds is plenty.
         if ticks % 5 == 0 {
             DispatchQueue.global(qos: .utility).async {
-                let used = Recordings.usedBytes()
+                let used = AppRecordings.store.usedBytes()
                 DispatchQueue.main.async { self.historyUsedBytes = used }
             }
         }
@@ -77,7 +77,7 @@ final class SettingsModel: ObservableObject {
 
     func setHistoryLimit(_ mb: Int) {
         historyLimitMB = mb
-        Recordings.limitMB = mb
+        AppRecordings.setLimit(mb)
         ticks = 0
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.refresh() }
     }

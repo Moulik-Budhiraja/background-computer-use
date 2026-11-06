@@ -5,6 +5,11 @@ import BCUShared
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let hub = Hub()
     private var server: SocketServer?
+    private var host: HostServer?
+    /// One engine runs per Mac; this app runs it unless a host app's
+    /// `bcu serve` already does, in which case it waits for that one to finish.
+    private var engineLock: EngineLock?
+    private var lockTimer: Timer?
     private var statusController: StatusController?
     private var settings: SettingsWindowController?
     private var onboarding: OnboardingWindowController?
@@ -12,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var viewers: [String: ViewerWindowController] = [:]
     private var hotKeys: HotKeys?
     private var permissionTimer: Timer?
+    private var recordTimer: Timer?
     private var updater: Updater?
     private var history: HistoryWindowController?
 
@@ -25,12 +31,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         CrashLog.install()
-        hub.start()
         updater = Updater(hub: hub)
-
-        let server = SocketServer { [hub] tool, args in hub.call(tool: tool, args: args) }
-        do { try server.start() } catch { Log.info("socket failed: \(error)") }
-        self.server = server
+        // A host app's `bcu serve` reads this to start this app rather than run
+        // an engine of its own. Kept current as permissions are granted or taken away.
+        var record = AppRecord.current()
+        record.write()
+        recordTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
+            let now = AppRecord.current()
+            if now != record { record = now; now.write() }
+        }
+        if !startEngine() { waitForEngine() }
 
         statusController = StatusController(hub: hub,
                                             openSettings: { [weak self] in self?.showSettings() },
@@ -52,7 +62,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // The event tap needs Accessibility; install it as soon as it's granted.
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] timer in
-            guard let self else { return }
+            // Only the running engine taps input; a second tap would hold the user's keys twice.
+            guard let self, self.engineLock != nil else { return }
             if AX.isTrusted && !self.hub.focusGuard.tapInstalled {
                 self.hub.focusGuard.installTap()
             }
@@ -60,7 +71,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Take the engine lock and start the engine. False if another engine runs.
+    private func startEngine() -> Bool {
+        guard let lock = EngineLock.acquire(name: BCUPaths.appName, version: BCUVersion.current) else { return false }
+        engineLock = lock
+        // This app records the sessions it shows; host apps choose for theirs.
+        hub.setRecordings(host: nil, AppRecordings.store)
+        hub.start()
+        let host = HostServer(hub: hub, ownerName: BCUPaths.appName, version: BCUVersion.current)
+        let server = SocketServer { [hub] tool, args in hub.call(tool: tool, args: args) }
+        server.hostHandler = { op, req, connection in host.handle(op, req, connection) }
+        do { try server.start() } catch { Log.info("socket failed: \(error)") }
+        self.server = server
+        self.host = host
+        return true
+    }
+
+    /// A host app's engine is running. Ask it to stop once its agents are
+    /// done, and take over then. Its agents' `bcu mcp` reconnect to this one.
+    private func waitForEngine() {
+        let owner = EngineLock.current()
+        Log.info("another engine is running (\(owner?.name ?? "unknown"), pid \(owner?.pid ?? 0)); asking it to hand over")
+        DispatchQueue.global().async {
+            _ = try? SocketClient().request(["op": "yield"])
+        }
+        lockTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            if self.startEngine() {
+                timer.invalidate()
+                self.lockTimer = nil
+                Log.info("took over as the engine")
+            }
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        guard engineLock != nil else { return }
         hub.shutdown()
         server?.stop()
     }
@@ -76,10 +122,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if control { viewer.showInControl() } else { viewer.toggle() }
     }
 
-    /// A viewer whose display was torn down closes and is dropped.
+    /// A viewer whose display was torn down, or whose session a host app
+    /// now shows itself, closes and is dropped.
     private func refreshViewers() {
+        let shown = Set(hub.shownEngines.map(\.sessionID))
         for (id, v) in viewers {
-            if v.engine.display.isRunning {
+            if v.engine.display.isRunning && shown.contains(id) {
                 v.refresh()
             } else {
                 v.close()

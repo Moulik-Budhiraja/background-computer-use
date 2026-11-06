@@ -6,7 +6,10 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "BackgroundComputerUse", targets: ["BackgroundComputerUse"]),
+        // Also the engine for host apps: `bcu serve` (see docs/embedding.md).
         .executable(name: "bcu", targets: ["bcu"]),
+        // The engine as a library, for a Swift host that runs it in process.
+        .library(name: "BCUCore", targets: ["BCUCore", "BCUShared"]),
     ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.0"),
@@ -27,8 +30,9 @@ let package = Package(
         .target(
             name: "BCUShared",
             path: "Sources/BCUShared",
-            // A symlink to shared/tools.json, which the Windows app reads too.
-            resources: [.embedInCode("tools.json")],
+            // A symlink to shared/tools.json, which the Windows app reads too,
+            // and one to VERSION, so a `bcu` outside the app knows its version.
+            resources: [.embedInCode("tools.json"), .embedInCode("VERSION")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // Display, input, accessibility, capture, window management and the focus guard.
@@ -46,10 +50,11 @@ let package = Package(
             path: "Sources/BackgroundComputerUse",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
-        // CLI: `bcu mcp` (stdio MCP server for agents) and `bcu call` (debugging).
+        // CLI: `bcu mcp` (stdio MCP server for agents), `bcu serve` (the engine
+        // without the menu bar app, for host apps) and `bcu call` (debugging).
         .executableTarget(
             name: "bcu",
-            dependencies: ["BCUShared"],
+            dependencies: ["BCUCore", "BCUShared"],
             path: "Sources/bcu",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

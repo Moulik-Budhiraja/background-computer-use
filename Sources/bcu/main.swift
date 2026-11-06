@@ -3,6 +3,7 @@ import BCUShared
 
 // bcu: command-line front end for Background Computer Use.
 //   bcu mcp                      stdio MCP server (what agents run)
+//   bcu serve                    the engine without the menu bar app (for host apps)
 //   bcu call <tool> ['<json>']   call one tool and print the result
 //   bcu status                   same as `bcu call status`
 //   bcu docs                     everything an agent is told, as Markdown
@@ -10,7 +11,15 @@ import BCUShared
 
 let usage = """
 usage:
-  bcu mcp                       run the MCP server on stdin/stdout
+  bcu mcp [--host ID] [--session ID] [--label NAME]
+                                run the MCP server on stdin/stdout. A host app passes
+                                --host so it shows the session in its own UI, and can
+                                name the session and its label
+  bcu serve [--owner NAME] [--log-dir DIR] [--no-parent-watch] [--own-engine]
+                                run the engine without the menu bar app, for a host
+                                app (see docs/embedding.md); it stops when its parent does.
+                                If the app is installed and set up, starts it and uses
+                                its engine instead, unless --own-engine
   bcu call <tool> ['{json}']    call one tool (images are saved to /tmp/bcu-*.png)
   bcu status                    show the app's status
   bcu tools                     list tool names
@@ -18,10 +27,31 @@ usage:
   bcu install-skill             install the skill for Claude Code (~/.claude/skills) and Codex (~/.codex/skills)
 """
 
-/// Connect to the app, launching it in the background if it isn't running.
+/// The app this `bcu` was shipped inside, if it isn't this one: a host app
+/// that runs the engine itself (`bcu serve`).
+let hostApp: Bundle? = {
+    let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+    var dir = exe.deletingLastPathComponent()
+    while dir.path != "/" {
+        if dir.pathExtension == "app" {
+            let b = Bundle(url: dir)
+            return b?.bundleIdentifier == BCUPaths.bundleID ? nil : b
+        }
+        dir = dir.deletingLastPathComponent()
+    }
+    return nil
+}()
+
+/// Who to open when the engine isn't running.
+var ownerName: String {
+    (hostApp?.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? BCUPaths.appName
+}
+
+/// Connect to the engine. Launches this app in the background if it isn't
+/// running; inside a host app, waits for the host to start its engine.
 func connect() throws -> SocketClient {
     if let client = try? SocketClient() { return client }
-    launchApp()
+    if hostApp == nil { launchApp() }
     let deadline = Date().addingTimeInterval(15)
     while Date() < deadline {
         if let client = try? SocketClient() { return client }
@@ -67,7 +97,23 @@ guard let command = args.first else {
 
 switch command {
 case "mcp":
-    MCPServer().run()
+    var host: String?, session: String?, label: String?
+    var i = 1
+    while i < args.count {
+        let value = i + 1 < args.count ? args[i + 1] : nil
+        switch args[i] {
+        case "--host": host = value
+        case "--session": session = value
+        case "--label": label = value
+        default:
+            FileHandle.standardError.write(Data("bcu: unknown option \(args[i])\n".utf8))
+            exit(64)
+        }
+        i += 2
+    }
+    MCPServer(host: host, session: session, label: label).run()
+case "serve":
+    Serve.run(Array(args.dropFirst()))
 case "call":
     guard args.count >= 2 else { print(usage); exit(1) }
     var toolArgs: JSONObject = [:]
