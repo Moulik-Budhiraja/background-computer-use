@@ -35,18 +35,18 @@ try {
 
   $env:BCU_VERSION = $version
   Write-Host "==> building $version"
-  cargo build --release --locked -p background-computer-use -p bcu | Out-Host
+  cargo build --release --locked -p background-computer-use -p bcu -p bcu-hook | Out-Host
   Run 'cargo build'
 
   # What the installer installs.
   $payload = Join-Path $PSScriptRoot 'target\payload'
   Remove-Item $payload -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory (Join-Path $payload 'skills') -Force | Out-Null
-  Copy-Item 'target\release\BackgroundComputerUse.exe', 'target\release\bcu.exe', 'app\install-monitor.ps1' $payload
+  Copy-Item 'target\release\BackgroundComputerUse.exe', 'target\release\bcu.exe', 'target\release\bcu_hook.dll', 'app\install-monitor.ps1' $payload
   Copy-Item '..\skills\background-computer-use' (Join-Path $payload 'skills') -Recurse
   if ($env:APPS_SIGN_SCRIPT) {
     Write-Host '==> signing the app'
-    & pwsh -NoProfile -NonInteractive -File $env:APPS_SIGN_SCRIPT (Join-Path $payload 'BackgroundComputerUse.exe') (Join-Path $payload 'bcu.exe') | Out-Host
+    & pwsh -NoProfile -NonInteractive -File $env:APPS_SIGN_SCRIPT (Join-Path $payload 'BackgroundComputerUse.exe') (Join-Path $payload 'bcu.exe') (Join-Path $payload 'bcu_hook.dll') | Out-Host
     Run 'signing'
   }
 

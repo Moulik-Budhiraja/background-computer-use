@@ -32,7 +32,7 @@ use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::{monitor, win};
+use crate::{monitor, offscreen, win};
 
 /// Marks the keys we replay, so the hook lets them through.
 const REPLAY_TAG: usize = 0x4243_5552; // "BCUR"
@@ -104,6 +104,7 @@ pub fn start() {
     {
         let fg = win::foreground();
         state().user_window = fg;
+        offscreen::set_user_window(fg);
     }
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let _ = RESTORE_TX.set(Mutex::new(tx));
@@ -128,12 +129,14 @@ pub fn start() {
             }
         })
         .expect("guard thread");
-    // Menus of agent windows on hidden screens. Its own thread, so the
+    // Menus of agent windows on hidden screens, and agent windows that show
+    // up on the user's screen (offscreen::watch). Its own thread, so the
     // keyboard and mouse hooks never wait on it.
     std::thread::Builder::new()
         .name("menu-watch".into())
         .spawn(|| unsafe {
             let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+            let _ = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE, None, Some(on_menu_event), 0, 0, flags);
             let _ = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, None, Some(on_menu_event), 0, 0, flags);
             let _ = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, None, Some(on_menu_event), 0, 0, flags);
             let mut msg = MSG::default();
@@ -167,12 +170,16 @@ pub fn set_fence(rect: Option<RECT>) {
     state().fence = rect;
 }
 
-pub fn add_agent_window(hwnd: HWND) {
+/// An agent's window, living on `area` (its monitor or hidden screen) as
+/// its `index`-th window: kept there from now on (see offscreen.rs).
+pub fn add_agent_window(hwnd: HWND, area: RECT, index: usize) {
     state().agent_windows.insert(hwnd.0 as usize);
+    offscreen::keep(hwnd, area, index);
 }
 
 pub fn remove_agent_window(hwnd: HWND) {
     state().agent_windows.remove(&(hwnd.0 as usize));
+    offscreen::forget(hwnd);
 }
 
 /// Whether any agent has this window.
@@ -191,6 +198,7 @@ pub fn note_target(hwnd: HWND) {
 /// Where an agent clicked, in screen pixels.
 pub fn note_point(p: POINT) {
     state().last_point = Some((p, Instant::now()));
+    offscreen::set_last_point(p.x, p.y);
 }
 
 /// The agent is about to act on `pid`. Activations of it count as the agent's until `end_action` + a grace period.
@@ -380,6 +388,7 @@ unsafe extern "system" fn on_foreground(_: HWINEVENTHOOK, _: u32, hwnd: HWND, _:
         let caused = agent_caused(&s, hwnd);
         if !caused && win::pid_tid(hwnd).0 != std::process::id() {
             s.user_window = hwnd;
+            offscreen::set_user_window(hwnd);
         }
         caused
     };
@@ -438,6 +447,15 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
 unsafe extern "system" fn on_menu_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, object: i32, _: i32, _: u32, _: u32) {
     // Only windows themselves (location changes also come for the caret and cursor).
     if hwnd.0.is_null() || object != OBJID_WINDOW.0 {
+        return;
+    }
+    if event == EVENT_OBJECT_CREATE {
+        offscreen::watch(event, hwnd);
+        return;
+    }
+    // Agent windows, and new windows of an app an agent is opening, that
+    // showed up on the user's screen.
+    if unsafe { GetAncestor(hwnd, GA_ROOT) } == hwnd && offscreen::watch(event, hwnd) {
         return;
     }
     // Location changes come for every window that moves; only follow the menus already moved.

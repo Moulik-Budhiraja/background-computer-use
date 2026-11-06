@@ -1,0 +1,12 @@
+[package]
+name = "bcu-hook"
+version = "0.1.0"
+edition = "2024"
+description = "bcu_hook.dll: moves agent windows off the user's screen from inside the app that shows them. Also the shared-memory layout the tray app writes for it."
+
+[lib]
+name = "bcu_hook"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+windows.workspace = true

@@ -23,7 +23,7 @@ jobs:
       - name: Test
         shell: pwsh
         working-directory: windows
-        run: cargo test --locked -p background-computer-use -p bcu
+        run: cargo test --locked -p background-computer-use -p bcu -p bcu-hook
       - uses: actions/upload-artifact@v4
         with:
           name: installer

@@ -4,14 +4,17 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::Win32::Foundation::{CloseHandle, HWND, RECT};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile, STGM_READ};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
-use windows::Win32::UI::Shell::{ITaskbarList, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW, TaskbarList};
-use windows::Win32::UI::WindowsAndMessaging::{SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos};
-use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::System::Threading::GetProcessId;
+use windows::Win32::UI::Shell::{
+    IShellLinkW, ITaskbarList, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW, ShellLink, TaskbarList,
+};
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE;
+use windows::core::{HSTRING, Interface, PCWSTR};
 
-use crate::{guard, win};
+use crate::{guard, monitor, offscreen, win};
 
 /// An app the agent asked for, resolved to something we can launch and match windows against.
 pub struct App {
@@ -19,6 +22,8 @@ pub struct App {
     pub launch: String,
     /// Lowercase executable file name ("msedge.exe"), when known, to tell its windows apart.
     pub exe: Option<String>,
+    /// The executable's full path, when known (for the browser checks).
+    pub path: Option<String>,
     pub name: String,
 }
 
@@ -69,16 +74,32 @@ fn start_menu_shortcut(name: &str) -> Option<PathBuf> {
     roots.into_iter().flatten().find_map(|r| walk(&r, &wanted, 0))
 }
 
+/// A shortcut's target, when it's a program on disk.
+fn shortcut_target(lnk: &Path) -> Option<String> {
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        link.cast::<IPersistFile>().ok()?.Load(&HSTRING::from(lnk.as_os_str()), STGM_READ).ok()?;
+        let mut buf = [0u16; 1024];
+        link.GetPath(&mut buf, std::ptr::null_mut(), 0).ok()?;
+        let path = String::from_utf16_lossy(&buf[..buf.iter().position(|c| *c == 0).unwrap_or(0)]);
+        (path.to_lowercase().ends_with(".exe") && Path::new(&path).exists()).then_some(path)
+    }
+}
+
+fn exe_app(path: &str, name: String) -> App {
+    App { launch: path.into(), exe: Some(exe_file(path)), path: Some(path.into()), name }
+}
+
 /// Resolve "Helium", "Notepad", "notepad.exe" or a full path.
 pub fn resolve(name: &str) -> Result<App, String> {
     let wanted = stem(name);
     if Path::new(name).is_absolute() && Path::new(name).exists() {
-        return Ok(App { launch: name.into(), exe: Some(exe_file(name)), name: win::app_name_from_exe(&exe_file(name)) });
+        return Ok(exe_app(name, win::app_name_from_exe(&exe_file(name))));
     }
     if let Some((browser, exe)) = win::default_browser()
         && (stem(&browser) == wanted || stem(&exe_file(&exe)) == wanted || browser.to_lowercase().starts_with(&wanted))
     {
-        return Ok(App { launch: exe.clone(), exe: Some(exe_file(&exe)), name: browser });
+        return Ok(exe_app(&exe, browser));
     }
     // A running app: launch its executable again.
     for hwnd in win::top_level_windows().into_iter().filter(|h| win::is_app_window(*h)) {
@@ -86,55 +107,65 @@ pub fn resolve(name: &str) -> Result<App, String> {
         if let Some(path) = win::exe_path(pid)
             && (stem(&exe_file(&path)) == wanted || win::app_name(pid).to_lowercase() == wanted)
         {
-            return Ok(App { launch: path.clone(), exe: Some(exe_file(&path)), name: win::app_name(pid) });
+            return Ok(exe_app(&path, win::app_name(pid)));
         }
     }
     if let Some(path) = app_path(name) {
-        return Ok(App { exe: Some(exe_file(&path)), name: win::app_name_from_exe(&exe_file(&path)), launch: path });
+        return Ok(exe_app(&path, win::app_name_from_exe(&exe_file(&path))));
     }
     if let Some(lnk) = start_menu_shortcut(name) {
         let display = lnk.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| name.into());
-        return Ok(App { launch: lnk.to_string_lossy().into(), exe: None, name: display });
+        // Knowing the program tells its windows apart and catches them as
+        // they open. A browser is started directly, so it can be given the
+        // switch it may need (browser.rs); other apps through the shortcut,
+        // which may carry arguments they need.
+        return Ok(match shortcut_target(&lnk) {
+            Some(path) if crate::browser::is_browser(&path) => exe_app(&path, display),
+            Some(path) => App { launch: lnk.to_string_lossy().into(), exe: Some(exe_file(&path)), path: Some(path), name: display },
+            None => App { launch: lnk.to_string_lossy().into(), exe: None, path: None, name: display },
+        });
     }
     // Let the shell try (PATH, system apps like notepad).
-    Ok(App { launch: name.into(), exe: Some(format!("{wanted}.exe")), name: name.into() })
+    Ok(App { launch: name.into(), exe: Some(format!("{wanted}.exe")), path: None, name: name.into() })
 }
 
-/// Start `target`, with `args` if given.
-fn launch(target: &str, args: Option<&str>) -> Result<(), String> {
+/// Start `target`, with `args` if given. Returns the process it started, if
+/// the shell says (not for apps it hands to a running process or a broker).
+pub fn launch(target: &str, args: Option<&str>) -> Result<Option<u32>, String> {
     let file = HSTRING::from(target);
     let params = args.map(HSTRING::from);
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC,
+        fMask: SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS,
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: params.as_ref().map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr())),
         nShow: SW_SHOWNOACTIVATE.0,
         ..Default::default()
     };
-    unsafe { ShellExecuteExW(&mut info) }.map_err(|e| format!("couldn't start {target}: {e}"))
+    unsafe { ShellExecuteExW(&mut info) }.map_err(|e| format!("couldn't start {target}: {e}"))?;
+    if info.hProcess.is_invalid() {
+        return Ok(None);
+    }
+    let pid = unsafe { GetProcessId(info.hProcess) };
+    unsafe {
+        let _ = CloseHandle(info.hProcess);
+    }
+    Ok((pid != 0).then_some(pid))
 }
 
 fn matches(app: &App, hwnd: HWND) -> bool {
-    match &app.exe {
-        Some(exe) => win::exe_name(win::pid_tid(hwnd).0).to_lowercase() == *exe,
-        None => true,
+    match (&app.path, &app.exe) {
+        // Helium and Chrome are both chrome.exe: compare paths when known.
+        (Some(path), _) => win::exe_path(win::pid_tid(hwnd).0).is_some_and(|p| p.eq_ignore_ascii_case(path)),
+        (None, Some(exe)) => win::exe_name(win::pid_tid(hwnd).0).to_lowercase() == *exe,
+        (None, None) => true,
     }
 }
 
-/// Where the n-th agent window goes on the monitor, keeping its size if it fits.
+/// Put the n-th agent window on the monitor, keeping its size if it fits.
+/// A maximized window is restored into place, without activating it.
 pub fn place(hwnd: HWND, monitor: RECT, n: usize) {
-    let f = win::frame(hwnd);
-    let mw = monitor.right - monitor.left;
-    let mh = monitor.bottom - monitor.top;
-    let w = (f.right - f.left).clamp(400, mw - 40);
-    let h = (f.bottom - f.top).clamp(300, mh - 40);
-    let step = (n % 6) as i32 * 30;
-    let x = (monitor.left + 20 + step).min(monitor.right - w);
-    let y = (monitor.top + 20 + step).min(monitor.bottom - h);
-    unsafe {
-        let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-    }
+    bcu_hook::place(hwnd, monitor, n as u32, bcu_hook::From::Outside);
 }
 
 pub fn on_monitor(hwnd: HWND, monitor: &RECT) -> bool {
@@ -162,17 +193,23 @@ pub fn show_in_taskbar(hwnd: HWND) {
     }
 }
 
-/// Open a new window of `app` and move it to the agent monitor as soon as it shows.
-/// `args` go to the app if it starts now (a browser that isn't running yet).
-/// Returns the window and notes on what happened.
+/// Open a new window of `app` on the agent monitor. `args` go to the app if
+/// it starts now (a browser that isn't running yet). Returns the window and
+/// notes on what happened.
+///
+/// The app's new windows are caught as it creates and shows them (see
+/// offscreen.rs), so they don't show on the user's screen; the loop here
+/// only finds which window is the agent's.
 pub fn open(app: &App, monitor: RECT, index: usize, args: Option<&str>) -> Result<(HWND, Vec<String>), String> {
     let known: HashSet<usize> = win::top_level_windows().into_iter().map(|h| h.0 as usize).collect();
     let mut notes = Vec::new();
     let t = Instant::now();
     // Activations by the app's running process count as the agent's from now on.
+    // Its running processes: any with a window, even hidden (a browser kept
+    // running in the background shows none, and opens the new window).
     let running: Vec<u32> = win::top_level_windows()
         .into_iter()
-        .filter(|h| win::is_app_window(*h) && matches(app, *h) && app.exe.is_some())
+        .filter(|h| app.exe.is_some() && matches(app, *h))
         .map(|h| win::pid_tid(h).0)
         .collect::<HashSet<_>>()
         .into_iter()
@@ -180,18 +217,20 @@ pub fn open(app: &App, monitor: RECT, index: usize, args: Option<&str>) -> Resul
     for pid in &running {
         guard::begin_action(*pid);
     }
+    let mut opening = offscreen::begin_open(&running, app.path.as_deref().or(app.exe.as_deref()), monitor, index);
     let result = (|| {
-        launch(&app.launch, args)?;
+        if let Some(pid) = launch(&app.launch, args)? {
+            opening.add_pid(pid);
+        }
         let deadline = t + Duration::from_secs(15);
         let mut found: Option<(HWND, Instant)> = None;
         loop {
             if let Some((hwnd, since)) = found {
-                // Chromium shows a new window and then resets its position: keep
-                // putting it back for a moment.
-                if !on_monitor(hwnd, &monitor) {
+                // offscreen.rs keeps it on the monitor from here; this is a backstop.
+                if !on_monitor(hwnd, &monitor) && !win::is_minimized(hwnd) {
                     place(hwnd, monitor, index);
                 }
-                if since.elapsed() > Duration::from_millis(1500) {
+                if since.elapsed() > Duration::from_millis(500) {
                     return Ok(hwnd);
                 }
             } else if Instant::now() > deadline {
@@ -204,21 +243,23 @@ pub fn open(app: &App, monitor: RECT, index: usize, args: Option<&str>) -> Resul
                     if known.contains(&(hwnd.0 as usize)) || !win::is_app_window(hwnd) || !matches(app, hwnd) {
                         continue;
                     }
-                    guard::add_agent_window(hwnd);
+                    guard::add_agent_window(hwnd, monitor, index);
                     let pid = win::pid_tid(hwnd).0;
                     guard::begin_action(pid);
-                    let was_visible_at = win::frame(hwnd);
-                    place(hwnd, monitor, index);
+                    let at = win::frame(hwnd);
+                    if !on_monitor(hwnd, &monitor) {
+                        place(hwnd, monitor, index);
+                    }
                     hide_from_taskbar(hwnd);
                     if win::foreground() == hwnd {
                         guard::give_back("a new window activated itself");
                     }
-                    notes.push(format!(
-                        "the window appeared after {:.0} ms at ({},{}) and was moved to your monitor",
-                        t.elapsed().as_secs_f64() * 1000.0,
-                        was_visible_at.left,
-                        was_visible_at.top
-                    ));
+                    let ms = t.elapsed().as_secs_f64() * 1000.0;
+                    notes.push(if monitor::on_user_screen(&at) {
+                        format!("the window appeared after {ms:.0} ms on the user's screen at ({},{}) and was moved to your monitor", at.left, at.top)
+                    } else {
+                        format!("the window opened on your monitor after {ms:.0} ms")
+                    });
                     found = Some((hwnd, Instant::now()));
                     break;
                 }
@@ -226,6 +267,7 @@ pub fn open(app: &App, monitor: RECT, index: usize, args: Option<&str>) -> Resul
             std::thread::sleep(Duration::from_millis(4));
         }
     })();
+    drop(opening);
     for pid in &running {
         if let Some(n) = guard::end_action(*pid) {
             notes.push(n);

@@ -13,6 +13,7 @@ mod gfx;
 mod guard;
 mod input;
 mod monitor;
+mod offscreen;
 mod pipe;
 mod sessions;
 mod setup;
@@ -52,6 +53,7 @@ fn main() {
         setup::uninstall(args.iter().any(|a| a == "--silent"));
         return;
     }
+    offscreen::start();
     guard::start();
     gfx::startup();
     updater::start(tray::request_quit);
