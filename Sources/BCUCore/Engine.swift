@@ -1783,7 +1783,9 @@ public final class Engine {
         end tell
         end timeout
         """
-        guard WindowManager.runAppleScript(script) else {
+        // Chromium can take the front when its URL is set, so the guard must
+        // count that as the agent's doing and put the user's app back.
+        guard guarded(w, cause: "loading a URL", { WindowManager.runAppleScript(script) }) else {
             throw ToolError("\(w.appName) didn't take the URL. Click the address bar, type_text the URL and \"\\n\".")
         }
         return ToolResult(text: "Loading \(url) in window \(w.id). Next: get_window_state window_id=\(w.id) (it waits for the page to settle).")
