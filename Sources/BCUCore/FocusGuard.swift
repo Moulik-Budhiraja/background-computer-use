@@ -57,6 +57,11 @@ public final class FocusGuard {
     private var lastUserOpenKeyMs = 0.0
     /// When the guard last put the user's app back in front of each app.
     private var restoredAwayMs: [pid_t: Double] = [:]
+    /// The cmd+Tab order (front first) before the agent touched it, taken
+    /// when an action begins while there's none; cleared once repaired or
+    /// when the user moves to another app (see `repairOrder`).
+    private var orderBefore: [pid_t]?
+    private var orderRepairGen = 0
     private var holding = false
     private var holdingSinceMs = 0.0
     /// With the app that was in front when each came: a key goes back to
@@ -234,6 +239,11 @@ public final class FocusGuard {
         let front = BCUFrontProcessPID()
         if front != 0 && front != pid && front != getpid() && !isTainted(front) {
             noteUserFront(front)
+            lock.lock(); let need = orderBefore == nil; lock.unlock()
+            if need {
+                let order = AppOrder.frontToBack()
+                lock.lock(); if orderBefore == nil && order.first == front { orderBefore = order }; lock.unlock()
+            }
         }
         lock.lock()
         var t = taints[pid] ?? Taint(count: 0, until: .infinity, cause: cause, strict: strict)
@@ -452,6 +462,9 @@ public final class FocusGuard {
             // The monitor thread usually restored already; this is the backup path.
             if BCUFrontProcessPID() == pid { restoreUserFront(from: pid, reason: "activation") }
         } else {
+            // The user moved to another app: the order before the agent's
+            // step no longer says where cmd+Tab should take them.
+            lock.lock(); if let first = orderBefore?.first, first != pid { orderBefore = nil }; lock.unlock()
             // Off the main thread: AX calls into Electron apps can be slow.
             DispatchQueue.global(qos: .userInitiated).async {
                 self.reclaimWhenSafe(pid)
@@ -681,7 +694,90 @@ public final class FocusGuard {
             }
             let n = self.drain()
             if n > 0 { self.record("held \(n) of your key events during a focus change (\(reason)) and replayed them into your app") }
+            if pid != 0 && front == pid { self.scheduleOrderRepair() }
         }
+    }
+
+    // MARK: cmd+Tab order
+
+    /// Once the agent's app has stopped taking the front (no restore for
+    /// 300 ms), put the cmd+Tab order back if it moved.
+    private func scheduleOrderRepair() {
+        lock.lock(); orderRepairGen += 1; let gen = orderRepairGen; lock.unlock()
+        restoreQueue.asyncAfter(deadline: .now() + .milliseconds(300)) {
+            self.lock.lock(); let current = self.orderRepairGen == gen; self.lock.unlock()
+            if current { self.repairOrder(gen, giveUpMs: nowMs() + 5000) }
+        }
+    }
+
+    /// An app that took the front for a few ms still moves up the cmd+Tab
+    /// order to second place, so the user's next cmd+Tab lands in it (Helium,
+    /// after almost every agent step) instead of the app they came from, and
+    /// it stays in front. macOS has no call to reorder that list (LaunchServices
+    /// refuses `_LSSetFrontApplication` from other processes), but every
+    /// activation moves an app to the top: activate the app that was second,
+    /// then the user's app again (no windows raised), and the order is what
+    /// it was before the step. The second app is in front for ~10 ms, guarded
+    /// like any agent activation: keys typed meanwhile are held and replayed.
+    private func repairOrder(_ gen: Int, giveUpMs: Double) {
+        lock.lock()
+        let user = userFrontPid
+        let window = userFrontWindow ?? 0
+        let before = orderBefore
+        let busy = taints.values.contains { $0.count > 0 } || !swapping.isEmpty || restoring || draining || !holdTokens.isEmpty
+        let intruders = Set(restoredAwayMs.filter { nowMs() - $0.value < 5000 }.keys)
+        lock.unlock()
+        guard let before, user != 0, before.first == user else { return }
+        // A step is running (it ends with another restore and another try),
+        // or the user is mid cmd+Tab, a drag or a menu: try again shortly.
+        if busy || QuietWait.focusSensitive(activity.snapshot, menuOpen: QuietWait.menuOpen()) != nil {
+            guard nowMs() < giveUpMs else { return }
+            restoreQueue.asyncAfter(deadline: .now() + .milliseconds(150)) {
+                self.lock.lock(); let current = self.orderRepairGen == gen; self.lock.unlock()
+                if current { self.repairOrder(gen, giveUpMs: giveUpMs) }
+            }
+            return
+        }
+        guard BCUFrontProcessPID() == user else { return }
+        let now = AppOrder.frontToBack(8)
+        guard let second = AppOrder.displaced(before: before, now: now, intruders: intruders),
+              NSRunningApplication(processIdentifier: second)?.isTerminated == false else {
+            if now.count >= 2 && now.first == user && now[1] == before[1] {
+                lock.lock(); if orderRepairGen == gen { orderBefore = nil }; lock.unlock()
+            }
+            return
+        }
+        let name = { (p: pid_t) in NSRunningApplication(processIdentifier: p)?.localizedName ?? "pid \(p)" }
+        let pushed = now[1]
+        lock.lock()
+        if restoring { lock.unlock(); return }
+        restoring = true
+        var t = taints[second] ?? Taint(count: 0, until: .infinity, cause: "restoring the cmd+Tab order", strict: false)
+        t.count += 1; t.until = .infinity
+        taints[second] = t
+        lock.unlock()
+        let t0 = nowMs()
+        _ = BCUSetFrontProcess(second, 0, 0x200)
+        while BCUFrontProcessPID() != second && nowMs() - t0 < 50 { sleepMs(1) }
+        var lastCall = nowMs()
+        _ = BCUSetFrontProcess(user, window, 0x200)
+        if window != 0 { _ = BCUPostMakeKeyRecords(user, window) }
+        while BCUFrontProcessPID() != user && nowMs() - t0 < 500 {
+            if nowMs() - lastCall >= 20 { _ = BCUSetFrontProcess(user, window, 0x200); lastCall = nowMs() }
+            sleepMs(1)
+        }
+        let back = BCUFrontProcessPID() == user
+        lock.lock()
+        if var t = taints[second] { t.count = max(0, t.count - 1); if t.count == 0 { t.until = nowMs() + 300 }; taints[second] = t }
+        holding = false
+        restoring = false
+        orderBefore = nil
+        lock.unlock()
+        let after = AppOrder.frontToBack(3)
+        let fixed = after.count >= 2 && after[0] == user && after[1] == second
+        record("\(name(pushed)) had moved up to second in your cmd+Tab order after taking the front; \(fixed ? "put \(name(second)) back second" : "COULD NOT put \(name(second)) back second") (\(Int(nowMs() - t0)) ms\(back ? "" : ", your app NOT back in front"))")
+        let n = drain()
+        if n > 0 { record("held \(n) of your key events while restoring the cmd+Tab order and replayed them into your app") }
     }
 
     // MARK: Tap
