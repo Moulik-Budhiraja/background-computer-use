@@ -413,7 +413,7 @@
   {
     "name": "navigate",
     "description": {
-      "macos": "Load a URL in your browser window (Chromium browsers: Helium, Chrome, Brave, Edge…). No keystrokes, so it never takes key focus or waits for the user. Prefer it to clicking the address bar and typing.",
+      "macos": "Load a URL in your browser window (Chromium browsers: Helium, Chrome, Brave, Edge…). No keystrokes, so it never waits for a pause in the user's typing; it only waits while the user holds a mouse button or key or has a menu open. Prefer it to clicking the address bar and typing.",
       "windows": "Not built on Windows yet: click the address bar, type_text the URL and \"\\n\"."
     },
     "inputSchema": {

@@ -1749,7 +1749,8 @@ public final class Engine {
     }
 
     /// Load a URL in one of the agent's Chromium windows through AppleScript:
-    /// no keystrokes, so no key focus taken and nothing to wait for.
+    /// no keystrokes, so no key swap and no waiting for a pause in the user's
+    /// input, only for a drag, a held key or an open menu to end.
     private func navigate(_ args: Args) throws -> ToolResult {
         let (w, _) = try agentWindow(args)
         guard let url = args.string("url")?.trimmingCharacters(in: .whitespaces), !url.isEmpty else { throw ToolError("give url") }
@@ -1770,22 +1771,39 @@ public final class Engine {
         // one by its frame, which is the same in both.
         func quoted(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
         let b = "{\(Int(frame.minX.rounded())), \(Int(frame.minY.rounded())), \(Int(frame.maxX.rounded())), \(Int(frame.maxY.rounded()))}"
+        // Two of the browser's windows can share a frame (the cascade repeats),
+        // and then nothing tells them apart: load in neither rather than
+        // maybe in another task's window.
         let script = """
         with timeout of 5 seconds
         tell application id \(quoted(bundleID))
+        set found to {}
         repeat with w in windows
-        if bounds of w is \(b) then
-        set URL of active tab of w to \(quoted(url))
-        return
-        end if
+        if bounds of w is \(b) then set end of found to id of w
         end repeat
-        error "no window with bounds \(b)"
+        if (count of found) is 0 then error "no window with bounds \(b)"
+        if (count of found) > 1 then error "more than one window with bounds \(b)"
+        set URL of active tab of window id (item 1 of found) to \(quoted(url))
         end tell
         end timeout
         """
-        // Chromium can take the front when its URL is set, so the guard must
-        // count that as the agent's doing and put the user's app back.
-        guard guarded(w, cause: "loading a URL", { WindowManager.runAppleScript(script) }) else {
+        // Chromium shows the window it loads a URL in: it can make it key and
+        // bring the app to the front. That would end a drag or close a menu
+        // in whatever app the user is in, so wait those out (only those).
+        if !priorityNow {
+            try awaitUser(pid: w.pid, appName: w.appName, cause: "loading a URL", anywhere: true)
+        }
+        // Run it as an agent action so the guard puts the user's app straight
+        // back, and if the user is in the browser, give key back to their window.
+        let shared = userIsIn(w.pid)
+        let userWindow = shared ? focusGuard.userWindow(of: w.pid) : nil
+        let loaded = guarded(w, cause: "loading a URL") { () -> Bool in
+            let ok = WindowManager.runAppleScript(script)
+            if shared { _ = focusGuard.reclaimKey(w.pid, prefer: userWindow) }
+            return ok
+        }
+        if shared { focusGuard.scheduleReclaim(w.pid) }
+        guard loaded else {
             throw ToolError("\(w.appName) didn't take the URL. Click the address bar, type_text the URL and \"\\n\".")
         }
         return ToolResult(text: "Loading \(url) in window \(w.id). Next: get_window_state window_id=\(w.id) (it waits for the page to settle).")
