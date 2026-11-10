@@ -411,6 +411,30 @@
     }
   },
   {
+    "name": "navigate",
+    "description": {
+      "macos": "Load a URL in your browser window (Chromium browsers: Helium, Chrome, Brave, Edge…). No keystrokes, so it never waits for a pause in the user's typing; it only waits while the user holds a mouse button or key or has a menu open. Prefer it to clicking the address bar and typing.",
+      "windows": "Not built on Windows yet: click the address bar, type_text the URL and \"\\n\"."
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "window_id": {
+          "type": "integer",
+          "description": "Your window."
+        },
+        "url": {
+          "type": "string",
+          "description": "The URL to load."
+        }
+      },
+      "required": [
+        "window_id",
+        "url"
+      ]
+    }
+  },
+  {
     "name": "handoff",
     "description": {
       "macos": "Ask the user to take over a window (a sign-in, a password or 2FA code, a decision). The user gets a notification with your reason, and the window comes onto their screen when they open it. Stop after calling this.",

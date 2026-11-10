@@ -58,5 +58,11 @@ let package = Package(
             path: "Sources/bcu",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        .testTarget(
+            name: "BCUCoreTests",
+            dependencies: ["BCUCore"],
+            path: "Tests/BCUCoreTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )

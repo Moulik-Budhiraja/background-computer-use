@@ -230,10 +230,12 @@ public final class WindowManager {
         }
     }
 
-    public func open(app query: String, placement: Placement = .auto, trigger: String? = nil) throws -> OpenResult {
+    /// `hold`: the user's input, when they're in that app. It's held only
+    /// from when the new window could take key until key is back on theirs.
+    public func open(app query: String, placement: Placement = .auto, trigger: String? = nil, hold: InputHold? = nil) throws -> OpenResult {
         let target = try resolveApp(query)
         if let running = target.running {
-            return try openNewWindow(pid: running.processIdentifier, name: target.name, bundleID: target.bundleID, placement: placement, trigger: trigger)
+            return try openNewWindow(pid: running.processIdentifier, name: target.name, bundleID: target.bundleID, placement: placement, trigger: trigger, hold: hold)
         }
         guard let url = target.url else { throw ToolError("can't find \(target.name) on disk") }
         return try launch(url: url, name: target.name, bundleID: target.bundleID)
@@ -296,9 +298,13 @@ public final class WindowManager {
     }
 
     /// Open a new window of a running app and put it on the agent display.
-    private func openNewWindow(pid: pid_t, name: String, bundleID: String?, placement: Placement = .auto, trigger: String? = nil) throws -> OpenResult {
+    private func openNewWindow(pid: pid_t, name: String, bundleID: String?, placement: Placement = .auto, trigger: String? = nil,
+                               hold: InputHold? = nil) throws -> OpenResult {
         let before = Set(WindowList.of(pid: pid).map(\.id))
         let catcher = WindowCatcher(pid: pid, before: before, manager: self)
+        // A window built by script can't take key before it exists: hold the
+        // user's input from the moment it shows up, not while it's asked for.
+        catcher.onSeen = { hold?.start() }
         Self.openLock.lock()
         focusGuard.beginAction(pid: pid, cause: "opening a \(name) window")
         lock.lock(); opening.insert(pid); lock.unlock()
@@ -311,6 +317,12 @@ public final class WindowManager {
         }
         noteBefore(pid: pid)
         var notes: [String] = []
+        // With the user's input held, this thread is what they're waiting
+        // on: at default QoS it waits hundreds of ms for a core while the
+        // app draws its new window.
+        let qos = qos_class_self()
+        if hold != nil { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) }
+        defer { if hold != nil { pthread_set_qos_class_self_np(qos, 0) } }
 
         // If an agent already has a window of this app, make it the app's key
         // window first: apps place new windows relative to their key window,
@@ -333,6 +345,7 @@ public final class WindowManager {
         // browsers) open it straight on the agent display, so no anchor is
         // needed and nothing ever reaches the user's screen.
         let scripted = trigger == nil || trigger == "script" ? Self.scriptedNewWindow(pid: pid, bundleID: bundleID) : nil
+        if scripted == nil { hold?.start() }
         var scope: KeyScope?
         if scripted == nil, placement.contains(.anchor), let anchor = anchorWindow(pid: pid) {
             scope = try? KeyScope.enter(pid: pid, window: anchor)
@@ -361,28 +374,55 @@ public final class WindowManager {
         defer { if assigned { _ = BCUProcessAssignToSpace(pid, 0) } }
         catcher.start()
         var how = ""
-        if let scripted, Self.runAppleScript(scripted(nextFrame(size: CGSize(width: 1400, height: 900)))) {
+        var caught: CGWindowID?
+        var scriptFailed = scripted == nil
+        if let scripted {
             how = "AppleScript, built at its place on the agent display"
-        } else if trigger != "key", let item = Self.newWindowMenuItem(pid: pid) {
-            let err = AX.perform(item.element, "AXPress")
-            how = "menu \"\(item.title)\"" + (err == .success ? "" : " (\(AX.errorName(err)))")
-        } else {
-            try Input.pressKey(pid: pid, key: "n", modifiers: ["cmd"])
-            how = "cmd+N"
+            // Chromium shows the window a few hundred ms before the script
+            // returns: run it alongside, so key goes back as soon as the
+            // window is caught rather than when the script is done.
+            let source = scripted(nextFrame(size: CGSize(width: 1400, height: 900)))
+            let ok = Locked<Bool?>(nil)
+            DispatchQueue.global(qos: .userInitiated).async { ok.value = Self.runAppleScript(source) }
+            // In the app the user is in, wait until it's shown too: it's
+            // caught when created, before it can take key, and giving key
+            // back then would end the hold just before the window takes it.
+            caught = catcher.waitForWindow(timeoutMs: 6500, shown: hold != nil) { ok.value == false }
+            scriptFailed = caught == nil && ok.value == false
         }
-        let caught = catcher.waitForWindow(timeoutMs: 5000)
+        if scriptFailed {
+            hold?.start()
+            if trigger != "key", let item = Self.newWindowMenuItem(pid: pid) {
+                let err = AX.perform(item.element, "AXPress")
+                how = "menu \"\(item.title)\"" + (err == .success ? "" : " (\(AX.errorName(err)))")
+            } else {
+                try Input.pressKey(pid: pid, key: "n", modifiers: ["cmd"])
+                how = "cmd+N"
+            }
+            caught = catcher.waitForWindow(timeoutMs: 5000)
+        }
         // Give key back right away: while the new window is key, the user's
         // window in the same app is blurred.
         scope?.exit()
-        if let id = caught, let previousKey, previousKey != id, WindowList.info(previousKey) != nil, AX.focusedWindowID(pid) == id {
-            KeyScope.postRecords(pid: pid, from: id, to: previousKey)
-            KeyScope.awaitKey(pid: pid, target: previousKey, budgetMs: 300)
+        // In the app the user is in, no check first that the new window is
+        // key: asking a browser busy building a window takes ~100 ms of their
+        // held input, and records to their window only ever give key back.
+        if let id = caught, let previousKey, previousKey != id, WindowList.info(previousKey) != nil,
+           hold != nil || AX.focusedWindowID(pid) == id {
+            // Quick records first (the user's window never repaints as
+            // inactive), then KeyScope's slower settle if those didn't land.
+            for settle in [5.0, 120.0] {
+                KeyScope.postRecords(pid: pid, from: id, to: previousKey, settle: settle)
+                KeyScope.awaitKey(pid: pid, target: previousKey, budgetMs: settle < 50 ? 150 : 300)
+                if AX.focusedWindowID(pid) == previousKey { break }
+            }
         }
         focusGuard.endSwap(pid)
         Engine.inputLock.unlock()
         holdingInput = false
         // The app the user is in must end with their window key.
         if BCUFrontProcessPID() == pid { focusGuard.reclaimWhenSafe(pid) }
+        if let ms = hold?.end() { Log.info("open_window: held the user's input \(Int(ms)) ms") }
         // Keep watching a moment in case the app moves or resizes the window back.
         sleepMs(250)
         catcher.stop()
@@ -793,6 +833,10 @@ final class WindowCatcher {
     private var polling = false
     private var startMs = 0.0
     private var firstSeenMs: Double?
+    /// Runs (on the polling thread) when the new window is first on screen.
+    /// Not on accessibility's "created": that comes before the window is
+    /// shown (a browser, ~250 ms), and a window that isn't shown can't take key.
+    var onSeen: (() -> Void)?
     private var firstOnUserMs: Double?
     private var lastOnUserMs: Double?
     private var movedMs: Double?
@@ -867,8 +911,10 @@ final class WindowCatcher {
             let now = nowMs()
             for info in WindowList.of(pid: pid, onScreenOnly: true) where info.layer == 0 && !before.contains(info.id) {
                 lock.lock()
-                if firstSeenMs == nil { firstSeenMs = now }
+                let first = firstSeenMs == nil
+                if first { firstSeenMs = now }
                 lock.unlock()
+                if first { onSeen?() }
                 if manager?.display.touchesUser(info.bounds) == true && manager?.display.holds(info.bounds) == false {
                     lock.lock()
                     if firstOnUserMs == nil { firstOnUserMs = now }
@@ -907,14 +953,20 @@ final class WindowCatcher {
         }
     }
 
-    func waitForWindow(timeoutMs: Double) -> CGWindowID? {
+    /// The new window once it's on the agent display. Gives up early when
+    /// `stop` says the request for it failed.
+    /// `shown`: also wait until it's on screen (1.5 s at most after it's in
+    /// place), since only a shown window can take key.
+    func waitForWindow(timeoutMs: Double, shown: Bool = false, stop: () -> Bool = { false }) -> CGWindowID? {
         let deadline = nowMs() + timeoutMs
-        while nowMs() < deadline {
+        var placedMs: Double?
+        while nowMs() < deadline && !stop() {
             lock.lock()
             let id = caughtID
             lock.unlock()
             if let id, let info = WindowList.info(id), manager?.display.holds(info.bounds) == true {
-                return id
+                if placedMs == nil { placedMs = nowMs() }
+                if !shown || info.onScreen || nowMs() - (placedMs ?? 0) > 1500 { return id }
             }
             sleepMs(10)
         }
