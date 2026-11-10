@@ -1798,6 +1798,11 @@ public final class Engine {
         let shared = userIsIn(w.pid)
         let userWindow = shared ? focusGuard.userWindow(of: w.pid) : nil
         let loaded = guarded(w, cause: "loading a URL") { () -> Bool in
+            // Until key is back on the user's window, the guard holds what
+            // they type into the browser and their clicks on it, then replays
+            // them, so none of it lands in the agent's page.
+            focusGuard.beginSwap(w.pid)
+            defer { focusGuard.endSwap(w.pid) }
             let ok = WindowManager.runAppleScript(script)
             if shared { _ = focusGuard.reclaimKey(w.pid, prefer: userWindow) }
             return ok
