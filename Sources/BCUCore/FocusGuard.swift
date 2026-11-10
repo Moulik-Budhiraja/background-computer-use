@@ -754,6 +754,23 @@ public final class FocusGuard {
             }
             return
         }
+        // An agent step that began since holds the input lock while it has
+        // key on its window: changing the front app or key under it would
+        // break it. Take the lock for the repair, or try again shortly.
+        func retry() {
+            guard nowMs() < giveUpMs else { return }
+            restoreQueue.asyncAfter(deadline: .now() + .milliseconds(150)) {
+                self.lock.lock(); let current = self.orderRepairGen == gen; self.lock.unlock()
+                if current { self.repairOrder(gen, giveUpMs: giveUpMs) }
+            }
+        }
+        guard Engine.inputLock.try() else { retry(); return }
+        defer { Engine.inputLock.unlock() }
+        lock.lock()
+        let stillIdle = !(taints.values.contains { $0.count > 0 } || !swapping.isEmpty || restoring || draining || !holdTokens.isEmpty)
+            && userFrontPid == user && orderRepairGen == gen
+        lock.unlock()
+        guard stillIdle else { retry(); return }
         guard BCUFrontProcessPID() == user else { return }
         let now = AppOrder.frontToBack(8)
         guard let second = AppOrder.displaced(before: before, now: now, intruders: intruders),

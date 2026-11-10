@@ -384,7 +384,10 @@ public final class WindowManager {
             let source = scripted(nextFrame(size: CGSize(width: 1400, height: 900)))
             let ok = Locked<Bool?>(nil)
             DispatchQueue.global(qos: .userInitiated).async { ok.value = Self.runAppleScript(source) }
-            caught = catcher.waitForWindow(timeoutMs: 6500) { ok.value == false }
+            // In the app the user is in, wait until it's shown too: it's
+            // caught when created, before it can take key, and giving key
+            // back then would end the hold just before the window takes it.
+            caught = catcher.waitForWindow(timeoutMs: 6500, shown: hold != nil) { ok.value == false }
             scriptFailed = caught == nil && ok.value == false
         }
         if scriptFailed {
@@ -952,14 +955,18 @@ final class WindowCatcher {
 
     /// The new window once it's on the agent display. Gives up early when
     /// `stop` says the request for it failed.
-    func waitForWindow(timeoutMs: Double, stop: () -> Bool = { false }) -> CGWindowID? {
+    /// `shown`: also wait until it's on screen (1.5 s at most after it's in
+    /// place), since only a shown window can take key.
+    func waitForWindow(timeoutMs: Double, shown: Bool = false, stop: () -> Bool = { false }) -> CGWindowID? {
         let deadline = nowMs() + timeoutMs
+        var placedMs: Double?
         while nowMs() < deadline && !stop() {
             lock.lock()
             let id = caughtID
             lock.unlock()
             if let id, let info = WindowList.info(id), manager?.display.holds(info.bounds) == true {
-                return id
+                if placedMs == nil { placedMs = nowMs() }
+                if !shown || info.onScreen || nowMs() - (placedMs ?? 0) > 1500 { return id }
             }
             sleepMs(10)
         }
