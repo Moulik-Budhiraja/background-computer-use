@@ -36,6 +36,13 @@ public final class Hub {
     /// came in on (see `bcu mcp`).
     private var parentOf: [String: String] = [:]
     private var order: [String] = []
+    /// Connections carrying each session's calls right now.
+    private var attached: [String: Int] = [:]
+    /// When each session's last connection went away.
+    private var departedAtMs: [String: Double] = [:]
+    /// A session whose agent went away keeps its windows this long, in case
+    /// the agent's connection comes back (its `bcu mcp` restarting).
+    public static let orphanGraceMs: Double = 30_000
     private var timer: Timer?
     private var ticks = 0
 
@@ -67,6 +74,33 @@ public final class Hub {
     public func engine(id: String) -> Engine? {
         lock.lock(); defer { lock.unlock() }
         return byID[id]
+    }
+
+    /// A connection began carrying this session's calls, or one that did
+    /// went away (`SocketServer.sessionHandler`). When the last one goes the
+    /// agent is gone: nobody is left to release its windows, and they'd hold
+    /// a display, an app's key window and the app itself back from the
+    /// front for good. Its display goes at once if it has no windows, and
+    /// its windows after `orphanGraceMs`. Not the default session
+    /// (`bcu call`), which is a new connection every call.
+    public func sessionAttached(_ id: String, _ on: Bool) {
+        guard id != Self.defaultSession else { return }
+        lock.lock()
+        let n = max(0, (attached[id] ?? 0) + (on ? 1 : -1))
+        attached[id] = n == 0 ? nil : n
+        departedAtMs[id] = n == 0 && !on ? nowMs() : nil
+        let e = byID[id]
+        lock.unlock()
+        guard !on, n == 0, let e else { return }
+        Log.info("session \(Self.short(id)): its agent went away")
+        e.agentLeft(graceMs: Self.orphanGraceMs) { [weak self, weak e] in e.flatMap { self?.isAttached($0) } ?? true }
+    }
+
+    /// Whether a connection carries this session's calls now, under any id
+    /// (a restarted agent's session goes on under its new one, see `takeOver`).
+    private func isAttached(_ e: Engine) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return byID.contains { $0.value === e && (attached[$0.key] ?? 0) > 0 }
     }
 
     /// The session a subagent's session came from, if it's a subagent's.
@@ -171,14 +205,60 @@ public final class Hub {
         if let parent {
             lock.lock(); parentOf[id] = parent; lock.unlock()
         }
-        let caller = engine(for: id, client: client, label: label, host: host)
+        var caller = engine(for: id, client: client, label: label, host: host)
         // An agent can hand a window to its subagent (or back): the call goes
         // to the session that owns the window, on that session's display.
-        if let windowID = (args["window_id"] as? NSNumber)?.uint32Value, caller.windows.window(windowID) == nil,
-           let owner = relative(of: id, owning: windowID) {
-            return owner.call(tool: tool, args: args)
+        if let windowID = (args["window_id"] as? NSNumber)?.uint32Value, caller.windows.window(windowID) == nil {
+            if let owner = relative(of: id, owning: windowID) {
+                return owner.call(tool: tool, args: args)
+            }
+            caller = takeOver(windowID, for: caller, id: id)
         }
         return caller.call(tool: tool, args: args)
+    }
+
+    /// An agent whose `bcu mcp` was restarted (its client does that after a
+    /// call times out or the server dies) comes back as a new session, and
+    /// the windows it's working in belong to the old one: every call on them
+    /// failed with "isn't one of yours", and the old session held them and
+    /// its display with nobody left to release them. So a call that names a
+    /// window of a session whose agent has gone away, from the same kind of
+    /// client, makes the caller that session again: same display, windows
+    /// and what it last read in them. (Only the agent that opened a window
+    /// was ever told its id.) A caller that already has a display or
+    /// windows of its own, or a host app's session (the app knows it by its
+    /// id), gets the windows instead. Returns the session to run the call.
+    private func takeOver(_ window: CGWindowID, for caller: Engine, id callerID: String) -> Engine {
+        lock.lock()
+        let departed = byID.first { id, e in
+            id != Self.defaultSession && e !== caller && (attached[id] ?? 0) == 0 && e.host == caller.host
+                && Self.kind(e.label) == Self.kind(caller.label) && e.windows.window(window) != nil
+        }
+        guard let (oldID, old) = departed else { lock.unlock(); return caller }
+        if caller.host == nil, !caller.display.isRunning, caller.windows.windows.isEmpty {
+            byID[callerID] = old
+            byID[oldID] = nil
+            departedAtMs[oldID] = nil
+            parentOf[oldID] = nil
+            order.removeAll { $0 == callerID }
+            if let i = order.firstIndex(of: oldID) { order[i] = callerID } else { order.append(callerID) }
+            lock.unlock()
+            Log.info("session \(Self.short(callerID)) is session \(Self.short(oldID)) back after its agent restarted: it keeps its display and \(old.windows.windows.count) window(s)")
+            changed()
+            return old
+        }
+        lock.unlock()
+        let moved = caller.windows.takeOver(from: old.windows)
+        Log.info("session \(Self.short(callerID)) took over \(moved) window(s) of session \(Self.short(oldID)), whose agent went away")
+        changed()
+        return caller
+    }
+
+    /// A session label without its number ("Claude Code 2" and "Claude Code").
+    static func kind(_ label: String) -> String {
+        let parts = label.split(separator: " ")
+        if parts.count > 1, let last = parts.last, Int(last) != nil { return parts.dropLast().joined(separator: " ") }
+        return label
     }
 
     /// The session in the same agent family as `id` (its parent, its
@@ -205,14 +285,28 @@ public final class Hub {
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, .main) { [weak self] _, _ in
             self?.routeAudio()
         }
+        // A display with nothing on it shouldn't be what keeps a closed
+        // laptop awake, or what macOS makes the main display while the
+        // user's sleep.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { _ in
+            AgentDisplay.reapSpares(all: true)
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.ticks += 1
             self.changed()
             self.routeAudio()
+            AgentDisplay.tend()
             if AgentDisplay.someoneWaiting {
-                // Another agent needs a display: one with no windows goes sooner.
+                // Another agent needs a display: one with no windows goes
+                // sooner, and so does one whose agent went away (an agent
+                // that's coming back is back within a few seconds).
                 for e in self.engines { e.tearDownIfIdle(idleMs: Self.busyTeardownMs) }
+                self.lock.lock()
+                let now = nowMs()
+                let departed = self.departedAtMs.filter { now - $0.value > Self.busyTeardownMs }.compactMap { id, _ in self.byID[id].map { (id, $0) } }
+                self.lock.unlock()
+                for (_, e) in departed { e.releaseAbandoned { [weak self, weak e] in e.flatMap { self?.isAttached($0) } ?? true } }
             }
             if self.ticks % 3600 == 0 {
                 self.lock.lock(); let stores = Array(self.recordings.values); self.lock.unlock()
@@ -249,7 +343,7 @@ public final class Hub {
     private func forgetDormant() {
         lock.lock()
         let gone = byID.filter { $0.key != Self.defaultSession && $0.value.isDormant(idleMs: Self.idleTeardownMs * 2) }.map(\.key)
-        for id in gone { byID[id]?.audio.end(); byID[id] = nil; parentOf[id] = nil }
+        for id in gone { byID[id]?.audio.end(); byID[id] = nil; parentOf[id] = nil; departedAtMs[id] = nil }
         order.removeAll { gone.contains($0) }
         lock.unlock()
         for id in gone { Log.info("session \(Self.short(id)) ended") }
@@ -258,11 +352,14 @@ public final class Hub {
 
     /// Main thread. Releases every session's windows, then removes the displays.
     public func shutdown() {
+        // First: no app stays kept from the front once the engine is gone.
+        focusGuard.gate.stop()
         let group = DispatchGroup()
         let all = engines
         for e in all { e.releaseForShutdown(group) }
         if group.wait(timeout: .now() + 4) == .timedOut { Log.info("shutdown: gave up waiting for windows to be released") }
         for e in all { e.finishShutdown() }
+        AgentDisplay.reapSpares(all: true)
     }
 
     /// The menu bar's pause and stop act on the sessions it shows; a host

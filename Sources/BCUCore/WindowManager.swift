@@ -66,11 +66,23 @@ public final class WindowManager {
     }
 
     /// Windows any session has registered: no other session catches them.
-    private static var registeredAnywhere: [CGWindowID: String] = [:]
+    private static var registeredAnywhere: [CGWindowID: (session: String, pid: pid_t)] = [:]
 
     static func isRegistered(_ id: CGWindowID, byOtherThan session: String) -> Bool {
         sharedLock.lock(); defer { sharedLock.unlock() }
-        return registeredAnywhere[id].map { $0 != session } ?? false
+        return registeredAnywhere[id].map { $0.session != session } ?? false
+    }
+
+    /// Some session's window, as of right now.
+    static func isRegistered(_ id: CGWindowID) -> Bool {
+        sharedLock.lock(); defer { sharedLock.unlock() }
+        return registeredAnywhere[id] != nil
+    }
+
+    /// The apps agents have windows in, across sessions.
+    public static func agentPids() -> Set<pid_t> {
+        sharedLock.lock(); defer { sharedLock.unlock() }
+        return Set(registeredAnywhere.values.map(\.pid))
     }
 
     public var windows: [AgentWindow] {
@@ -85,14 +97,26 @@ public final class WindowManager {
 
     func register(_ w: AgentWindow) {
         lock.lock(); registry[w.id] = w; registeredAt[w.id] = nowMs(); lock.unlock()
-        Self.sharedLock.lock(); Self.registeredAnywhere[w.id] = sessionKey; Self.sharedLock.unlock()
+        Self.sharedLock.lock(); Self.registeredAnywhere[w.id] = (sessionKey, w.pid); Self.sharedLock.unlock()
         persist()
+    }
+
+    /// Move every window of `other` (a session whose agent is gone) to this
+    /// session. They're on its display still; the sweep brings each onto
+    /// this one. Returns how many.
+    func takeOver(from other: WindowManager) -> Int {
+        let theirs = other.windows
+        for w in theirs {
+            other.unregister(w.id)
+            register(w)
+        }
+        return theirs.count
     }
 
     func unregister(_ id: CGWindowID) {
         lock.lock(); registry[id] = nil; registeredAt[id] = nil; lock.unlock()
         Self.sharedLock.lock()
-        if Self.registeredAnywhere[id] == sessionKey { Self.registeredAnywhere[id] = nil }
+        if Self.registeredAnywhere[id]?.session == sessionKey { Self.registeredAnywhere[id] = nil }
         Self.sharedLock.unlock()
         persist()
     }
@@ -132,9 +156,19 @@ public final class WindowManager {
         guard let data = try? Data(contentsOf: url),
               let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
         var notes: [String] = []
-        for e in entries {
+        func live(_ e: [String: Any]) -> (id: CGWindowID, pid: pid_t, ax: AXUIElement)? {
             guard let id = (e["id"] as? Int).map({ CGWindowID($0) }), let pid = (e["pid"] as? Int).map({ pid_t($0) }),
-                  WindowList.info(id)?.pid == pid, let ax = AX.window(pid: pid, id: id) else { continue }
+                  WindowList.info(id)?.pid == pid, let ax = AX.window(pid: pid, id: id) else { return nil }
+            return (id, pid, ax)
+        }
+        // A dialog the last run caught that's still asking whether to leave
+        // a page would keep that page's window open: answer it first.
+        for e in entries where e["kind"] as? String == AgentWindow.Kind.caught.rawValue {
+            if let w = live(e), answerLeave(w.ax) { sleepMs(400); notes.append("answered Leave for \(e["app"] ?? "?")") }
+        }
+        for e in entries {
+            guard let (id, pid, ax) = live(e) else { continue }
+            _ = pid
             if e["kind"] as? String == "borrowed", let f = e["frame"] as? [Double], f.count == 4 {
                 AX.setPosition(ax, CGPoint(x: f[0], y: f[1]))
                 AX.setSize(ax, CGSize(width: f[2], height: f[3]))
@@ -142,6 +176,19 @@ public final class WindowManager {
             } else if let close = AX.element(ax, "AXCloseButton") {
                 AX.perform(close, "AXPress")
                 notes.append("closed leftover \(e["app"] ?? "?") window \(id)")
+            }
+        }
+        // A page that asks only now: its dialog is a new window of that app.
+        sleepMs(500)
+        for e in entries {
+            guard let id = (e["id"] as? Int).map({ CGWindowID($0) }), let pid = (e["pid"] as? Int).map({ pid_t($0) }),
+                  WindowList.info(id) != nil else { continue }
+            for other in AX.windows(pid) where AX.windowID(other) != id && AX.string(other, "AXSubrole") != "AXStandardWindow" {
+                // (Only a dialog this run's close brought up: not one of the entries, and small.)
+                if let size = AX.size(other), size.width < 700, size.height < 500, answerLeave(other) {
+                    notes.append("answered Leave for \(e["app"] ?? "?") window \(id)")
+                    sleepMs(400)
+                }
             }
         }
         return notes
@@ -232,10 +279,15 @@ public final class WindowManager {
 
     /// `hold`: the user's input, when they're in that app. It's held only
     /// from when the new window could take key until key is back on theirs.
-    public func open(app query: String, placement: Placement = .auto, trigger: String? = nil, hold: InputHold? = nil) throws -> OpenResult {
+    /// `beforeAsk` runs once it's this session's turn to open a window,
+    /// just before the app is asked for it (and before any input is held);
+    /// if it throws, nothing is opened.
+    public func open(app query: String, placement: Placement = .auto, trigger: String? = nil, hold: InputHold? = nil,
+                     beforeAsk: (() throws -> Void)? = nil) throws -> OpenResult {
         let target = try resolveApp(query)
         if let running = target.running {
-            return try openNewWindow(pid: running.processIdentifier, name: target.name, bundleID: target.bundleID, placement: placement, trigger: trigger, hold: hold)
+            return try openNewWindow(pid: running.processIdentifier, name: target.name, bundleID: target.bundleID, placement: placement, trigger: trigger,
+                                     hold: hold, beforeAsk: beforeAsk)
         }
         guard let url = target.url else { throw ToolError("can't find \(target.name) on disk") }
         return try launch(url: url, name: target.name, bundleID: target.bundleID)
@@ -244,6 +296,10 @@ public final class WindowManager {
     /// Launch a not-running app hidden and without activation, move its first
     /// windows onto the agent display, then unhide it there.
     private func launch(url: URL, name: String, bundleID: String?) throws -> OpenResult {
+        // An app that starts up brings itself forward when it's ready,
+        // whatever it was asked: kept from the front from the moment it appears.
+        if let bundleID { focusGuard.willLaunch(bundleID: bundleID) }
+        defer { if let bundleID { focusGuard.launched(bundleID: bundleID) } }
         let config = NSWorkspace.OpenConfiguration()
         config.activates = false
         config.hides = true
@@ -299,13 +355,23 @@ public final class WindowManager {
 
     /// Open a new window of a running app and put it on the agent display.
     private func openNewWindow(pid: pid_t, name: String, bundleID: String?, placement: Placement = .auto, trigger: String? = nil,
-                               hold: InputHold? = nil) throws -> OpenResult {
+                               hold: InputHold? = nil, beforeAsk: (() throws -> Void)? = nil) throws -> OpenResult {
+        // Not while displays are still being added (see `awaitSettled`):
+        // before this session's turn, and again once it has it.
+        var settledMs = AgentDisplay.awaitSettled()
+        Self.openLock.lock()
+        settledMs += AgentDisplay.awaitSettled()
+        if settledMs > 100 { Log.info("open: waited \(Int(settledMs)) ms for the displays to settle") }
+        // Which windows the app has now, taken once it's this session's turn:
+        // taken before the wait, it would miss the window another session
+        // opened meanwhile, and this one would catch that as its own (two
+        // agents with one window, and the window it really opened left
+        // wherever the app put it).
         let before = Set(WindowList.of(pid: pid).map(\.id))
         let catcher = WindowCatcher(pid: pid, before: before, manager: self)
         // A window built by script can't take key before it exists: hold the
         // user's input from the moment it shows up, not while it's asked for.
         catcher.onSeen = { hold?.start() }
-        Self.openLock.lock()
         focusGuard.beginAction(pid: pid, cause: "opening a \(name) window")
         lock.lock(); opening.insert(pid); lock.unlock()
         Self.sharedLock.lock(); Self.openingAnywhere.insert(pid); Self.sharedLock.unlock()
@@ -323,6 +389,7 @@ public final class WindowManager {
         let qos = qos_class_self()
         if hold != nil { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) }
         defer { if hold != nil { pthread_set_qos_class_self_np(qos, 0) } }
+        try beforeAsk?()
 
         // If an agent already has a window of this app, make it the app's key
         // window first: apps place new windows relative to their key window,
@@ -330,21 +397,22 @@ public final class WindowManager {
         // screen (where it would cover the pointer and end hover effects).
         // This session's own window first, else any agent's.
         // Key changes while opening must not interleave with another session
-        // typing into a window of the same app, so hold the input lock until
-        // key is handed back.
-        Engine.inputLock.lock()
+        // typing into a window of the same app, so hold the app's input lock
+        // until key is handed back.
+        let appLock = Engine.inputLock(pid)
+        appLock.lock()
         var holdingInput = true
         // Keys typed into the app while its key window is moving are held,
         // even if the user wasn't in it.
         focusGuard.beginSwap(pid)
-        defer { if holdingInput { focusGuard.endSwap(pid); Engine.inputLock.unlock() } }
+        defer { if holdingInput { focusGuard.endSwap(pid); appLock.unlock() } }
         // Read under the lock: another session's swap may have an agent
         // window key until it's done.
         let previousKey = AX.focusedWindowID(pid)
         // Apps that can be told where to build a new window (Chromium
         // browsers) open it straight on the agent display, so no anchor is
         // needed and nothing ever reaches the user's screen.
-        let scripted = trigger == nil || trigger == "script" ? Self.scriptedNewWindow(pid: pid, bundleID: bundleID) : nil
+        let scripted = trigger == nil || trigger == "script" ? Self.scriptableBrowser(pid: pid, bundleID: bundleID) : nil
         if scripted == nil { hold?.start() }
         var scope: KeyScope?
         if scripted == nil, placement.contains(.anchor), let anchor = anchorWindow(pid: pid) {
@@ -378,17 +446,32 @@ public final class WindowManager {
         var scriptFailed = scripted == nil
         if let scripted {
             how = "AppleScript, built at its place on the agent display"
-            // Chromium shows the window a few hundred ms before the script
-            // returns: run it alongside, so key goes back as soon as the
-            // window is caught rather than when the script is done.
-            let source = scripted(nextFrame(size: CGSize(width: 1400, height: 900)))
+            // The browser shows the window before it answers: ask alongside,
+            // so key goes back as soon as the window is caught rather than
+            // when the answer is in.
+            let frame = nextFrame(size: CGSize(width: 1400, height: 900))
             let ok = Locked<Bool?>(nil)
-            DispatchQueue.global(qos: .userInitiated).async { ok.value = Self.runAppleScript(source) }
+            // Its answer names the window by the browser's own id, which
+            // `navigate` needs; whichever comes last, the answer or the
+            // catch, files it.
+            let named = Locked<(id: String?, window: CGWindowID?)>((nil, nil))
+            DispatchQueue.global(qos: .userInitiated).async {
+                let answer = BrowserAutomation.makeWindow(bundleID: scripted, bounds: frame)
+                if let id = answer.id {
+                    let window = named.with { $0.id = id; return $0.window }
+                    if let window { Self.noteBrowserID(id, of: window) }
+                }
+                ok.value = answer.made
+            }
             // In the app the user is in, wait until it's shown too: it's
             // caught when created, before it can take key, and giving key
             // back then would end the hold just before the window takes it.
             caught = catcher.waitForWindow(timeoutMs: 6500, shown: hold != nil) { ok.value == false }
             scriptFailed = caught == nil && ok.value == false
+            if let caught {
+                let id = named.with { $0.window = caught; return $0.id }
+                if let id { Self.noteBrowserID(id, of: caught) }
+            }
         }
         if scriptFailed {
             hold?.start()
@@ -418,7 +501,7 @@ public final class WindowManager {
             }
         }
         focusGuard.endSwap(pid)
-        Engine.inputLock.unlock()
+        appLock.unlock()
         holdingInput = false
         // The app the user is in must end with their window key.
         if BCUFrontProcessPID() == pid { focusGuard.reclaimWhenSafe(pid) }
@@ -446,17 +529,33 @@ public final class WindowManager {
         return OpenResult(window: aw, notes: notes)
     }
 
-    /// The AppleScript that makes the app build a new window at a given frame
-    /// (global points, top-left origin) before it shows it, for apps known to
-    /// honor that: Chromium browsers (`make new window with properties
-    /// {bounds:…}`). Most apps' scripting (Finder's, TextEdit's) places a new
-    /// window where it always would and applies the bounds after it's on
-    /// screen, which is no better than moving it. Nil for those.
-    static func scriptedNewWindow(pid: pid_t, bundleID: String?) -> ((CGRect) -> String)? {
+    /// The bundle id of an app that can be told where to build a new window
+    /// (global points, top-left origin) before it shows it: Chromium
+    /// browsers (`make new window with properties {bounds:…}`). Most apps'
+    /// scripting (Finder's, TextEdit's) places a new window where it always
+    /// would and applies the bounds after it's on screen, which is no better
+    /// than moving it. Nil for those.
+    static func scriptableBrowser(pid: pid_t, bundleID: String?) -> String? {
         guard let bundleID, let url = NSRunningApplication(processIdentifier: pid)?.bundleURL,
               BrowserAutomation.isScriptableChromium(url), mayScript(bundleID, app: url) else { return nil }
-        func bounds(_ r: CGRect) -> String { "{\(Int(r.minX)), \(Int(r.minY)), \(Int(r.maxX)), \(Int(r.maxY))}" }
-        return { "with timeout of 5 seconds\ntell application id \"\(bundleID)\" to make new window with properties {bounds:\(bounds($0))}\nend timeout" }
+        return bundleID
+    }
+
+    /// The browser's own ids (`id of window` in its scripting) of windows it
+    /// built when asked to, by window id.
+    private static var browserIDs: [CGWindowID: String] = [:]
+
+    static func noteBrowserID(_ id: String, of window: CGWindowID) {
+        sharedLock.lock(); defer { sharedLock.unlock() }
+        // (Window ids aren't reused while the Mac is up; this only keeps the
+        // table from growing.)
+        if browserIDs.count > 500 { browserIDs = browserIDs.filter { WindowList.info($0.key) != nil } }
+        browserIDs[window] = id
+    }
+
+    static func browserID(of window: CGWindowID) -> String? {
+        sharedLock.lock(); defer { sharedLock.unlock() }
+        return browserIDs[window]
     }
 
     private static let askedLock = NSLock()
@@ -480,27 +579,6 @@ public final class WindowManager {
             }
             return false
         }
-    }
-
-    /// Run AppleScript source; whether it finished without an error. The
-    /// first time for each app macOS asks the user whether this app may
-    /// control it (Automation); until they answer it times out.
-    static func runAppleScript(_ source: String, timeoutMs: Double = 6000) -> Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        p.arguments = source.split(separator: "\n").flatMap { ["-e", String($0)] }
-        let err = Pipe()
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = err
-        do { try p.run() } catch { return false }
-        let deadline = nowMs() + timeoutMs
-        while p.isRunning && nowMs() < deadline { sleepMs(10) }
-        if p.isRunning { p.terminate(); Log.info("AppleScript timed out"); return false }
-        if p.terminationStatus != 0 {
-            Log.info("AppleScript failed: \(String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))")
-            return false
-        }
-        return true
     }
 
     /// A window of `pid` on an agent display to open the new window next to.
@@ -594,8 +672,12 @@ public final class WindowManager {
     public func release(_ id: CGWindowID, keepOpen: Bool) throws -> String {
         guard let w = window(id) else { throw ToolError("window \(id) isn't one of yours") }
         guard let ax = AX.window(pid: w.pid, id: id) else {
-            unregister(id)
-            return "window \(id) is already gone"
+            // (Gone only if the window server says so: see `Engine.agentWindow`.)
+            if WindowList.info(id) == nil {
+                unregister(id)
+                return "window \(id) is already gone"
+            }
+            throw ToolError("\(w.appName) isn't answering right now, so window \(id) is still open. It may be showing a dialog that has to be answered first (list_windows shows a dialog of yours). Try again in a moment.")
         }
         focusGuard.unpark(w.pid, window: id, reason: "window released")
         noteBefore(pid: w.pid)
@@ -614,19 +696,160 @@ public final class WindowManager {
                 unregister(id)
                 return "left window \(id) open"
             }
+            let before = Set(AX.windows(w.pid).compactMap { AX.windowID($0) })
+            let onScreenBefore = Set(WindowList.of(pid: w.pid).map(\.id))
             if let close = AX.element(ax, "AXCloseButton") {
                 AX.perform(close, "AXPress")
             } else {
                 AX.perform(ax, "AXCancel")
             }
-            let deadline = nowMs() + 1500
-            while WindowList.info(id) != nil && nowMs() < deadline { sleepMs(50) }
-            if WindowList.info(id) != nil {
-                return "window \(id) didn't close. A dialog may be asking something (unsaved changes?): check get_window_state, answer it, then release again."
+            // A page can ask whether to leave it ("Leave site?"), in a dialog
+            // that comes up on the user's screen. The agent asked to close
+            // its own window, so the answer is yes, given the moment the
+            // dialog shows rather than when the wait runs out: it's gone
+            // from their screen within a frame or two.
+            var asked: String?
+            var looked: Set<CGWindowID> = []
+            func closed(withinMs ms: Double) -> Bool {
+                let deadline = nowMs() + ms
+                while WindowList.info(id) != nil && nowMs() < deadline {
+                    for info in WindowList.of(pid: w.pid, onScreenOnly: true)
+                    where info.layer <= 8 && !onScreenBefore.contains(info.id) && !looked.contains(info.id) {
+                        // (Not in accessibility yet: look again next time round.)
+                        guard let dialog = AX.window(pid: w.pid, id: info.id) else { continue }
+                        looked.insert(info.id)
+                        let said = Self.texts(in: dialog).joined(separator: " ")
+                        if Self.answerLeave(dialog) { asked = said }
+                    }
+                    sleepMs(10)
+                }
+                return WindowList.info(id) == nil
             }
-            unregister(id)
-            return "closed window \(id)"
+            if closed(withinMs: 1500) {
+                unregister(id)
+                for other in windows where other.kind == .caught && WindowList.info(other.id) == nil { unregister(other.id) }
+                if let asked { return "closed window \(id) (the page asked \"\(asked)\"; answered Leave)" }
+                return "closed window \(id)"
+            }
+            // The app asked before closing, in a window of its own that can
+            // be anywhere (Chromium's "Leave site?" comes up on the user's
+            // screen). Left unanswered it holds the app's key window, so no
+            // agent's keys reach the app and no window of it closes.
+            for dialog in dialogs(pid: w.pid, notIn: before) {
+                let said = Self.texts(in: dialog.ax)
+                let buttons = Self.buttons(in: dialog.ax)
+                // A page asking whether to leave it: the agent asked to
+                // close its own window, so yes.
+                if Self.answerLeave(dialog.ax) {
+                    if closed(withinMs: 1500) {
+                        unregister(id)
+                        if window(dialog.id) != nil { unregister(dialog.id) }
+                        return "closed window \(id) (the page asked \"\(said.joined(separator: " "))\"; answered Leave)"
+                    }
+                    continue
+                }
+                // Anything else is the agent's to answer: put it where the agent looks.
+                let frame = WindowList.info(id)?.bounds ?? display.bounds
+                let size = AX.size(dialog.ax) ?? CGSize(width: 400, height: 300)
+                AX.setPosition(dialog.ax, CGPoint(x: frame.midX - size.width / 2, y: frame.minY + 80))
+                if window(dialog.id) == nil {
+                    register(AgentWindow(id: dialog.id, pid: w.pid, appName: w.appName, bundleID: w.bundleID, kind: .caught))
+                }
+                return "window \(id) didn't close: \(w.appName) is asking \"\(said.joined(separator: " "))\" (\(buttons.map(\.title).joined(separator: " / "))). The dialog is over window \(id) on your display now: get_window_state window_id=\(id) lists its buttons. Press one, then release again."
+            }
+            return "window \(id) didn't close. A dialog may be asking something (unsaved changes?): check get_window_state, answer it, then release again."
         }
+    }
+
+    /// Windows of `pid` that aren't ordinary ones (dialogs, alerts) and
+    /// could be asking about a window of this session's: ones that weren't
+    /// there `before`, and ones this session's watchdog already caught (it
+    /// can get to a new dialog first). Never another session's.
+    private func dialogs(pid: pid_t, notIn before: Set<CGWindowID>) -> [(ax: AXUIElement, id: CGWindowID)] {
+        AX.windows(pid).compactMap { ax in
+            guard let wid = AX.windowID(ax), AX.string(ax, "AXSubrole") != "AXStandardWindow",
+                  !Self.isRegistered(wid, byOtherThan: sessionKey),
+                  !before.contains(wid) || window(wid)?.kind == .caught else { return nil }
+            return (ax, wid)
+        }
+    }
+
+    private static func walk(_ el: AXUIElement, depth: Int = 0, _ visit: (AXUIElement, String) -> Void) {
+        guard depth < 8 else { return }
+        visit(el, AX.string(el, "AXRole") ?? "")
+        for child in AX.children(el) { walk(child, depth: depth + 1, visit) }
+    }
+
+    static func buttons(in el: AXUIElement) -> [(title: String, element: AXUIElement)] {
+        var out: [(String, AXUIElement)] = []
+        walk(el) { e, role in
+            if role == "AXButton", let t = AX.string(e, "AXTitle"), !t.isEmpty { out.append((t, e)) }
+        }
+        return out
+    }
+
+    /// A small dialog asking whether to leave a page (Chromium's "Leave
+    /// site?", with Leave and Cancel): press Leave. Only ever for a window
+    /// known to be an agent's (a session's own, or on an agent display),
+    /// about a window the agent is done with.
+    @discardableResult
+    static func answerLeave(_ dialog: AXUIElement) -> Bool {
+        let found = buttons(in: dialog)
+        guard found.count <= 4, let leave = found.first(where: { $0.title == "Leave" }),
+              found.contains(where: { $0.title == "Cancel" }) else { return false }
+        return AX.perform(leave.element, "AXPress") == .success
+    }
+
+    static func texts(in el: AXUIElement) -> [String] {
+        var out: [String] = []
+        walk(el) { e, role in
+            if role == "AXStaticText", let t = AX.string(e, "AXValue"), !t.isEmpty, out.count < 4 { out.append(String(t.prefix(160))) }
+        }
+        return out
+    }
+
+    private static let leftoverLock = NSLock()
+
+    /// Windows on a display that nobody should have left there: ordinary
+    /// ones and dialogs, of any app but this one.
+    static func windows(on bounds: CGRect) -> [WindowInfo] {
+        guard !bounds.isEmpty else { return [] }
+        return WindowList.all(onScreenOnly: true).filter { w in
+            w.pid != getpid() && w.layer >= 0 && w.layer <= 8 && w.alpha > 0 && w.bounds.width > 40 && w.bounds.height > 40
+                && bounds.contains(CGPoint(x: w.bounds.midX, y: w.bounds.midY)) && w.owner != "Window Server" && w.owner != "Dock"
+        }
+    }
+
+    /// Close what's left on a display no agent is using any more: when the
+    /// display goes, macOS moves every window on it to the user's screen.
+    /// Returns how many wouldn't close. Not on the main thread.
+    @discardableResult
+    static func closeLeftovers(on bounds: CGRect) -> Int {
+        // One sweep at a time: each can wait a second or two on an app.
+        guard leftoverLock.try() else { return windows(on: bounds).count }
+        defer { leftoverLock.unlock() }
+        // Not a window some session has: it's on this display for a moment
+        // (macOS put it here, or it's being taken over), and its session
+        // moves it to its own. It counts as left, so the display stays
+        // until it's gone.
+        // Dialogs first: one that's asking about a window keeps it open.
+        let found = windows(on: bounds).filter { !isRegistered($0.id) }
+            .compactMap { info in AX.window(pid: info.pid, id: info.id).map { (info, $0) } }
+        for (_, ax) in found where answerLeave(ax) { sleepMs(400) }
+        for (info, ax) in found where WindowList.info(info.id) != nil {
+            if let close = AX.element(ax, "AXCloseButton") { AX.perform(close, "AXPress") } else { AX.perform(ax, "AXCancel") }
+            let deadline = nowMs() + 1200
+            while WindowList.info(info.id) != nil && nowMs() < deadline { sleepMs(50) }
+        }
+        // A page that only now asks whether to leave: nobody is left to say no.
+        for info in windows(on: bounds) where !isRegistered(info.id) {
+            if let ax = AX.window(pid: info.pid, id: info.id), answerLeave(ax) { sleepMs(400) }
+        }
+        let left = windows(on: bounds)
+        if !left.isEmpty {
+            Log.info("leftover windows on an agent display wouldn't close: \(left.map { "\($0.owner) \($0.id) \"\($0.title.prefix(30))\"" }.joined(separator: ", "))")
+        }
+        return left.count
     }
 
     /// The window stays on the agent display until the user asks for it
@@ -654,6 +877,10 @@ public final class WindowManager {
         // The user asked for it, so it takes the front.
         focusGuard.noteUserSwitch()
         _ = BCUSetFrontProcess(w.pid, id, 0x200)
+        // The make-key records once the app is active (see `FocusGuard.makeKeyAgain`).
+        let deadline = nowMs() + 400
+        while BCUFrontProcessPID() != w.pid && nowMs() < deadline { sleepMs(2) }
+        sleepMs(FocusGuard.activationSettleMs)
         _ = BCUPostMakeKeyRecords(w.pid, id)
         AX.perform(ax, "AXRaise")
     }
@@ -752,8 +979,14 @@ public final class WindowManager {
         // the agent display. A new, unregistered window there, from the app the
         // user is in, is theirs: move it to their screen.
         let front = BCUFrontProcessPID()
-        for info in onScreen where info.layer == 0 && agent[info.id] == nil && display.holds(info.bounds)
-            && !opening.contains(info.pid) && !Self.isOpening(info.pid) {
+        for info in onScreen where info.layer == 0 && agent[info.id] == nil && display.holds(info.bounds) {
+            // Asked afresh, and in this order: `agent` is from the start of
+            // this sweep, and an open that finished since has registered its
+            // window before saying it's done. Reading the older copy and the
+            // newer flag took an agent's new window for one the user opened,
+            // and put it on their screen.
+            lock.lock(); let mine = opening.contains(info.pid); lock.unlock()
+            if mine || Self.isOpening(info.pid) || Self.isRegistered(info.id) { continue }
             // Judge each new window for 1.5 s: the guard learns the user's front
             // app a moment after it changes.
             lock.lock()
@@ -776,7 +1009,11 @@ public final class WindowManager {
             focusGuard.record("moved a new \(info.owner) window you opened from the agent display to your screen")
         }
 
-        for info in onScreen where info.layer == 0 {
+        // Up to the modal-panel level: an alert the app raises (Chromium's
+        // "Leave site?", a save or permission dialog) sits above ordinary
+        // windows, comes up on the user's screen, and takes the app's key
+        // window. Missed, it stays there, and every agent in the app is stuck.
+        for info in onScreen where info.layer >= 0 && info.layer <= 8 {
             if let w = agent[info.id] {
                 if !w.handedOff && display.touchesUser(info.bounds) && !display.holds(info.bounds),
                    let ax = AX.window(pid: w.pid, id: w.id) {
@@ -805,10 +1042,18 @@ public final class WindowManager {
                   display.touchesUser(info.bounds), !display.holds(info.bounds),
                   info.bounds.width > 40, info.bounds.height > 40,
                   let ax = AX.window(pid: info.pid, id: info.id) else { continue }
-            moveToAgent(ax, size: info.bounds.size)
+            // A dialog goes over the window it's about (where the agent
+            // will find it listed with that window's elements), another
+            // window to the next free place.
+            let dialog = info.layer > 0 || AX.string(ax, "AXSubrole") != "AXStandardWindow"
+            if dialog, let about = agent.values.filter({ $0.pid == info.pid && !$0.handedOff }).compactMap({ WindowList.info($0.id)?.bounds }).first {
+                AX.setPosition(ax, CGPoint(x: about.midX - info.bounds.width / 2, y: about.minY + 80))
+            } else {
+                moveToAgent(ax, size: info.bounds.size)
+            }
             let app = NSRunningApplication(processIdentifier: info.pid)
             register(AgentWindow(id: info.id, pid: info.pid, appName: app?.localizedName ?? info.owner, bundleID: app?.bundleIdentifier, kind: .caught))
-            focusGuard.record("caught a new \(app?.localizedName ?? info.owner) window on your display and moved it to the agent display")
+            focusGuard.record("caught a new \(app?.localizedName ?? info.owner) \(dialog ? "dialog" : "window") on your display and moved it to the agent display")
         }
 
         lock.lock()
@@ -880,7 +1125,7 @@ final class WindowCatcher {
 
     /// AXObserver path: runs on the main thread right after the window is created.
     fileprivate func created(_ element: AXUIElement) {
-        guard let id = AX.windowID(element), !before.contains(id) else { return }
+        guard let id = AX.windowID(element), !before.contains(id), !WindowManager.isRegistered(id) else { return }
         catchWindow(id: id, element: element)
     }
 
@@ -909,7 +1154,9 @@ final class WindowCatcher {
     private func poll() {
         while polling {
             let now = nowMs()
-            for info in WindowList.of(pid: pid, onScreenOnly: true) where info.layer == 0 && !before.contains(info.id) {
+            // (Never a window some session already has, whenever it appeared.)
+            for info in WindowList.of(pid: pid, onScreenOnly: true) where info.layer == 0 && !before.contains(info.id)
+                && !WindowManager.isRegistered(info.id) {
                 lock.lock()
                 let first = firstSeenMs == nil
                 if first { firstSeenMs = now }

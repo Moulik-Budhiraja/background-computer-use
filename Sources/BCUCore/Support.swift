@@ -140,4 +140,8 @@ final class Locked<T>: @unchecked Sendable {
     func mutate(_ change: (inout T) -> Void) {
         lock.lock(); change(&stored); lock.unlock()
     }
+    func with<R>(_ body: (inout T) -> R) -> R {
+        lock.lock(); defer { lock.unlock() }
+        return body(&stored)
+    }
 }

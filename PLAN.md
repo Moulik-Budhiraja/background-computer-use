@@ -59,7 +59,10 @@ So the tool snapshots each touched app's key and main window before acting and r
 
 ### 3. Activation
 
-Some actions make an app activate itself (bring itself frontmost): opening a window, showing a sheet, opening a menu. Without injection this can't be blocked, so it has to be made harmless:
+Some actions make an app activate itself (bring itself frontmost): opening a window, showing a sheet, opening a menu. The call can't be blocked without injection, but macOS can be made to refuse it:
+- **Front gate.** Every app's own request to come forward goes through WindowServer (`SLSSetFrontProcessWithInfo`), which refuses it for an app that isn't on LaunchServices' list of apps permitted in front (`LSPermittedFrontASNs`, set with `_LSSetMetaApplicationInformationItem`; an empty list permits everyone). While agents have windows in apps the user isn't in, the list is every running app but those. It keeps the user out of them too (a click or cmd+Tab is refused the same way), so the input tap empties it before any event that could be a switch goes on, and a helper process empties it if the engine dies or hangs. See `FrontGate.swift`.
+
+For the moments the gate is open:
 - **Keystroke hold.** The guard watches your keyboard with an event tap. If an app activates within a short window after an agent action on that app, the guard holds your keystrokes, re-activates your app, and replays them. Nothing you type lands in the agent's window, even for one frame.
 - **Separate Spaces.** With "Displays have separate Spaces" on, an app activating on the agent display doesn't switch your Space or move your windows.
 - **Measure what macOS does.** macOS 14+ made activation cooperative for apps that use the new `activate()` API, so many apps may not steal focus at all. The spike measures this per app instead of assuming it.

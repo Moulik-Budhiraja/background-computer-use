@@ -105,6 +105,8 @@ final class Chaos {
             while BCUFrontProcessPID() != getpid() && nowMs() - t0 < 200 { usleep(1000) }
             let away = nowMs() - t0
             sleepMs(ms - away)
+            // The app coming back isn't its own doing: let it through the gate.
+            focusGuard.gate.lift(ms: 600)
             _ = BCUSetFrontProcess(back, 0, 0x200)
             let t1 = nowMs()
             while BCUFrontProcessPID() != back && nowMs() - t1 < 300 { usleep(1000) }
