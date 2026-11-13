@@ -159,6 +159,8 @@ public final class FrontGate {
     private var liftedUntilMs = 0.0
     private var switcherOpen = false
     private var switcherSinceMs = 0.0
+    private var pointerDown = false
+    private var pointerSinceMs = 0.0
     /// Another process keeps a list of its own (a kiosk or exam app): hands off.
     private var foreign = false
     private var started = false
@@ -175,6 +177,8 @@ public final class FrontGate {
 
     /// The cmd+Tab switcher never keeps the gate open longer than this by itself.
     private static let switcherMaxMs = 30_000.0
+    /// Nor a mouse button whose release the tap never saw.
+    private static let pointerMaxMs = 60_000.0
     private static let markerName = "front-gate.on"
     static let watchdogFlag = "--bcu-front-gate-watchdog"
 
@@ -232,14 +236,17 @@ public final class FrontGate {
     public func stop() {
         lock.lock()
         stopping = true
-        if applied != nil { clearLocked() }
+        let cleared = applied == nil || clearLocked()
         let helper = watchdog
         watchdog = nil
         try? heartbeat?.close()
         heartbeat = nil
         lock.unlock()
+        // The helper clears the list too as it goes (on the signal, or when
+        // the pipe closes). If it's still there after all that, the marker
+        // stays so that the next launch clears it.
         helper?.terminate()
-        try? FileManager.default.removeItem(at: markerURL)
+        if cleared { try? FileManager.default.removeItem(at: markerURL) }
     }
 
     // MARK: Opening it for the user
@@ -274,6 +281,23 @@ public final class FrontGate {
         lock.unlock()
     }
 
+    /// A mouse button went down, or came up: open for as long as it's held
+    /// and `ms` after. What a drag is let go on can come forward (a file on
+    /// a Dock icon, an item of a Dock menu), however long the drag took.
+    public func pointer(down: Bool, ms: Double) {
+        lock.lock()
+        let now = nowMs()
+        if down {
+            if !pointerDown { pointerSinceMs = now }
+            pointerDown = true
+            if applied != nil { clearLocked(); stats.lifts += 1 }
+        } else {
+            pointerDown = false
+        }
+        liftedUntilMs = max(liftedUntilMs, now + ms)
+        lock.unlock()
+    }
+
     public var isLifted: Bool {
         lock.lock(); defer { lock.unlock() }
         return liftedLocked(nowMs())
@@ -281,7 +305,8 @@ public final class FrontGate {
 
     private func liftedLocked(_ now: Double) -> Bool {
         if switcherOpen && now - switcherSinceMs > Self.switcherMaxMs { switcherOpen = false }
-        return now < liftedUntilMs || switcherOpen
+        if pointerDown && now - pointerSinceMs > Self.pointerMaxMs { pointerDown = false }
+        return now < liftedUntilMs || switcherOpen || pointerDown
     }
 
     // MARK: Keeping the list
@@ -403,20 +428,25 @@ public final class FrontGate {
         }
     }
 
-    /// Lock held.
-    private func clearLocked() {
-        // A list this process couldn't take away again would keep the user
-        // out of those apps: ask twice, and say so if it's still there (the
-        // watchdog keeps trying, and so does every later pass).
-        if Self.setList([]) != 0, Self.currentList() != nil, Self.setList([]) != 0, Self.currentList() != nil {
-            let now = nowMs()
-            guard now - lastClearNoteMs > 5000 else { return }
+    /// Lock held. False if the list is still there: then this process still
+    /// counts it as its own, so every later pass, `lift` and `stop` ask again
+    /// (forgetting it would make the next pass take it for another app's
+    /// list and leave it alone for good).
+    @discardableResult
+    private func clearLocked() -> Bool {
+        for _ in 0..<2 {
+            if Self.setList([]) == 0 || Self.currentList() == nil {
+                applied = nil
+                appliedList = []
+                return true
+            }
+        }
+        let now = nowMs()
+        if now - lastClearNoteMs > 5000 {
             lastClearNoteMs = now
             DispatchQueue.global().async { Log.info("gate: couldn't clear the permitted-front list; trying again") }
-        } else {
-            applied = nil
-            appliedList = []
         }
+        return false
     }
 
     // MARK: Watchdog
@@ -425,6 +455,10 @@ public final class FrontGate {
     /// log out. The helper clears it when this process dies (its pipe closes)
     /// or hangs (no byte for 3 s).
     private func startWatchdog() {
+        // The heartbeat is written to a pipe whose other end goes when the
+        // helper dies: that must be an error to act on (`beat` clears the
+        // list), not a signal that kills this process with the list in place.
+        signal(SIGPIPE, SIG_IGN)
         guard let exe = Bundle.main.executableURL ?? URL(string: CommandLine.arguments[0]).map({ URL(fileURLWithPath: $0.path) }) else { return }
         let p = Process()
         p.executableURL = exe
@@ -489,14 +523,20 @@ public final class FrontGate {
     public static func runWatchdogIfAsked() {
         guard CommandLine.arguments.contains(watchdogFlag) else { return }
         signal(SIGPIPE, SIG_IGN)
+        // Told to go (the engine's `stop`, or `pkill` by name, which hits
+        // both processes): clear on the way out, like on any other exit.
+        // The handler only sets a flag; `poll` returns when a signal lands.
+        for s in [SIGTERM, SIGINT, SIGHUP] { signal(s) { _ in watchdogToldToGo = 1 } }
         func clear() {
             if currentList() != nil { setList([]) }
         }
         var fd = pollfd(fd: 0, events: Int16(POLLIN), revents: 0)
         var buffer = [UInt8](repeating: 0, count: 64)
         while true {
+            if watchdogToldToGo != 0 { clear(); exit(0) }
             fd.revents = 0
             let r = poll(&fd, 1, 3000)
+            if watchdogToldToGo != 0 { clear(); exit(0) }
             if r == 0 {
                 // The engine hasn't answered for 3 s: let the user through.
                 clear()
@@ -515,3 +555,6 @@ public final class FrontGate {
         }
     }
 }
+
+/// Set by the watchdog's signal handlers (see `runWatchdogIfAsked`).
+nonisolated(unsafe) private var watchdogToldToGo: sig_atomic_t = 0

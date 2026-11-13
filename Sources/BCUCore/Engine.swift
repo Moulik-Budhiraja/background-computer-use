@@ -90,6 +90,11 @@ public final class Engine {
     private let waitBudget = WaitBudget()
     /// The current step passed `priority: "now"`: no waiting for the user.
     private var priorityNow = false
+    /// How long the tool call under way has waited for the user to stop
+    /// typing, over all its steps, and how deep in `run` it is (a batch
+    /// runs its steps through `run` too).
+    private var typingWaitedMs = 0.0
+    private var runDepth = 0
     /// Waits for the user during the current call, for its result.
     private var waitNotes: [String] = []
     /// Waits for other agents (a free display, their turn at an app's key
@@ -481,6 +486,13 @@ public final class Engine {
         let outerPriority = priorityNow
         priorityNow = args.string("priority")?.lowercased() == "now"
         defer { priorityNow = outerPriority }
+        // The patience for the user's typing is the whole call's (see `typingDeadline`).
+        if runDepth == 0 { typingWaitedMs = 0 }
+        runDepth += 1
+        defer {
+            runDepth -= 1
+            if runDepth == 0 { typingWaitedMs = 0 }
+        }
         defer {
             if Self.batchable.contains(tool), tool != "wait", let id = args.int("window_id") {
                 lastActionMs[CGWindowID(id)] = nowMs()
@@ -1105,7 +1117,7 @@ public final class Engine {
                 freeze = ScreenFreeze.show(shots, chromeOnly: typing)
             }
         }
-        if let freeze { focusGuard.onUserPress = { [weak freeze] in freeze?.uncoverContent() } }
+        if let freeze { focusGuard.onUserPress(for: sessionID) { [weak freeze] in freeze?.uncoverContent() } }
         cover = SwapCover(pid: w.pid, freeze: freeze, userWindow: userWindow ?? focusGuard.userWindow(of: w.pid),
                           openedMs: nowMs(), lastUsedMs: nowMs())
         UserSim.shared.coverOpened(cause)
@@ -1115,7 +1127,7 @@ public final class Engine {
     private func closeCover() {
         guard let c = cover else { return }
         cover = nil
-        focusGuard.onUserPress = nil
+        focusGuard.onUserPress(for: sessionID, nil)
         c.freeze?.end()
         UserSim.shared.coverClosed()
     }
@@ -1182,15 +1194,19 @@ public final class Engine {
     /// A step gave the user's typing `typingPatienceMs` to stop, in one wait
     /// or in several (it started over each time they started again).
     private static func typingError(appName: String, cause: String) -> ToolError {
-        ToolError("the user has been typing in \(appName) for the \(Int(QuietRules.typingPatienceMs / 1000)) s this step waited, and \(cause) would take the keyboard from their window for a moment (what they type would lag), so nothing was done: their typing goes first. Steps that need no key focus still work meanwhile: set_value, type_text without Return or Tab, clicking an element, get_window_state. Otherwise wait a few seconds and retry.")
+        ToolError("the user has been typing in \(appName) for the \(Int(QuietRules.typingPatienceMs / 1000)) s this step waited, and \(cause) would take the keyboard from their window for a moment (what they type would lag), so that wasn't done: their typing goes first. Steps that need no key focus still work meanwhile: set_value, type_text without Return or Tab, clicking an element, get_window_state. Otherwise wait a few seconds and retry.")
     }
 
     /// The user is typing, and steps wait for that (see `QuietWait.typing`
     /// and `QuietRules.safeTyping`).
     private var userTyping: Bool { QuietRules.safeTyping && QuietWait.typing(focusGuard.activity.snapshot, now: nowMs()) }
 
-    /// When a step that waits for the user's typing gives up.
-    private var typingDeadline: Double { nowMs() + QuietRules.typingPatienceMs }
+    /// When a step that waits for the user's typing gives up: once the tool
+    /// call it's part of has waited `typingPatienceMs` in all. A call can be
+    /// many steps (a batch's, text typed a few characters at a time, each
+    /// Return), and with a fresh allowance for each it would outlast the
+    /// client's timeout and go on typing after the agent was told it failed.
+    private var typingDeadline: Double { nowMs() + max(0, QuietRules.typingPatienceMs - typingWaitedMs) }
 
     /// `anywhere`: the step may bring its app to the front, which breaks a
     /// drag or a menu in whatever app the user is in, so wait out those
@@ -1216,6 +1232,7 @@ public final class Engine {
             : QuietWait.wait(focusGuard.activity, pid: pid, softMs: caps.softMs, hardMs: caps.hardMs,
                              typingOnly: typingOnly, giveUpAtMs: giveUpAtMs, stop: stop, willWait: willWait)
         waitBudget.add(r.countedMs)
+        typingWaitedMs += max(0, r.waitedMs - r.countedMs)
         if shown {
             stateLock.lock(); _busy = busy; stateLock.unlock()
             changed()

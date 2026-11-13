@@ -812,6 +812,53 @@ public final class WindowManager {
 
     /// Windows on a display that nobody should have left there: ordinary
     /// ones and dialogs, of any app but this one.
+    /// When each window was first seen on a spare display (see `rescue`).
+    nonisolated(unsafe) private static var seenOnSpare: [CGWindowID: Double] = [:]
+
+    /// A display kept as a spare has no agent and nothing sweeping it, but
+    /// apps still open new windows where their last one was: a window the
+    /// user opens in an app an agent used can land there, where they can't
+    /// see it (and it would be closed with the display later). One that's
+    /// new there, a standard window, from the app the user is in, is
+    /// theirs: put it on their screen, as `sweep` does for a display in use.
+    /// Asked every second while there are spares; done off the caller's
+    /// thread (it asks the app over accessibility, which can take a while).
+    static func rescue(fromSpares spares: [CGRect]) {
+        rescueQueue.async { rescueNow(fromSpares: spares) }
+    }
+
+    private static let rescueQueue = DispatchQueue(label: "bcu.spare-rescue", qos: .utility)
+
+    private static func rescueNow(fromSpares spares: [CGRect]) {
+        guard !spares.isEmpty, let guardian = FocusGuard.shared else {
+            if !seenOnSpare.isEmpty { seenOnSpare = [:] }
+            return
+        }
+        let front = BCUFrontProcessPID()
+        let now = nowMs()
+        let there = WindowList.all(onScreenOnly: true).filter { info in
+            info.layer == 0 && spares.contains { $0.contains(CGPoint(x: info.bounds.midX, y: info.bounds.midY)) }
+        }
+        seenOnSpare = seenOnSpare.filter { id, _ in there.contains { $0.id == id } }
+        for info in there where !isRegistered(info.id) && !isOpening(info.pid) {
+            let firstSeen = seenOnSpare[info.id] ?? now
+            if seenOnSpare[info.id] == nil { seenOnSpare[info.id] = firstSeen }
+            // Judged for a few seconds from when it shows up (this looks
+            // once a second, and the guard learns the user's app a moment
+            // after it changes); what was there before isn't touched.
+            guard now - firstSeen < 3000, info.pid == front, info.pid == guardian.userFront,
+                  info.bounds.width > 100, info.bounds.height > 100,
+                  let ax = AX.window(pid: info.pid, id: info.id),
+                  AX.string(ax, "AXSubrole") == "AXStandardWindow" else { continue }
+            let main = CGDisplayBounds(CGMainDisplayID())
+            let w = min(info.bounds.width, main.width - 80), h = min(info.bounds.height, main.height - 120)
+            AX.setPosition(ax, CGPoint(x: main.midX - w / 2, y: main.midY - h / 2))
+            AX.setSize(ax, CGSize(width: w, height: h))
+            seenOnSpare[info.id] = -1e12
+            guardian.record("moved a new \(info.owner) window you opened from a spare agent display to your screen")
+        }
+    }
+
     static func windows(on bounds: CGRect) -> [WindowInfo] {
         guard !bounds.isEmpty else { return [] }
         return WindowList.all(onScreenOnly: true).filter { w in

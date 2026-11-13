@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import CoreGraphics
 import CPrivate
 
@@ -32,13 +33,19 @@ public final class FocusGuard {
     /// Keeps agents' apps from bringing themselves to the front (see `FrontGate`).
     public let gate = FrontGate()
     /// Called from the input tap when the user presses a key or a mouse
-    /// button (not for moves or scrolls). Must return at once.
-    public var onUserPress: (() -> Void)? {
-        get { pressLock.lock(); defer { pressLock.unlock() }; return _onUserPress }
-        set { pressLock.lock(); _onUserPress = newValue; pressLock.unlock() }
+    /// button (not for moves or scrolls): `hook` must return at once. One
+    /// per owner (a session), so that two agents with a cover up in the
+    /// same app don't take away each other's; nil removes it.
+    public func onUserPress(for owner: String, _ hook: (() -> Void)?) {
+        pressLock.lock(); pressHooks[owner] = hook; pressLock.unlock()
     }
-    private var _onUserPress: (() -> Void)?
+    private var pressHooks: [String: () -> Void] = [:]
     private let pressLock = NSLock()
+
+    private func userPressed() {
+        pressLock.lock(); let hooks = Array(pressHooks.values); pressLock.unlock()
+        for hook in hooks { hook() }
+    }
 
     private let lock = NSLock()
     /// An app the agent is acting on. `count`: actions running now (sessions
@@ -74,6 +81,12 @@ public final class FocusGuard {
     /// from the moment they appear, before the launch reports a pid.
     private var launching: [String: Int] = [:]
     private var userFrontPid: pid_t = 0
+    /// The last regular app the user was in (see `gateTargets`).
+    private var userRegularPid: pid_t = 0
+    private var frontPolicy: (pid: pid_t, regular: Bool) = (0, true)
+    private var secureInputSeenMs = -Double.infinity
+    /// The Space each of the user's displays shows (see `spaceChanged`).
+    private var shownSpaces: [CGDirectDisplayID: UInt64] = [:]
     private var userFrontWindow: CGWindowID?
     private var lastUserMouseDownMs = 0.0
     private var lastUserSwitchKeyMs = 0.0
@@ -171,11 +184,21 @@ public final class FocusGuard {
         installTap()
         gate.targets = { [weak self] in self?.gateTargets() ?? FrontGate.Targets() }
         gate.tapWorking = { [weak self] in
-            guard let tap = self?.tap else { return false }
-            return CGEvent.tapIsEnabled(tap: tap)
+            guard let self, let tap = self.tap, CGEvent.tapIsEnabled(tap: tap) else { return false }
+            // With secure input on (a password field, Terminal's Secure
+            // Keyboard Entry) macOS shows the tap no keys at all, though it
+            // stays enabled: cmd+Tab and Return would never open the gate.
+            // So it stays open, and a moment longer: what the password was
+            // for (unlocking, an approval) is what brings an app forward.
+            let now = nowMs()
+            self.lock.lock(); defer { self.lock.unlock() }
+            if IsSecureEventInputEnabled() { self.secureInputSeenMs = now }
+            return now - self.secureInputSeenMs > Self.keyLiftMs
         }
         gate.onNote = { [weak self] note in self?.record(note) }
         gate.start()
+        let spaces = Self.userSpaces()
+        lock.lock(); shownSpaces = spaces; lock.unlock()
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.spaceChanged()
         }
@@ -465,6 +488,9 @@ public final class FocusGuard {
         if userFrontPid != pid { userFrontWindow = nil }
         userFrontPid = pid
         lock.unlock()
+        if NSRunningApplication(processIdentifier: pid)?.activationPolicy == .regular {
+            lock.lock(); userRegularPid = pid; lock.unlock()
+        }
         var window = AX.focusedWindowID(pid)
         if let w = window, Self.onAgentDisplay(w) { window = nil }
         lock.lock()
@@ -622,9 +648,20 @@ public final class FocusGuard {
     /// there is one the gate was keeping back, macOS couldn't bring it
     /// forward: do that for them.
     private func spaceChanged() {
-        // (Adding or removing a display posts this too: nothing to do then,
-        // and the gate stays shut.)
+        // Adding or removing a display posts this too. Nothing to do then,
+        // and the gate stays shut: bringing forward whatever window is on
+        // top would hand the keyboard to an app the user wasn't in.
         DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + .milliseconds(60)) {
+            // A real switch: one of the user's displays shows another Space
+            // than it did. (Where macOS won't say, any of these counts.)
+            let now = Self.userSpaces()
+            self.lock.lock()
+            let before = self.shownSpaces
+            self.shownSpaces = now
+            self.lock.unlock()
+            let known = now.values.contains { $0 != 0 }
+            let switched = now.contains { id, space in space != 0 && before[id] != nil && before[id] != space }
+            guard switched || !known else { return }
             let front = BCUFrontProcessPID()
             let agents = AgentDisplay.running.map(\.liveBounds)
             let onScreen = WindowList.all(onScreenOnly: true).filter { w in
@@ -642,14 +679,42 @@ public final class FocusGuard {
         }
     }
 
+    /// The Space on each of the user's displays (0 where macOS won't say).
+    private static func userSpaces() -> [CGDirectDisplayID: UInt64] {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var n: UInt32 = 0
+        guard CGGetActiveDisplayList(16, &ids, &n) == .success else { return [:] }
+        let agents = Set(AgentDisplay.running.map(\.displayID))
+        var out: [CGDirectDisplayID: UInt64] = [:]
+        for id in ids.prefix(Int(n)) where !agents.contains(id) { out[id] = BCUCurrentSpaceForDisplay(id) }
+        return out
+    }
+
     /// What the gate keeps from the front: the apps agents have windows in
     /// or are acting on. (It leaves out whichever is in front itself.)
     private func gateTargets() -> FrontGate.Targets {
         var pids = WindowManager.agentPids()
+        // Whether what's in front is an ordinary app (asked only when it changes).
+        let front = BCUFrontProcessPID()
         lock.lock()
+        var policy = frontPolicy
+        lock.unlock()
+        if policy.pid != front {
+            policy = (front, front == 0 || NSRunningApplication(processIdentifier: front)?.activationPolicy == .regular)
+        }
+        lock.lock()
+        frontPolicy = policy
         let now = nowMs()
         for (pid, t) in taints where t.gated && (t.count > 0 || t.until >= now) { pids.insert(pid) }
         let bundles = Set(launching.keys)
+        // Never the app the user is in, when agents have windows in it too:
+        // the gate leaves out whichever app is in front, but theirs isn't
+        // for a moment each time something of the system's is (the lock
+        // screen, the screen saver, a Touch ID or password sheet). macOS
+        // gives it the front back by itself afterwards, with no click or key
+        // for the tap to open the gate on, and would be refused.
+        pids.remove(userFrontPid)
+        if !policy.regular { pids.remove(userRegularPid) }
         lock.unlock()
         return FrontGate.Targets(pids: pids, bundleIDs: bundles)
     }
@@ -1063,6 +1128,32 @@ public final class FocusGuard {
 
     // MARK: Tap
 
+    /// Open the gate for an event that can switch apps, before it goes on
+    /// (see `FrontGate`): any mouse button, for as long as it's down and a
+    /// moment after; cmd+Tab until command is let go; Return, a function
+    /// key or a key with a modifier.
+    private func openGate(for type: CGEventType, _ event: CGEvent) {
+        switch type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            gate.pointer(down: true, ms: Self.clickLiftMs)
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            gate.pointer(down: false, ms: Self.clickLiftMs)
+        case .keyDown:
+            let code = event.getIntegerValueField(.keyboardEventKeycode)
+            let opens = code == 36 || code == 76 || !event.flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty
+            // The switch comes when command is let go, however long that is.
+            if event.flags.contains(.maskCommand) && code == 48 {
+                gate.switcher(open: true)
+            } else if opens || Self.functionKeys.contains(code) {
+                gate.lift(ms: Self.keyLiftMs)
+            }
+        case .flagsChanged:
+            if !event.flags.contains(.maskCommand) { gate.switcher(open: false) }
+        default:
+            break
+        }
+    }
+
     fileprivate func handle(type: CGEventType, event: CGEvent) -> CGEvent? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
@@ -1074,6 +1165,9 @@ public final class FocusGuard {
             return event
         }
         if event.getIntegerValueField(.eventSourceUserData) == FocusGuard.replayMarker {
+            // Held and going on only now: the gate opened when it was
+            // pressed and has shut again since.
+            openGate(for: type, event)
             if type == .keyDown || type == .keyUp { noteDelivered(event, type) }
             if Self.isKey(type) {
                 lock.lock()
@@ -1085,7 +1179,7 @@ public final class FocusGuard {
             return event
         }
         activity.note(type, event)
-        if type == .keyDown || Self.isMouseDown(type) { onUserPress?() }
+        if type == .keyDown || Self.isMouseDown(type) { userPressed() }
         switch type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .tabletPointer:
             let p = event.location
@@ -1105,7 +1199,7 @@ public final class FocusGuard {
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             // A click can bring any app forward (its window, the Dock, a
             // link that opens in the browser): the gate opens before it goes on.
-            gate.lift(ms: Self.clickLiftMs)
+            openGate(for: type, event)
             lock.lock(); lastUserMouseDownMs = nowMs(); let holdAll = !holdTokens.isEmpty || draining; let anySwap = !swapping.isEmpty; lock.unlock()
             if AgentDisplay.fenced(at: event.location) != nil {
                 Log.info("guard: dropped a click on an agent display at \(Int(event.location.x)),\(Int(event.location.y))")
@@ -1126,6 +1220,7 @@ public final class FocusGuard {
             }
             return event
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            openGate(for: type, event)
             lock.lock(); let holdIt = !holdTokens.isEmpty || draining || held.contains { Self.isMouseDown($0.event.type) }; lock.unlock()
             if holdIt { hold(event); return nil }
             return event
@@ -1137,15 +1232,14 @@ public final class FocusGuard {
             if type == .keyDown {
                 let code = event.getIntegerValueField(.keyboardEventKeycode)
                 let opens = code == 36 || code == 76 || !event.flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty
-                // The switch comes when command is let go, however long that is.
-                if cmdTab { gate.switcher(open: true) } else if opens || Self.functionKeys.contains(code) { gate.lift(ms: Self.keyLiftMs) }
+                openGate(for: type, event)
                 lock.lock()
                 lastUserKeyMs = nowMs()
                 if opens { lastUserOpenKeyMs = nowMs() }
                 if cmdTab { lastUserSwitchKeyMs = nowMs() }
                 lock.unlock()
             }
-            if type == .flagsChanged && !event.flags.contains(.maskCommand) { gate.switcher(open: false) }
+            if type == .flagsChanged { openGate(for: type, event) }
             if type == .keyUp {
                 let code = event.getIntegerValueField(.keyboardEventKeycode)
                 lock.lock()

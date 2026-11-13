@@ -186,6 +186,20 @@ final class FrontGateTests: XCTestCase {
         XCTAssertFalse(FrontGate.isOurs(apps([1]), set: apps(Array(1...60))))
     }
 
+    /// A drag can last any time, and what it's let go on may come forward
+    /// (a file on a Dock icon): open for as long as the button is down.
+    func testTheGateStaysOpenWhileAMouseButtonIsDown() {
+        let gate = FrontGate()
+        XCTAssertFalse(gate.isLifted)
+        gate.pointer(down: true, ms: 20)
+        sleepMs(60)
+        XCTAssertTrue(gate.isLifted)
+        gate.pointer(down: false, ms: 20)
+        XCTAssertTrue(gate.isLifted)
+        sleepMs(60)
+        XCTAssertFalse(gate.isLifted)
+    }
+
     /// macOS 26.7 answers -10663 (attribute not settable) to setting the
     /// list. The gate has to give up there, not ask again every 5 ms.
     func testAMacOSThatRefusesTheListTurnsTheGateOff() throws {

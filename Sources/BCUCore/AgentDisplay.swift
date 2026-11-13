@@ -592,6 +592,10 @@ public final class AgentDisplay {
         }
         reapSpares()
         for d in running { d.reconfigured() }
+        registryLock.lock()
+        let kept = spares.map { CGDisplayBounds($0.id) }
+        registryLock.unlock()
+        WindowManager.rescue(fromSpares: kept)
     }
 
     /// No user display to sit beside the last time this looked.
