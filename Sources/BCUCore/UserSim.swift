@@ -164,6 +164,8 @@ final class UserSim {
                 lock.lock(); let ok = pid == onlyPid || alsoPids.contains(pid); lock.unlock()
                 guard ok else { note("activate: pid \(pid) isn't allowed"); break }
                 note("activate \(pid)")
+                // As a click on its window would: the gate opens for the user.
+                FocusGuard.shared?.noteUserSwitch()
                 _ = BCUSetFrontProcess(pid, CGWindowID(a.int("window_id") ?? 0), 0x200)
                 if let wid = a.int("window_id") { _ = BCUPostMakeKeyRecords(pid, CGWindowID(wid)) }
                 let deadline = nowMs() + 1000

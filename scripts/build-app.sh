@@ -16,6 +16,10 @@
 # Application" identity in the keychain, else ad hoc. Accessibility and Screen
 # Recording stay granted only while the bundle ID and Developer ID team stay
 # the same, so an ad hoc build asks for them again.
+#
+# A plain build signs with $BCU_SIGN_IDENTITY too when it's set (to run a
+# test build from ./build without installing it). $BCU_SIGN_KEYCHAIN names
+# the keychain the identity is in when that isn't on the search list.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -80,7 +84,7 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-IDENTITY="-"
+IDENTITY="${BCU_SIGN_IDENTITY:--}"
 if [ $INSTALL = 1 ]; then
   IDENTITY="${BCU_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | grep -m1 'Developer ID Application' | sed -E 's/.*"(.*)"/\1/' || true)}"
   if [ -z "$IDENTITY" ]; then
@@ -90,6 +94,7 @@ if [ $INSTALL = 1 ]; then
 fi
 SIGN_FLAGS=(--force --sign "$IDENTITY")
 [ "$IDENTITY" != "-" ] && SIGN_FLAGS+=(--options runtime --timestamp)
+[ -n "${BCU_SIGN_KEYCHAIN:-}" ] && SIGN_FLAGS+=(--keychain "$BCU_SIGN_KEYCHAIN")
 sign() { codesign "${SIGN_FLAGS[@]}" "$@"; }
 
 # Nested code first, from the inside out, as Sparkle's docs list it. The XPC

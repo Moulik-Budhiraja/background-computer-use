@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import CoreGraphics
 import CPrivate
 
@@ -12,17 +13,39 @@ public struct GuardEvent {
 /// - Cursor fence: mouse moves that would land on the agent display are pulled
 ///   back in the event tap, and a watcher thread checks the cursor every 4 ms
 ///   and brings it back from anything that got past the tap.
+/// - Front gate: the apps agents are working in can't bring themselves to the
+///   front at all while the user is elsewhere (see `FrontGate`). The gate opens
+///   whenever the user does something that could switch apps; the next two
+///   are for those moments, and for a macOS without the gate.
 /// - Keystroke hold: if an app the agent is acting on makes itself frontmost,
 ///   the user's keystrokes are held, the user's app is put back in front, and
 ///   the keys are replayed into it. Nothing typed lands in the agent's window.
 /// - Activation watch: the same restore runs when such an activation is seen
 ///   even without typing.
+/// - Arrival: when the user switches to an app agents have windows in, its
+///   key window is made theirs before their keys go on.
 /// One guard for every agent display: it fences the cursor off all of them
 /// and watches the front app for every session.
 public final class FocusGuard {
     public var onEvent: ((GuardEvent) -> Void)?
     /// The user's recent input, for waiting until they pause (see `QuietWait`).
     public let activity = UserActivity()
+    /// Keeps agents' apps from bringing themselves to the front (see `FrontGate`).
+    public let gate = FrontGate()
+    /// Called from the input tap when the user presses a key or a mouse
+    /// button (not for moves or scrolls): `hook` must return at once. One
+    /// per owner (a session), so that two agents with a cover up in the
+    /// same app don't take away each other's; nil removes it.
+    public func onUserPress(for owner: String, _ hook: (() -> Void)?) {
+        pressLock.lock(); pressHooks[owner] = hook; pressLock.unlock()
+    }
+    private var pressHooks: [String: () -> Void] = [:]
+    private let pressLock = NSLock()
+
+    private func userPressed() {
+        pressLock.lock(); let hooks = Array(pressHooks.values); pressLock.unlock()
+        for hook in hooks { hook() }
+    }
 
     private let lock = NSLock()
     /// An app the agent is acting on. `count`: actions running now (sessions
@@ -35,18 +58,35 @@ public final class FocusGuard {
         var until: Double
         var cause: String
         var strict: Bool
+        /// Kept from the front by the gate while tainted. Not for an app the
+        /// guard itself brings forward (`repairOrder`).
+        var gated = true
     }
     private var taints: [pid_t: Taint] = [:]
     /// Apps whose key window an agent has moved to one of its windows right
     /// now (see `beginSwap`), with nesting counts.
     private var swapping: [pid_t: Int] = [:]
+    private var swapSinceMs: [pid_t: Double] = [:]
     /// Apps the user isn't in whose key window was left on an agent's
     /// window after its step (see `park`).
     private var parked: [pid_t: ParkedKey] = [:]
     /// Keys the user typed into an app while it was mid-swap, held until key
     /// is back on their window. With when the first one came.
     private var pidHeld: [pid_t: (sinceMs: Double, events: [CGEvent])] = [:]
+    /// Apps with agent windows the user has just switched to, with when:
+    /// until the key window there is theirs (`handOver`), what they type
+    /// into it is held.
+    private var arriving: [pid_t: Double] = [:]
+    /// Apps being launched for an agent, by bundle ID: kept from the front
+    /// from the moment they appear, before the launch reports a pid.
+    private var launching: [String: Int] = [:]
     private var userFrontPid: pid_t = 0
+    /// The last regular app the user was in (see `gateTargets`).
+    private var userRegularPid: pid_t = 0
+    private var frontPolicy: (pid: pid_t, regular: Bool) = (0, true)
+    private var secureInputSeenMs = -Double.infinity
+    /// The Space each of the user's displays shows (see `spaceChanged`).
+    private var shownSpaces: [CGDirectDisplayID: UInt64] = [:]
     private var userFrontWindow: CGWindowID?
     private var lastUserMouseDownMs = 0.0
     private var lastUserSwitchKeyMs = 0.0
@@ -116,7 +156,8 @@ public final class FocusGuard {
     static let frontBackMs = 500.0
     /// Keys typed into an app mid-swap are held at most this long.
     static let maxPidHoldMs = 5000.0
-    fileprivate static weak var shared: FocusGuard?
+    /// The running guard (there is one), for the tap callback and the test tools.
+    static weak var shared: FocusGuard?
 
     public init() {
     }
@@ -141,6 +182,34 @@ public final class FocusGuard {
             self?.activated(app)
         }
         installTap()
+        gate.targets = { [weak self] in self?.gateTargets() ?? FrontGate.Targets() }
+        gate.tapWorking = { [weak self] in
+            guard let self, let tap = self.tap, CGEvent.tapIsEnabled(tap: tap) else { return false }
+            // With secure input on (a password field, Terminal's Secure
+            // Keyboard Entry) macOS shows the tap no keys at all, though it
+            // stays enabled: cmd+Tab and Return would never open the gate.
+            // So it stays open, and a moment longer: what the password was
+            // for (unlocking, an approval) is what brings an app forward.
+            let now = nowMs()
+            self.lock.lock(); defer { self.lock.unlock() }
+            if IsSecureEventInputEnabled() { self.secureInputSeenMs = now }
+            return now - self.secureInputSeenMs > Self.keyLiftMs
+        }
+        gate.onNote = { [weak self] note in self?.record(note) }
+        gate.start()
+        let spaces = Self.userSpaces()
+        lock.lock(); shownSpaces = spaces; lock.unlock()
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.spaceChanged()
+        }
+        let watcher = Thread { [weak self] in self?.watchFront() }
+        watcher.name = "bcu.guard.front"
+        watcher.qualityOfService = .userInteractive
+        watcher.start()
+        let windowWatcher = Thread { [weak self] in self?.watchUserWindow() }
+        windowWatcher.name = "bcu.guard.userwindow"
+        windowWatcher.qualityOfService = .utility
+        windowWatcher.start()
         let watchdog = Thread { [weak self] in
             while let s = self {
                 s.watchHolds()
@@ -206,13 +275,19 @@ public final class FocusGuard {
     private func checkCursor() -> Bool {
         let fenced = AgentDisplay.fencedBounds
         guard !fenced.isEmpty, let p = CGEvent(source: nil)?.location else { return false }
-        guard let agent = fenced.first(where: { $0.contains(p) }) else {
+        let users = AgentDisplay.userDisplayIDs().map { CGDisplayBounds($0) }
+        // An agent display lying over one of the user's (macOS wouldn't
+        // place it while the screens slept): the cursor there is on their
+        // screen, where it belongs. Warping it to the same spot every few
+        // ms would end every hover effect under it.
+        let overlapped = fenced.first(where: { $0.contains(p) }).map { a in users.contains { $0.contains(p) && $0.intersects(a) } } ?? false
+        guard !overlapped, let agent = fenced.first(where: { $0.contains(p) }) else {
             // Off every display (an event posted with a far-off location can
             // leave it there): just as invisible, and macOS only brings it
             // back when the displays change.
-            if !AgentDisplay.userDisplayIDs().contains(where: { CGDisplayBounds($0).contains(p) }) {
+            if !users.contains(where: { $0.contains(p) }) {
                 let q = nearestUserPoint(p, agent: .null)
-                if q != p {
+                if q != p && !fenced.contains(where: { $0.contains(q) }) {
                     CGWarpMouseCursorPosition(q)
                     CGAssociateMouseAndMouseCursorPosition(1)
                     lock.lock()
@@ -226,6 +301,8 @@ public final class FocusGuard {
             return fenced.contains { $0.insetBy(dx: -400, dy: -400).contains(p) }
         }
         let q = nearestUserPoint(p, agent: agent)
+        // Nowhere better to put it (no user display): leave it be.
+        guard q != p, !fenced.contains(where: { $0.contains(q) }) else { return false }
         CGWarpMouseCursorPosition(q)
         CGAssociateMouseAndMouseCursorPosition(1)
         let tapState: String
@@ -269,6 +346,8 @@ public final class FocusGuard {
         t.strict = strict
         taints[pid] = t
         lock.unlock()
+        // Shut before the app is asked for anything, not at the gate's next look.
+        if !gate.blocks(pid) { gate.sync() }
     }
 
     public func endAction(pid: pid_t, graceMs: Double = 700) {
@@ -303,15 +382,24 @@ public final class FocusGuard {
     /// mid-swap), clicks on its windows are held, nothing else moves its key
     /// window, and they're replayed once key is back on the user's window.
     public func beginSwap(_ pid: pid_t) {
-        lock.lock(); swapping[pid, default: 0] += 1; lock.unlock()
+        lock.lock()
+        if swapping[pid] == nil { swapSinceMs[pid] = nowMs() }
+        swapping[pid, default: 0] += 1
+        lock.unlock()
     }
 
     public func endSwap(_ pid: pid_t) {
         lock.lock()
         if let n = swapping[pid] { swapping[pid] = n > 1 ? n - 1 : nil }
         let done = swapping[pid] == nil
+        let since = done ? swapSinceMs.removeValue(forKey: pid) : nil
+        let waiting = pidHeld[pid]?.events.count ?? 0
         lock.unlock()
-        if done { releasePidHeld(pid) }
+        if done {
+            // What the user felt of it: how long anything they typed into the app waited.
+            if waiting > 0, let since { Log.info("guard: key was away from the user's window in pid \(pid) for \(Int(nowMs() - since)) ms; \(waiting) of their key events waited") }
+            releasePidHeld(pid)
+        }
     }
 
     public func isSwapping(_ pid: pid_t) -> Bool {
@@ -341,6 +429,7 @@ public final class FocusGuard {
     /// agent handed them), so the activation that follows is theirs.
     public func noteUserSwitch() {
         lock.lock(); lastUserSwitchKeyMs = nowMs(); lock.unlock()
+        gate.lift(ms: Self.keyLiftMs)
     }
 
     /// True when the user recently clicked or switched apps, so an activation
@@ -394,99 +483,268 @@ public final class FocusGuard {
 
     private func noteUserFront(_ pid: pid_t) {
         lock.lock()
+        // While the answer is on its way a restore still needs a window to
+        // raise: keep the last one known for this app.
+        if userFrontPid != pid { userFrontWindow = nil }
         userFrontPid = pid
-        userFrontWindow = nil
         lock.unlock()
+        if NSRunningApplication(processIdentifier: pid)?.activationPolicy == .regular {
+            lock.lock(); userRegularPid = pid; lock.unlock()
+        }
         var window = AX.focusedWindowID(pid)
         if let w = window, Self.onAgentDisplay(w) { window = nil }
         lock.lock()
         guard userFrontPid == pid else { lock.unlock(); return }
-        userFrontWindow = window
+        if window != nil { userFrontWindow = window }
         lock.unlock()
     }
 
-    // MARK: Front monitor
+    // MARK: Front watch
 
-    private var monitorDepth = 0
-    private var monitorLog: [(ms: Double, pid: pid_t, agent: Bool)] = []
-    private var monitorStartMs = 0.0
+    /// One change of the front app, for the report each tool call gives.
+    private struct FrontChange {
+        let seq: Int
+        let ms: Double
+        let pid: pid_t
+        /// An agent's app that put itself there.
+        let agent: Bool
+    }
+    private var frontLog: [FrontChange] = []
+    private var frontSeq = 0
+    private let arriveQueue = DispatchQueue(label: "bcu.guard.arrive", qos: .userInteractive)
 
-    /// Sample the front process every 5 ms until `stopMonitor`, so each action
-    /// can report exactly what happened to the user's focus.
-    public func startMonitor() {
-        lock.lock()
-        monitorDepth += 1
-        let first = monitorDepth == 1
-        if first {
-            monitorLog = [(0, BCUFrontProcessPID(), false)]
-            monitorStartMs = nowMs()
+    /// Samples the front app (WindowServer's own view) for as long as the
+    /// guard runs: every millisecond while agents have windows or an action
+    /// is in its grace period, every 20 ms otherwise. An agent's app that
+    /// got to the front is sent back from here rather than on NSWorkspace's
+    /// notification, which comes about 25 ms later; when it's the user who
+    /// came to an app, its key window is sorted out (`arrived`).
+    private func watchFront() {
+        var last = BCUFrontProcessPID()
+        var n = 0
+        var fast = false
+        while true {
+            let pid = BCUFrontProcessPID()
+            if pid != 0 && pid != last {
+                last = pid
+                frontChanged(to: pid)
+            }
+            if n % 20 == 0 { fast = !WindowManager.agentPids().isEmpty || !activeTaints.isEmpty }
+            n &+= 1
+            usleep(fast ? 1000 : 20_000)
         }
+    }
+
+    /// The user can move between windows of the app they're in without the
+    /// app changing, and a restore that raised the window they were in when
+    /// they arrived would bring the wrong one forward. Ask every 300 ms
+    /// while agents are at work (its own thread: the app may be slow to answer).
+    private func watchUserWindow() {
+        while true {
+            usleep(300_000)
+            guard !WindowManager.agentPids().isEmpty || !activeTaints.isEmpty else { continue }
+            let front = BCUFrontProcessPID()
+            lock.lock()
+            let mine = front != 0 && front == userFrontPid && swapping[front] == nil && arriving[front] == nil
+            lock.unlock()
+            guard mine else { continue }
+            let app = AXUIElementCreateApplication(front)
+            AXUIElementSetMessagingTimeout(app, 0.25)
+            guard let w = AX.element(app, "AXFocusedWindow"), let id = AX.windowID(w), !Self.onAgentDisplay(id) else { continue }
+            lock.lock()
+            if userFrontPid == front && swapping[front] == nil { userFrontWindow = id }
+            lock.unlock()
+        }
+    }
+
+    private func frontChanged(to pid: pid_t) {
+        let agent = pid != getpid() && pid != userFront && agentCaused(pid)
+        lock.lock()
+        frontSeq += 1
+        frontLog.append(FrontChange(seq: frontSeq, ms: nowMs(), pid: pid, agent: agent))
+        if frontLog.count > 400 { frontLog.removeFirst(frontLog.count - 400) }
         lock.unlock()
-        guard first else { return }
-        let thread = Thread { [weak self] in
-            while let self {
-                self.lock.lock()
-                let active = self.monitorDepth > 0
-                let last = self.monitorLog.last?.pid
-                self.lock.unlock()
-                if !active { break }
-                let pid = BCUFrontProcessPID()
-                if pid != last {
-                    let agent = pid != 0 && pid != self.userFront && self.agentCaused(pid)
-                    self.lock.lock()
-                    self.monitorLog.append((nowMs() - self.monitorStartMs, pid, agent))
-                    self.lock.unlock()
-                    // Restore here rather than waiting for NSWorkspace's
-                    // notification, which arrives ~25 ms later.
-                    if agent {
-                        self.restoreUserFront(from: pid, reason: "self-activation", immediate: true)
-                    }
-                }
-                usleep(1000)
+        if agent {
+            restoreUserFront(from: pid, reason: "self-activation", immediate: true)
+        } else if pid != getpid() {
+            arrived(pid)
+        }
+    }
+
+    /// Where the record of front-app changes stands; pass it to `frontReport` later.
+    public var frontMark: Int {
+        lock.lock(); defer { lock.unlock() }
+        return frontSeq
+    }
+
+    /// What `apps` (the ones an agent is working in) did to the user's front
+    /// app since `mark`, or nil if nothing: each time one of them was in
+    /// front and for how long. Changes the user made themselves aren't news.
+    public func frontReport(since mark: Int, apps: Set<pid_t>) -> String? {
+        lock.lock()
+        let log = frontLog
+        lock.unlock()
+        let mine = log.indices.filter { log[$0].seq > mark && log[$0].agent && apps.contains(log[$0].pid) }
+        guard !mine.isEmpty else { return nil }
+        func name(_ pid: pid_t) -> String { NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)" }
+        let now = nowMs()
+        let parts = mine.map { i -> String in
+            let end = i + 1 < log.count ? log[i + 1].ms : now
+            return "\(name(log[i].pid)) was frontmost for \(Int(end - log[i].ms)) ms"
+        }
+        let front = BCUFrontProcessPID()
+        let still = mine.last == log.count - 1 && front == log[log.count - 1].pid
+        return "Front app changed: " + parts.joined(separator: "; ")
+            + (still ? ", and is STILL in front" : ", then the user's app (\(name(front))) was back in front")
+    }
+
+    /// The user came to `pid`: they switched to it, it wasn't an agent's doing.
+    private func arrived(_ pid: pid_t) {
+        let agentApp = parkedKey(pid) != nil || WindowManager.agentPids().contains(pid)
+        lock.lock()
+        // The order before the agent's step no longer says where cmd+Tab should take them.
+        if let first = orderBefore?.first, first != pid { orderBefore = nil }
+        let known = userFrontPid == pid
+        if agentApp { arriving[pid] = nowMs() }
+        lock.unlock()
+        if agentApp {
+            arriveQueue.async {
+                self.handOver(pid)
+                self.lock.lock(); self.arriving[pid] = nil; self.lock.unlock()
+                self.releasePidHeld(pid)
             }
         }
-        thread.qualityOfService = .userInteractive
-        thread.start()
-    }
-
-    /// Stops sampling after `tailMs` and returns a description of any front
-    /// changes, or nil if the user's front app never changed.
-    public func stopMonitor(tailMs: Double = 400) -> String? {
-        sleepMs(tailMs)
-        lock.lock()
-        monitorDepth = max(0, monitorDepth - 1)
-        let log = monitorLog
-        lock.unlock()
-        // Report only when the agent caused a change; the user's own app
-        // switches during an action aren't news.
-        guard log.count > 1, log.contains(where: { $0.agent }) else { return nil }
-        func name(_ pid: pid_t) -> String { NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)" }
-        var parts: [String] = []
-        for (i, entry) in log.enumerated() where i > 0 {
-            let end = i + 1 < log.count ? log[i + 1].ms : nowMs() - monitorStartMs
-            parts.append("\(name(entry.pid)) was frontmost from \(Int(entry.ms)) ms for \(Int(end - entry.ms)) ms")
+        // Off this thread: accessibility calls into a busy app can take a second.
+        if !known || agentApp {
+            DispatchQueue.global(qos: .userInitiated).async { self.noteUserFront(pid) }
         }
-        let final = log.last!.pid == log.first!.pid ? "then the user's app (\(name(log.first!.pid))) was back in front" : "and is STILL in front"
-        return "Front app changed: " + parts.joined(separator: "; ") + ", " + final
     }
 
+    /// The user is in `pid` now, where agents have windows. If one of those
+    /// is its key window (left so after a step, or made key by AppKit on
+    /// activation as the one that had key last), their typing would go
+    /// somewhere they can't see. Key goes to their window; what they type
+    /// meanwhile is held (`arriving`) and replayed once it has.
+    private func handOver(_ pid: pid_t) {
+        let t0 = nowMs()
+        // A step in this app holds its lock while its window has key; seeing
+        // the user there it stops, and hands key back itself.
+        let appLock = Engine.inputLock(pid)
+        let locked = appLock.lock(before: Date().addingTimeInterval(Self.maxHoldMs / 1000))
+        defer { if locked { appLock.unlock() } }
+        lock.lock()
+        let was = parked.removeValue(forKey: pid)
+        lock.unlock()
+        guard BCUFrontProcessPID() == pid, !isSwapping(pid) else { return }
+        let moved = reclaimKey(pid)
+        // No window of theirs to take key: at least not the agent's.
+        if let was, AX.focusedWindowID(pid) == was.window { _ = BCUPostFocusRecord(pid, was.window, false) }
+        if moved || was != nil {
+            Log.info("guard: the user came to pid \(pid), where an agent's window had key; sorted out in \(Int(nowMs() - t0)) ms")
+        }
+    }
+
+    /// The user moved to another Space. If the app whose window is in front
+    /// there is one the gate was keeping back, macOS couldn't bring it
+    /// forward: do that for them.
+    private func spaceChanged() {
+        // Adding or removing a display posts this too. Nothing to do then,
+        // and the gate stays shut: bringing forward whatever window is on
+        // top would hand the keyboard to an app the user wasn't in.
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + .milliseconds(60)) {
+            // A real switch: one of the user's displays shows another Space
+            // than it did. (Where macOS won't say, any of these counts.)
+            let now = Self.userSpaces()
+            self.lock.lock()
+            let before = self.shownSpaces
+            self.shownSpaces = now
+            self.lock.unlock()
+            let known = now.values.contains { $0 != 0 }
+            let switched = now.contains { id, space in space != 0 && before[id] != nil && before[id] != space }
+            guard switched || !known else { return }
+            let front = BCUFrontProcessPID()
+            let agents = AgentDisplay.running.map(\.liveBounds)
+            let onScreen = WindowList.all(onScreenOnly: true).filter { w in
+                w.layer == 0 && w.alpha > 0 && w.bounds.width > 100 && w.bounds.height > 100 && !agents.contains { $0.intersects(w.bounds) }
+            }
+            guard let top = onScreen.first, top.pid != front, top.pid != getpid(),
+                  !onScreen.contains(where: { $0.pid == front }), WindowManager.agentPids().contains(top.pid) else { return }
+            self.noteUserSwitch()
+            _ = BCUSetFrontProcess(top.pid, top.id, 0x200)
+            let deadline = nowMs() + 300
+            while BCUFrontProcessPID() != top.pid && nowMs() < deadline { sleepMs(2) }
+            sleepMs(Self.activationSettleMs)
+            _ = BCUPostMakeKeyRecords(top.pid, top.id)
+            self.record("you moved to a Space where \(top.owner) is in front; brought it forward")
+        }
+    }
+
+    /// The Space on each of the user's displays (0 where macOS won't say).
+    private static func userSpaces() -> [CGDirectDisplayID: UInt64] {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var n: UInt32 = 0
+        guard CGGetActiveDisplayList(16, &ids, &n) == .success else { return [:] }
+        let agents = Set(AgentDisplay.running.map(\.displayID))
+        var out: [CGDirectDisplayID: UInt64] = [:]
+        for id in ids.prefix(Int(n)) where !agents.contains(id) { out[id] = BCUCurrentSpaceForDisplay(id) }
+        return out
+    }
+
+    /// What the gate keeps from the front: the apps agents have windows in
+    /// or are acting on. (It leaves out whichever is in front itself.)
+    private func gateTargets() -> FrontGate.Targets {
+        var pids = WindowManager.agentPids()
+        // Whether what's in front is an ordinary app (asked only when it changes).
+        let front = BCUFrontProcessPID()
+        lock.lock()
+        var policy = frontPolicy
+        lock.unlock()
+        if policy.pid != front {
+            policy = (front, front == 0 || NSRunningApplication(processIdentifier: front)?.activationPolicy == .regular)
+        }
+        lock.lock()
+        frontPolicy = policy
+        let now = nowMs()
+        for (pid, t) in taints where t.gated && (t.count > 0 || t.until >= now) { pids.insert(pid) }
+        let bundles = Set(launching.keys)
+        // Never the app the user is in, when agents have windows in it too:
+        // the gate leaves out whichever app is in front, but theirs isn't
+        // for a moment each time something of the system's is (the lock
+        // screen, the screen saver, a Touch ID or password sheet). macOS
+        // gives it the front back by itself afterwards, with no click or key
+        // for the tap to open the gate on, and would be refused.
+        pids.remove(userFrontPid)
+        if !policy.regular { pids.remove(userRegularPid) }
+        lock.unlock()
+        return FrontGate.Targets(pids: pids, bundleIDs: bundles)
+    }
+
+    /// An app is about to be launched for an agent: keep it from the front
+    /// from the moment it appears. Pair with `launched`.
+    public func willLaunch(bundleID: String) {
+        lock.lock(); launching[bundleID, default: 0] += 1; lock.unlock()
+        gate.sync()
+    }
+
+    public func launched(bundleID: String) {
+        lock.lock()
+        if let n = launching[bundleID] { launching[bundleID] = n > 1 ? n - 1 : nil }
+        lock.unlock()
+    }
+
+    /// NSWorkspace's word that an app became active, about 25 ms after the
+    /// front watch saw it: the backup for both of its jobs.
     private func activated(_ app: NSRunningApplication) {
         let pid = app.processIdentifier
         Log.info("guard: activated \(app.localizedName ?? "?") pid \(pid) tainted=\(isTainted(pid)) userFront=\(userFront) agentCaused=\(agentCaused(pid)) \(debugCause(pid))")
         if pid == getpid() { return }
         if agentCaused(pid) && pid != userFront {
-            // The monitor thread usually restored already; this is the backup path.
             if BCUFrontProcessPID() == pid { restoreUserFront(from: pid, reason: "activation") }
-        } else {
-            // The user moved to another app: the order before the agent's
-            // step no longer says where cmd+Tab should take them.
-            lock.lock(); if let first = orderBefore?.first, first != pid { orderBefore = nil }; lock.unlock()
-            // Off the main thread: AX calls into Electron apps can be slow.
-            DispatchQueue.global(qos: .userInitiated).async {
-                self.reclaimWhenSafe(pid)
-                self.unpark(pid, reason: "the user switched to it")
-                self.noteUserFront(pid)
-            }
+        } else if BCUFrontProcessPID() == pid {
+            lock.lock()
+            let handled = userFrontPid == pid || arriving[pid] != nil
+            lock.unlock()
+            if !handled { arrived(pid) }
         }
     }
 
@@ -540,8 +798,9 @@ public final class FocusGuard {
     /// it so the app counts itself inactive again. Then the user's held keys
     /// for the app go on. `window`: only if that's the parked one.
     public func unpark(_ pid: pid_t, window: CGWindowID? = nil, reason: String) {
-        Engine.inputLock.lock()
-        defer { Engine.inputLock.unlock() }
+        let appLock = Engine.inputLock(pid)
+        appLock.lock()
+        defer { appLock.unlock() }
         lock.lock()
         guard let p = parked[pid], window == nil || p.window == window else { lock.unlock(); return }
         parked[pid] = nil
@@ -559,12 +818,13 @@ public final class FocusGuard {
         releasePidHeld(pid)
     }
 
-    /// `reclaimKey`, but never in the middle of a key swap: a swap in any
-    /// session holds the input lock from before it moves key until key is
-    /// back, so taking the lock waits for it to end.
+    /// `reclaimKey`, but never in the middle of a key swap: a swap in this
+    /// app, from any session, holds the app's input lock from before it
+    /// moves key until key is back, so taking the lock waits for it to end.
     public func reclaimWhenSafe(_ pid: pid_t) {
-        Engine.inputLock.lock()
-        defer { Engine.inputLock.unlock() }
+        let appLock = Engine.inputLock(pid)
+        appLock.lock()
+        defer { appLock.unlock() }
         if isSwapping(pid) { return }
         reclaimKey(pid)
     }
@@ -615,6 +875,11 @@ public final class FocusGuard {
 
     /// The window of `pid` the user would expect to be key: a standard
     /// window on their screens (not a popup, tooltip or suggestion list).
+    /// `prefer` if given (the caller saw it key just now), else the one in
+    /// front on their screens, which is the one they're in. The window they
+    /// were in when they came to the app is only a last resort: they may
+    /// have moved to another of its windows since, and handing key to that
+    /// one sends their typing to a window behind the one they're looking at.
     func userWindow(of pid: pid_t, prefer: CGWindowID? = nil) -> CGWindowID? {
         let agents = AgentDisplay.running.map(\.liveBounds)
         let onScreen = WindowList.of(pid: pid, onScreenOnly: true).filter { w in
@@ -629,7 +894,7 @@ public final class FocusGuard {
             guard let ax = axWindows.first(where: { AX.windowID($0) == id }) else { return false }
             return AX.string(ax, "AXSubrole") == "AXStandardWindow" && AX.bool(ax, "AXMinimized") != true
         }
-        let candidates = [prefer, last].compactMap { $0 } + onScreen.map(\.id)
+        let candidates = [prefer].compactMap { $0 } + onScreen.map(\.id) + [last].compactMap { $0 }
         return candidates.first { ids.contains($0) && standard($0) }
     }
 
@@ -678,10 +943,6 @@ public final class FocusGuard {
         restoreQueue.async {
             if pid != 0 {
                 if !immediate { status = BCUSetFrontProcess(pid, window, 0x200) }
-                // Not while an agent's window is key there for a swap: that
-                // would move key under the agent's keystrokes. The swap gives
-                // key back itself.
-                if window != 0 && !self.isSwapping(pid) { _ = BCUPostMakeKeyRecords(pid, window) }
                 let deadline = nowMs() + 500
                 var lastCall = nowMs()
                 while BCUFrontProcessPID() != pid && nowMs() < deadline {
@@ -696,6 +957,10 @@ public final class FocusGuard {
                     sleepMs(1)
                 }
                 Log.info("guard: restore (\(reason)) setFront=\(status) call \(Int(t1 - t0)) ms, front back after \(Int(nowMs() - t0)) ms")
+                if BCUFrontProcessPID() == pid {
+                    self.makeKeyAgain(pid, window: CGWindowID(window))
+                    self.uncover(pid, window: CGWindowID(window), from: agent)
+                }
             }
             self.lock.lock()
             self.holding = false
@@ -712,6 +977,46 @@ public final class FocusGuard {
             if n > 0 { self.record("held \(n) of your key events during a focus change (\(reason)) and replayed them into your app") }
             if pid != 0 && front == pid { self.scheduleOrderRepair() }
         }
+    }
+
+    /// How long an app takes to see that it's active again once it's in front.
+    static let activationSettleMs = 30.0
+
+    /// Being in front again doesn't give the user's app a key window: it
+    /// comes back active with none, its window drawn inactive (grey title
+    /// bar, lighter shadow) though their typing still reaches it. The make-key
+    /// records give it one, but only once the app knows it's active: if they
+    /// get there first (the other app took the front twice, say), it ends up
+    /// the same way. So: after it's in front, and after a moment. Not while
+    /// an agent's window is key there for a swap, which gives key back itself.
+    private func makeKeyAgain(_ pid: pid_t, window: CGWindowID) {
+        sleepMs(Self.activationSettleMs)
+        guard BCUFrontProcessPID() == pid, !isSwapping(pid) else { return }
+        // Not known (the app was busy when asked): accessibility names the
+        // window that would be key.
+        var id = window != 0 ? window : (AX.focusedWindowID(pid) ?? 0)
+        if id != 0, Self.onAgentDisplay(id) { id = userWindow(of: pid) ?? 0 }
+        if id != 0 { _ = BCUPostMakeKeyRecords(pid, id) }
+    }
+
+    /// An app that put itself in front brought windows forward with it, and
+    /// giving the front back doesn't send them behind again: one of them can
+    /// stay on top of the user's window, on their screen, with their app in
+    /// front (so cmd+Tab shows nothing wrong). Raise the user's window back
+    /// over it; their app is in front, so nothing else moves.
+    private func uncover(_ pid: pid_t, window: CGWindowID, from intruder: pid_t) {
+        guard intruder != 0, intruder != pid else { return }
+        let id = window != 0 ? window : (AX.focusedWindowID(pid) ?? 0)
+        guard id != 0, let info = WindowList.info(id) else { return }
+        let agents = AgentDisplay.running.map(\.liveBounds)
+        let over = WindowList.above(id).filter { w in
+            w.pid == intruder && w.layer == 0 && w.alpha > 0 && w.bounds.intersects(info.bounds)
+                && !agents.contains { $0.intersects(w.bounds) }
+        }
+        guard !over.isEmpty, let ax = AX.window(pid: pid, id: id) else { return }
+        AX.perform(ax, "AXRaise")
+        let name = NSRunningApplication(processIdentifier: intruder)?.localizedName ?? "pid \(intruder)"
+        record("\(name) left a window over yours when it took the front; raised your window back over it")
     }
 
     // MARK: cmd+Tab order
@@ -754,9 +1059,10 @@ public final class FocusGuard {
             }
             return
         }
-        // An agent step that began since holds the input lock while it has
-        // key on its window: changing the front app or key under it would
-        // break it. Take the lock for the repair, or try again shortly.
+        // An agent step that began since holds its app's input lock while
+        // it has key on its window: changing the front app or key under it
+        // would break it. Take the user's app's lock for the repair (and the
+        // second app's, below), or try again shortly.
         func retry() {
             guard nowMs() < giveUpMs else { return }
             restoreQueue.asyncAfter(deadline: .now() + .milliseconds(150)) {
@@ -764,8 +1070,9 @@ public final class FocusGuard {
                 if current { self.repairOrder(gen, giveUpMs: giveUpMs) }
             }
         }
-        guard Engine.inputLock.try() else { retry(); return }
-        defer { Engine.inputLock.unlock() }
+        let userLock = Engine.inputLock(user)
+        guard userLock.try() else { retry(); return }
+        defer { userLock.unlock() }
         lock.lock()
         let stillIdle = !(taints.values.contains { $0.count > 0 } || !swapping.isEmpty || restoring || draining || !holdTokens.isEmpty)
             && userFrontPid == user && orderRepairGen == gen
@@ -782,24 +1089,30 @@ public final class FocusGuard {
         }
         let name = { (p: pid_t) in NSRunningApplication(processIdentifier: p)?.localizedName ?? "pid \(p)" }
         let pushed = now[1]
+        let secondLock = Engine.inputLock(second)
+        guard secondLock.try() else { retry(); return }
+        defer { secondLock.unlock() }
         lock.lock()
         if restoring { lock.unlock(); return }
         restoring = true
-        var t = taints[second] ?? Taint(count: 0, until: .infinity, cause: "restoring the cmd+Tab order", strict: false)
+        var t = taints[second] ?? Taint(count: 0, until: .infinity, cause: "restoring the cmd+Tab order", strict: false, gated: false)
         t.count += 1; t.until = .infinity
         taints[second] = t
         lock.unlock()
+        // The second app has to reach the front for a moment, even if agents
+        // have windows in it.
+        gate.lift(ms: 600)
         let t0 = nowMs()
         _ = BCUSetFrontProcess(second, 0, 0x200)
         while BCUFrontProcessPID() != second && nowMs() - t0 < 50 { sleepMs(1) }
         var lastCall = nowMs()
         _ = BCUSetFrontProcess(user, window, 0x200)
-        if window != 0 { _ = BCUPostMakeKeyRecords(user, window) }
         while BCUFrontProcessPID() != user && nowMs() - t0 < 500 {
             if nowMs() - lastCall >= 20 { _ = BCUSetFrontProcess(user, window, 0x200); lastCall = nowMs() }
             sleepMs(1)
         }
         let back = BCUFrontProcessPID() == user
+        if back { makeKeyAgain(user, window: CGWindowID(window)) }
         lock.lock()
         if var t = taints[second] { t.count = max(0, t.count - 1); if t.count == 0 { t.until = nowMs() + 300 }; taints[second] = t }
         holding = false
@@ -815,6 +1128,32 @@ public final class FocusGuard {
 
     // MARK: Tap
 
+    /// Open the gate for an event that can switch apps, before it goes on
+    /// (see `FrontGate`): any mouse button, for as long as it's down and a
+    /// moment after; cmd+Tab until command is let go; Return, a function
+    /// key or a key with a modifier.
+    private func openGate(for type: CGEventType, _ event: CGEvent) {
+        switch type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            gate.pointer(down: true, ms: Self.clickLiftMs)
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            gate.pointer(down: false, ms: Self.clickLiftMs)
+        case .keyDown:
+            let code = event.getIntegerValueField(.keyboardEventKeycode)
+            let opens = code == 36 || code == 76 || !event.flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty
+            // The switch comes when command is let go, however long that is.
+            if event.flags.contains(.maskCommand) && code == 48 {
+                gate.switcher(open: true)
+            } else if opens || Self.functionKeys.contains(code) {
+                gate.lift(ms: Self.keyLiftMs)
+            }
+        case .flagsChanged:
+            if !event.flags.contains(.maskCommand) { gate.switcher(open: false) }
+        default:
+            break
+        }
+    }
+
     fileprivate func handle(type: CGEventType, event: CGEvent) -> CGEvent? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
@@ -826,6 +1165,9 @@ public final class FocusGuard {
             return event
         }
         if event.getIntegerValueField(.eventSourceUserData) == FocusGuard.replayMarker {
+            // Held and going on only now: the gate opened when it was
+            // pressed and has shut again since.
+            openGate(for: type, event)
             if type == .keyDown || type == .keyUp { noteDelivered(event, type) }
             if Self.isKey(type) {
                 lock.lock()
@@ -837,14 +1179,17 @@ public final class FocusGuard {
             return event
         }
         activity.note(type, event)
+        if type == .keyDown || Self.isMouseDown(type) { userPressed() }
         switch type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .tabletPointer:
             let p = event.location
             if let agent = AgentDisplay.fenced(at: p) {
                 let q = nearestUserPoint(p, agent: agent)
-                event.location = q
-                CGWarpMouseCursorPosition(q)
-                CGAssociateMouseAndMouseCursorPosition(1)
+                if q != p && AgentDisplay.fenced(at: q) == nil {
+                    event.location = q
+                    CGWarpMouseCursorPosition(q)
+                    CGAssociateMouseAndMouseCursorPosition(1)
+                }
             }
             if type != .mouseMoved {
                 lock.lock(); let pressHeld = held.contains { Self.isMouseDown($0.event.type) }; lock.unlock()
@@ -852,15 +1197,30 @@ public final class FocusGuard {
             }
             return event
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            // A click can bring any app forward (its window, the Dock, a
+            // link that opens in the browser): the gate opens before it goes on.
+            openGate(for: type, event)
             lock.lock(); lastUserMouseDownMs = nowMs(); let holdAll = !holdTokens.isEmpty || draining; let anySwap = !swapping.isEmpty; lock.unlock()
-            if AgentDisplay.fenced(at: event.location) != nil { return nil }
+            if AgentDisplay.fenced(at: event.location) != nil {
+                Log.info("guard: dropped a click on an agent display at \(Int(event.location.x)),\(Int(event.location.y))")
+                return nil
+            }
             // A click now would make the user's window key mid-swap; hold it.
-            if holdAll { hold(event); return nil }
+            if holdAll {
+                Log.info("guard: holding a click (\(heldWhy()))")
+                hold(event)
+                return nil
+            }
             // Even in an app they weren't in: a click on its window would
             // activate it and move key under the agent's keystrokes.
-            if anySwap, let pid = Self.windowOwner(at: event.location), isSwapping(pid) { hold(event); return nil }
+            if anySwap, let pid = Self.windowOwner(at: event.location), isSwapping(pid) {
+                Log.info("guard: holding a click on pid \(pid), which is mid-swap")
+                hold(event)
+                return nil
+            }
             return event
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            openGate(for: type, event)
             lock.lock(); let holdIt = !holdTokens.isEmpty || draining || held.contains { Self.isMouseDown($0.event.type) }; lock.unlock()
             if holdIt { hold(event); return nil }
             return event
@@ -872,12 +1232,14 @@ public final class FocusGuard {
             if type == .keyDown {
                 let code = event.getIntegerValueField(.keyboardEventKeycode)
                 let opens = code == 36 || code == 76 || !event.flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty
+                openGate(for: type, event)
                 lock.lock()
                 lastUserKeyMs = nowMs()
                 if opens { lastUserOpenKeyMs = nowMs() }
                 if cmdTab { lastUserSwitchKeyMs = nowMs() }
                 lock.unlock()
             }
+            if type == .flagsChanged { openGate(for: type, event) }
             if type == .keyUp {
                 let code = event.getIntegerValueField(.keyboardEventKeycode)
                 lock.lock()
@@ -889,7 +1251,7 @@ public final class FocusGuard {
             }
             lock.lock()
             let alreadyHolding = holding || !holdTokens.isEmpty || draining || !held.isEmpty || replaysInFlight > 0
-            let anySwap = !swapping.isEmpty || !pidHeld.isEmpty || !parked.isEmpty
+            let anySwap = !swapping.isEmpty || !pidHeld.isEmpty || !parked.isEmpty || !arriving.isEmpty
             let now = nowMs()
             let anyTaint = taints.values.contains { $0.count > 0 || $0.until >= now }
             lock.unlock()
@@ -905,7 +1267,7 @@ public final class FocusGuard {
                 lock.lock()
                 // Or one left on an agent's window: the user just switched
                 // to the app, and key moves to their window in a moment.
-                let mid = swapping[front] != nil || pidHeld[front] != nil || parked[front] != nil
+                let mid = swapping[front] != nil || pidHeld[front] != nil || parked[front] != nil || arriving[front] != nil
                 if mid, let copy = event.copy() {
                     if firstCapture(copy, "held for an app mid-swap") {
                         var p = pidHeld[front] ?? (nowMs(), [])
@@ -929,6 +1291,12 @@ public final class FocusGuard {
         default:
             return event
         }
+    }
+
+    /// Why all the user's input is being held right now, for the log.
+    private func heldWhy() -> String {
+        lock.lock(); defer { lock.unlock() }
+        return "hold tokens \(holdTokens.count), draining \(draining), queued \(held.count), replays in flight \(replaysInFlight)"
     }
 
     /// A key event goes on to the app now.
@@ -957,6 +1325,14 @@ public final class FocusGuard {
         let s = String(utf16CodeUnits: buf, count: len)
         return s == " " ? "␣" : (s.isEmpty ? "#\(e.getIntegerValueField(.keyboardEventKeycode))" : s)
     }
+
+    /// How long the gate stays open after a click (a link clicked in one app
+    /// can take a moment to bring the browser forward) and after a key that
+    /// can open or switch apps.
+    static let clickLiftMs = 1000.0
+    static let keyLiftMs = 1500.0
+    /// F1–F20, Mission Control and Launchpad: keys that can show another app.
+    static let functionKeys: Set<Int64> = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106, 64, 79, 80, 90, 160, 131]
 
     private static func isMouseDown(_ t: CGEventType) -> Bool {
         t == .leftMouseDown || t == .rightMouseDown || t == .otherMouseDown
@@ -1008,9 +1384,9 @@ public final class FocusGuard {
         // its activation went unnoticed: give key to them now.
         let front = BCUFrontProcessPID()
         lock.lock()
-        let parkedFront = parked[front] != nil && swapping[front] == nil
+        let parkedFront = parked[front] != nil && swapping[front] == nil && arriving[front] == nil
         lock.unlock()
-        if parkedFront {
+        if parkedFront && !agentCaused(front) {
             DispatchQueue.global(qos: .userInteractive).async { self.unpark(front, reason: "the user is in it") }
         }
         lock.lock()
@@ -1023,6 +1399,8 @@ public final class FocusGuard {
             replaysInFlight = 0
         }
         let stale = !held.isEmpty && !draining && now - heldSinceMs > Self.maxHoldMs
+        // An arrival that never finished (the app isn't answering).
+        arriving = arriving.filter { now - $0.value < Self.maxPidHoldMs }
         let stalePids = pidHeld.filter { now - $0.value.sinceMs > Self.maxPidHoldMs }.map(\.key)
         lock.unlock()
         if !what.isEmpty { record("released your input after \(Int(Self.maxHoldMs)) ms held for \(what.joined(separator: " and "))") }
@@ -1099,9 +1477,10 @@ public final class FocusGuard {
                 if safeFor != front {
                     if !keySafe(front) {
                         // Reclaim, but without waiting on a swap that may be stuck.
-                        if Engine.inputLock.lock(before: Date().addingTimeInterval(0.05)) {
+                        let appLock = Engine.inputLock(front)
+                        if appLock.lock(before: Date().addingTimeInterval(0.05)) {
                             if !isSwapping(front) { reclaimKey(front) }
-                            Engine.inputLock.unlock()
+                            appLock.unlock()
                         }
                     }
                     if !keySafe(front) {
@@ -1120,6 +1499,7 @@ public final class FocusGuard {
                 }
                 lock.lock(); removeHeld(e); lock.unlock()
                 e.setIntegerValueField(.eventSourceUserData, value: FocusGuard.replayMarker)
+                gate.lift(ms: Self.clickLiftMs)
                 e.post(tap: .cghidEventTap)
                 n += 1
                 // A click can switch apps and move key: keys typed after it

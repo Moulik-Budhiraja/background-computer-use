@@ -62,6 +62,7 @@ enum Serve {
         let host = HostServer(hub: hub, ownerName: owner, version: BCUVersion.current)
         let server = SocketServer { tool, args in hub.call(tool: tool, args: args) }
         server.hostHandler = { op, req, connection in host.handle(op, req, connection) }
+        server.sessionHandler = { [hub] session, on in hub.sessionAttached(session, on) }
         do {
             try server.start()
         } catch {

@@ -82,11 +82,19 @@ public final class Engine {
         var value: String
     }
     private var focusedText: [CGWindowID: TextFocus] = [:]
+    /// A Chromium browser's own id for each of this session's windows of it
+    /// (`navigate` names the window by it), found the first time it's needed.
+    private var browserWindowIDs: [CGWindowID: String] = [:]
     /// Steps that take key focus in the app the user is in wait for a pause
     /// in their input (see `QuietWait`), within this session's budget.
     private let waitBudget = WaitBudget()
     /// The current step passed `priority: "now"`: no waiting for the user.
     private var priorityNow = false
+    /// How long the tool call under way has waited for the user to stop
+    /// typing, over all its steps, and how deep in `run` it is (a batch
+    /// runs its steps through `run` too).
+    private var typingWaitedMs = 0.0
+    private var runDepth = 0
     /// Waits for the user during the current call, for its result.
     private var waitNotes: [String] = []
     /// Waits for other agents (a free display, their turn at an app's key
@@ -104,10 +112,28 @@ public final class Engine {
     private var _waitingReason: String?
     private var _busy: String?
     private var lastCallMs = 0.0
+    private var lastLeftoverLogMs = -Double.infinity
+    /// How far this session has reported front-app changes (`FocusGuard.frontReport`).
+    private var frontMark = 0
+    /// Apps this call acted on that the session may have no window in (yet,
+    /// or any more): one being opened, one whose window was just closed.
+    private var touched: Set<pid_t> = []
 
-    /// Input to apps (key-window swaps, clicks, keys) from any session goes
-    /// one at a time: two sessions in the same app would fight over its key window.
-    public static let inputLock = NSRecursiveLock()
+    private static let inputLocksLock = NSLock()
+    private static var inputLocks: [pid_t: NSRecursiveLock] = [:]
+
+    /// Input to one app (key-window swaps, clicks, keys) goes one step at a
+    /// time, whichever session it's from: two in the same app would fight
+    /// over its key window. Steps in different apps don't wait for each
+    /// other, so one agent stuck on an app that isn't answering holds up
+    /// only the agents in that app.
+    public static func inputLock(_ pid: pid_t) -> NSRecursiveLock {
+        inputLocksLock.lock(); defer { inputLocksLock.unlock() }
+        if let l = inputLocks[pid] { return l }
+        let l = NSRecursiveLock()
+        inputLocks[pid] = l
+        return l
+    }
     /// How long `open_window` waits for a free display when all are taken.
     /// Under Codex's default 60 s tool timeout.
     static let displayWaitS: TimeInterval = 45
@@ -128,6 +154,7 @@ public final class Engine {
         let safe = label.replacingOccurrences(of: " ", with: "-").lowercased()
         audio = SessionAudio(name: "\(safe)-\(sessionID.prefix(8))")
         recorder = SessionRecorder(sessionID: sessionID, label: label, display: display)
+        frontMark = focusGuard.frontMark
     }
 
     /// Create the session's display if it doesn't exist yet. Any thread.
@@ -150,10 +177,14 @@ public final class Engine {
             agentWaitNotes.append("waited \(String(format: "%.0f", (nowMs() - waitStart) / 1000)) s for a free display, since \(AgentDisplay.maxDisplays) other agents were using theirs")
         }
         var failure: Error?
+        // A new display rearranges them all, and macOS then moves windows to
+        // where they were the last time the displays were like this.
+        let userWindows = AgentDisplay.noteUserWindows()
         onMain { do { try self.display.start() } catch { failure = error } }
         if let failure { throw failure }
+        if !display.reused { AgentDisplay.restoreUserWindows(userWindows) }
         guard display.waitUntilOnline() else {
-            onMain { self.display.stop() }
+            onMain { self.display.stop(remove: true) }
             throw ToolError("virtual display never came online")
         }
         onMain {
@@ -180,6 +211,16 @@ public final class Engine {
             let idle = self._busy == nil && nowMs() - self.lastCallMs > idleMs
             self.stateLock.unlock()
             guard idle else { return }
+            // Never let go of a display with a window still on it (one that
+            // wouldn't close, or that an app opened by itself): macOS would
+            // move it onto the user's screen.
+            if WindowManager.closeLeftovers(on: self.display.bounds) > 0 {
+                if nowMs() - self.lastLeftoverLogMs > 60_000 {
+                    self.lastLeftoverLogMs = nowMs()
+                    self.log("Kept the agent display: a window on it wouldn't close", error: true)
+                }
+                return
+            }
             self.recorder.stop()
             DispatchQueue.main.sync {
                 self.windows.stopWatchdog()
@@ -187,7 +228,41 @@ public final class Engine {
             }
             self.snapshots.removeAll()
             self.audio.end()
-            self.log("Removed the agent display: no windows for a while")
+            self.log("Gave up the agent display: no windows for a while")
+        }
+    }
+
+    /// The session's agent is gone (its connection closed). With nothing
+    /// open its display goes now; whatever it left open is released after
+    /// `graceMs` unless it's `back` by then. A window the user took over
+    /// stays with them.
+    func agentLeft(graceMs: Double, back: @escaping () -> Bool) {
+        tearDownIfIdle(idleMs: 0)
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(Int(graceMs))) {
+            self.releaseAbandoned(back: back)
+        }
+    }
+
+    /// Close what an agent that went away left open, and give up its
+    /// display, unless it's `back`. Any thread; safe to call twice.
+    func releaseAbandoned(back: @escaping () -> Bool) {
+        guard !back() else { return }
+        queue.async {
+            guard !back(), !self.userInControl else { return }
+            let mine = self.windows.windows
+            guard !mine.isEmpty else { self.tearDownIfIdle(idleMs: 0); return }
+            var notes: [String] = []
+            for w in mine {
+                if w.withUser {
+                    self.windows.unregister(w.id)
+                    notes.append("left \(w.appName) window \(w.id) with you")
+                } else {
+                    notes.append((try? self.windows.release(w.id, keepOpen: false)) ?? "window \(w.id): failed")
+                }
+            }
+            self.snapshots.removeAll()
+            self.log("The agent went away without closing its windows: " + notes.joined(separator: "; "))
+            self.tearDownIfIdle(idleMs: 0)
         }
     }
 
@@ -207,7 +282,7 @@ public final class Engine {
     public func finishShutdown() {
         recorder.stop()
         windows.stopWatchdog()
-        display.stop()
+        display.stop(remove: true)
         audio.end()
     }
 
@@ -353,7 +428,7 @@ public final class Engine {
             waitNotes = []
             agentWaitNotes = []
             waitBudget.step()
-            if monitored { focusGuard.startMonitor() }
+            touched = []
             do {
                 var result = try run(tool: tool, args: Args(args))
                 if !waitNotes.isEmpty {
@@ -364,7 +439,7 @@ public final class Engine {
                     result.text += "\n[other agents] " + agentWaitNotes.map(Self.sentence).joined(separator: " ") + " That's expected: the step ran, don't repeat it."
                     agentWaitNotes = []
                 }
-                if monitored, let focusNote = focusGuard.stopMonitor() {
+                if monitored, let focusNote = focusReport() {
                     focusGuard.record("\(tool): \(focusNote)")
                     result.text += "\n[focus guard] \(focusNote)"
                 }
@@ -373,11 +448,25 @@ public final class Engine {
                 }
                 return result
             } catch {
-                if monitored { _ = focusGuard.stopMonitor(tailMs: 0) }
+                var text = "\(error)"
+                if monitored, let focusNote = focusReport() {
+                    focusGuard.record("\(tool): \(focusNote)")
+                    text += "\n[focus guard] \(focusNote)"
+                }
                 log("\(tool) failed after \(Int(nowMs() - startMs)) ms: \(error)", error: true)
-                return .error("\(error)")
+                return .error(text)
             }
         }
+    }
+
+    /// What this session's apps did to the user's front app since it last
+    /// said: each change is reported once, by the call that's running when
+    /// it happens or the next one (an app can take the front a moment after
+    /// the step that caused it), and only by sessions working in that app.
+    private func focusReport() -> String? {
+        let apps = Set(windows.windows.map(\.pid)).union(touched)
+        defer { frontMark = focusGuard.frontMark }
+        return focusGuard.frontReport(since: frontMark, apps: apps)
     }
 
     private static func describe(_ tool: String) -> String {
@@ -397,6 +486,13 @@ public final class Engine {
         let outerPriority = priorityNow
         priorityNow = args.string("priority")?.lowercased() == "now"
         defer { priorityNow = outerPriority }
+        // The patience for the user's typing is the whole call's (see `typingDeadline`).
+        if runDepth == 0 { typingWaitedMs = 0 }
+        runDepth += 1
+        defer {
+            runDepth -= 1
+            if runDepth == 0 { typingWaitedMs = 0 }
+        }
         defer {
             if Self.batchable.contains(tool), tool != "wait", let id = args.int("window_id") {
                 lastActionMs[CGWindowID(id)] = nowMs()
@@ -471,6 +567,8 @@ public final class Engine {
         case "admin_activate":
             let pid = pid_t(try args.requireInt("pid"))
             let wid = CGWindowID(args.int("window_id") ?? 0)
+            // Stands in for the user switching to it.
+            focusGuard.noteUserSwitch()
             let r = BCUSetFrontProcess(pid, wid, 0x200)
             if wid != 0 { _ = BCUPostMakeKeyRecords(pid, wid) }
             sleepMs(300)
@@ -483,6 +581,30 @@ public final class Engine {
             if let b = args.bool("bool") { value = b ? kCFBooleanTrue : kCFBooleanFalse } else { value = try args.requireString("value") as CFString }
             let err = AX.set(n.element, attr, value)
             return ToolResult(text: "\(attr) -> \(AX.errorName(err)); value now \"\(AX.string(n.element, "AXValue") ?? "")\"")
+        case "admin_key_raw":
+            // Experiment: post a key to the window's process, stamped with the
+            // window, without making the window key first.
+            let (w, _) = try agentWindow(args)
+            try Input.pressKey(pid: w.pid, key: try args.requireString("key"), modifiers: args.strings("modifiers") ?? [], windowID: w.id)
+            sleepMs(args.double("wait_ms") ?? 150)
+            return ToolResult(text: "posted; app key window \(AX.focusedWindowID(w.pid).map(String.init) ?? "none"), AppKit active \(AX.bool(AX.app(w.pid), "AXFrontmost") == true), front pid \(BCUFrontProcessPID())")
+        case "admin_type_raw":
+            let (w, _) = try agentWindow(args)
+            let n = try Input.typeText(pid: w.pid, try args.requireString("text"), windowID: w.id)
+            sleepMs(args.double("wait_ms") ?? 150)
+            return ToolResult(text: "posted \(n) characters; app key window \(AX.focusedWindowID(w.pid).map(String.init) ?? "none"), AppKit active \(AX.bool(AX.app(w.pid), "AXFrontmost") == true)")
+        case "admin_records":
+            // Experiment: post one focus record to a window of an app: "lose" or "gain", or the make-key pair.
+            let pid = pid_t(try args.requireInt("pid"))
+            let wid = CGWindowID(try args.requireInt("window"))
+            let r: Int32
+            switch args.string("kind") ?? "lose" {
+            case "gain": r = BCUPostFocusRecord(pid, wid, true)
+            case "makekey": r = BCUPostMakeKeyRecords(pid, wid)
+            default: r = BCUPostFocusRecord(pid, wid, false)
+            }
+            sleepMs(args.double("wait_ms") ?? 100)
+            return ToolResult(text: "status \(r); app key window \(AX.focusedWindowID(pid).map(String.init) ?? "none"), AppKit active \(AX.bool(AX.app(pid), "AXFrontmost") == true)")
         case "admin_click_raw":
             let (w, ax) = try agentWindow(args)
             let p: CGPoint
@@ -658,6 +780,7 @@ public final class Engine {
             let pid = pid_t(try args.requireInt("pid"))
             let wid = CGWindowID(try args.requireInt("window_id"))
             guard let win = AX.window(pid: pid, id: wid) else { throw ToolError("no window") }
+            focusGuard.noteUserSwitch()
             _ = AX.perform(win, "AXRaise")
             _ = BCUSetFrontProcess(pid, wid, 0x200)
             _ = BCUPostMakeKeyRecords(pid, wid)
@@ -740,8 +863,16 @@ public final class Engine {
             throw ToolError("window \(id) isn't one of yours. Use open_window or borrow_window first, or list_windows.")
         }
         guard let ax = AX.window(pid: w.pid, id: id) else {
-            windows.unregister(id)
-            throw ToolError("window \(id) no longer exists")
+            // Gone only if the window server says so. An app that doesn't
+            // answer accessibility (it's busy, or one of its dialogs is
+            // waiting for an answer) still has its windows, and forgetting
+            // one here leaves it open with nobody to close it: once the
+            // session's display goes, it lands on the user's screen.
+            if WindowList.info(id) == nil {
+                windows.unregister(id)
+                throw ToolError("window \(id) no longer exists")
+            }
+            throw ToolError("\(w.appName) isn't answering right now (it's busy, or showing a dialog that has to be answered first; list_windows shows a dialog of yours). Window \(id) is still open: try again in a moment.")
         }
         if w.handedOff {
             throw ToolError("window \(id) is handed off to the user. Wait for them, then call take_back.")
@@ -789,39 +920,85 @@ public final class Engine {
     /// unless the agent's window is still the app's key window and the user
     /// hasn't switched to the app since, so input never goes anywhere else.
     private func keyed<T>(_ w: AgentWindow, cause: String, _ body: (_ check: () throws -> Void) throws -> T) throws -> T {
-        if paused { throw ToolError("paused by the user") }
-        if userInControl { throw ToolError("the user took over your display") }
-        if let c = cover, !(c.pid == w.pid && userIsIn(w.pid) && nowMs() - c.lastUsedMs < Self.coverGapMs
-                             && nowMs() - c.openedMs < Self.coverMaxMs) {
+        let giveUpAt = typingDeadline
+        while true {
+            do {
+                return try keyedOnce(w, cause: cause, giveUpAtMs: giveUpAt, body)
+            } catch is YieldToUser {
+                // They started typing between the wait and the keys: wait again.
+                Log.info("swap: \(label) left \(cause) in \(w.appName) for later: the user started typing")
+                if nowMs() >= giveUpAt {
+                    throw Self.typingError(appName: w.appName, cause: cause)
+                }
+                sleepMs(20)
+            }
+        }
+    }
+
+    /// A batch keeps the cover up from one step to the next, but only for a
+    /// step in the same app that starts soon enough, and not once the user
+    /// has typed under it: then the step waits for them like a first one.
+    private func dropStaleCover(_ w: AgentWindow) {
+        guard let c = cover else { return }
+        let fresh = nowMs() - c.lastUsedMs < Self.coverGapMs && nowMs() - c.openedMs < Self.coverMaxMs
+        let typedUnder = QuietRules.safeTyping && focusGuard.activity.snapshot.lastKeyDownMs >= c.openedMs
+        if !(c.pid == w.pid && userIsIn(w.pid) && fresh && !typedUnder) {
             closeCover()
         }
-        if cover == nil && userIsIn(w.pid) && !priorityNow {
-            try awaitUser(w, cause: cause)
+    }
+
+    /// The user started typing in the app just as a step was about to take
+    /// key there, and nothing has been sent yet: the step starts over, after
+    /// they've stopped.
+    private struct YieldToUser: Error {}
+
+    private func keyedOnce<T>(_ w: AgentWindow, cause: String, giveUpAtMs: Double,
+                              _ body: (_ check: () throws -> Void) throws -> T) throws -> T {
+        if paused { throw ToolError("paused by the user") }
+        if userInControl { throw ToolError("the user took over your display") }
+        dropStaleCover(w)
+        if cover == nil && userIsIn(w.pid) {
+            try awaitUser(w, cause: cause, giveUpAtMs: giveUpAtMs)
         }
         // Another agent mid-task in this app goes first. Checked again under
         // the input lock: it may have started a step while this one waited.
         let turnStart = nowMs()
+        let appLock = Self.inputLock(w.pid)
         while true {
             if !userIsIn(w.pid) { try awaitAgentTurn(w, cause: cause, since: turnStart) }
-            Self.inputLock.lock()
+            appLock.lock()
             if userIsIn(w.pid) || leaseHolder(w.pid, window: w.id) == nil || nowMs() - turnStart > Self.agentWaitMaxMs { break }
-            Self.inputLock.unlock()
+            appLock.unlock()
         }
-        defer { Self.inputLock.unlock() }
+        defer { appLock.unlock() }
+        touched.insert(w.pid)
         focusGuard.beginAction(pid: w.pid, cause: cause)
         windows.noteBefore(pid: w.pid)
         defer { focusGuard.endAction(pid: w.pid) }
         let shared = userIsIn(w.pid)
+        // Waiting for the lock can take as long as another agent's step in
+        // this app, and with several agents waiting on one pause they'd
+        // otherwise go one after another over what the user types next.
+        var yielded = false
+        func yieldIfTyping() throws {
+            guard shared, userTyping else { return }
+            yielded = true
+            throw YieldToUser()
+        }
+        if cover == nil { try yieldIfTyping() }
         if cover == nil && shared { openCover(w, cause: cause) } else if cover != nil { UserSim.shared.coverUsed(cause) }
         defer {
-            if batching { cover?.lastUsedMs = nowMs() } else { closeCover() }
+            if batching && !yielded { cover?.lastUsedMs = nowMs() } else { closeCover() }
         }
+        // Taking the copy took a moment too.
+        try yieldIfTyping()
         // From here until key is back, the guard holds keys typed into this
         // app and clicks on it, even if the user wasn't in it.
         focusGuard.beginSwap(w.pid)
         defer { focusGuard.endSwap(w.pid) }
         // Key must be the user's going in, or the swap wouldn't give it back.
         let userWindow = shared ? (cover?.userWindow ?? focusGuard.userWindow(of: w.pid)) : nil
+        let swapStart = nowMs()
         if shared { focusGuard.reclaimKey(w.pid, prefer: userWindow) }
         let scope: KeyScope
         do {
@@ -833,7 +1010,18 @@ public final class Engine {
         // Key is this window's now, whoever had it parked before; other
         // agents wait while this step runs too.
         focusGuard.park(w.pid, window: w.id, owner: sessionID)
-        defer { handBack(scope, w) }
+        let keyAt = nowMs()
+        defer {
+            let backFrom = nowMs()
+            handBack(scope, w)
+            // How long the user's window was without key, and on what.
+            if shared {
+                Log.info("swap: \(cause) in \(w.appName)\(yielded ? " (given up for the user's typing)" : ""): \(Int(keyAt - swapStart)) ms taking key, \(Int(backFrom - keyAt)) ms for the step, \(Int(nowMs() - backFrom)) ms giving it back")
+            }
+        }
+        // Their key is held from here on: with nothing sent yet, give key
+        // straight back rather than have it wait for the step as well.
+        try yieldIfTyping()
         let wasFront = BCUFrontProcessPID() == w.pid
         let check = { [self] in
             let key = AX.focusedWindowID(w.pid)
@@ -888,7 +1076,6 @@ public final class Engine {
     private struct SwapCover {
         let pid: pid_t
         let freeze: ScreenFreeze?
-        let hold: Int
         /// The user's window in the app, which gets key back.
         let userWindow: CGWindowID?
         let openedMs: Double
@@ -896,62 +1083,51 @@ public final class Engine {
     }
 
     /// A batch keeps the cover up for the next step only if it starts this
-    /// soon, and never longer than this in all, since the user's input is
-    /// held the whole time. Typing ends a swap after `typeChunkMs`, so a
-    /// step started inside `coverMaxMs` ends well inside the guard's own
-    /// limit (`FocusGuard.maxHoldMs`).
+    /// soon, and never longer than this in all: the user's window shouldn't
+    /// sit under a copy for long. Typing ends a swap after `typeChunkMs`, so
+    /// what the user types into the app during one is held well inside the
+    /// guard's own limit (`FocusGuard.maxHoldMs`).
     private static let coverGapMs = 500.0
     private static let coverMaxMs = 1000.0
     private static let inFlightMs = 60.0
-    /// Captures of the user's window before going without a copy, when
-    /// they keep typing through each one.
-    private static let captureTries = 3
     /// Keystroke typing goes in swaps of at most this many characters and this long.
     private static let typeChunk = 16
     private static let typeChunkMs = 400.0
 
-    /// Hold the user's input and cover their window, which is about to be
-    /// drawn inactive for a moment.
+    /// Cover the user's window, which is about to be drawn inactive for a
+    /// moment. Their input isn't held for the cover: what they type into the
+    /// app while key is away is held by the swap itself (`beginSwap`), for as
+    /// long as the swap lasts and no longer, and what's inside their window
+    /// is left uncovered while they type (see `ScreenFreeze`), so nothing
+    /// they type waits on a copy coming off.
     private func openCover(_ w: AgentWindow, cause: String) {
-        // Capture the copy before holding the user's input, not after: a
-        // capture can keep WindowServer busy for 100 ms or more on a busy
-        // machine, and their input shouldn't wait on that. If they type
-        // during the capture, the copy is out of date, so capture again
-        // (or go without one).
-        var hold: Int?
+        // A key the user pressed just now is still being drawn: let it land
+        // first, or the copy would show their window without it.
+        let sinceInput = nowMs() - focusGuard.activity.snapshot.lastInputMs
+        if sinceInput < Self.inFlightMs { sleepMs(Self.inFlightMs - sinceInput) }
+        focusGuard.reclaimKey(w.pid)
         var freeze: ScreenFreeze?
         var userWindow: CGWindowID?
-        for _ in 0..<Self.captureTries {
-            // A key the user pressed just now is still being drawn: let it
-            // land first, or the copy would never match their window again
-            // and stay up until it times out.
-            let sinceInput = nowMs() - focusGuard.activity.snapshot.lastInputMs
-            if sinceInput < Self.inFlightMs { sleepMs(Self.inFlightMs - sinceInput) }
-            focusGuard.reclaimKey(w.pid)
-            guard let key = AX.focusedWindowID(w.pid), key != w.id, !FocusGuard.onAgentDisplay(key) else { break }
+        if let key = AX.focusedWindowID(w.pid), key != w.id, !FocusGuard.onAgentDisplay(key) {
             userWindow = key
             let start = nowMs()
-            let shots = ScreenFreeze.capture(userWindow: key)
-            let h = focusGuard.beginHold()
-            if focusGuard.activity.snapshot.lastInputMs < start {
-                hold = h
-                if let shots { freeze = ScreenFreeze.show(shots) }
-                break
+            if let shots = ScreenFreeze.capture(userWindow: key) {
+                let activity = focusGuard.activity.snapshot
+                let typing = activity.lastInputMs >= start || nowMs() - activity.lastKeyDownMs < QuietRules.typingMs
+                freeze = ScreenFreeze.show(shots, chromeOnly: typing)
             }
-            focusGuard.endHold(h)
         }
-        let held = hold ?? focusGuard.beginHold()
-        cover = SwapCover(pid: w.pid, freeze: freeze, hold: held, userWindow: userWindow ?? focusGuard.userWindow(of: w.pid),
+        if let freeze { focusGuard.onUserPress(for: sessionID) { [weak freeze] in freeze?.uncoverContent() } }
+        cover = SwapCover(pid: w.pid, freeze: freeze, userWindow: userWindow ?? focusGuard.userWindow(of: w.pid),
                           openedMs: nowMs(), lastUsedMs: nowMs())
         UserSim.shared.coverOpened(cause)
     }
 
-    /// Let the user's input go on (the guard replays it once key is theirs),
-    /// then take the copy off once their window looks as before.
+    /// Take the copy off once the user's window looks as before.
     private func closeCover() {
         guard let c = cover else { return }
         cover = nil
-        focusGuard.endHold(c.hold)
+        focusGuard.onUserPress(for: sessionID, nil)
         c.freeze?.end()
         UserSim.shared.coverClosed()
     }
@@ -1007,17 +1183,40 @@ public final class Engine {
 
     /// Wait for a moment the user won't notice their window freezing, and
     /// note it for the step's result. Throws if they paused the agent or
-    /// took over meanwhile, or if at the cap they're still mid something
-    /// moving focus would break (a menu open, a button or key held).
-    private func awaitUser(_ w: AgentWindow, cause: String) throws {
-        try awaitUser(pid: w.pid, appName: w.appName, cause: cause, anywhere: false)
+    /// took over meanwhile, if at the cap they're still mid something
+    /// moving focus would break (a menu open, a button or key held), or if
+    /// they're still typing at `giveUpAtMs`: their typing goes first,
+    /// however long it lasts.
+    private func awaitUser(_ w: AgentWindow, cause: String, giveUpAtMs: Double) throws {
+        try awaitUser(pid: w.pid, appName: w.appName, cause: cause, anywhere: false, typingOnly: priorityNow, giveUpAtMs: giveUpAtMs)
     }
+
+    /// A step gave the user's typing `typingPatienceMs` to stop, in one wait
+    /// or in several (it started over each time they started again).
+    private static func typingError(appName: String, cause: String) -> ToolError {
+        ToolError("the user has been typing in \(appName) for the \(Int(QuietRules.typingPatienceMs / 1000)) s this step waited, and \(cause) would take the keyboard from their window for a moment (what they type would lag), so that wasn't done: their typing goes first. Steps that need no key focus still work meanwhile: set_value, type_text without Return or Tab, clicking an element, get_window_state. Otherwise wait a few seconds and retry.")
+    }
+
+    /// The user is typing, and steps wait for that (see `QuietWait.typing`
+    /// and `QuietRules.safeTyping`).
+    private var userTyping: Bool { QuietRules.safeTyping && QuietWait.typing(focusGuard.activity.snapshot, now: nowMs()) }
+
+    /// When a step that waits for the user's typing gives up: once the tool
+    /// call it's part of has waited `typingPatienceMs` in all. A call can be
+    /// many steps (a batch's, text typed a few characters at a time, each
+    /// Return), and with a fresh allowance for each it would outlast the
+    /// client's timeout and go on typing after the agent was told it failed.
+    private var typingDeadline: Double { nowMs() + max(0, QuietRules.typingPatienceMs - typingWaitedMs) }
 
     /// `anywhere`: the step may bring its app to the front, which breaks a
     /// drag or a menu in whatever app the user is in, so wait out those
-    /// (only those) wherever they are. Otherwise the step only moves focus
-    /// inside `pid`, the app the user is in: the full pause rules.
-    private func awaitUser(pid: pid_t, appName: String, cause: String, anywhere: Bool) throws {
+    /// (only those) wherever they are. Otherwise the step moves focus
+    /// inside `pid`, the app the user is in: the full pause rules, or with
+    /// `typingOnly` (the step passed `priority: "now"`, or it has waited
+    /// already and only has to make sure they haven't started typing since)
+    /// just the one that has no cap.
+    private func awaitUser(pid: pid_t, appName: String, cause: String, anywhere: Bool, typingOnly: Bool = false,
+                           giveUpAtMs: Double = .infinity) throws {
         let caps = waitBudget.caps
         let startMs = nowMs()
         stateLock.lock(); let busy = _busy; stateLock.unlock()
@@ -1030,8 +1229,10 @@ public final class Engine {
         let stop = { self.paused || self.userInControl }
         let r = anywhere
             ? QuietWait.waitAnywhere(focusGuard.activity, hardMs: caps.hardMs, stop: stop, willWait: willWait)
-            : QuietWait.wait(focusGuard.activity, pid: pid, softMs: caps.softMs, hardMs: caps.hardMs, stop: stop, willWait: willWait)
-        waitBudget.add(r.waitedMs)
+            : QuietWait.wait(focusGuard.activity, pid: pid, softMs: caps.softMs, hardMs: caps.hardMs,
+                             typingOnly: typingOnly, giveUpAtMs: giveUpAtMs, stop: stop, willWait: willWait)
+        waitBudget.add(r.countedMs)
+        typingWaitedMs += max(0, r.waitedMs - r.countedMs)
         if shown {
             stateLock.lock(); _busy = busy; stateLock.unlock()
             changed()
@@ -1056,10 +1257,16 @@ public final class Engine {
             let browser = BrowserAutomation.isScriptableChromium(NSRunningApplication(processIdentifier: pid)?.bundleURL ?? URL(fileURLWithPath: "/"))
             throw ToolError("the user is holding a mouse button or key\(where_) (dragging, say), and \(effect) would interrupt it, so nothing was done. Wait a few seconds and retry\(browser && !anywhere ? ", or use navigate to load a URL without keys" : "").")
         }
+        if r.outcome == .typing {
+            let note = "waited \(Int(QuietRules.typingPatienceMs / 1000)) s in all\(where_) before \(cause), but the user is still typing"
+            UserSim.shared.waited(fromMs: startMs, note)
+            Log.info("defer: \(note); failed the step")
+            throw Self.typingError(appName: appName, cause: cause)
+        }
         guard r.waitedMs >= 20 else { return }
         var note = "waited \(secs) s for \(r.reason ?? "the user to pause")\(anywhere ? "" : " in \(appName)") before \(cause)"
         switch r.outcome {
-        case .quiet, .menu, .held, .stopped: break
+        case .quiet, .menu, .held, .typing, .stopped: break
         case .gap: note += ", then went in a short gap in their input"
         case .cap: note += ", then went anyway (their input was held and replayed)"
         }
@@ -1073,8 +1280,10 @@ public final class Engine {
     }
 
     private func guarded<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) rethrows -> T {
-        Self.inputLock.lock()
-        defer { Self.inputLock.unlock() }
+        let appLock = Self.inputLock(w.pid)
+        appLock.lock()
+        defer { appLock.unlock() }
+        touched.insert(w.pid)
         focusGuard.beginAction(pid: w.pid, cause: cause)
         windows.noteBefore(pid: w.pid)
         defer { focusGuard.endAction(pid: w.pid) }
@@ -1135,6 +1344,7 @@ public final class Engine {
         // A new window becomes its app's key window until it's handed back;
         // hold the user's input meanwhile if they're in that app.
         let shared = (try windows.resolveApp(app).running).map { userIsIn($0.processIdentifier) } ?? false
+        if let running = try windows.resolveApp(app).running { touched.insert(running.processIdentifier) }
         // A new window takes its app's key: let another agent at work in
         // that app finish its step first.
         if !shared, let running = try windows.resolveApp(app).running {
@@ -1144,14 +1354,58 @@ public final class Engine {
         // In the app the user is in, the new window takes key from theirs
         // (the full pause rules); elsewhere it may bring its app to the front
         // (Chromium does, launching does), which breaks those in any app.
-        if !priorityNow {
-            let target = try windows.resolveApp(app)
-            try awaitUser(pid: target.running?.processIdentifier ?? 0, appName: target.name, cause: "opening a window", anywhere: !shared)
+        // There, their typing goes first whatever the step's priority.
+        let giveUpAt = typingDeadline
+        let target = try windows.resolveApp(app)
+        if !priorityNow || shared {
+            try awaitUser(pid: target.running?.processIdentifier ?? 0, appName: target.name, cause: "opening a window", anywhere: !shared,
+                          typingOnly: priorityNow, giveUpAtMs: giveUpAt)
         }
         let hold = shared ? InputHold(focusGuard) : nil
         defer { _ = hold?.end() }
-        let result = try windows.open(app: app, placement: WindowManager.Placement(name: args.string("placement")), trigger: args.string("trigger"), hold: hold)
+        // In the app the user is in, the new window takes key from theirs
+        // for a moment: their window is drawn inactive and the menu bar dims.
+        // A copy of their window's title bar, toolbars and shadow and of the
+        // menu bar (not of what's inside it: it's up for a few hundred ms and
+        // they may be typing) goes up just before the app is asked for the
+        // window. Put up when the new window was first seen, it was a frame
+        // late: the window takes key as it shows (measured: their shadow
+        // drawn as an inactive window's for up to 127 ms).
+        let freeze = Locked<ScreenFreeze?>(nil)
+        let userPid = shared ? (try windows.resolveApp(app).running)?.processIdentifier : nil
+        let beforeAsk: (() throws -> Void)? = userPid.map { pid in
+            {
+                // It can be seconds since the wait above (displays settling,
+                // another session's window first): not if they've started
+                // typing meanwhile. Waited out below, not here, where every
+                // other session's next window would wait with it.
+                if self.userTyping && self.userIsIn(pid) { throw YieldToUser() }
+                guard let key = AX.focusedWindowID(pid), !FocusGuard.onAgentDisplay(key),
+                      let shots = ScreenFreeze.capture(userWindow: key) else { return }
+                // Nor during the copy, which takes 0.1 s, and over a second
+                // on a busy Mac.
+                if self.userTyping && self.userIsIn(pid) { throw YieldToUser() }
+                freeze.value = ScreenFreeze.show(shots, chromeOnly: true)
+            }
+        }
+        defer { freeze.value?.end() }
+        func open() throws -> WindowManager.OpenResult {
+            while true {
+                do {
+                    return try windows.open(app: app, placement: WindowManager.Placement(name: args.string("placement")), trigger: args.string("trigger"),
+                                            hold: hold, beforeAsk: beforeAsk)
+                } catch is YieldToUser {
+                    Log.info("open: \(label) left opening a \(target.name) window for later: the user started typing there")
+                    if nowMs() >= giveUpAt {
+                        throw Self.typingError(appName: target.name, cause: "opening a window")
+                    }
+                    try awaitUser(pid: userPid ?? 0, appName: target.name, cause: "opening a window", anywhere: false, typingOnly: true, giveUpAtMs: giveUpAt)
+                }
+            }
+        }
+        let result = try open()
         let w = result.window
+        touched.insert(w.pid)
         let frame = WindowList.info(w.id)?.bounds ?? .zero
         let text = "Opened window \(w.id) of \(w.appName) on your display (\(Int(frame.width))x\(Int(frame.height))). Next: get_window_state window_id=\(w.id).\nNotes: \(result.notes.joined(separator: "; "))"
         return ToolResult(text: text)
@@ -1205,9 +1459,11 @@ public final class Engine {
             focusedText[id] = nil
             return ToolResult(text: "window \(id) is already closed")
         }
+        if let w = windows.window(id) { touched.insert(w.pid) }
         let text = try windows.release(id, keepOpen: args.bool("keep_open") ?? false)
         snapshots[id] = nil
         focusedText[id] = nil
+        browserWindowIDs[id] = nil
         return ToolResult(text: text)
     }
 
@@ -1529,7 +1785,10 @@ public final class Engine {
                     let n = try Input.typeText(pid: w.pid, piece, windowID: w.id) { i in
                         sent = i
                         // Keep each swap short: the user's input may be held meanwhile.
-                        if i > 0 && nowMs() - start > Self.typeChunkMs { return false }
+                        // And end it at once if they start typing into the app:
+                        // the rest waits until they've stopped (see `keyed`).
+                        if i > 0 && (nowMs() - start > Self.typeChunkMs
+                                     || (QuietRules.safeTyping && self.focusGuard.activity.snapshot.lastKeyDownMs >= start && self.userIsIn(w.pid))) { return false }
                         try check()
                         return true
                     }
@@ -1748,9 +2007,10 @@ public final class Engine {
         return ToolResult(text: "Dragged from (\(Int(fx)),\(Int(fy))) to (\(Int(tx)),\(Int(ty))).")
     }
 
-    /// Load a URL in one of the agent's Chromium windows through AppleScript:
-    /// no keystrokes, so no key swap and no waiting for a pause in the user's
-    /// input, only for a drag, a held key or an open menu to end.
+    /// Load a URL in one of the agent's Chromium windows by Apple event: no
+    /// keystrokes. With the user in another app that means no waiting for a
+    /// pause in their input, only for a drag, a held key or an open menu to
+    /// end. With the user in the browser it waits like a keystroke would.
     private func navigate(_ args: Args) throws -> ToolResult {
         let (w, _) = try agentWindow(args)
         guard let url = args.string("url")?.trimmingCharacters(in: .whitespaces), !url.isEmpty else { throw ToolError("give url") }
@@ -1766,52 +2026,130 @@ public final class Engine {
             BrowserAutomation.request(bundleID) { _ in }
             throw ToolError("macOS is asking the user whether this app may control \(w.appName). Retry once they've answered, or click the address bar and type_text the URL and \"\\n\".")
         }
-        guard let frame = WindowList.info(w.id)?.bounds else { throw ToolError("window \(w.id) is gone") }
-        // AppleScript knows the browser's windows by its own ids; find this
-        // one by its frame, which is the same in both.
-        func quoted(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
-        let b = "{\(Int(frame.minX.rounded())), \(Int(frame.minY.rounded())), \(Int(frame.maxX.rounded())), \(Int(frame.maxY.rounded()))}"
-        // Two of the browser's windows can share a frame (the cascade repeats),
-        // and then nothing tells them apart: load in neither rather than
-        // maybe in another task's window.
-        let script = """
-        with timeout of 5 seconds
-        tell application id \(quoted(bundleID))
-        set found to {}
-        repeat with w in windows
-        if bounds of w is \(b) then set end of found to id of w
-        end repeat
-        if (count of found) is 0 then error "no window with bounds \(b)"
-        if (count of found) > 1 then error "more than one window with bounds \(b)"
-        set URL of active tab of window id (item 1 of found) to \(quoted(url))
-        end tell
-        end timeout
-        """
+        // The browser's scripting knows its windows by its own ids. Which
+        // one this window is gets proven once (`provenBrowserID`), and
+        // checked each time after: the browser's window with that id has to
+        // be exactly where this one is.
+        var browserID = browserWindowIDs[w.id]
+        if let id = browserID, !BrowserAutomation.sameFrame(BrowserAutomation.frame(bundleID: bundleID, window: id), WindowList.info(w.id)?.bounds) {
+            log("navigate: \(w.appName)'s window id \(id) is no longer where window \(w.id) is; finding it again")
+            browserID = nil
+        }
+        if browserID == nil {
+            browserID = provenBrowserID(w, bundleID: bundleID, candidate: WindowManager.browserID(of: w.id))
+            guard WindowList.info(w.id) != nil else { throw ToolError("window \(w.id) is gone") }
+            browserWindowIDs[w.id] = browserID
+        }
+        guard let browserID else {
+            throw ToolError("couldn't tell which of \(w.appName)'s windows this is. Click the address bar, type_text the URL and \"\\n\".")
+        }
         // Chromium shows the window it loads a URL in: it can make it key and
         // bring the app to the front. That would end a drag or close a menu
         // in whatever app the user is in, so wait those out (only those).
-        if !priorityNow {
-            try awaitUser(pid: w.pid, appName: w.appName, cause: "loading a URL", anywhere: true)
+        // With the user in the browser, the load takes key from their
+        // window and holds what they type: the full pause rules, and their
+        // typing first whatever the step's priority.
+        //
+        // Then, if the user is in the browser, its key window is theirs: the
+        // agent's takes it for as long as the browser needs to start the
+        // load, with their window covered meanwhile and key handed straight
+        // back (as for a keystroke, see `keyed`).
+        let giveUpAt = typingDeadline
+        var shared = false
+        var covered = false
+        defer {
+            if covered { if batching { cover?.lastUsedMs = nowMs() } else { closeCover() } }
         }
-        // Run it as an agent action so the guard puts the user's app straight
-        // back, and if the user is in the browser, give key back to their window.
-        let shared = userIsIn(w.pid)
-        let userWindow = shared ? focusGuard.userWindow(of: w.pid) : nil
-        let loaded = guarded(w, cause: "loading a URL") { () -> Bool in
-            // Until key is back on the user's window, the guard holds what
-            // they type into the browser and their clicks on it, then replays
-            // them, so none of it lands in the agent's page.
-            focusGuard.beginSwap(w.pid)
-            defer { focusGuard.endSwap(w.pid) }
-            let ok = WindowManager.runAppleScript(script)
-            if shared { _ = focusGuard.reclaimKey(w.pid, prefer: userWindow) }
-            return ok
+        var loaded = false
+        while true {
+            dropStaleCover(w)
+            let inBrowser = userIsIn(w.pid)
+            if cover == nil && (!priorityNow || inBrowser) {
+                try awaitUser(pid: w.pid, appName: w.appName, cause: "loading a URL", anywhere: !inBrowser,
+                              typingOnly: priorityNow, giveUpAtMs: giveUpAt)
+            }
+            shared = userIsIn(w.pid)
+            if shared && cover == nil { openCover(w, cause: "loading a URL") }
+            covered = shared
+            let userWindow = shared ? (cover?.userWindow ?? focusGuard.userWindow(of: w.pid)) : nil
+            let sent = guarded(w, cause: "loading a URL") { () -> Bool? in
+                // Its turn came (another agent's step in the browser first)
+                // and the copy is up: not if they've started typing meanwhile.
+                if shared && userTyping { return nil }
+                // Until key is back on the user's window, the guard holds what
+                // they type into the browser and their clicks on it, then replays
+                // them, so none of it lands in the agent's page.
+                focusGuard.beginSwap(w.pid)
+                defer { focusGuard.endSwap(w.pid) }
+                let ok = BrowserAutomation.setURL(bundleID: bundleID, window: browserID, url: url)
+                if shared { _ = focusGuard.reclaimKey(w.pid, prefer: userWindow) }
+                return ok
+            }
+            if let sent { loaded = sent; break }
+            closeCover()
+            covered = false
+            Log.info("navigate: \(label) left loading a URL in \(w.appName) for later: the user started typing")
+            if nowMs() >= giveUpAt {
+                throw Self.typingError(appName: w.appName, cause: "loading a URL")
+            }
         }
         if shared { focusGuard.scheduleReclaim(w.pid) }
         guard loaded else {
+            browserWindowIDs[w.id] = nil
             throw ToolError("\(w.appName) didn't take the URL. Click the address bar, type_text the URL and \"\\n\".")
         }
-        return ToolResult(text: "Loading \(url) in window \(w.id). Next: get_window_state window_id=\(w.id) (it waits for the page to settle).")
+        // The window's accessibility tree is the old page's until the new
+        // one takes its place, which can be a second later on a busy Mac: a
+        // read just after would find the old page, loaded and still, and
+        // take it for the new one. The browser knows the tab is loading from
+        // the start, so wait for it to say it's done, 3 s at most, with
+        // nothing covered or held meanwhile.
+        if covered { closeCover(); covered = false }
+        let since = nowMs()
+        var loading: Bool? = true
+        while loading == true && nowMs() - since < 3000 {
+            sleepMs(40)
+            loading = BrowserAutomation.isLoading(bundleID: bundleID, window: browserID)
+        }
+        let state = loading == false ? "Loaded" : "Loading"
+        return ToolResult(text: "\(state) \(url) in window \(w.id). Next: get_window_state window_id=\(w.id) (it waits for the page to settle).")
+    }
+
+    /// The browser's own id for an agent's window, proven instead of
+    /// matched. Matching by frame goes wrong in both directions: a window
+    /// left from an earlier task sits at the very same frame (each display
+    /// comes back at the same place, and windows are laid out the same way
+    /// on it), so the frame names two windows or, when the browser's idea of
+    /// one of them is stale, the wrong one (measured on a user's Mac: 177
+    /// loads refused for two windows with one frame, and one URL loaded
+    /// into another task's window). So the window is moved a few points
+    /// through accessibility, and the id is the one whose window the
+    /// browser then reports at the new place: only this window went there.
+    /// `candidate` is the id the browser gave when it built a window for
+    /// this session, which saves asking about every window but is proven
+    /// the same way (the window caught for that request can be another
+    /// that appeared just then). The window goes back where it was.
+    private func provenBrowserID(_ w: AgentWindow, bundleID: String, candidate: String?) -> String? {
+        guard let ax = AX.window(pid: w.pid, id: w.id), let start = WindowList.info(w.id)?.bounds else { return nil }
+        defer { AX.setPosition(ax, start.origin) }
+        for step in [CGFloat(3), 7, 5] {
+            // Up, or down where there's no room above.
+            let room = start.minY - step >= display.bounds.minY + 30
+            let moved = start.offsetBy(dx: 0, dy: room ? -step : step)
+            let before = candidate.flatMap { BrowserAutomation.frame(bundleID: bundleID, window: $0) }
+            AX.setPosition(ax, moved.origin)
+            // The app moves it a moment after it's asked.
+            let deadline = nowMs() + 700
+            while !BrowserAutomation.sameFrame(WindowList.info(w.id)?.bounds, moved) && nowMs() < deadline { sleepMs(10) }
+            guard BrowserAutomation.sameFrame(WindowList.info(w.id)?.bounds, moved) else { continue }
+            if let candidate, BrowserAutomation.sameFrame(before, start),
+               BrowserAutomation.sameFrame(BrowserAutomation.frame(bundleID: bundleID, window: candidate), moved) {
+                return candidate
+            }
+            if case .found(let id) = BrowserAutomation.windowID(bundleID: bundleID, bounds: moved) { return id }
+        }
+        log("navigate: couldn't tell which of \(w.appName)'s windows window \(w.id) is")
+        return nil
     }
 
     private func pressMenuItem(_ args: Args) throws -> ToolResult {

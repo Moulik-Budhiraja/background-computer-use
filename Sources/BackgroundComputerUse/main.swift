@@ -1,4 +1,8 @@
 import AppKit
+import BCUCore
+
+// Started as the front gate's watchdog: that's all this process does.
+FrontGate.runWatchdogIfAsked()
 
 let app = NSApplication.shared
 if let i = CommandLine.arguments.firstIndex(of: "--history-selftest"), i + 1 < CommandLine.arguments.count {

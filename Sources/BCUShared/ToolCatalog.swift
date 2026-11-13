@@ -21,15 +21,18 @@ public enum ToolCatalog {
     the field); only Return and Tab go as keys. Keys and pixel clicks make your window its app's key window. \
     In an app the user isn't in, your window keeps key focus between steps; when the user is in it, key goes \
     straight back to them (their input is held for that moment and replayed). When the user is in that app, such a step first \
-    waits (3 s at most, usually much less) for a pause in their typing, clicking or scrolling, and the result \
-    says how long; that's expected, don't repeat the step. If the user has a menu open in that app, or holds a \
-    mouse button or key (a drag), the step fails instead of interrupting it: retry in a few seconds. \
+    waits for a pause in their clicking or scrolling (3 s at most, usually much less) and for them to stop \
+    typing (however long they type: their typing goes first), and the result says how long; that's expected, \
+    don't repeat the step. If the user has a menu open in that app, holds a mouse button or key (a drag), or \
+    is still typing after 30 s, the step fails instead of interrupting them, with nothing done: carry on \
+    with steps that need no key focus, or retry in a few seconds. (The user can turn Safe typing off in \
+    Settings: then typing is waited for 3 s at most, like clicking.) \
     `open_window` waits the same way (for a menu or a held button anywhere). If another agent is mid-task in that app, the step waits its turn too. Keystroke typing stops if the user switches to that \
     app partway; the error says how much was typed, so type the rest. Pass priority="now" only when the step \
     can't wait (a dialog or toast about to close, a hover then a click, a code about to expire).
     Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's \
     elements in `get_window_state`; click their rows by number. In a browser, to go to a URL use \
-    `navigate` (it sends no keys, so it doesn't wait for the user to pause); in a browser it doesn't support, \
+    `navigate` (it sends no keys, so it doesn't wait for the user to pause unless they're in that same browser); in a browser it doesn't support, \
     click the address bar, then `type_text` the URL followed by "\\n".
     5. When you already know the next few steps (fill a form and submit, type a URL and press Return), send \
     them in one `batch` call: it runs them in order, stops at the first failure, and returns the window's \

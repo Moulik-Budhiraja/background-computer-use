@@ -31,6 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         CrashLog.install()
+        SafeTypingSetting.apply()
         updater = Updater(hub: hub)
         // A host app's `bcu serve` reads this to start this app rather than run
         // an engine of its own. Kept current as permissions are granted or taken away.
@@ -81,6 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let host = HostServer(hub: hub, ownerName: BCUPaths.appName, version: BCUVersion.current)
         let server = SocketServer { [hub] tool, args in hub.call(tool: tool, args: args) }
         server.hostHandler = { op, req, connection in host.handle(op, req, connection) }
+        server.sessionHandler = { [hub] session, on in hub.sessionAttached(session, on) }
         do { try server.start() } catch { Log.info("socket failed: \(error)") }
         self.server = server
         self.host = host
