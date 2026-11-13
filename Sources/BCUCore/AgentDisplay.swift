@@ -164,23 +164,45 @@ public final class AgentDisplay {
             let deadline = nowMs() + 5000
             var lastMoved = nowMs()
             var moved: Set<CGWindowID> = []
+            // Where each window belongs: where it was, unless the user has
+            // moved it since.
+            var place: [CGWindowID: CGRect] = [:]
+            for w in before.frames { place[w.id] = w.bounds }
+            var dragged: [CGWindowID: (last: CGRect, changes: Int)] = [:]
             while nowMs() < deadline && nowMs() - lastMoved < quietMs {
                 sleepMs(15)
                 // The user's own displays changed too (a monitor unplugged):
                 // then where things were no longer says where they belong.
                 guard Set(userDisplayIDs()) == before.displays else { break }
-                // A window the user is dragging isn't macOS's doing.
-                if CGEventSource.buttonState(.hidSystemState, button: .left) { continue }
+                // A window the user is dragging or resizing isn't macOS's
+                // doing, and where they leave it is where it belongs now.
+                // Theirs is the one under the pointer that moves on every
+                // look; what macOS does to a window is one jump or two.
+                if CGEventSource.buttonState(.hidSystemState, button: .left) {
+                    let pointer = CGEvent(source: nil)?.location
+                    for w in before.frames {
+                        guard let now = WindowList.info(w.id)?.bounds, now != .zero else { continue }
+                        var d = dragged[w.id] ?? (now, 0)
+                        if now != d.last { d.changes += 1; d.last = now }
+                        dragged[w.id] = d
+                        if d.changes >= 3, let pointer, now.insetBy(dx: -12, dy: -12).contains(pointer) { place[w.id] = now }
+                    }
+                    continue
+                }
+                dragged = [:]
                 for w in before.frames {
-                    guard let now = WindowList.info(w.id)?.bounds, now != .zero,
-                          abs(now.minX - w.bounds.minX) > 1 || abs(now.minY - w.bounds.minY) > 1
-                            || abs(now.width - w.bounds.width) > 1 || abs(now.height - w.bounds.height) > 1,
+                    // An agent has taken it since (`borrow_window` moves a
+                    // window of the user's onto its display): not put back.
+                    if WindowManager.isRegistered(w.id) { continue }
+                    guard let want = place[w.id], let now = WindowList.info(w.id)?.bounds, now != .zero,
+                          abs(now.minX - want.minX) > 1 || abs(now.minY - want.minY) > 1
+                            || abs(now.width - want.width) > 1 || abs(now.height - want.height) > 1,
                           let ax = AX.window(pid: w.pid, id: w.id) else { continue }
                     // A window that fills the screen takes its place only
                     // once it's smaller, and its size only once it has moved.
-                    AX.setPosition(ax, w.bounds.origin)
-                    AX.setSize(ax, w.bounds.size)
-                    AX.setPosition(ax, w.bounds.origin)
+                    AX.setPosition(ax, want.origin)
+                    AX.setSize(ax, want.size)
+                    AX.setPosition(ax, want.origin)
                     moved.insert(w.id)
                     lastMoved = nowMs()
                 }
@@ -234,13 +256,15 @@ public final class AgentDisplay {
             // the far end: never one with a display in use after it, or a
             // spare that's staying.
             gone.removeAll { $0.slot < furthestInUse }
-            while let blocked = gone.first(where: { g in spares.contains { s in s.slot > g.slot && !gone.contains { $0.id == s.id } } }) {
-                gone.removeAll { $0.id == blocked.id }
-            }
             // Not with a window on it (an app put one there since): it would
             // land on the user's screen. Close it first; next time, then.
             let busy = gone.filter { !WindowManager.windows(on: CGDisplayBounds($0.id)).isEmpty }
             gone.removeAll { g in busy.contains { $0.id == g.id } }
+            // (After the busy ones are held back: one of those staying means
+            // the spares before it stay too.)
+            while let blocked = gone.first(where: { g in spares.contains { s in s.slot > g.slot && !gone.contains { $0.id == s.id } } }) {
+                gone.removeAll { $0.id == blocked.id }
+            }
             for b in busy {
                 let bounds = CGDisplayBounds(b.id)
                 DispatchQueue.global(qos: .utility).async { WindowManager.closeLeftovers(on: bounds) }

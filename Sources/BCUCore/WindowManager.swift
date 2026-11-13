@@ -389,7 +389,6 @@ public final class WindowManager {
         let qos = qos_class_self()
         if hold != nil { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) }
         defer { if hold != nil { pthread_set_qos_class_self_np(qos, 0) } }
-        try beforeAsk?()
 
         // If an agent already has a window of this app, make it the app's key
         // window first: apps place new windows relative to their key window,
@@ -401,6 +400,11 @@ public final class WindowManager {
         // until key is handed back.
         let appLock = Engine.inputLock(pid)
         appLock.lock()
+        // Only now, with the app to this session: another session's step
+        // there can take seconds, and the caller's check (has the user
+        // started typing?) and its cover over their window are for the
+        // moment the window is asked for, not for that wait.
+        do { try beforeAsk?() } catch { appLock.unlock(); throw error }
         var holdingInput = true
         // Keys typed into the app while its key window is moving are held,
         // even if the user wasn't in it.
