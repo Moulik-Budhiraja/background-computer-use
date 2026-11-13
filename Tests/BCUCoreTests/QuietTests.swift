@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import BCUCore
 
@@ -183,5 +184,33 @@ final class FrontGateTests: XCTestCase {
     func testSmallPartOfOurListIsSomeoneElses() {
         // A kiosk app allowing one or two apps, which happen to be ones we allowed too.
         XCTAssertFalse(FrontGate.isOurs(apps([1]), set: apps(Array(1...60))))
+    }
+
+    /// macOS 26.7 answers -10663 (attribute not settable) to setting the
+    /// list. The gate has to give up there, not ask again every 5 ms.
+    func testAMacOSThatRefusesTheListTurnsTheGateOff() throws {
+        try XCTSkipUnless(FrontGate.available, "no LaunchServices calls here")
+        let others = ["com.apple.finder", "com.apple.dock"].compactMap {
+            NSRunningApplication.runningApplications(withBundleIdentifier: $0).first?.processIdentifier
+        }
+        try XCTSkipUnless(others.count == 2, "needs Finder and the Dock running")
+        var asked = 0
+        FrontGate.setListForTests = { list in
+            // (Clearing a list that isn't there is asked for too; count the real ones.)
+            if !list.isEmpty { asked += 1 }
+            return -10663
+        }
+        defer { FrontGate.setListForTests = nil }
+        let gate = FrontGate()
+        gate.targets = { FrontGate.Targets(pids: Set(others)) }
+        gate.tapWorking = { true }
+        var passes = 0
+        while gate.passForTests() && passes < 20 { passes += 1 }
+        try XCTSkipIf(asked == 0, "another app keeps a list of its own on this Mac")
+        XCTAssertEqual(asked, 3)
+        XCTAssertLessThan(passes, 20, "the gate's thread never ended")
+        XCTAssertFalse(gate.isOn)
+        XCTAssertFalse(gate.passForTests())
+        XCTAssertEqual(asked, 3)
     }
 }

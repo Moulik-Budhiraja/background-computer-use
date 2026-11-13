@@ -30,6 +30,11 @@ import CPrivate
 /// can't switch apps and leave it shut. While it's open the guard falls back
 /// to putting the user's app back after the fact, as before.
 ///
+/// This works on macOS 15. On 26.7 and 27.2 the list belongs to WindowServer
+/// and LaunchServices refuses it from anyone else (status -10663, and no
+/// list is kept): the gate then gives up after `maxRefusals` tries and the
+/// guard puts the user's app back after the fact, as it always did.
+///
 /// The list outlives the process that set it, and a list left behind would
 /// lock the user out of those apps. So a helper process (`runWatchdogIfAsked`)
 /// clears it if this one dies or stops answering for 3 s, and a new engine
@@ -101,12 +106,18 @@ public final class FrontGate {
         }
     }
 
-    /// One round trip to launchservicesd, about a millisecond.
+    /// One round trip to launchservicesd, about a millisecond. LaunchServices'
+    /// status: 0, or why not (on macOS 26.7 it's -10663, "attribute not
+    /// settable", for a process without Apple's entitlement).
     @discardableResult
-    private static func setList(_ asns: [CFTypeRef]) -> Bool {
-        guard let ls else { return false }
-        return ls.setMeta(session, ls.permittedKey, asns as CFArray) == 0
+    private static func setList(_ asns: [CFTypeRef]) -> Int32 {
+        if let setListForTests { return setListForTests(asns) }
+        guard let ls else { return -1 }
+        return ls.setMeta(session, ls.permittedKey, asns as CFArray)
     }
+
+    /// Tests stand in for a macOS that answers differently.
+    nonisolated(unsafe) static var setListForTests: (([CFTypeRef]) -> Int32)?
 
     /// Whether the list in place (`now`) is the one this process set. Still
     /// so if LaunchServices dropped apps that quit since; not if it names an
@@ -155,6 +166,10 @@ public final class FrontGate {
     private var heartbeat: FileHandle?
     private var lastHeartbeatMs = 0.0
     private var watchdogFailures = 0
+    /// Times in a row macOS turned the list down, or took it without keeping it.
+    private var refusals = 0
+    private static let maxRefusals = 3
+    private var lastClearNoteMs = -Double.infinity
     private var stats = (applies: 0, lifts: 0, sinceMs: 0.0)
 
     /// The cmd+Tab switcher never keeps the gate open longer than this by itself.
@@ -184,6 +199,11 @@ public final class FrontGate {
     public func start() {
         guard Self.available else {
             Log.info("gate: this macOS has no permitted-front list; apps that take the front are put back after the fact")
+            return
+        }
+        // BCU_FRONT_GATE=0 at launch: no gate, as on a macOS that refuses it.
+        if ProcessInfo.processInfo.environment["BCU_FRONT_GATE"] == "0" {
+            Log.info("gate: off (BCU_FRONT_GATE=0); apps that take the front are put back after the fact")
             return
         }
         lock.lock()
@@ -289,6 +309,9 @@ public final class FrontGate {
     /// newer ones would put the older list back.
     private let stepLock = NSLock()
 
+    /// One pass as the gate's thread makes it, for tests.
+    func passForTests() -> Bool { step() != nil }
+
     /// Apply the list once. How long the thread should wait before the next
     /// look (µs), or nil when the gate is shutting down.
     private func step() -> UInt32? {
@@ -352,20 +375,47 @@ public final class FrontGate {
             FileManager.default.createFile(atPath: markerURL.path, contents: nil)
         }
         let permitted = apps.filter { !out.contains($0.pid) }.map(\.asn)
-        if Self.setList(permitted) {
+        let status = Self.setList(permitted)
+        // Taken, and really there: a macOS that answers 0 and keeps no list
+        // would have this run on every pass for nothing.
+        if status == 0, let now = Self.currentList(), Self.isOurs(now, set: permitted) {
             applied = out
             appliedList = permitted
             stats.applies += 1
-        } else if applied != nil {
-            clearLocked()
+            refusals = 0
+            return
+        }
+        if applied != nil || Self.currentList() != nil { clearLocked() }
+        refusals += 1
+        guard refusals >= Self.maxRefusals else { return }
+        // This macOS doesn't let the list be set: no gate here, for as long
+        // as this process runs. The guard puts apps back after the fact.
+        stopping = true
+        let helper = watchdog
+        watchdog = nil
+        try? heartbeat?.close()
+        heartbeat = nil
+        try? FileManager.default.removeItem(at: markerURL)
+        DispatchQueue.global().async {
+            helper?.terminate()
+            Log.info("gate: macOS won't take the permitted-front list (status \(status)); the gate is off, and an agent's app that takes the front is put back after the fact")
         }
     }
 
     /// Lock held.
     private func clearLocked() {
-        Self.setList([])
-        applied = nil
-        appliedList = []
+        // A list this process couldn't take away again would keep the user
+        // out of those apps: ask twice, and say so if it's still there (the
+        // watchdog keeps trying, and so does every later pass).
+        if Self.setList([]) != 0, Self.currentList() != nil, Self.setList([]) != 0, Self.currentList() != nil {
+            let now = nowMs()
+            guard now - lastClearNoteMs > 5000 else { return }
+            lastClearNoteMs = now
+            DispatchQueue.global().async { Log.info("gate: couldn't clear the permitted-front list; trying again") }
+        } else {
+            applied = nil
+            appliedList = []
+        }
     }
 
     // MARK: Watchdog
