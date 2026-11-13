@@ -30,10 +30,11 @@ import CPrivate
 /// can't switch apps and leave it shut. While it's open the guard falls back
 /// to putting the user's app back after the fact, as before.
 ///
-/// This works on macOS 15. On 26.7 and 27.2 the list belongs to WindowServer
-/// and LaunchServices refuses it from anyone else (status -10663, and no
-/// list is kept): the gate then gives up after `maxRefusals` tries and the
-/// guard puts the user's app back after the fact, as it always did.
+/// This works on macOS 15. On 27.2 the list belongs to WindowServer and
+/// LaunchServices refuses it from anyone else (status -10663, and no list
+/// is kept; 26.7 answered the same to the one call tried there): the gate
+/// then gives up after `maxRefusals` tries and the guard puts the user's
+/// app back after the fact, as it always did.
 ///
 /// The list outlives the process that set it, and a list left behind would
 /// lock the user out of those apps. So a helper process (`runWatchdogIfAsked`)
