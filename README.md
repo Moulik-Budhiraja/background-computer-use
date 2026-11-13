@@ -141,6 +141,8 @@ python3 Tools/Lab/run.py scenario --agents 3 --kinds helium --user helium --burs
 
 The simulated user types nonstop unless `--burst` is given: then in runs of about that many keys with a pause after each (`--pause` ms, spread log-normally with `--spread`), and with `--seed` in the same rhythm every run, so two builds can be measured against the same typing.
 
+The front gate rests on LaunchServices calls that aren't public, so a macOS version it hasn't run on gets checked first: `python3 Tools/Lab/gate_check.py probe /tmp/gate` (macOS alone: is the list honored, and does clearing it let every app forward again) and, with this build's engine running, `python3 Tools/Lab/gate_check.py engine /tmp/gate` (the gate arms, a click and cmd+Tab still get you into the agent's app, the helper clears the list when the engine is killed). Both pass on macOS 15.7.
+
 Each run prints one line per thing the user could notice (front app, menu bar, title bar, shadow, hover, typing, windows, cursor, displays) and saves the raw records, the frames that differed most, and the engine's log for the run. Run it on a Mac nobody is using: the simulated user types into whatever of its own is in front. The shell it runs from needs Accessibility and Screen Recording.
 
 WindowServer logs every change of front app and every one it refuses, which tells an app that got to the front by itself from one that was put there:
