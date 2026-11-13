@@ -1,0 +1,48 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Lab user page</title>
+<style>
+  body { font: 16px -apple-system, sans-serif; margin: 24px; }
+  textarea { width: 95%; height: 220px; font: 16px Menlo, monospace; }
+  #tile { margin-top: 16px; height: 120px; background: #d0d0d0; padding: 8px; }
+  #tile:hover { background: orange; }
+</style></head>
+<body>
+<h1>Lab user page</h1>
+<textarea id="notes" aria-label="User notes" autofocus spellcheck="false" autocorrect="off" autocapitalize="off"></textarea>
+<div id="tile">hover tile</div>
+<script>
+  // What the user feels in a page of their own, sent to the lab's server:
+  // each key with when it arrived, the pointer leaving the tile, the page
+  // losing focus.
+  const notes = document.getElementById('notes');
+  const tile = document.getElementById('tile');
+  let queue = [];
+  function note(ev, extra) { queue.push(Object.assign({ev, wall: Date.now(), perf: performance.now()}, extra || {})); }
+  setInterval(() => {
+    if (!queue.length) return;
+    const body = JSON.stringify(queue); queue = [];
+    fetch('/log', {method: 'POST', body}).catch(() => {});
+  }, 200);
+  notes.addEventListener('keydown', e => note('keydown', {key: e.key, stamp: e.timeStamp, repeat: e.repeat}));
+  // Any key the page gets at all, wherever its focus is (a key meant for another window, say).
+  document.addEventListener('keydown', e => { if (e.target !== notes) note('stray_key', {key: e.key}); }, true);
+  notes.addEventListener('input', () => note('input', {len: notes.value.length}));
+  tile.addEventListener('mouseenter', () => note('hover_enter'));
+  tile.addEventListener('mouseleave', () => note('hover_exit'));
+  window.addEventListener('blur', () => note('blur'));
+  window.addEventListener('focus', () => { note('focus'); notes.focus(); });
+  document.addEventListener('visibilitychange', () => note('visibility', {state: document.visibilityState}));
+  notes.focus();
+  // Where the text area and the tile are on screen (points, top-left origin),
+  // so the lab can click into one and rest the pointer on the other.
+  function rects() {
+    const top = window.screenY + (window.outerHeight - window.innerHeight), left = window.screenX;
+    const box = el => { const r = el.getBoundingClientRect(); return [left + r.left, top + r.top, r.width, r.height]; };
+    note('rects', {notes: box(notes), tile: box(tile)});
+  }
+  window.addEventListener('resize', rects);
+  setInterval(rects, 500);
+  note('ready', {origin: performance.timeOrigin});
+  rects();
+</script>
+</body></html>
