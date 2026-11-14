@@ -182,7 +182,15 @@ public final class FrontGate {
     private static let markerName = "front-gate.on"
     static let watchdogFlag = "--bcu-front-gate-watchdog"
 
-    private var markerURL: URL { BCUPaths.supportDirectory.appendingPathComponent(Self.markerName) }
+    private var markerURL: URL { Self.markerURL }
+    /// There while this engine has (or is about to have) a list of its own
+    /// in place. The watchdog clears a list only while it's there, so another
+    /// app's list (a kiosk or exam app's) outlives this engine.
+    private static var markerURL: URL { BCUPaths.supportDirectory.appendingPathComponent(markerName) }
+
+    /// Whether the watchdog may clear the list it finds: only one this
+    /// engine put there (its marker is in place).
+    static func watchdogMayClear(markerExists: Bool, listExists: Bool) -> Bool { markerExists && listExists }
 
     public init() {}
 
@@ -357,6 +365,8 @@ public final class FrontGate {
                 foreign = true
                 applied = nil
                 appliedList = []
+                // Not this engine's any more: the watchdog must leave it too.
+                try? FileManager.default.removeItem(at: markerURL)
                 DispatchQueue.global().async { self.onNote?("another app keeps a list of the apps allowed in front; not touching it, so an agent's app that takes the front is put back after the fact") }
             }
             lock.unlock()
@@ -528,7 +538,10 @@ public final class FrontGate {
         // The handler only sets a flag; `poll` returns when a signal lands.
         for s in [SIGTERM, SIGINT, SIGHUP] { signal(s) { _ in watchdogToldToGo = 1 } }
         func clear() {
-            if currentList() != nil { setList([]) }
+            let marker = markerURL.path
+            guard watchdogMayClear(markerExists: FileManager.default.fileExists(atPath: marker), listExists: currentList() != nil) else { return }
+            setList([])
+            if currentList() == nil { try? FileManager.default.removeItem(atPath: marker) }
         }
         var fd = pollfd(fd: 0, events: Int16(POLLIN), revents: 0)
         var buffer = [UInt8](repeating: 0, count: 64)

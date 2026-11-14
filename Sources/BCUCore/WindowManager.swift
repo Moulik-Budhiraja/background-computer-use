@@ -166,25 +166,35 @@ public final class WindowManager {
         for e in entries where e["kind"] as? String == AgentWindow.Kind.caught.rawValue {
             if let w = live(e), answerLeave(w.ax) { sleepMs(400); notes.append("answered Leave for \(e["app"] ?? "?")") }
         }
+        // The dialogs each app already had up before anything here is closed:
+        // those are the user's (a "Leave site?" on a page of their own), and
+        // answering one would throw away what they'd typed there.
+        var dialogsBefore: [pid_t: Set<CGWindowID>] = [:]
+        var closed: [(id: CGWindowID, pid: pid_t, app: Any)] = []
         for e in entries {
             guard let (id, pid, ax) = live(e) else { continue }
-            _ = pid
             if e["kind"] as? String == "borrowed", let f = e["frame"] as? [Double], f.count == 4 {
                 AX.setPosition(ax, CGPoint(x: f[0], y: f[1]))
                 AX.setSize(ax, CGSize(width: f[2], height: f[3]))
                 notes.append("returned \(e["app"] ?? "?") window \(id)")
             } else if let close = AX.element(ax, "AXCloseButton") {
+                if dialogsBefore[pid] == nil { dialogsBefore[pid] = Self.dialogIDs(pid) }
                 AX.perform(close, "AXPress")
+                closed.append((id, pid, e["app"] ?? "?"))
                 notes.append("closed leftover \(e["app"] ?? "?") window \(id)")
             }
         }
         // A page that asks only now: its dialog is a new window of that app.
+        // Only for a window closed here that's still open, and only a dialog
+        // that wasn't there before the close (a window returned to the user
+        // was never closed, so nothing is answered for it).
         sleepMs(500)
-        for e in entries {
-            guard let id = (e["id"] as? Int).map({ CGWindowID($0) }), let pid = (e["pid"] as? Int).map({ pid_t($0) }),
-                  WindowList.info(id) != nil else { continue }
-            for other in AX.windows(pid) where AX.windowID(other) != id && AX.string(other, "AXSubrole") != "AXStandardWindow" {
-                // (Only a dialog this run's close brought up: not one of the entries, and small.)
+        for (id, pid, app) in closed {
+            guard WindowList.info(id) != nil, let before = dialogsBefore[pid] else { continue }
+            for other in AX.windows(pid) where AX.string(other, "AXSubrole") != "AXStandardWindow" {
+                guard let otherID = AX.windowID(other), otherID != id,
+                      Self.isNewDialog(otherID, before: before, closed: closed.map(\.id)) else { continue }
+                let e: [String: Any] = ["app": app]
                 if let size = AX.size(other), size.width < 700, size.height < 500, answerLeave(other) {
                     notes.append("answered Leave for \(e["app"] ?? "?") window \(id)")
                     sleepMs(400)
@@ -192,6 +202,19 @@ public final class WindowManager {
             }
         }
         return notes
+    }
+
+    /// The ids of an app's windows that aren't standard ones (dialogs, sheets
+    /// with a window of their own).
+    static func dialogIDs(_ pid: pid_t) -> Set<CGWindowID> {
+        Set(AX.windows(pid).filter { AX.string($0, "AXSubrole") != "AXStandardWindow" }.compactMap { AX.windowID($0) })
+    }
+
+    /// Whether a dialog seen after recovery closed some windows came up
+    /// because of that: it wasn't there before, and isn't one of the windows
+    /// closed.
+    static func isNewDialog(_ id: CGWindowID, before: Set<CGWindowID>, closed: [CGWindowID]) -> Bool {
+        !before.contains(id) && !closed.contains(id)
     }
 
     /// Close any window (used for one-off cleanup, not exposed to agents).
