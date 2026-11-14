@@ -248,6 +248,17 @@ public final class Hub {
             return old
         }
         lock.unlock()
+        // The windows are on the old session's display, which goes with it.
+        // The caller's sweep brings windows it owns onto its own display,
+        // and only runs with one: start it first (a host app's session that
+        // hasn't opened a window yet has none). Without a display the
+        // windows stay the old session's.
+        if !caller.display.isRunning {
+            do { try caller.ensureDisplay() } catch {
+                Log.info("session \(Self.short(callerID)) can't take over session \(Self.short(oldID))'s windows: no display for them (\(error))")
+                return caller
+            }
+        }
         let moved = caller.windows.takeOver(from: old.windows)
         Log.info("session \(Self.short(callerID)) took over \(moved) window(s) of session \(Self.short(oldID)), whose agent went away")
         changed()
