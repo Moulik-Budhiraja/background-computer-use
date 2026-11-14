@@ -142,6 +142,7 @@ public final class AgentDisplay {
     /// Note where their windows are before the change (`noteUserWindows`),
     /// and after it put back any that macOS moved (`restoreUserWindows`).
     public static func noteUserWindows() -> UserWindows {
+        clearNotedStaleTiles()
         registryLock.lock()
         let spare = spares.map(\.id)
         registryLock.unlock()
@@ -151,6 +152,89 @@ public final class AgentDisplay {
                 && !agents.contains { $0.contains(CGPoint(x: w.bounds.midX, y: w.bounds.midY)) }
         }.map { (id: $0.id, pid: $0.pid, bounds: $0.bounds) }
         return UserWindows(frames: frames, displays: Set(userDisplayIDs()))
+    }
+
+    // MARK: Stale tiles
+
+    /// On macOS 26 and later a window the user tiled and then set back to
+    /// its own size can keep its tile in WindowManager, which puts the window
+    /// back in the tile at every display change. Nothing outside the app can
+    /// drop that tile; the app's own Window > Move & Resize > Return to
+    /// Previous Size does, and macOS only enables it while the app is in
+    /// front. So it's pressed for a window macOS has just moved, when the
+    /// user is in that app with that window; any other is kept
+    /// (`noteStaleTile`) and tried again before the next display change.
+    static let untileIdentifier = "_zoomUntile:"
+
+    /// Whether the menu item may be pressed for this window: it acts on the
+    /// app's main window, so that has to be the one, in the app in front,
+    /// and the app has to say the window is tiled (the item is enabled).
+    static func mayUntile(front: pid_t, pid: pid_t, mainWindow: CGWindowID?, id: CGWindowID, itemEnabled: Bool) -> Bool {
+        front == pid && mainWindow == id && itemEnabled
+    }
+
+    private static func untileItem(_ pid: pid_t) -> AXUIElement? {
+        guard let bar = AX.element(AX.app(pid), "AXMenuBar") else { return nil }
+        // Menu bar item > menu > Move & Resize > menu > the item.
+        func find(_ el: AXUIElement, depth: Int) -> AXUIElement? {
+            for child in AX.children(el) {
+                if AX.string(child, "AXIdentifier") == untileIdentifier { return child }
+                if depth > 0, let found = find(child, depth: depth - 1) { return found }
+            }
+            return nil
+        }
+        return find(bar, depth: 4)
+    }
+
+    /// Any thread but main isn't needed; never holds a lock. True when the
+    /// tile was cleared (or the app says the window has none).
+    @discardableResult
+    static func clearStaleTile(pid: pid_t, id: CGWindowID, frame want: CGRect) -> Bool {
+        guard WindowList.info(id)?.pid == pid else { return true }
+        guard BCUFrontProcessPID() == pid, let item = untileItem(pid) else { return false }
+        let enabled = AX.bool(item, "AXEnabled") ?? false
+        let main = AX.element(AX.app(pid), "AXMainWindow").flatMap { AX.windowID($0) }
+        // In front, with this window, and nothing to return from: no tile.
+        if main == id && !enabled { return true }
+        guard mayUntile(front: BCUFrontProcessPID(), pid: pid, mainWindow: main, id: id, itemEnabled: enabled) else { return false }
+        guard AX.perform(item, "AXPress") == .success else { return false }
+        // Returning to the previous size can change the frame: the window
+        // belongs where the user had it.
+        let until = nowMs() + 600
+        while nowMs() < until {
+            sleepMs(15)
+            guard let now = WindowList.info(id)?.bounds, now != .zero else { break }
+            if abs(now.minX - want.minX) > 1 || abs(now.minY - want.minY) > 1 || abs(now.width - want.width) > 1 || abs(now.height - want.height) > 1,
+               let ax = AX.window(pid: pid, id: id) {
+                AX.setPosition(ax, want.origin)
+                AX.setSize(ax, want.size)
+                AX.setPosition(ax, want.origin)
+            }
+        }
+        Log.info("cleared a stale tile on a window of the user's (pid \(pid), window \(id)), so display changes leave it alone")
+        return true
+    }
+
+    private static let staleLock = NSLock()
+    private static var staleTiles: [CGWindowID: pid_t] = [:]
+
+    private static func noteStaleTile(pid: pid_t, id: CGWindowID) {
+        staleLock.lock(); staleTiles[id] = pid; staleLock.unlock()
+    }
+
+    /// Before a display change: clear what couldn't be cleared last time
+    /// (the user wasn't in that app then).
+    private static func clearNotedStaleTiles() {
+        staleLock.lock(); let noted = staleTiles; staleLock.unlock()
+        for (id, pid) in noted {
+            guard let frame = WindowList.info(id)?.bounds, frame != .zero else {
+                staleLock.lock(); staleTiles[id] = nil; staleLock.unlock()
+                continue
+            }
+            if clearStaleTile(pid: pid, id: id, frame: frame) {
+                staleLock.lock(); staleTiles[id] = nil; staleLock.unlock()
+            }
+        }
     }
 
     /// Any thread; returns at once and watches on a thread of its own for
@@ -209,6 +293,13 @@ public final class AgentDisplay {
             }
             if !moved.isEmpty {
                 Log.info("macOS moved \(moved.count) of the user's windows when the displays changed; put them back where they were")
+            }
+            // Why macOS moved it: usually a tile it still holds for a window
+            // that has since gone back to its own size. Clear that, so the
+            // next display change leaves the window alone.
+            for w in before.frames where moved.contains(w.id) {
+                guard let want = place[w.id] else { continue }
+                if !clearStaleTile(pid: w.pid, id: w.id, frame: want) { noteStaleTile(pid: w.pid, id: w.id) }
             }
         }
         thread.name = "bcu.display.windows"

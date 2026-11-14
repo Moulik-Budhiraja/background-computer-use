@@ -18,4 +18,15 @@ final class ReviewFixTests: XCTestCase {
         XCTAssertFalse(FrontGate.watchdogMayClear(markerExists: false, listExists: true))
         XCTAssertFalse(FrontGate.watchdogMayClear(markerExists: true, listExists: false))
     }
+
+    func testReturnToPreviousSizeIsPressedOnlyForTheUsersMainWindowInFront() {
+        XCTAssertTrue(AgentDisplay.mayUntile(front: 10, pid: 10, mainWindow: 5, id: 5, itemEnabled: true))
+        // In the background macOS disables the item: not pressed.
+        XCTAssertFalse(AgentDisplay.mayUntile(front: 11, pid: 10, mainWindow: 5, id: 5, itemEnabled: false))
+        XCTAssertFalse(AgentDisplay.mayUntile(front: 11, pid: 10, mainWindow: 5, id: 5, itemEnabled: true))
+        // The item acts on the main window: another window being main would untile that one.
+        XCTAssertFalse(AgentDisplay.mayUntile(front: 10, pid: 10, mainWindow: 6, id: 5, itemEnabled: true))
+        // Not tiled, as far as the app knows.
+        XCTAssertFalse(AgentDisplay.mayUntile(front: 10, pid: 10, mainWindow: 5, id: 5, itemEnabled: false))
+    }
 }
