@@ -27,7 +27,8 @@ enum Attribution {
         /// The user's last cmd+Tab (or a switch they asked BCU for).
         var lastSwitchKeyMs: Double
         /// The user's last key that could open or switch to an app: Return,
-        /// or a key with command, control or option held.
+        /// or a key with command, control or option held. Not evidence
+        /// (see `agentCaused`).
         var lastOpenKeyMs: Double
         /// When the user last came to an app other than this one.
         var arrivedElsewhereMs: Double
@@ -38,19 +39,29 @@ enum Attribution {
     /// How long after the guard put the user's app back the same app coming
     /// forward again is still the app's own doing.
     static let reassertMs = 1000.0
-    /// How long after a key that could open an app one coming forward is the user's doing.
-    static let openKeyMs = 1500.0
 
     /// Whether the app coming forward now is the agent's doing.
+    ///
+    /// It is while a step on it is running or settling, or just after the
+    /// guard put the user's app back in front of it, unless the user clicked
+    /// or pressed cmd+Tab in the last `switchMs`.
+    ///
+    /// One click or cmd+Tab explains one front change. Once the user has
+    /// come to another app since, it's used up: they switch away from the
+    /// browser, arrive, and the page an agent is loading brings the browser
+    /// forward 250 ms later. Counting the same cmd+Tab again left them in
+    /// the browser.
+    ///
+    /// A key that could open an app (Return, a shortcut) isn't evidence.
+    /// People press those all the time in the app they're in, and an agent's
+    /// app comes forward on nearly every step. Counting them left the
+    /// agent's app in front whenever the two fell within 1.5 s.
     static func agentCaused(_ f: Facts) -> Bool {
         let reasserting = f.restoredAwayMs.map { f.nowMs - $0 < reassertMs } ?? false
-        let running = f.step?.running ?? 0
         guard reasserting || f.step.map({ $0.running > 0 || $0.settleUntilMs >= f.nowMs }) == true else { return false }
-        let strict = f.step?.strict ?? false
-        let click = !strict && f.nowMs - f.lastMouseDownMs < switchMs
-        let clickOrSwitch = click || f.nowMs - f.lastSwitchKeyMs < switchMs
-        if reasserting || running > 0 { return !clickOrSwitch }
-        return !clickOrSwitch && (strict || f.nowMs - f.lastOpenKeyMs >= openKeyMs)
+        func unanswered(_ ms: Double) -> Bool { f.nowMs - ms < switchMs && ms > f.arrivedElsewhereMs }
+        let click = f.step?.strict != true && unanswered(f.lastMouseDownMs)
+        return !(click || unanswered(f.lastSwitchKeyMs))
     }
 }
 
@@ -86,7 +97,20 @@ enum NewWindow {
     /// How long after an agent's step began a new window is the step's.
     static let agentMs = 10_000.0
 
+    /// With no step of the session's to explain it, a new window in the app
+    /// the user is in is theirs, as it always was.
+    ///
+    /// A window that wasn't there when the session's step on the app began,
+    /// and came up within `agentMs` of it, is the step's: a sign-in popup
+    /// opens beside the window whose button the agent pressed. Unless the
+    /// user is in the app and has clicked or pressed an opening key since
+    /// the step began. Then it's theirs if the step is over, and unclear
+    /// while the step can still be opening things.
     static func cause(_ f: Facts) -> Cause {
-        f.userInApp ? .user : .unclear
+        guard let began = f.agentBeganMs, f.firstSeenMs >= began, f.firstSeenMs - began < agentMs else {
+            return f.userInApp ? .user : .unclear
+        }
+        guard f.userInApp, f.userOpenInputMs >= began else { return .agent }
+        return f.stepSettling ? .unclear : .user
     }
 }

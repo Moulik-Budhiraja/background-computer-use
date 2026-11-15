@@ -1052,6 +1052,11 @@ public final class WindowManager {
     /// A window counts as spawned by this session's action only this long
     /// after the action began.
     private static let catchWindowMs = 10_000.0
+    /// A window a step opened on this display becomes the session's once
+    /// it's been there this long, and is no longer looked at after
+    /// `agentJudgeMs`.
+    private static let agentSettleMs = 400.0
+    private static let agentJudgeMs = 5000.0
 
     /// Keep agent windows off the user's displays and catch new windows an
     /// agent action spawned there (dialogs, popups, extra windows).
@@ -1096,12 +1101,27 @@ public final class WindowManager {
             // guard counts it as the user's (not a self-activation it's undoing).
             // Only standard windows: popups the agent's own window opens
             // (suggestion lists, menus) are separate windows too.
-            guard nowMs() - firstSeen < 1500, info.bounds.width > 100, info.bounds.height > 100 else { continue }
+            let age = nowMs() - firstSeen
+            guard age < Self.agentJudgeMs, info.bounds.width > 100, info.bounds.height > 100 else { continue }
             let cause = NewWindow.cause(NewWindow.Facts(
                 firstSeenMs: firstSeen, userInApp: info.pid == front && info.pid == focusGuard.userFront,
                 userOpenInputMs: focusGuard.lastUserOpenInputMs, agentBeganMs: agentBegan,
                 stepSettling: focusGuard.isTainted(info.pid)))
-            guard cause == .user,
+            if cause == .agent {
+                // What this session's step opened (a sign-in popup, a second
+                // window) is the session's: its agent finds it in
+                // list_windows, and it's closed with the rest. Not in its
+                // first moments: the guard may not know yet that the user
+                // just came to the app.
+                guard age >= Self.agentSettleMs, let ax = AX.window(pid: info.pid, id: info.id),
+                      ["AXStandardWindow", "AXDialog", "AXSystemDialog"].contains(AX.string(ax, "AXSubrole") ?? "") else { continue }
+                let app = NSRunningApplication(processIdentifier: info.pid)
+                register(AgentWindow(id: info.id, pid: info.pid, appName: app?.localizedName ?? info.owner, bundleID: app?.bundleIdentifier, kind: .caught))
+                lock.lock(); seenOnAgent[info.id] = -1e12; lock.unlock()
+                Log.info("session \(sessionKey.prefix(8)): \(info.owner) window \(info.id) came up on the agent display after this session's step in that app; it's the session's now")
+                continue
+            }
+            guard cause == .user, age < 1500,
                   let ax = AX.window(pid: info.pid, id: info.id),
                   AX.string(ax, "AXSubrole") == "AXStandardWindow" else { continue }
             let main = CGDisplayBounds(CGMainDisplayID())

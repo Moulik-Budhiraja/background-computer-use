@@ -451,15 +451,11 @@ public final class FocusGuard {
         return "taint=\(until) key=\(Int(now - lastUserKeyMs))ms openKey=\(Int(now - lastUserOpenKeyMs))ms click=\(Int(now - lastUserMouseDownMs))ms\(restored)"
     }
 
-    /// Whether `pid` becoming frontmost right now is the agent's doing.
-    /// While an action on it is running: yes, unless the user clicked or
-    /// switched apps. In the grace period after: only if the user hasn't
-    /// clicked or pressed a key that could open an app either (launchers,
-    /// Terminal `open`, links). Typing in another app doesn't count: Chromium
-    /// can take the front again well after the step, and taking that for the
-    /// user switching left the app in front of them. Nor does anything just
-    /// after the guard put the user's app back in front of `pid`: that's the
-    /// app taking the front again, too soon for anyone to have switched.
+    /// Whether `pid` becoming frontmost right now is the agent's doing
+    /// (the rule is `Attribution.agentCaused`): yes while an action on it is
+    /// running or in its grace period, or just after the guard put the
+    /// user's app back in front of it, unless the user clicked or pressed
+    /// cmd+Tab and hasn't come to another app since.
     func agentCaused(_ pid: pid_t) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return Attribution.agentCaused(Attribution.Facts(
@@ -613,7 +609,8 @@ public final class FocusGuard {
         // The order before the agent's step no longer says where cmd+Tab should take them.
         if let first = orderBefore?.first, first != pid { orderBefore = nil }
         let known = userFrontPid == pid
-        if !known {
+        // (Once per arrival: NSWorkspace's word of the same change comes here too.)
+        if !known, arrivals.last?.pid != pid {
             arrivals.append((pid, nowMs()))
             if arrivals.count > 4 { arrivals.removeFirst(arrivals.count - 4) }
         }
