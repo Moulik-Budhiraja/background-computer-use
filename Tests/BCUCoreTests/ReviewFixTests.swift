@@ -29,4 +29,12 @@ final class ReviewFixTests: XCTestCase {
         // Not tiled, as far as the app knows.
         XCTAssertFalse(AgentDisplay.mayUntile(front: 10, pid: 10, mainWindow: 5, id: 5, itemEnabled: false))
     }
+
+    func testASessionBackAfterARestartIsFoundByEitherId() {
+        // Kept under the new connection's id "new"; it still calls itself "old".
+        let byID = ["new": "old", "other": "other"]
+        XCTAssertEqual(Hub.lookup("new", in: byID, sessionID: { $0 }), "old")
+        XCTAssertEqual(Hub.lookup("old", in: byID, sessionID: { $0 }), "old")
+        XCTAssertNil(Hub.lookup("gone", in: byID, sessionID: { $0 }))
+    }
 }

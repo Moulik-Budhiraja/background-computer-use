@@ -73,7 +73,15 @@ public final class Hub {
 
     public func engine(id: String) -> Engine? {
         lock.lock(); defer { lock.unlock() }
-        return byID[id]
+        return Self.lookup(id, in: byID, sessionID: \.sessionID)
+    }
+
+    /// A session by the id its connection uses, or by the id it was made
+    /// with: one that came back after its agent restarted (`takeOver`) is
+    /// kept under the new connection's id but still says its own
+    /// (`Engine.sessionID`, what a host app is told), and both find it.
+    static func lookup<E>(_ id: String, in byID: [String: E], sessionID: (E) -> String) -> E? {
+        byID[id] ?? byID.values.first { sessionID($0) == id }
     }
 
     /// A connection began carrying this session's calls, or one that did
