@@ -575,7 +575,7 @@ public final class RemoteControl {
         guard let src = CGEventSource(stateID: .hidSystemState),
               let e = CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: point, mouseButton: cgButton) else { return }
         Input.stampMouse(e, pid: w.pid, windowID: w.id, phase: phase, clickState: state, button: button,
-                         group: type == .mouseMoved ? 0 : Input.clickGroup, location: point)
+                         at: point, origin: Input.origin(of: w.id) ?? w.bounds.origin)
         e.flags = flags
         BCUPostEventToPid(w.pid, e, false)
     }

@@ -6,24 +6,38 @@ import CPrivate
 /// cursor, activates the app or goes through the global HID stream.
 ///
 /// The event recipes follow trycua/cua's cua-driver (MIT):
-/// - mouse events carry the target pid (field 40) and window id (51, 91, 92)
-///   and are preceded by a mouseMoved and an off-screen primer click;
+/// - mouse events carry the target pid (field 40), the window id (51, 91, 92),
+///   the point inside that window and the time they were posted, and are
+///   preceded by a mouseMoved and an off-screen primer click;
 /// - keyboard events carry SkyLight's authentication message, except menu
 ///   shortcuts, which only reach NSMenu without it.
 public enum Input {
     public enum Button { case left, right }
 
-    /// Field 58 ("click group") for mouse downs and ups. Keep it small: Chromium
-    /// renderers crash on some clicks when it's large (measured on Helium:
-    /// 1-100 fine, 1000 and up crashed the tab), and leaving it out stops
-    /// clicks from registering. Real HID clicks don't need it.
-    static let clickGroup: Int64 = 1
-
     private static func source() -> CGEventSource? {
         CGEventSource(stateID: .hidSystemState)
     }
 
-    static func stampMouse(_ e: CGEvent, pid: pid_t, windowID: CGWindowID, phase: Int64, clickState: Int64, button: Int64, group: Int64, location: CGPoint) {
+    /// Where a window is in global points, to turn a global point into one
+    /// inside the window. Nil when the window is gone.
+    static func origin(of windowID: CGWindowID) -> CGPoint? {
+        WindowList.info(windowID)?.bounds.origin
+    }
+
+    /// Stamp a mouse event for one window of one process.
+    ///
+    /// The event carries the point inside the window (top-left origin;
+    /// `origin` is the window's top left in global points). That's where the
+    /// app takes the event to be: on macOS 26 and later the window server
+    /// passes it on as given, so a global point there lands outside the
+    /// window and no view gets the click.
+    ///
+    /// The timestamp is the time now, as on a real event: a posted mouse
+    /// down or up keeps the one it's given, and apps that order input by
+    /// time drop a click from long ago. It's also event field 58, so nothing
+    /// else may be put there.
+    static func stampMouse(_ e: CGEvent, pid: pid_t, windowID: CGWindowID, phase: Int64, clickState: Int64, button: Int64,
+                           at point: CGPoint, origin: CGPoint) {
         BCUEventSetIntegerField(e, 0, phase)        // gesture phase
         BCUEventSetIntegerField(e, 1, clickState)   // kCGMouseEventClickState
         BCUEventSetIntegerField(e, 3, button)       // kCGMouseEventButtonNumber
@@ -34,8 +48,8 @@ public enum Input {
             BCUEventSetIntegerField(e, 91, Int64(windowID))  // window under pointer
             BCUEventSetIntegerField(e, 92, Int64(windowID))  // window that can handle it
         }
-        BCUEventSetIntegerField(e, 58, group)       // click group
-        BCUEventSetWindowLocation(e, location)
+        BCUEventSetWindowLocation(e, CGPoint(x: point.x - origin.x, y: point.y - origin.y))
+        e.timestamp = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         e.flags = []
     }
 
@@ -45,14 +59,14 @@ public enum Input {
                              check: () throws -> Void = {}) throws {
         try check()
         guard let src = source() else { throw ToolError("could not create an event source") }
-        let group = clickGroup
+        guard let origin = origin(of: windowID) else { throw ToolError("window \(windowID) is gone") }
         let offScreen = CGPoint(x: -1, y: -1)
         let (downType, upType, cgButton, buttonNumber): (CGEventType, CGEventType, CGMouseButton, Int64) =
             button == .left ? (.leftMouseDown, .leftMouseUp, .left, 0) : (.rightMouseDown, .rightMouseUp, .right, 1)
 
         func post(_ type: CGEventType, _ at: CGPoint, phase: Int64, state: Int64, btn: Int64, mouseButton: CGMouseButton) {
             guard let e = CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: at, mouseButton: mouseButton) else { return }
-            stampMouse(e, pid: pid, windowID: windowID, phase: phase, clickState: state, button: btn, group: group, location: at)
+            stampMouse(e, pid: pid, windowID: windowID, phase: phase, clickState: state, button: btn, at: at, origin: origin)
             BCUPostEventToPid(pid, e, false)
         }
 
@@ -77,10 +91,9 @@ public enum Input {
     /// Scroll wheel at a global point. Positive dy scrolls content down (towards the end).
     public static func scroll(pid: pid_t, windowID: CGWindowID, at point: CGPoint, dx: Int, dy: Int) throws {
         guard let src = source() else { throw ToolError("could not create an event source") }
-        // Chromium ignores wheel events that don't carry the point inside the target window.
-        let origin = WindowList.info(windowID)?.bounds.origin
+        guard let origin = origin(of: windowID) else { throw ToolError("window \(windowID) is gone") }
         if let move = CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) {
-            stampMouse(move, pid: pid, windowID: windowID, phase: 2, clickState: 0, button: 0, group: 0, location: point)
+            stampMouse(move, pid: pid, windowID: windowID, phase: 2, clickState: 0, button: 0, at: point, origin: origin)
             BCUPostEventToPid(pid, move, false)
         }
         sleepMs(15)
@@ -96,7 +109,8 @@ public enum Input {
                 BCUEventSetIntegerField(e, 91, Int64(windowID))
                 BCUEventSetIntegerField(e, 92, Int64(windowID))
             }
-            if let origin { BCUEventSetWindowLocation(e, CGPoint(x: point.x - origin.x, y: point.y - origin.y)) }
+            // Chromium ignores wheel events that don't carry the point inside the target window.
+            BCUEventSetWindowLocation(e, CGPoint(x: point.x - origin.x, y: point.y - origin.y))
             BCUPostEventToPid(pid, e, false)
             sleepMs(30)
         }
@@ -105,10 +119,10 @@ public enum Input {
     /// Press, move in steps, release.
     public static func drag(pid: pid_t, windowID: CGWindowID, from: CGPoint, to: CGPoint, steps: Int = 20, durationMs: Double = 300) throws {
         guard let src = source() else { throw ToolError("could not create an event source") }
-        let group = clickGroup
+        guard let origin = origin(of: windowID) else { throw ToolError("window \(windowID) is gone") }
         func post(_ type: CGEventType, _ at: CGPoint, phase: Int64, state: Int64) {
             guard let e = CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: at, mouseButton: .left) else { return }
-            stampMouse(e, pid: pid, windowID: windowID, phase: phase, clickState: state, button: 0, group: group, location: at)
+            stampMouse(e, pid: pid, windowID: windowID, phase: phase, clickState: state, button: 0, at: at, origin: origin)
             BCUPostEventToPid(pid, e, false)
         }
         post(.mouseMoved, from, phase: 2, state: 0)
