@@ -121,9 +121,13 @@ final class NewWindowTests: XCTestCase {
     }
 
     /// The user pressed a shortcut in the same app between the agent's
-    /// press and the window: either could have opened it, so it stays put.
-    func testAWindowEitherCouldHaveOpenedStaysWhereItIs() {
-        XCTAssertEqual(cause(userInApp: true, userInput: seen - 50, agentBegan: seen - 181, settling: true), .unclear)
+    /// press and the window: either could have opened it. It goes to the
+    /// user. A window of theirs left on the agent display can't be seen,
+    /// and what they type next goes into it. Waiting for the step to end
+    /// says nothing new, and a long step would leave it there for good.
+    func testAWindowEitherCouldHaveOpenedGoesToTheUser() {
+        XCTAssertEqual(cause(userInApp: true, userInput: seen - 50, agentBegan: seen - 181, settling: true), .user)
+        XCTAssertEqual(cause(userInApp: true, userInput: seen - 50, agentBegan: seen - 181, settling: false), .user)
     }
 
     // MARK: What the user opened is still theirs
