@@ -97,6 +97,9 @@ public final class FocusGuard {
     private var lastUserOpenKeyMs = 0.0
     /// When the guard last put the user's app back in front of each app.
     private var restoredAwayMs: [pid_t: Double] = [:]
+    /// The last few times the user came to another app (a front change that
+    /// was theirs, to an app they weren't in), oldest first.
+    private var arrivals: [(pid: pid_t, ms: Double)] = []
     /// The cmd+Tab order (front first) before the agent touched it, taken
     /// when an action begins while there's none; cleared once repaired or
     /// when the user moves to another app (see `repairOrder`).
@@ -459,14 +462,19 @@ public final class FocusGuard {
     /// app taking the front again, too soon for anyone to have switched.
     func agentCaused(_ pid: pid_t) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        let now = nowMs()
-        let reasserting = restoredAwayMs[pid].map { now - $0 < 1000 } ?? false
-        guard reasserting || taints[pid].map({ $0.count > 0 || $0.until >= now }) == true else { return false }
-        let strict = taints[pid]?.strict ?? false
-        let click = !strict && now - lastUserMouseDownMs < 400
-        let clickOrSwitch = click || now - lastUserSwitchKeyMs < 400
-        if reasserting || (taints[pid]?.count ?? 0) > 0 { return !clickOrSwitch }
-        return !clickOrSwitch && (strict || now - lastUserOpenKeyMs >= 1500)
+        return Attribution.agentCaused(Attribution.Facts(
+            nowMs: nowMs(),
+            step: taints[pid].map { Attribution.Step(running: $0.count, settleUntilMs: $0.until, strict: $0.strict) },
+            restoredAwayMs: restoredAwayMs[pid],
+            lastMouseDownMs: lastUserMouseDownMs, lastSwitchKeyMs: lastUserSwitchKeyMs, lastOpenKeyMs: lastUserOpenKeyMs,
+            arrivedElsewhereMs: arrivals.last(where: { $0.pid != pid })?.ms ?? -.infinity))
+    }
+
+    /// When the user last clicked or pressed a key that could open a window
+    /// (Return, or a key with command, control or option held).
+    var lastUserOpenInputMs: Double {
+        lock.lock(); defer { lock.unlock() }
+        return max(lastUserOpenKeyMs, lastUserMouseDownMs)
     }
 
     func record(_ summary: String) {
@@ -605,6 +613,10 @@ public final class FocusGuard {
         // The order before the agent's step no longer says where cmd+Tab should take them.
         if let first = orderBefore?.first, first != pid { orderBefore = nil }
         let known = userFrontPid == pid
+        if !known {
+            arrivals.append((pid, nowMs()))
+            if arrivals.count > 4 { arrivals.removeFirst(arrivals.count - 4) }
+        }
         if agentApp { arriving[pid] = nowMs() }
         lock.unlock()
         if agentApp {

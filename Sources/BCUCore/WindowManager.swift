@@ -1022,6 +1022,9 @@ public final class WindowManager {
     }
     private var fitTries: [CGWindowID: (count: Int, lastMs: Double)] = [:]
     private var seenOnAgent: [CGWindowID: Double] = [:]
+    /// For a window first seen on this display that wasn't there when this
+    /// session's last step on its app began: when that step began.
+    private var spawnedAfter: [CGWindowID: Double] = [:]
 
     /// Shrink and shift an agent window that sticks out past the agent
     /// display's edge (apps can undo the first resize while a new window
@@ -1081,14 +1084,24 @@ public final class WindowManager {
             // app a moment after it changes.
             lock.lock()
             let firstSeen = seenOnAgent[info.id] ?? nowMs()
-            if seenOnAgent[info.id] == nil { seenOnAgent[info.id] = firstSeen }
+            if seenOnAgent[info.id] == nil {
+                seenOnAgent[info.id] = firstSeen
+                // What this session was doing in the app when it showed up
+                // (the next step's note of the app's windows will include it).
+                if let known = knownBefore[info.pid], !known.ids.contains(info.id) { spawnedAfter[info.id] = known.ms }
+            }
+            let agentBegan = spawnedAfter[info.id]
             lock.unlock()
             // "The user is in this app": WindowServer's front app is it AND the
             // guard counts it as the user's (not a self-activation it's undoing).
             // Only standard windows: popups the agent's own window opens
             // (suggestion lists, menus) are separate windows too.
-            guard nowMs() - firstSeen < 1500, info.pid == front, info.pid == focusGuard.userFront,
-                  info.bounds.width > 100, info.bounds.height > 100,
+            guard nowMs() - firstSeen < 1500, info.bounds.width > 100, info.bounds.height > 100 else { continue }
+            let cause = NewWindow.cause(NewWindow.Facts(
+                firstSeenMs: firstSeen, userInApp: info.pid == front && info.pid == focusGuard.userFront,
+                userOpenInputMs: focusGuard.lastUserOpenInputMs, agentBeganMs: agentBegan,
+                stepSettling: focusGuard.isTainted(info.pid)))
+            guard cause == .user,
                   let ax = AX.window(pid: info.pid, id: info.id),
                   AX.string(ax, "AXSubrole") == "AXStandardWindow" else { continue }
             let main = CGDisplayBounds(CGMainDisplayID())
