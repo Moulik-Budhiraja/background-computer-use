@@ -96,9 +96,8 @@ final class AttributionTests: XCTestCase {
 final class NewWindowTests: XCTestCase {
     private let seen = 10_000.0
 
-    private func cause(userInApp: Bool, userInput: Double = -1e9, agentBegan: Double? = nil, settling: Bool = false) -> NewWindow.Cause {
-        NewWindow.cause(NewWindow.Facts(firstSeenMs: seen, userInApp: userInApp, userOpenInputMs: userInput, agentBeganMs: agentBegan,
-                                        stepSettling: settling))
+    private func cause(userInApp: Bool, userInput: Double = -1e9, agentBegan: Double? = nil) -> NewWindow.Cause {
+        NewWindow.cause(NewWindow.Facts(firstSeenMs: seen, userInApp: userInApp, userOpenInputMs: userInput, agentBeganMs: agentBegan))
     }
 
     // MARK: What an agent's step opened is the agent's
@@ -106,18 +105,18 @@ final class NewWindowTests: XCTestCase {
     /// An agent pressed a button 181 ms before a sign-in window came up
     /// beside its own. The user is in another app.
     func testAWindowAnAgentsStepOpenedIsTheAgents() {
-        XCTAssertEqual(cause(userInApp: false, agentBegan: seen - 181, settling: true), .agent)
+        XCTAssertEqual(cause(userInApp: false, agentBegan: seen - 181), .agent)
     }
 
     /// The same while the guard takes the user to be in that app, and they
     /// pressed Return 459 ms before, which was before the agent's step.
     func testAWindowAnAgentsStepOpenedIsntTheUsersForAKeyFromBeforeTheStep() {
-        XCTAssertEqual(cause(userInApp: true, userInput: seen - 459, agentBegan: seen - 181, settling: true), .agent)
+        XCTAssertEqual(cause(userInApp: true, userInput: seen - 459, agentBegan: seen - 181), .agent)
     }
 
     /// The user is reading in the same browser and hasn't touched it for 20 s.
     func testAWindowAnAgentsStepOpenedIsTheAgentsWhileTheUserReadsInTheSameApp() {
-        XCTAssertEqual(cause(userInApp: true, userInput: seen - 20_000, agentBegan: seen - 200, settling: true), .agent)
+        XCTAssertEqual(cause(userInApp: true, userInput: seen - 20_000, agentBegan: seen - 200), .agent)
     }
 
     /// The user pressed a shortcut in the same app between the agent's
@@ -126,8 +125,7 @@ final class NewWindowTests: XCTestCase {
     /// and what they type next goes into it. Waiting for the step to end
     /// says nothing new, and a long step would leave it there for good.
     func testAWindowEitherCouldHaveOpenedGoesToTheUser() {
-        XCTAssertEqual(cause(userInApp: true, userInput: seen - 50, agentBegan: seen - 181, settling: true), .user)
-        XCTAssertEqual(cause(userInApp: true, userInput: seen - 50, agentBegan: seen - 181, settling: false), .user)
+        XCTAssertEqual(cause(userInApp: true, userInput: seen - 50, agentBegan: seen - 181), .user)
     }
 
     // MARK: What the user opened is still theirs

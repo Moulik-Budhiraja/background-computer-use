@@ -1105,8 +1105,7 @@ public final class WindowManager {
             guard age < Self.agentJudgeMs, info.bounds.width > 100, info.bounds.height > 100 else { continue }
             let cause = NewWindow.cause(NewWindow.Facts(
                 firstSeenMs: firstSeen, userInApp: info.pid == front && info.pid == focusGuard.userFront,
-                userOpenInputMs: focusGuard.lastUserOpenInputMs, agentBeganMs: agentBegan,
-                stepSettling: focusGuard.isTainted(info.pid)))
+                userOpenInputMs: focusGuard.lastUserOpenInputMs, agentBeganMs: agentBegan))
             if cause == .agent {
                 // What this session's step opened (a sign-in popup, a second
                 // window) is the session's: its agent finds it in

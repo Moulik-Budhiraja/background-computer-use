@@ -89,9 +89,6 @@ enum NewWindow {
         /// When the session's last step on the app began, if the window
         /// wasn't there before it. nil: no such step.
         var agentBeganMs: Double?
-        /// A step on the app is running or has just ended, so what it opens
-        /// can still be showing up.
-        var stepSettling: Bool
     }
 
     /// How long after an agent's step began a new window is the step's.
