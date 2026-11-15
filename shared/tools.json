@@ -154,7 +154,7 @@
         "priority": {
           "type": "string",
           "description": {
-            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.",
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
             "windows": "Ignored on Windows, where steps never wait for the user."
           }
         },
@@ -244,7 +244,7 @@
         "priority": {
           "type": "string",
           "description": {
-            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.",
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
             "windows": "Ignored on Windows, where steps never wait for the user."
           }
         },
@@ -289,7 +289,7 @@
         "priority": {
           "type": "string",
           "description": {
-            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.",
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
             "windows": "Ignored on Windows, where steps never wait for the user."
           }
         },
@@ -355,7 +355,7 @@
         "priority": {
           "type": "string",
           "description": {
-            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.",
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
             "windows": "Ignored on Windows, where steps never wait for the user."
           }
         },
@@ -395,7 +395,7 @@
         "priority": {
           "type": "string",
           "description": {
-            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). \"now\" runs at once; only for steps that can't wait.",
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
             "windows": "Ignored on Windows, where steps never wait for the user."
           }
         },
@@ -413,7 +413,7 @@
   {
     "name": "navigate",
     "description": {
-      "macos": "Load a URL in your browser window (Chromium browsers: Helium, Chrome, Brave, Edge…). No keystrokes, so it never waits for a pause in the user's typing; it only waits while the user holds a mouse button or key or has a menu open. Prefer it to clicking the address bar and typing.",
+      "macos": "Load a URL in your browser window (Chromium browsers: Helium, Chrome, Brave, Edge…). No keystrokes: with the user in another app it only waits while they hold a mouse button or key or have a menu open. With the user in that same browser it waits for a pause in their input, as a key step does. Prefer it to clicking the address bar and typing.",
       "windows": "Not built on Windows yet: click the address bar, type_text the URL and \"\\n\"."
     },
     "inputSchema": {

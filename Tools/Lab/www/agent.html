@@ -1,0 +1,27 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Lab agent page</title>
+<style>
+  body { font: 16px -apple-system, sans-serif; margin: 24px; }
+  button, input { font-size: 16px; }
+  .filler p { margin: 0 0 18px; color: #555; }
+</style></head>
+<body>
+<h1>Lab agent page</h1>
+<p><button id="inc" onclick="count.textContent = String(Number(count.textContent) + 1)">Increment</button>
+   <span>Count <b id="count">0</b></span></p>
+<form id="form" onsubmit="event.preventDefault(); out.textContent = 'Submitted ' + field.value; field.value = ''; return false">
+  <label>Agent field <input id="field" aria-label="Agent field" autocomplete="off"></label>
+</form>
+<p id="out">Nothing submitted</p>
+<p><a id="next" href="agent.html?next=1">Next page</a></p>
+<div class="filler" id="filler"></div>
+<p id="bottom">Bottom of the page</p>
+<script>
+  const filler = document.getElementById('filler');
+  for (let i = 1; i <= 60; i++) {
+    const p = document.createElement('p');
+    p.textContent = 'Filler paragraph ' + i + ' so the page scrolls.';
+    filler.appendChild(p);
+  }
+</script>
+</body></html>

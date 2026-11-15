@@ -18,9 +18,16 @@ import CPrivate
 /// lights, the focus ring, the app menus) look as they did before; content
 /// that changes on its own (a video, a spinner, the clock) doesn't count.
 ///
+/// While the user is typing, the copy of what's inside their window would
+/// be out of date before it's up, and would hide what they type next. Then
+/// (`chromeOnly`, or `uncoverContent` once they press something) the
+/// window's copy has a hole where its content is: only what typing doesn't
+/// change stays covered, the title bar and toolbars, the shadow and the menu
+/// bar, and their text shows as they type it.
+///
 /// Panels are shown and removed on the main thread, but nothing here waits
-/// on it for long while the user's input is held: if it's busy, the step
-/// goes without a cover, and removal never blocks.
+/// on it for long: if it's busy, the step goes without a cover, and removal
+/// never blocks.
 final class ScreenFreeze {
     fileprivate struct Cover {
         let panel: NSPanel
@@ -36,6 +43,8 @@ final class ScreenFreeze {
         let bar: Bool
         /// The chrome, small, to tell when it's back.
         var before: [UInt8] = []
+        /// The same copy with the window's content left out, if it has any.
+        let holed: CGImage?
     }
 
     /// Panels being put up on the main thread. If that takes too long the
@@ -48,6 +57,8 @@ final class ScreenFreeze {
 
     private var covers: [Cover] = []
     private var captureMs = 0.0, shownMs = 0.0
+    private let stateLock = NSLock()
+    private var contentUncovered = false
     private static var pool: [NSPanel] = []
 
     /// Room around the window for its shadow, which is larger while it's key.
@@ -61,7 +72,7 @@ final class ScreenFreeze {
 
     /// The copies `show` puts up, captured beforehand.
     struct Shots {
-        fileprivate let shots: [(image: CGImage, own: CGImage, rect: CGRect, id: CGWindowID, level: NSWindow.Level, chrome: [CGRect]?, size: CGSize)]
+        fileprivate let shots: [(image: CGImage, own: CGImage, rect: CGRect, id: CGWindowID, level: NSWindow.Level, chrome: [CGRect]?, size: CGSize, holed: CGImage?)]
         fileprivate let startMs: Double
         let captureMs: Double
     }
@@ -86,8 +97,9 @@ final class ScreenFreeze {
         guard count == 1 else { return nil }
         let screen = CGDisplayBounds(display)
         let bars = menuBars()
-        var shots: [(image: CGImage, own: CGImage, rect: CGRect, id: CGWindowID, level: NSWindow.Level, chrome: [CGRect]?, size: CGSize)] = []
+        var shots: [(image: CGImage, own: CGImage, rect: CGRect, id: CGWindowID, level: NSWindow.Level, chrome: [CGRect]?, size: CGSize, holed: CGImage?)] = []
         let windowChrome = chrome(of: userWindow, pid: info.pid, frame: info.bounds)
+        let content = contentArea(of: userWindow, pid: info.pid, frame: info.bounds)
 
         // The window as the screen shows it, with its shadow and rim (which
         // change too, and aren't in the window's own pixels), but not the
@@ -106,10 +118,11 @@ final class ScreenFreeze {
             let holes = (infront.filter { !$0.bounds.contains(screen) }.map(\.bounds)
                 + notifications(in: infront.filter { $0.bounds.contains(screen) })).map { $0.insetBy(dx: -40, dy: -40) }
             if let around = capture(display, screen: screen, area), let image = cutOut(holes, from: around, area: area, window: own, frame: info.bounds) {
-                shots.append((image, own, area, userWindow, .normal, windowChrome, info.bounds.size))
+                shots.append((image, own, area, userWindow, .normal, windowChrome, info.bounds.size, punch(content, outOf: image, area: area)))
             } else if let inner = crop(own, from: info.bounds, to: info.bounds.insetBy(dx: 1, dy: 1)) {
                 // No screen copy: the window's own pixels, inside its rim.
-                shots.append((inner, own, info.bounds.insetBy(dx: 1, dy: 1), userWindow, .normal, windowChrome, info.bounds.size))
+                let rect = info.bounds.insetBy(dx: 1, dy: 1)
+                shots.append((inner, own, rect, userWindow, .normal, windowChrome, info.bounds.size, punch(content, outOf: inner, area: rect)))
             }
         }
         // Every menu bar on the user's displays (which one dims depends on the
@@ -120,19 +133,20 @@ final class ScreenFreeze {
             let menus = appMenus(of: bar)
             let menuChrome = menus.map { [$0.offsetBy(dx: -bar.bounds.minX, dy: -bar.bounds.minY)] }
             if let image = capture(barDisplay, screen: CGDisplayBounds(barDisplay), bar.bounds) {
-                shots.append((image, own, bar.bounds, bar.id, .statusBar, menuChrome, bar.bounds.size))
+                shots.append((image, own, bar.bounds, bar.id, .statusBar, menuChrome, bar.bounds.size, nil))
             } else if let menus, let image = crop(own, from: bar.bounds, to: menus) {
                 // No screen copy: the menu bar's own pixels hold the app
                 // menus but not the status items, which are windows of their own.
-                shots.append((image, own, menus, bar.id, .statusBar, menuChrome, bar.bounds.size))
+                shots.append((image, own, menus, bar.id, .statusBar, menuChrome, bar.bounds.size, nil))
             }
         }
         guard !shots.isEmpty else { return nil }
         return Shots(shots: shots, startMs: t0, captureMs: nowMs() - t0)
     }
 
-    /// Put captured copies up over the windows they show.
-    static func show(_ captured: Shots) -> ScreenFreeze? {
+    /// Put captured copies up over the windows they show. `chromeOnly`: with
+    /// the window's content left out from the start (the user is typing).
+    static func show(_ captured: Shots, chromeOnly: Bool = false) -> ScreenFreeze? {
         let shots = captured.shots
         let t0 = captured.startMs
         let freeze = ScreenFreeze()
@@ -147,7 +161,7 @@ final class ScreenFreeze {
                 let panel = pool.popLast() ?? makePanel()
                 panel.level = shot.level
                 panel.setFrame(cocoaRect(shot.rect), display: false)
-                panel.contentView?.layer?.contents = shot.image
+                panel.contentView?.layer?.contents = chromeOnly ? (shot.holed ?? shot.image) : shot.image
                 // Right above the window it copies: windows above that stay
                 // above. The menu bar's copy goes in front of the status items.
                 if shot.level == .normal { panel.order(.above, relativeTo: Int(shot.id)) } else { panel.orderFrontRegardless() }
@@ -175,8 +189,9 @@ final class ScreenFreeze {
         let panels = showing.panels
         showing.lock.unlock()
         for (shot, panel) in zip(shots, panels) {
-            freeze.covers.append(Cover(panel: panel, windowID: shot.id, own: shot.own, chrome: shot.chrome, size: shot.size, bar: shot.level == .statusBar))
+            freeze.covers.append(Cover(panel: panel, windowID: shot.id, own: shot.own, chrome: shot.chrome, size: shot.size, bar: shot.level == .statusBar, holed: shot.holed))
         }
+        freeze.contentUncovered = chromeOnly
         freeze.shownMs = nowMs() - t0
         freeze.captureMs = captured.captureMs
         // While WindowServer puts them on screen.
@@ -184,6 +199,22 @@ final class ScreenFreeze {
         for i in freeze.covers.indices { freeze.covers[i].before = freeze.covers[i].print(freeze.covers[i].own) }
         sleepMs(showMs - (nowMs() - up))
         return freeze
+    }
+
+    /// The user pressed a key or a button: what's inside their window is
+    /// about to change, so stop covering it (the title bar, shadow and menu
+    /// bar stay covered). Any thread; returns at once.
+    func uncoverContent() {
+        stateLock.lock()
+        if contentUncovered { stateLock.unlock(); return }
+        contentUncovered = true
+        let swaps = covers.compactMap { c in c.holed.map { (c.panel, $0) } }
+        stateLock.unlock()
+        guard !swaps.isEmpty else { return }
+        DispatchQueue.main.async {
+            for (panel, image) in swaps where panel.isVisible { panel.contentView?.layer?.contents = image }
+            CATransaction.flush()
+        }
     }
 
     /// Take the copies off once the windows under them look as they did, or
@@ -207,8 +238,11 @@ final class ScreenFreeze {
         Log.info("freeze: copies up after \(Int(shownMs)) ms (\(Int(captureMs)) ms capturing), windows back \(Int(nowMs() - start)) ms after the swap\(waiting.isEmpty ? "" : ", gave up waiting on \(waiting.map { "\($0.windowID) (\(worst[$0.windowID] ?? -1) px differ)" }.joined(separator: ", "))")")
         // One more frame so the window's restored pixels are on screen, not just in its buffer.
         sleepMs(17)
+        stateLock.lock()
         let panels = covers.map(\.panel)
         covers.removeAll()
+        contentUncovered = true
+        stateLock.unlock()
         if Thread.isMainThread { Self.remove(panels) } else { DispatchQueue.main.async { Self.remove(panels) } }
     }
 
@@ -247,6 +281,41 @@ final class ScreenFreeze {
             .map { $0.intersection(CGRect(origin: .zero, size: frame.size)) }
             .filter { !$0.isNull && $0.width >= 1 && $0.height >= 1 }
         return local.isEmpty ? nil : local
+    }
+
+    /// The part of a window under its title bar and toolbars, where what
+    /// the user types shows: from the top of the web area or scroll area
+    /// their focus is in, else from 52 points down (a title bar and toolbar).
+    private static func contentArea(of id: CGWindowID, pid: pid_t, frame: CGRect) -> CGRect {
+        var top = frame.minY + min(52, frame.height / 3)
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.1)
+        if let el = AX.element(app, "AXFocusedUIElement"), let w = AX.element(el, "AXWindow"), AX.windowID(w) == id {
+            var current: AXUIElement? = el
+            var area: CGRect?
+            for _ in 0..<14 {
+                guard let e = current else { break }
+                let role = AX.string(e, "AXRole") ?? ""
+                if role == "AXWebArea" || role == "AXScrollArea", let f = AX.frame(e) { area = f }
+                current = AX.element(e, "AXParent")
+            }
+            if let area, area.minY > frame.minY, area.minY < frame.minY + frame.height * 0.45 { top = area.minY }
+        }
+        return CGRect(x: frame.minX + 1, y: top, width: frame.width - 2, height: max(0, frame.maxY - top - 1))
+    }
+
+    /// `image` (a copy of the screen in `area`) with `hole` (global points)
+    /// left clear, so what's really there shows through.
+    private static func punch(_ hole: CGRect, outOf image: CGImage, area: CGRect) -> CGImage? {
+        let part = hole.intersection(area)
+        guard !part.isNull, part.width > 8, part.height > 8, area.width > 0 else { return nil }
+        let scale = CGFloat(image.width) / area.width
+        guard let ctx = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: image.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        ctx.clear(CGRect(x: (part.minX - area.minX) * scale, y: (area.maxY - part.maxY) * scale, width: part.width * scale, height: part.height * scale))
+        return ctx.makeImage()
     }
 
     // MARK: Helpers

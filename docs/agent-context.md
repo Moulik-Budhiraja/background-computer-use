@@ -13,8 +13,8 @@ How to work:
 1. Call `status` once to learn the user's default browser. When a task needs a browser, use that one.
 2. `open_window` opens a new window of an app on your display (for a browser, a new window in the user's own profile). Use `borrow_window` only for single-window apps.
 3. `get_window_state` returns the window's accessibility tree with numbered elements and a screenshot. Act on elements by number. Use x/y (window points, matching the screenshot pixels) only when no element fits. An element keeps its number for as long as it exists. After the first read, `get_window_state` lists only what changed (- removed, + added, ~ changed); pass full=true when you need the whole list again. Right after an action it waits (up to 5 s) for the window to settle, so you don't need to sleep.
-4. Prefer `click` on an element and `set_value`: they work through accessibility. While the user is in the same app, `type_text` writes into the field through accessibility too (pass `element` when you know the field); only Return and Tab go as keys. Keys and pixel clicks make your window its app's key window. In an app the user isn't in, your window keeps key focus between steps; when the user is in it, key goes straight back to them (their input is held for that moment and replayed). When the user is in that app, such a step first waits (3 s at most, usually much less) for a pause in their typing, clicking or scrolling, and the result says how long; that's expected, don't repeat the step. If the user has a menu open in that app, or holds a mouse button or key (a drag), the step fails instead of interrupting it: retry in a few seconds. `open_window` waits the same way (for a menu or a held button anywhere). If another agent is mid-task in that app, the step waits its turn too. Keystroke typing stops if the user switches to that app partway; the error says how much was typed, so type the rest. Pass priority="now" only when the step can't wait (a dialog or toast about to close, a hover then a click, a code about to expire).
-Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's elements in `get_window_state`; click their rows by number. In a browser, to go to a URL use `navigate` (it sends no keys, so it doesn't wait for the user to pause); in a browser it doesn't support, click the address bar, then `type_text` the URL followed by "\n".
+4. Prefer `click` on an element and `set_value`: they work through accessibility. While the user is in the same app, `type_text` writes into the field through accessibility too (pass `element` when you know the field); only Return and Tab go as keys. Keys and pixel clicks make your window its app's key window. In an app the user isn't in, your window keeps key focus between steps; when the user is in it, key goes straight back to them (their input is held for that moment and replayed). When the user is in that app, such a step first waits for a pause in their clicking or scrolling (3 s at most, usually much less) and for them to stop typing (however long they type: their typing goes first), and the result says how long; that's expected, don't repeat the step. If the user has a menu open in that app, holds a mouse button or key (a drag), or is still typing after 30 s, the step fails instead of interrupting them, with nothing done: carry on with steps that need no key focus, or retry in a few seconds. (The user can turn Safe typing off in Settings: then typing is waited for 3 s at most, like clicking.) `open_window` waits the same way (for a menu or a held button anywhere). If another agent is mid-task in that app, the step waits its turn too. Keystroke typing stops if the user switches to that app partway; the error says how much was typed, so type the rest. Pass priority="now" only when the step can't wait (a dialog or toast about to close, a hover then a click, a code about to expire).
+Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's elements in `get_window_state`; click their rows by number. In a browser, to go to a URL use `navigate` (it sends no keys, so it doesn't wait for the user to pause unless they're in that same browser); in a browser it doesn't support, click the address bar, then `type_text` the URL followed by "\n".
 5. When you already know the next few steps (fill a form and submit, type a URL and press Return), send them in one `batch` call: it runs them in order, stops at the first failure, and returns the window's state at the end. Otherwise check the result with `get_window_state` after each meaningful step.
 6. When finished, `release_window` every window you opened or borrowed.
 7. Never type, read or reveal the user's passwords: fill them from the browser's or password manager's autofill. You may enter 2FA codes for accounts the task allows. If you need the user (a sign-in no password manager can fill, a decision), call `handoff` with a reason and stop.
@@ -81,7 +81,7 @@ Click an element (by number) or a point (x, y in window points). Element clicks 
 - `button` (string): left (default) or right.
 - `count` (integer): 1 (default) or 2 for double-click.
 - `element` (integer): Element number from get_window_state.
-- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). "now" runs at once; only for steps that can't wait.
+- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). "now" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and "now" skips that too.)
 - `x` (number): Window-relative x, if no element.
 - `y` (number): Window-relative y, if no element.
 
@@ -108,7 +108,7 @@ Type text into your window. With `element`, that element is focused first. Uses 
 - `text` (string, required): Text to type. \n presses Return.
 - `window_id` (integer, required): Your window.
 - `element` (integer): Optional element to focus first.
-- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). "now" runs at once; only for steps that can't wait.
+- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). "now" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and "now" skips that too.)
 
 ### press_key
 
@@ -117,7 +117,7 @@ Press a key or shortcut in your window, e.g. key "return", or key "l" with modif
 - `key` (string, required): Key name: a letter or digit, return, tab, space, escape, delete, forward_delete, up, down, left, right, home, end, page_up, page_down, f1-f12, or a punctuation character.
 - `window_id` (integer, required): Your window.
 - `modifiers` (array of string): Any of cmd, shift, option, ctrl, fn.
-- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). "now" runs at once; only for steps that can't wait.
+- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). "now" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and "now" skips that too.)
 
 ### scroll
 
@@ -139,7 +139,7 @@ Drag from one window point to another.
 - `to_x` (number, required)
 - `to_y` (number, required)
 - `window_id` (integer, required): Your window.
-- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). "now" runs at once; only for steps that can't wait.
+- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). "now" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and "now" skips that too.)
 
 ### press_menu_item
 
@@ -147,11 +147,11 @@ Choose a menu bar item of the window's app, applied to your window, e.g. path ["
 
 - `path` (array of string, required): Menu titles from the menu bar down.
 - `window_id` (integer, required): Your window.
-- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s). "now" runs at once; only for steps that can't wait.
+- `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). "now" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and "now" skips that too.)
 
 ### navigate
 
-Load a URL in your browser window (Chromium browsers: Helium, Chrome, Brave, Edge…). No keystrokes, so it never waits for a pause in the user's typing; it only waits while the user holds a mouse button or key or has a menu open. Prefer it to clicking the address bar and typing.
+Load a URL in your browser window (Chromium browsers: Helium, Chrome, Brave, Edge…). No keystrokes: with the user in another app it only waits while they hold a mouse button or key or have a menu open. With the user in that same browser it waits for a pause in their input, as a key step does. Prefer it to clicking the address bar and typing.
 
 - `url` (string, required): The URL to load.
 - `window_id` (integer, required): Your window.
@@ -233,9 +233,9 @@ Prefer, in order:
 
 When the user is in another window of the same app, `type_text` writes the text into the field through accessibility, without keystrokes; only Return and Tab are pressed as keys. Pass `element` when you know the field. Keystrokes and pixel clicks make your window its app's key window. In an app the user isn't in, your window keeps key focus between steps, so a field you clicked stays focused for the next step. When the user is in the same app, key goes straight back to them after the step, and their input is held for that moment and replayed. If another agent is mid-task in the same app, such a step first waits for its turn, and the result says how long; that's expected, don't repeat the step.
 
-The user comes first. When they're in the app you're working in, a step that takes key focus (`press_key`, Return or Tab, a click at x and y, `drag`, `press_menu_item`) first waits for a pause in their typing, clicking or scrolling, or for a menu they have open to close. The wait is 3 seconds at most and usually far less, and the result says how long it was and why, for example "Waited 1.4 s for the user to stop typing". That's expected: the step ran, so don't repeat it. In a `batch`, back-to-back steps like that wait once and run together, so batch them when you can. Pass `"priority": "now"` only when a step can't wait: a dialog or toast that closes on its own, a hover followed by a click, a code about to expire. It runs at once even mid-typing, which the user feels.
+The user comes first. When they're in the app you're working in, a step that takes key focus (`press_key`, Return or Tab, a click at x and y, `drag`, `press_menu_item`) first waits for a pause in their typing, clicking or scrolling, or for a menu they have open to close. For clicking and scrolling the wait is 3 seconds at most and usually far less. Their typing always goes first: the step waits for as long as they type, until 2 seconds after their last key. The result says how long the wait was and why, for example "Waited 1.4 s for the user to stop typing". That's expected: the step ran, so don't repeat it. If they're still typing after 30 seconds, the step fails with nothing done and says so: carry on with steps that need no key focus (`set_value`, `type_text` without Return or Tab, a `click` on an element, `get_window_state`), or retry after a few seconds. In a `batch`, back-to-back steps like that wait once and run together, so batch them when you can. Pass `"priority": "now"` only when a step can't wait: a dialog or toast that closes on its own, a hover followed by a click, a code about to expire. It skips the wait for clicks and scrolling, but not the one for the user's typing. (The user can turn Safe typing off in the app's Settings to make you faster in an app they're typing in. Then their typing is waited for like clicking, 3 seconds at most, and `"priority": "now"` skips that too.)
 
-To open a URL in a browser on a Mac, use `navigate`: it loads the URL without keystrokes, so it doesn't wait for the user to pause (only while they hold a mouse button or key or have a menu open). Where it isn't available (Windows, a browser it doesn't support), press `cmd+l` on a Mac or `ctrl+l` on Windows (or click the address bar) and `type_text` the URL followed by `\n`.
+To open a URL in a browser on a Mac, use `navigate`: it loads the URL without keystrokes, so with the user in another app it doesn't wait for them to pause (only while they hold a mouse button or key or have a menu open). With the user in that same browser it waits like the steps above. Where it isn't available (Windows, a browser it doesn't support), press `cmd+l` on a Mac or `ctrl+l` on Windows (or click the address bar) and `type_text` the URL followed by `\n`.
 
 In `type_text`, `\n` presses Return. In a chat or email composer, Return usually sends the message. For a line break inside a message, press `return` with `["shift"]`, and check with `get_window_state` before anything is sent.
 

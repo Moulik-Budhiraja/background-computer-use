@@ -85,6 +85,9 @@ public final class SocketServer {
     private let handler: (String, JSONObject) -> ToolResult
     /// Answers an `op` request; nil for no reply.
     public var hostHandler: ((String, JSONObject, SocketConnection) -> JSONObject?)?
+    /// A connection began carrying a session's tool calls (true), or went
+    /// away having carried them (false): how the engine learns an agent is gone.
+    public var sessionHandler: ((String, Bool) -> Void)?
     private var listenFD: Int32 = -1
     private var nextID = 0
     private let idLock = NSLock()
@@ -150,6 +153,8 @@ public final class SocketServer {
     private func serve(_ connection: SocketConnection) {
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 65536)
+        var sessions: Set<String> = []
+        defer { for s in sessions { sessionHandler?(s, false) } }
         while true {
             let n = read(connection.fd, &chunk, chunk.count)
             if n < 0 && errno == EINTR { continue }
@@ -171,6 +176,7 @@ public final class SocketServer {
                 }
                 let tool = request["tool"] as? String ?? ""
                 let args = request["args"] as? JSONObject ?? [:]
+                if let session = args["_session"] as? String, sessions.insert(session).inserted { sessionHandler?(session, true) }
                 let result = handler(tool, args)
                 connection.send(result.wire(id: id))
             }

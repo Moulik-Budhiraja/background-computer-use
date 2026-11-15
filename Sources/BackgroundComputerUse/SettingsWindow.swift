@@ -34,11 +34,31 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 }
 
+/// "Safe typing" in Settings (`QuietRules.safeTyping`): on until the user
+/// turns it off, and kept in the app's defaults.
+enum SafeTypingSetting {
+    private static let key = "safeTyping"
+
+    /// At launch: what the user chose, if they ever did.
+    static func apply() {
+        guard let saved = UserDefaults.standard.object(forKey: key) as? Bool else { return }
+        QuietRules.safeTyping = saved
+        if !saved { Log.info("settings: safe typing is off") }
+    }
+
+    static func set(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: key)
+        QuietRules.safeTyping = on
+        Log.info("settings: safe typing turned \(on ? "on" : "off")")
+    }
+}
+
 final class SettingsModel: ObservableObject {
     let engine: Engine
     @Published var accessibility = false
     @Published var screenRecording = false
     @Published var launchAtLogin = false
+    @Published var safeTyping = QuietRules.safeTyping
     @Published var copied: String?
     @Published var historyLimitMB = AppRecordings.store.limitMB
     @Published var historyUsedBytes: Int64 = 0
@@ -65,6 +85,7 @@ final class SettingsModel: ObservableObject {
         accessibility = AX.isTrusted
         screenRecording = Capture.hasPermission
         launchAtLogin = LaunchAtLogin.isEnabled
+        if safeTyping != QuietRules.safeTyping { safeTyping = QuietRules.safeTyping }
         // Adding up the recordings' size touches every file; every few seconds is plenty.
         if ticks % 5 == 0 {
             DispatchQueue.global(qos: .utility).async {
@@ -117,6 +138,11 @@ final class SettingsModel: ObservableObject {
     func setLaunchAtLogin(_ on: Bool) {
         LaunchAtLogin.set(on)
         refresh()
+    }
+
+    func setSafeTyping(_ on: Bool) {
+        SafeTypingSetting.set(on)
+        safeTyping = on
     }
 
     func copy(_ text: String, label: String) {
@@ -216,6 +242,16 @@ struct SettingsView: View {
                     .generalRow()
                     RowDivider(inset: 14)
                     HStack {
+                        Text("Safe typing")
+                        Spacer()
+                        Toggle("", isOn: Binding(get: { model.safeTyping }, set: { model.setSafeTyping($0) }))
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                            .labelsHidden()
+                    }
+                    .generalRow()
+                    RowDivider(inset: 14)
+                    HStack {
                         Text("Pause or resume the agent")
                         Spacer()
                         Keycaps(keys: ["⌃", "⌥", "⌘", "P"])
@@ -238,6 +274,12 @@ struct SettingsView: View {
                     }
                     .generalRow()
                 }
+                Text(model.safeTyping
+                     ? "Safe typing: an agent working in the app you're typing in waits until you pause."
+                     : "Safe typing is off: agents work faster in the app you're typing in, and your keys can arrive late.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
             }
         }
         .font(.system(size: 13))

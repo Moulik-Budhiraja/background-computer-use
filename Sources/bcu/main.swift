@@ -1,5 +1,9 @@
 import AppKit
+import BCUCore
 import BCUShared
+
+// Started as the front gate's watchdog (by `bcu serve`): that's all this process does.
+FrontGate.runWatchdogIfAsked()
 
 // bcu: command-line front end for Background Computer Use.
 //   bcu mcp                      stdio MCP server (what agents run)

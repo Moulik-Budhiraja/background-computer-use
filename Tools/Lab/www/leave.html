@@ -1,0 +1,17 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Lab leave page</title>
+<style>body { font: 16px -apple-system, sans-serif; margin: 24px; } input, button { font-size: 16px; }</style></head>
+<body>
+<h1>Lab leave page</h1>
+<p>Once anything is typed or clicked here, the page asks before it's closed ("Leave site?"), like a web app with unsaved changes.</p>
+<p><label>Draft <input id="draft" aria-label="Draft" autocomplete="off"></label> <button id="arm">Arm</button></p>
+<p id="state">Not armed</p>
+<script>
+  function arm() {
+    window.onbeforeunload = e => { e.preventDefault(); e.returnValue = ''; return ''; };
+    document.getElementById('state').textContent = 'Armed';
+  }
+  document.getElementById('draft').addEventListener('input', arm);
+  document.getElementById('arm').addEventListener('click', arm);
+</script>
+</body></html>
