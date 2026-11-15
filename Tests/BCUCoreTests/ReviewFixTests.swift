@@ -37,4 +37,9 @@ final class ReviewFixTests: XCTestCase {
         XCTAssertEqual(Hub.lookup("old", in: byID, sessionID: { $0 }), "old")
         XCTAssertNil(Hub.lookup("gone", in: byID, sessionID: { $0 }))
     }
+
+    func testAWindowReleasedWithKeepOpenIsNotALeftover() {
+        XCTAssertEqual(WindowManager.leftovers([1, 2, 3], kept: [2]), [1, 3])
+        XCTAssertEqual(WindowManager.leftovers([2], kept: [2]), [])
+    }
 }

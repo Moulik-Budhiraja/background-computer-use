@@ -720,6 +720,7 @@ public final class WindowManager {
             return "returned window \(id) to where it was"
         case .opened, .caught:
             if keepOpen {
+                Self.keep(id)
                 unregister(id)
                 return "left window \(id) open"
             }
@@ -894,11 +895,26 @@ public final class WindowManager {
         }
     }
 
+    /// Windows an agent released with `keep_open`: nobody's any more, and
+    /// promised to stay open. They aren't leftovers: never closed or answered
+    /// for, and they don't hold a display back (when it goes, macOS moves
+    /// them to the user's screen).
+    private static let keptLock = NSLock()
+    private static var keptOpen: Set<CGWindowID> = []
+    static func keep(_ id: CGWindowID) { keptLock.lock(); keptOpen.insert(id); keptLock.unlock() }
+    static func leftovers(_ ids: [CGWindowID], kept: Set<CGWindowID>) -> [CGWindowID] { ids.filter { !kept.contains($0) } }
+
     /// Close what's left on a display no agent is using any more: when the
     /// display goes, macOS moves every window on it to the user's screen.
     /// Returns how many wouldn't close. Not on the main thread.
     @discardableResult
     static func closeLeftovers(on bounds: CGRect) -> Int {
+        keptLock.lock(); let kept = keptOpen; keptLock.unlock()
+        func windows(on bounds: CGRect) -> [WindowInfo] {
+            let all = Self.windows(on: bounds)
+            let left = Set(leftovers(all.map(\.id), kept: kept))
+            return all.filter { left.contains($0.id) }
+        }
         // One sweep at a time: each can wait a second or two on an app.
         guard leftoverLock.try() else { return windows(on: bounds).count }
         defer { leftoverLock.unlock() }
