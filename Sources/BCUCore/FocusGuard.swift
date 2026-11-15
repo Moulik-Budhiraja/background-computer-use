@@ -97,6 +97,9 @@ public final class FocusGuard {
     private var lastUserOpenKeyMs = 0.0
     /// When the guard last put the user's app back in front of each app.
     private var restoredAwayMs: [pid_t: Double] = [:]
+    /// The last few times the user came to another app (a front change that
+    /// was theirs, to an app they weren't in), oldest first.
+    private var arrivals: [(pid: pid_t, ms: Double)] = []
     /// The cmd+Tab order (front first) before the agent touched it, taken
     /// when an action begins while there's none; cleared once repaired or
     /// when the user moves to another app (see `repairOrder`).
@@ -448,25 +451,26 @@ public final class FocusGuard {
         return "taint=\(until) key=\(Int(now - lastUserKeyMs))ms openKey=\(Int(now - lastUserOpenKeyMs))ms click=\(Int(now - lastUserMouseDownMs))ms\(restored)"
     }
 
-    /// Whether `pid` becoming frontmost right now is the agent's doing.
-    /// While an action on it is running: yes, unless the user clicked or
-    /// switched apps. In the grace period after: only if the user hasn't
-    /// clicked or pressed a key that could open an app either (launchers,
-    /// Terminal `open`, links). Typing in another app doesn't count: Chromium
-    /// can take the front again well after the step, and taking that for the
-    /// user switching left the app in front of them. Nor does anything just
-    /// after the guard put the user's app back in front of `pid`: that's the
-    /// app taking the front again, too soon for anyone to have switched.
+    /// Whether `pid` becoming frontmost right now is the agent's doing
+    /// (the rule is `Attribution.agentCaused`): yes while an action on it is
+    /// running or in its grace period, or just after the guard put the
+    /// user's app back in front of it, unless the user clicked or pressed
+    /// cmd+Tab and hasn't come to another app since.
     func agentCaused(_ pid: pid_t) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        let now = nowMs()
-        let reasserting = restoredAwayMs[pid].map { now - $0 < 1000 } ?? false
-        guard reasserting || taints[pid].map({ $0.count > 0 || $0.until >= now }) == true else { return false }
-        let strict = taints[pid]?.strict ?? false
-        let click = !strict && now - lastUserMouseDownMs < 400
-        let clickOrSwitch = click || now - lastUserSwitchKeyMs < 400
-        if reasserting || (taints[pid]?.count ?? 0) > 0 { return !clickOrSwitch }
-        return !clickOrSwitch && (strict || now - lastUserOpenKeyMs >= 1500)
+        return Attribution.agentCaused(Attribution.Facts(
+            nowMs: nowMs(),
+            step: taints[pid].map { Attribution.Step(running: $0.count, settleUntilMs: $0.until, strict: $0.strict) },
+            restoredAwayMs: restoredAwayMs[pid],
+            lastMouseDownMs: lastUserMouseDownMs, lastSwitchKeyMs: lastUserSwitchKeyMs, lastOpenKeyMs: lastUserOpenKeyMs,
+            arrivedElsewhereMs: arrivals.last(where: { $0.pid != pid })?.ms ?? -.infinity))
+    }
+
+    /// When the user last clicked or pressed a key that could open a window
+    /// (Return, or a key with command, control or option held).
+    var lastUserOpenInputMs: Double {
+        lock.lock(); defer { lock.unlock() }
+        return max(lastUserOpenKeyMs, lastUserMouseDownMs)
     }
 
     func record(_ summary: String) {
@@ -605,6 +609,11 @@ public final class FocusGuard {
         // The order before the agent's step no longer says where cmd+Tab should take them.
         if let first = orderBefore?.first, first != pid { orderBefore = nil }
         let known = userFrontPid == pid
+        // (Once per arrival: NSWorkspace's word of the same change comes here too.)
+        if !known, arrivals.last?.pid != pid {
+            arrivals.append((pid, nowMs()))
+            if arrivals.count > 4 { arrivals.removeFirst(arrivals.count - 4) }
+        }
         if agentApp { arriving[pid] = nowMs() }
         lock.unlock()
         if agentApp {
