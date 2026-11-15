@@ -104,13 +104,13 @@ enum NewWindow {
     /// and came up within `agentMs` of it, is the step's: a sign-in popup
     /// opens beside the window whose button the agent pressed. Unless the
     /// user is in the app and has clicked or pressed an opening key since
-    /// the step began. Then it's theirs if the step is over, and unclear
-    /// while the step can still be opening things.
+    /// the step began: then either could have opened it, and it goes to
+    /// the user. A window of theirs left on the agent display can't be
+    /// seen, and what they type next goes into it.
     static func cause(_ f: Facts) -> Cause {
         guard let began = f.agentBeganMs, f.firstSeenMs >= began, f.firstSeenMs - began < agentMs else {
             return f.userInApp ? .user : .unclear
         }
-        guard f.userInApp, f.userOpenInputMs >= began else { return .agent }
-        return f.stepSettling ? .unclear : .user
+        return f.userInApp && f.userOpenInputMs >= began ? .user : .agent
     }
 }
