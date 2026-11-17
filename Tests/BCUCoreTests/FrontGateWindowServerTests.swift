@@ -305,6 +305,23 @@ final class FrontGateWindowServerTests: XCTestCase {
         XCTAssertFalse(FrontGate.watchdogKeepsTrying(cleared: true, owner: 50, engine: 50))
     }
 
+    /// A click right after the watchdog's cleanup, before the next pass:
+    /// the list stays down (adding the app kept back alone would keep every
+    /// other app out), and comes back up once the click's moment is over.
+    func testAClickAfterTheWatchdogsCleanupLeavesTheListDown() {
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        XCTAssertTrue(FrontGate.watchdogClear())
+        XCTAssertEqual(list, [])
+        gate.pointer(down: true, ms: 30)
+        XCTAssertEqual(list, [])
+        gate.pointer(down: false, ms: 30)
+        sleepMs(60)
+        _ = gate.passForTests()
+        XCTAssertEqual(list, [psn(user), psn(other)])
+        gate.stop()
+    }
+
     /// The app kept back can't be put on for the user's click: the whole
     /// list comes down, so the click still gets them there.
     func testAFailedAddForAClickTakesTheListDown() {
