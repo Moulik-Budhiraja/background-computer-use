@@ -77,17 +77,10 @@ final class FrontGateWindowServerTests: XCTestCase {
         gate.stop()
     }
 
-    /// Nothing of the gate's is left on the list once it stops, nor once no
-    /// agent has an app to keep back.
+    /// Nothing of the gate's is left on the list once it stops.
     func testNothingIsLeftOnTheList() {
         let gate = makeGate()
         for _ in 0..<3 { _ = gate.passForTests() }
-        XCTAssertFalse(list.isEmpty)
-        gate.targets = { FrontGate.Targets() }
-        _ = gate.passForTests()
-        XCTAssertEqual(list, [])
-        gate.targets = { [unowned self] in FrontGate.Targets(pids: [agent]) }
-        _ = gate.passForTests()
         XCTAssertFalse(list.isEmpty)
         gate.stop()
         XCTAssertEqual(list, [])
@@ -110,6 +103,53 @@ final class FrontGateWindowServerTests: XCTestCase {
         XCTAssertTrue(list.contains(psn(agent)))
         gate.stop()
         XCTAssertEqual(list, [])
+    }
+
+    /// Background-only processes never come to the front: each entry is a
+    /// call to WindowServer, so they stay off.
+    func testBackgroundOnlyProcessesStayOff() {
+        FrontGate.system.canComeForward = { [unowned self] in $0 != other }
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        XCTAssertEqual(list, [psn(user)])
+        XCTAssertTrue(gate.blocks(agent))
+        gate.stop()
+    }
+
+    /// The agent's app getting to the front anyway (the guard puts the
+    /// user's app back) doesn't take the list down: each entry taken off
+    /// one at a time leaves the apps already off refused until the rest are.
+    func testTheAgentsAppInFrontDoesntTakeTheListDown() {
+        var front = user
+        FrontGate.system.frontPid = { front }
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        let before = calls
+        front = agent
+        for _ in 0..<3 { _ = gate.passForTests() }
+        XCTAssertTrue(list.isSuperset(of: [psn(user), psn(other)]))
+        XCTAssertLessThanOrEqual(calls - before, 1)
+        front = user
+        for _ in 0..<3 { _ = gate.passForTests() }
+        XCTAssertEqual(list, [psn(user), psn(other)])
+        gate.stop()
+    }
+
+    /// When agents stop needing an app kept back, everyone is let through at
+    /// once, and the list itself goes only after a while.
+    func testWithNothingToKeepBackTheListGoesLater() {
+        FrontGate.windowServerIdleClearMs = 80
+        defer { FrontGate.windowServerIdleClearMs = 30_000 }
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        gate.targets = { FrontGate.Targets() }
+        _ = gate.passForTests()
+        XCTAssertEqual(list, [psn(user), psn(agent), psn(other)])
+        XCTAssertFalse(gate.blocks(agent))
+        sleepMs(120)
+        _ = gate.passForTests()
+        XCTAssertEqual(list, [])
+        gate.stop()
     }
 
     /// A process that died with entries on the list (they outlive it) leaves
