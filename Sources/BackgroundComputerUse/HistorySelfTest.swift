@@ -15,6 +15,15 @@ enum HistorySelfTest {
         controller.model.load()
         spin(1.5)
         snapshot(host, to: out.appendingPathComponent("history-latest.png"))
+        // The newest action's mark, hovered: its callout over the track.
+        if let mark = controller.model.marks.last(where: { $0.kind >= .action }) {
+            controller.model.go(to: mark.item, animated: false)
+            spin(1.0)
+            controller.trackViewForTest.hoverForTest(mark.item)
+            spin(0.3)
+            snapshot(host, to: out.appendingPathComponent("history-hover.png"))
+            controller.trackViewForTest.hoverForTest(nil)
+        }
         for (n, s) in controller.model.segments.enumerated() {
             controller.model.go(to: s.first + min(2, s.last - s.first), animated: false)
             spin(1.0)
@@ -90,6 +99,15 @@ enum HistorySelfTest {
         for i in 0..<100 {
             framesC.append((fake(size, app: "Mail", title: "Inbox", body: String("Re: Thursday's review, moved to 3 pm".prefix(i / 2)), field: nil, step: i), t, "Mail", "com.apple.mail"))
             if i % 8 == 0 { eventsC.append((t - 120, "click (60 ms): Clicked \"Reply\"", CGPoint(x: 500, y: 200), true)) }
+            // A look, then a click that failed on the next frame: zoomed
+            // out, their dots merge into one red one.
+            if i == 60 { eventsC.append((t - 300, "get_window_state (40 ms): Mail, Inbox", nil, false)) }
+            if i == 61 { eventsC.append((t - 300, "!click failed after 80 ms: element 12 is gone", nil, false)) }
+            // An error that isn't a tool's, then a click that worked, on one frame.
+            if i == 80 {
+                eventsC.append((t - 300, "!Couldn't bring the window to the user: it closed", nil, false))
+                eventsC.append((t - 200, "click (50 ms): Clicked \"Send\"", nil, false))
+            }
             t += 1100 + Double(i % 5)
         }
         RecordingTest.record(into: store, session: "33333333-cccc", label: "Claude Code", size: size, frames: framesC, events: eventsC)
@@ -145,6 +163,26 @@ enum HistorySelfTest {
         spin(1.0)
         snapshot(host, to: out.appendingPathComponent("history-zoomed-out.png"))
         var clockOK = clockOrder(controller.model, "recorded")
+        // Hovering the merged dot shows the error that colors it.
+        var hoverOK = false
+        if let look = controller.model.marks.first(where: { $0.lines.contains { $0.hasPrefix("get_window_state: Mail") } }) {
+            let text = controller.trackViewForTest.calloutForTest(look.item) ?? "none"
+            hoverOK = text.hasPrefix("click failed after 80 ms")
+            controller.trackViewForTest.hoverForTest(look.item)
+            spin(0.3)
+            snapshot(host, to: out.appendingPathComponent("history-hover-merged.png"))
+            controller.trackViewForTest.hoverForTest(nil)
+            print("merged dot callout: \(text) -> \(hoverOK ? "ok" : "WRONG")")
+        }
+        if let both = controller.model.marks.first(where: { $0.lines.contains { $0.hasPrefix("Couldn't bring") } }) {
+            let text = controller.trackViewForTest.calloutForTest(both.item) ?? "none"
+            let ok = both.kind == .error && text.hasPrefix("Couldn't bring")
+            hoverOK = hoverOK && ok
+            print("error then action callout: \(text) -> \(ok ? "ok" : "WRONG")")
+        } else {
+            hoverOK = false
+            print("error then action callout: no mark -> WRONG")
+        }
         // Scrubbing the Mail run where the other run's frames sit between its
         // own: the playhead moves on instead of snapping back.
         let m = controller.model
@@ -407,7 +445,7 @@ enum HistorySelfTest {
                 gestureOK = dragOK && kept && keptEdge && handedOff
             }
         }
-        exit(ok == total && total > 0 && wrong == 0 && limitOK && clockOK && prunedOK && liveOK && gestureOK ? 0 : 1)
+        exit(ok == total && total > 0 && wrong == 0 && limitOK && clockOK && prunedOK && liveOK && gestureOK && hoverOK ? 0 : 1)
     }
 
     /// Frames further right are later (gaps only go forward in time), and

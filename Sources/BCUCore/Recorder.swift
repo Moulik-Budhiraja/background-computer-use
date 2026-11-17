@@ -828,7 +828,8 @@ public enum RecordingTest {
         for f in frames {
             while e < events.count && events[e].t <= f.t {
                 let ev = events[e]
-                if let text = ev.text { w.note(text, error: false, t: ev.t) }
+                // A text starting with "!" is recorded as an error, without the "!".
+                if let text = ev.text { w.note(text.hasPrefix("!") ? String(text.dropFirst()) : text, error: text.hasPrefix("!"), t: ev.t) }
                 if let p = ev.point { w.pointer(p, click: ev.click, t: ev.t) }
                 e += 1
             }
