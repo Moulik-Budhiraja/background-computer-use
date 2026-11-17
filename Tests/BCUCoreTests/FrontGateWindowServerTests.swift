@@ -93,6 +93,25 @@ final class FrontGateWindowServerTests: XCTestCase {
         XCTAssertEqual(list, [])
     }
 
+    /// On 27.2 LaunchServices reads WindowServer's list back (it only refuses
+    /// to set it). The gate's own entries, read that way, aren't another
+    /// app's list: it keeps the agent's app back, and still opens for a click.
+    func testItsOwnEntriesReadBackArentAnotherAppsList() {
+        let apps = [user, agent, other]
+        FrontGate.system.currentList = { [unowned self] in
+            let on = apps.filter { list.contains(psn($0)) }
+            return on.isEmpty ? nil : on.map { "\($0)" as CFString }
+        }
+        let gate = makeGate()
+        for _ in 0..<5 { XCTAssertTrue(gate.passForTests()) }
+        XCTAssertEqual(list, [psn(user), psn(other)])
+        XCTAssertTrue(gate.blocks(agent))
+        gate.pointer(down: true, ms: 30)
+        XCTAssertTrue(list.contains(psn(agent)))
+        gate.stop()
+        XCTAssertEqual(list, [])
+    }
+
     /// A process that died with entries on the list (they outlive it) leaves
     /// a record; the next one takes those entries off before anything else.
     func testAnEarlierRunsEntriesAreTakenOff() {
