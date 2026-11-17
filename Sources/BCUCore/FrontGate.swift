@@ -275,6 +275,9 @@ public final class FrontGate {
         if started { lock.unlock(); return }
         started = true
         lock.unlock()
+        // Which engine runs now: an earlier engine's watchdog still trying
+        // to take its entries off stops, and this one takes them over.
+        _ = Self.system.writeFile(Self.engineURL, "\(getpid())\n")
         Self.clearLeftovers()
         adoptLeftovers()
         startWatchdog()
@@ -888,7 +891,11 @@ public final class FrontGate {
 
     /// Whether the watchdog, its engine gone, keeps trying to take recorded
     /// entries off. `owner`: the engine that last started (nil: none since).
-    static func watchdogKeepsTrying(cleared: Bool, owner: pid_t?, engine: pid_t) -> Bool { false }
+    static func watchdogKeepsTrying(cleared: Bool, owner: pid_t?, engine: pid_t) -> Bool {
+        !cleared && (owner == nil || owner == engine)
+    }
+
+    private static var engineURL: URL { BCUPaths.supportDirectory.appendingPathComponent("front-gate.engine") }
 
     /// Call first thing in `main`: when this process was started as the
     /// gate's watchdog, it runs that and never returns.
@@ -899,11 +906,18 @@ public final class FrontGate {
         // both processes): clear on the way out, like on any other exit.
         // The handler only sets a flag; `poll` returns when a signal lands.
         for s in [SIGTERM, SIGINT, SIGHUP] { signal(s) { _ in watchdogToldToGo = 1 } }
-        /// On the way out the engine may be finishing an update: give it 2 s.
+        let engine = getppid()
+        /// On the way out: until every recorded entry is off (the engine may
+        /// be finishing an update, or an entry won't come off yet), or a new
+        /// engine has started and taken them over.
         func clear() {
-            for _ in 0..<100 {
-                if watchdogClear() { return }
-                usleep(20_000)
+            var pause: UInt32 = 20_000
+            while true {
+                let cleared = watchdogClear()
+                let owner = (try? String(contentsOf: engineURL, encoding: .utf8)).flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                guard watchdogKeepsTrying(cleared: cleared, owner: owner, engine: engine) else { return }
+                usleep(pause)
+                pause = min(pause * 2, 2_000_000)
             }
         }
         var fd = pollfd(fd: 0, events: Int16(POLLIN), revents: 0)
@@ -915,7 +929,8 @@ public final class FrontGate {
             if watchdogToldToGo != 0 { clear(); exit(0) }
             if r == 0 {
                 // The engine hasn't answered for 3 s: let the user through.
-                clear()
+                // One try (the next comes in 3 s): the engine may be back.
+                watchdogClear()
                 continue
             }
             if r < 0 {
