@@ -276,6 +276,7 @@ public final class FrontGate {
         started = true
         lock.unlock()
         Self.clearLeftovers()
+        adoptLeftovers()
         startWatchdog()
         let thread = Thread { [weak self] in
             while let self, self.pass() {}
@@ -308,6 +309,11 @@ public final class FrontGate {
     }
 
     static func clearLeftoversForTests() { clearLeftovers() }
+
+    /// Entries the cleanup at launch couldn't take off.
+    private func adoptLeftovers() {}
+
+    func adoptLeftoversForTests() { adoptLeftovers() }
 
     /// Take recorded entries off WindowServer's list. Those that wouldn't
     /// come off while their app still runs are returned, to stay recorded:
