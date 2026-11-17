@@ -701,7 +701,11 @@ public final class FocusGuard {
         lock.lock()
         frontPolicy = policy
         let now = nowMs()
-        for (pid, t) in taints where t.gated && (t.count > 0 || t.until >= now) { pids.insert(pid) }
+        var stepping = Set<pid_t>()
+        for (pid, t) in taints where t.gated && (t.count > 0 || t.until >= now) {
+            pids.insert(pid)
+            if t.count > 0 { stepping.insert(pid) }
+        }
         let bundles = Set(launching.keys)
         // Never the app the user is in, when agents have windows in it too:
         // the gate leaves out whichever app is in front, but theirs isn't
@@ -712,7 +716,7 @@ public final class FocusGuard {
         pids.remove(userFrontPid)
         if !policy.regular { pids.remove(userRegularPid) }
         lock.unlock()
-        return FrontGate.Targets(pids: pids, bundleIDs: bundles)
+        return FrontGate.Targets(pids: pids, bundleIDs: bundles, stepping: stepping.intersection(pids))
     }
 
     /// An app is about to be launched for an agent: keep it from the front
@@ -1033,7 +1037,7 @@ public final class FocusGuard {
             if event.flags.contains(.maskCommand) && code == 48 {
                 gate.switcher(open: true)
             } else if opens || Self.functionKeys.contains(code) {
-                gate.lift(ms: Self.keyLiftMs)
+                gate.liftForKey(ms: Self.keyLiftMs)
             }
         case .flagsChanged:
             if !event.flags.contains(.maskCommand) { gate.switcher(open: false) }

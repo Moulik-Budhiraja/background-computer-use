@@ -200,6 +200,10 @@ public final class FrontGate {
     /// Since when agents have needed nothing kept back (WindowServer's list).
     private var idleSinceMs: Double?
     private var liftedUntilMs = 0.0
+    /// Open for a key: for everyone but the apps an agent is stepping in.
+    private var keyLiftedUntilMs = 0.0
+    /// The apps an agent was stepping in at the last pass.
+    private var lastStepping: Set<pid_t> = []
     private var switcherOpen = false
     private var switcherSinceMs = 0.0
     private var pointerDown = false
@@ -344,21 +348,37 @@ public final class FrontGate {
         lock.unlock()
     }
 
-    /// A key that may switch apps (Return, a shortcut, a function key).
-    public func liftForKey(ms: Double) { lift(ms: ms) }
+    /// A key that may switch apps (Return, a shortcut, a function key): every
+    /// app goes through but those an agent's step is running in right now.
+    /// What comes forward from those then is almost always the agent's doing
+    /// (Return on a link into that browser at that very moment opens it
+    /// without bringing it forward). A click lets everyone through: it may be
+    /// on that app's window.
+    public func liftForKey(ms: Double) {
+        lock.lock()
+        keyLiftedUntilMs = max(keyLiftedUntilMs, nowMs() + ms)
+        openForUserLocked(keeping: lastStepping)
+        lock.unlock()
+    }
 
-    /// Lock held. Let every app through: LaunchServices' list goes; on
-    /// WindowServer's, the apps kept back go on too (one call each, where
-    /// taking everyone else off would be one per running app).
-    private func openForUserLocked() {
+    /// Lock held. Let every app through but `keeping`: LaunchServices' list
+    /// goes (or is set again without them); on WindowServer's, the apps kept
+    /// back go on (one call each, where taking everyone else off would be one
+    /// per running app).
+    private func openForUserLocked(keeping: Set<pid_t> = []) {
         guard let held = applied else { return }
+        let keep = held.intersection(keeping)
+        guard keep != held else { return }
         stats.lifts += 1
-        guard useWindowServer else { clearLocked(); return }
-        let psns = held.map(Self.system.processSerialNumber).filter { $0 != 0 && !onWindowServerList.contains($0) }
+        guard useWindowServer else {
+            if keep.isEmpty { clearLocked() } else { applyLocked(Targets(pids: keep), seed: appliedSeed) }
+            return
+        }
+        let psns = held.subtracting(keep).map(Self.system.processSerialNumber).filter { $0 != 0 && !onWindowServerList.contains($0) }
         Self.writeRecord(onWindowServerList.union(psns))
         for p in psns where Self.system.updateWindowServerList(p, true) == 0 { onWindowServerList.insert(p) }
-        applied = nil
-        appliedTargets = Targets()
+        applied = keep.isEmpty ? nil : keep
+        appliedTargets = Targets(pids: keep)
     }
 
     /// cmd+Tab went down (open) or command came up (closed): the switch
@@ -465,6 +485,17 @@ public final class FrontGate {
         }
         if foreign { foreign = false }
         let open = !tapOK || liftedLocked(now)
+        let keyOpen = now < keyLiftedUntilMs
+        lastStepping = want.stepping
+        /// What to keep back of `t` now: nothing while open for the user;
+        /// while open for a key, only the apps an agent is stepping in.
+        func narrowed(_ t: Targets) -> Targets {
+            if open { return Targets() }
+            var t = t
+            t.stepping = []
+            if keyOpen { t.pids.formIntersection(want.stepping); t.bundleIDs = [] }
+            return t
+        }
         if useWindowServer {
             // The watchdog took this engine's entries off (after a stall), and their record.
             if !onWindowServerList.isEmpty && !FileManager.default.fileExists(atPath: markerURL.path) {
@@ -486,14 +517,14 @@ public final class FrontGate {
                 // the user, while there's nothing to keep back, and while the
                 // app kept back is in front anyway (the guard puts the user's
                 // app back, which is on the list).
-                let target = open || held.isEmpty ? Targets() : held
+                let target = held.isEmpty ? Targets() : narrowed(held)
                 let seed = Self.appListSeed()
                 if onWindowServerList.isEmpty || target != appliedTargets || seed != appliedSeed { applyWindowServerLocked(target, seed: seed) }
             }
         } else {
             // The list was cleared from outside (the watchdog, after a stall).
             if current == nil && applied != nil { applied = nil; appliedList = [] }
-            var wanted = open ? Targets() : want
+            var wanted = narrowed(want)
             // Never the app in front: whoever is there now, the user sees it.
             wanted.pids.remove(front)
             wanted.pids.remove(getpid())
