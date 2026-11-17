@@ -431,7 +431,10 @@ public final class FrontGate {
         lock.lock()
         if stopping { lock.unlock(); return nil }
         beat(now)
-        let current = Self.currentList()
+        // On WindowServer's list LaunchServices reads back this process's own
+        // entries as a list; and it counts adds, so another app's entries and
+        // these don't undo each other. Nothing to tell apart there.
+        let current = useWindowServer ? nil : Self.currentList()
         // A list that isn't this process's: someone else is deciding who may
         // be in front. Leave it alone, and take no part until it's gone.
         if let current, applied == nil || !Self.isOurs(current, set: appliedList) {
