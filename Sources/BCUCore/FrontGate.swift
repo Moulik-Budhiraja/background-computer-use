@@ -287,6 +287,8 @@ public final class FrontGate {
 
     /// A list a crashed engine left (its watchdog should have cleared it).
     private static func clearLeftovers() {
+        // (A note the last run's watchdog left its engine.)
+        try? FileManager.default.removeItem(at: clearedURL)
         guard FileManager.default.fileExists(atPath: markerURL.path) else { return }
         let left = withRecordLock(wait: true) { () -> [UInt64] in
             let psns = readRecord()
@@ -432,11 +434,24 @@ public final class FrontGate {
         return body()
     }
 
-    /// Lock and record lock held. The watchdog took this engine's entries
-    /// off (after a stall), and their record with them: none is on any more.
+    /// The watchdog left this after a cleanup: the engine's next pass
+    /// starts again from what's still recorded.
+    private static var clearedURL: URL { BCUPaths.supportDirectory.appendingPathComponent("front-gate.cleared") }
+
+    /// Lock held. The watchdog took this engine's entries off (after a
+    /// stall), all of them (no record left) or some.
+    private var watchdogClearedLocked: Bool {
+        FileManager.default.fileExists(atPath: Self.clearedURL.path)
+            || (!onWindowServerList.isEmpty && !FileManager.default.fileExists(atPath: markerURL.path))
+    }
+
+    /// Lock and record lock held. Pick up what the watchdog took off: only
+    /// what it couldn't is on any more.
     private func noteWatchdogClearLocked() {
-        guard !onWindowServerList.isEmpty, !FileManager.default.fileExists(atPath: markerURL.path) else { return }
-        onWindowServerList = []
+        guard watchdogClearedLocked else { return }
+        // What it couldn't take off is still on, and still recorded.
+        onWindowServerList = Set(Self.readRecord())
+        try? FileManager.default.removeItem(at: Self.clearedURL)
         applied = nil
         appliedTargets = Targets()
     }
@@ -557,12 +572,8 @@ public final class FrontGate {
             return t
         }
         if useWindowServer {
-            // The watchdog took this engine's entries off (after a stall), and their record.
-            if !onWindowServerList.isEmpty && !FileManager.default.fileExists(atPath: markerURL.path) {
-                onWindowServerList = []
-                applied = nil
-                appliedTargets = Targets()
-            }
+            // The watchdog took this engine's entries off (after a stall).
+            if watchdogClearedLocked { _ = Self.withRecordLock(wait: true) { noteWatchdogClearLocked() } }
             var held = want
             held.pids.remove(front)
             held.pids.remove(getpid())
@@ -846,6 +857,8 @@ public final class FrontGate {
             guard !psns.isEmpty else { return 0 }
             let left = takeOffRecorded(psns)
             writeRecord(Set(left))
+            // For the engine, if it's still there: it starts again from the record.
+            FileManager.default.createFile(atPath: clearedURL.path, contents: nil)
             return left.isEmpty ? 1 : 2
         }
         guard let took, took != 2 else { return false }
