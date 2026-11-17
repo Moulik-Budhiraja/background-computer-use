@@ -57,6 +57,19 @@ pid_t BCUFrontProcessPID(void);
 /// user's app after another app activated itself. 0x200 = user generated.
 int BCUSetFrontProcess(pid_t pid, uint32_t windowID, uint32_t options);
 
+#pragma mark - Permitted-front list (WindowServer)
+
+/// SLPSAddToPermittedFrontPSNList / SLPSRemoveFromPermittedFrontPSNList exist.
+BOOL BCUPermittedFrontAvailable(void);
+
+/// `pid`'s process serial number as (high << 32) | low, 0 if it has none.
+/// Serial numbers aren't reused within a login session, unlike pids.
+uint64_t BCUProcessPSN(pid_t pid);
+
+/// Add a process (by serial number) to WindowServer's list of apps permitted
+/// to bring themselves to the front, or remove it. Returns the CGError (0 = done).
+int BCUPermittedFrontUpdate(uint64_t psn, BOOL add);
+
 #pragma mark - Capture
 
 /// SLSHWCaptureWindowList: one window's backing store as a CGImage (+1, caller

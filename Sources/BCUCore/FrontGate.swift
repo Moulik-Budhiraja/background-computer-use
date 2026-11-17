@@ -79,26 +79,49 @@ public final class FrontGate {
     /// macOS has the calls this needs.
     public static var available: Bool { ls != nil }
 
-    /// The list as it is now, nil for none (everyone permitted). About a microsecond.
-    private static func currentList() -> [CFTypeRef]? {
+    /// What the gate reads from and changes on this Mac, in one place so
+    /// tests can stand in for all of it (and read nothing of the Mac's).
+    struct System {
+        var runningApps: () -> [App] = FrontGate.lsRunningApps
+        var appListSeed: () -> Int64 = FrontGate.lsAppListSeed
+        var currentList: () -> [CFTypeRef]? = FrontGate.lsCurrentList
+        var setList: ([CFTypeRef]) -> Int32 = FrontGate.lsSetList
+        var frontPid: () -> pid_t = { BCUFrontProcessPID() }
+        /// WindowServer's own list (macOS 26 and later), changed one app at a time.
+        var windowServerListAvailable: () -> Bool = { BCUPermittedFrontAvailable() }
+        var processSerialNumber: (pid_t) -> UInt64 = { BCUProcessPSN($0) }
+        var updateWindowServerList: (_ psn: UInt64, _ add: Bool) -> Int32 = { BCUPermittedFrontUpdate($0, $1) }
+    }
+
+    nonisolated(unsafe) static var system = System()
+
+    /// The list as it is now, nil for none (everyone permitted).
+    private static func currentList() -> [CFTypeRef]? { system.currentList() }
+    private static func appListSeed() -> Int64 { system.appListSeed() }
+    private static func runningApps() -> [App] { system.runningApps() }
+    @discardableResult
+    private static func setList(_ asns: [CFTypeRef]) -> Int32 { system.setList(asns) }
+
+    /// About a microsecond.
+    private static func lsCurrentList() -> [CFTypeRef]? {
         guard let ls, let list = ls.copyMeta(session, ls.permittedKey)?.takeRetainedValue() as? [CFTypeRef], !list.isEmpty else { return nil }
         return list
     }
 
     /// Changes whenever an app starts or quits. About a microsecond.
-    private static func appListSeed() -> Int64 {
+    private static func lsAppListSeed() -> Int64 {
         guard let ls else { return 0 }
         return (ls.copyMeta(session, ls.seedKey)?.takeRetainedValue() as? NSNumber)?.int64Value ?? 0
     }
 
-    private struct App {
+    struct App {
         let asn: CFTypeRef
         let pid: pid_t
         let bundleID: String?
     }
 
     /// Every app LaunchServices knows, agents and menu bar items included.
-    private static func runningApps() -> [App] {
+    private static func lsRunningApps() -> [App] {
         guard let ls, let list = ls.copyApps(session)?.takeRetainedValue() as? [CFTypeRef] else { return [] }
         return list.map { asn in
             App(asn: asn,
@@ -110,8 +133,7 @@ public final class FrontGate {
     /// One round trip to launchservicesd, about a millisecond. LaunchServices'
     /// status: 0, or why not (on macOS 26.7 it's -10663, "attribute not
     /// settable", for a process without Apple's entitlement).
-    @discardableResult
-    private static func setList(_ asns: [CFTypeRef]) -> Int32 {
+    private static func lsSetList(_ asns: [CFTypeRef]) -> Int32 {
         if let setListForTests { return setListForTests(asns) }
         guard let ls else { return -1 }
         return ls.setMeta(session, ls.permittedKey, asns as CFArray)
@@ -223,14 +245,7 @@ public final class FrontGate {
         if started { lock.unlock(); return }
         started = true
         lock.unlock()
-        // A list a crashed engine left (its watchdog should have cleared it).
-        if FileManager.default.fileExists(atPath: markerURL.path) {
-            if Self.currentList() != nil {
-                Self.setList([])
-                Log.info("gate: cleared the permitted-front list an earlier run left behind")
-            }
-            try? FileManager.default.removeItem(at: markerURL)
-        }
+        Self.clearLeftovers()
         startWatchdog()
         let thread = Thread { [weak self] in
             while let self, self.pass() {}
@@ -239,6 +254,18 @@ public final class FrontGate {
         thread.qualityOfService = .userInteractive
         thread.start()
     }
+
+    /// A list a crashed engine left (its watchdog should have cleared it).
+    private static func clearLeftovers() {
+        guard FileManager.default.fileExists(atPath: markerURL.path) else { return }
+        if currentList() != nil {
+            setList([])
+            Log.info("gate: cleared the permitted-front list an earlier run left behind")
+        }
+        try? FileManager.default.removeItem(at: markerURL)
+    }
+
+    static func clearLeftoversForTests() { clearLeftovers() }
 
     /// Before the engine goes away: open the gate for good.
     public func stop() {
@@ -352,7 +379,7 @@ public final class FrontGate {
         stepLock.lock(); defer { stepLock.unlock() }
         let want = targets?() ?? Targets()
         let tapOK = tapWorking?() ?? false
-        let front = BCUFrontProcessPID()
+        let front = Self.system.frontPid()
         let now = nowMs()
         lock.lock()
         if stopping { lock.unlock(); return nil }
