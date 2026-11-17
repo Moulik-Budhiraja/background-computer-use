@@ -194,6 +194,8 @@ public final class FrontGate {
     private var onWindowServerList: Set<UInt64> = []
     /// Anything of this process's on either list.
     private var hasListLocked: Bool { applied != nil || !onWindowServerList.isEmpty }
+    /// Since when agents have needed nothing kept back (WindowServer's list).
+    private var idleSinceMs: Double?
     private var liftedUntilMs = 0.0
     private var switcherOpen = false
     private var switcherSinceMs = 0.0
@@ -467,11 +469,18 @@ public final class FrontGate {
             var held = want
             held.pids.remove(front)
             held.pids.remove(getpid())
-            if held.isEmpty {
+            if want.isEmpty { if idleSinceMs == nil { idleSinceMs = now } } else { idleSinceMs = nil }
+            if let since = idleSinceMs, now - since >= Self.windowServerIdleClearMs {
+                // Taking the list down is one call per entry, and an app
+                // already off is refused until the rest are: only once
+                // agents have needed nothing kept back for a while.
                 if hasListLocked { clearLocked() }
-            } else {
-                // Open for the user: everyone stays on, the apps kept back too.
-                let target = open ? Targets() : held
+            } else if hasListLocked || !held.isEmpty {
+                // Everyone on (the apps kept back too) while it's open for
+                // the user, while there's nothing to keep back, and while the
+                // app kept back is in front anyway (the guard puts the user's
+                // app back, which is on the list).
+                let target = open || held.isEmpty ? Targets() : held
                 let seed = Self.appListSeed()
                 if onWindowServerList.isEmpty || target != appliedTargets || seed != appliedSeed { applyWindowServerLocked(target, seed: seed) }
             }
@@ -489,7 +498,7 @@ public final class FrontGate {
                 if applied == nil || wanted != appliedTargets || seed != appliedSeed { applyLocked(wanted, seed: seed) }
             }
         }
-        let active = applied != nil || !want.isEmpty
+        let active = hasListLocked || !want.isEmpty
         lock.unlock()
         // A new app must be on the list before it finishes launching, and an
         // agent's app off it before it next shows a window.
@@ -555,7 +564,8 @@ public final class FrontGate {
             let p = Self.system.processSerialNumber(app.pid)
             guard p != 0 else { continue }
             everyone.insert(p)
-            if !out.contains(app.pid) { want.insert(p) }
+            // (Background-only processes never come forward: no call for them.)
+            if !out.contains(app.pid) && Self.system.canComeForward(app.pid) { want.insert(p) }
         }
         guard !want.isEmpty else {
             if hasListLocked { clearLocked() }
@@ -612,7 +622,11 @@ public final class FrontGate {
     private func clearLocked() -> Bool {
         if useWindowServer {
             var everyone: Set<UInt64>?
-            for p in onWindowServerList {
+            // The app in front last: until the list is gone, an app already
+            // off it is refused the front.
+            let front = Self.system.processSerialNumber(Self.system.frontPid())
+            let order = onWindowServerList.filter { $0 != front } + onWindowServerList.filter { $0 == front }
+            for p in order {
                 if Self.system.updateWindowServerList(p, false) == 0 { onWindowServerList.remove(p); continue }
                 // An app that quit took its entry with it.
                 if everyone == nil { everyone = Set(Self.runningApps().map { Self.system.processSerialNumber($0.pid) }) }
