@@ -234,6 +234,24 @@ final class FrontGateWindowServerTests: XCTestCase {
         gate.stop()
     }
 
+    /// After the watchdog took some entries off (after a stall), the engine
+    /// sees it on its next pass and puts them back, though one wouldn't come off.
+    func testTheEngineSeesAPartialCleanup() {
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        let update = FrontGate.system.updateWindowServerList
+        FrontGate.system.updateWindowServerList = { [unowned self] p, add in
+            !add && p == psn(other) ? -1 : update(p, add)
+        }
+        XCTAssertFalse(FrontGate.watchdogClear())
+        XCTAssertEqual(list, [psn(other)])
+        FrontGate.system.updateWindowServerList = update
+        _ = gate.passForTests()
+        XCTAssertEqual(list, [psn(user), psn(other)])
+        gate.stop()
+        XCTAssertEqual(list, [])
+    }
+
     /// The same at the next launch.
     func testTheNextLaunchKeepsWhatItCouldntTakeOff() {
         let gate = makeGate()
