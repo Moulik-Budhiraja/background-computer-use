@@ -310,8 +310,19 @@ public final class FrontGate {
 
     static func clearLeftoversForTests() { clearLeftovers() }
 
-    /// Entries the cleanup at launch couldn't take off.
-    private func adoptLeftovers() {}
+    /// Entries the cleanup at launch couldn't take off are this engine's:
+    /// LaunchServices reads them back as a list on 27.2, and taken for
+    /// another app's they'd be left on (and their record dropped) for good.
+    /// They come off with the rest of this engine's list.
+    private func adoptLeftovers() {
+        let left = Self.readRecord()
+        guard !left.isEmpty, Self.system.windowServerListAvailable() else { return }
+        lock.lock()
+        useWindowServer = true
+        onWindowServerList.formUnion(left)
+        lock.unlock()
+        Log.info("gate: \(left.count) entries an earlier run left on WindowServer's permitted-front list wouldn't come off; using that list, and they come off with the rest")
+    }
 
     func adoptLeftoversForTests() { adoptLeftovers() }
 
