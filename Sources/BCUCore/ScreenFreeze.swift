@@ -36,7 +36,9 @@ final class ScreenFreeze {
         let own: CGImage
         /// Window-local rects (points) that tell active from inactive; nil
         /// for the whole image.
-        let chrome: [CGRect]?
+        var chrome: [CGRect]?
+        /// Where the window's content is (window-local points), if it has a copy.
+        var content: CGRect?
         /// The window's size in points, to map `chrome` onto its pixels.
         let size: CGSize
         /// A menu bar (Window Server's own window) rather than an app's.
@@ -75,6 +77,19 @@ final class ScreenFreeze {
         fileprivate let shots: [(image: CGImage, own: CGImage, rect: CGRect, id: CGWindowID, level: NSWindow.Level, chrome: [CGRect]?, size: CGSize, holed: CGImage?)]
         fileprivate let startMs: Double
         let captureMs: Double
+        /// Each window's content area, window-local.
+        fileprivate var contents: [CGWindowID: CGRect] = [:]
+    }
+
+    /// What to compare of a window whose content changes on its own (a
+    /// video), given its chrome and its content area (window-local points).
+    /// Its chrome outside the content (the traffic lights), else the strip
+    /// above the content (title bar and toolbar), else nothing.
+    static func liveChrome(_ chrome: [CGRect]?, content: CGRect, size: CGSize) -> [CGRect] {
+        let outside = (chrome ?? []).filter { !$0.intersects(content) }
+        if !outside.isEmpty { return outside }
+        let strip = CGRect(x: 0, y: 0, width: size.width, height: content.minY)
+        return strip.height >= 1 ? [strip] : []
     }
 
     /// Cover `userWindow` (the app's key window, on the user's display) and
@@ -141,7 +156,9 @@ final class ScreenFreeze {
             }
         }
         guard !shots.isEmpty else { return nil }
-        return Shots(shots: shots, startMs: t0, captureMs: nowMs() - t0)
+        var result = Shots(shots: shots, startMs: t0, captureMs: nowMs() - t0)
+        result.contents[userWindow] = content.offsetBy(dx: -info.bounds.minX, dy: -info.bounds.minY)
+        return result
     }
 
     /// Put captured copies up over the windows they show. `chromeOnly`: with
@@ -189,7 +206,7 @@ final class ScreenFreeze {
         let panels = showing.panels
         showing.lock.unlock()
         for (shot, panel) in zip(shots, panels) {
-            freeze.covers.append(Cover(panel: panel, windowID: shot.id, own: shot.own, chrome: shot.chrome, size: shot.size, bar: shot.level == .statusBar, holed: shot.holed))
+            freeze.covers.append(Cover(panel: panel, windowID: shot.id, own: shot.own, chrome: shot.chrome, content: captured.contents[shot.id], size: shot.size, bar: shot.level == .statusBar, holed: shot.holed))
         }
         freeze.contentUncovered = chromeOnly
         freeze.shownMs = nowMs() - t0
@@ -197,8 +214,34 @@ final class ScreenFreeze {
         // While WindowServer puts them on screen.
         let up = nowMs()
         for i in freeze.covers.indices { freeze.covers[i].before = freeze.covers[i].print(freeze.covers[i].own) }
+        // Content that changed since the capture changes on its own (a
+        // video, an animation): a still copy of it would freeze it, and it
+        // would never match the copy. Leave it uncovered, and don't wait on it.
+        for i in freeze.covers.indices where !freeze.covers[i].bar {
+            let c = freeze.covers[i]
+            guard let content = c.content, let now = ownPixels(c.windowID, bar: false),
+                  changed(c.own, now, in: content, size: c.size) else { continue }
+            freeze.covers[i].chrome = liveChrome(c.chrome, content: content, size: c.size)
+            freeze.covers[i].before = freeze.covers[i].print(c.own)
+            if let holed = c.holed {
+                DispatchQueue.main.async {
+                    if c.panel.isVisible { c.panel.contentView?.layer?.contents = holed }
+                    CATransaction.flush()
+                }
+            }
+        }
         sleepMs(showMs - (nowMs() - up))
         return freeze
+    }
+
+    /// Whether `content` (window-local points) differs between two copies of
+    /// a window of `size` points.
+    private static func changed(_ a: CGImage, _ b: CGImage, in content: CGRect, size: CGSize) -> Bool {
+        guard size.width > 0, size.height > 0, a.width == b.width, a.height == b.height else { return false }
+        let sx = CGFloat(a.width) / size.width, sy = CGFloat(a.height) / size.height
+        let px = CGRect(x: content.minX * sx, y: content.minY * sy, width: content.width * sx, height: content.height * sy).integral
+        guard let pa = a.cropping(to: px), let pb = b.cropping(to: px) else { return false }
+        return difference(thumbnail(pa), thumbnail(pb)) > allowedDifference
     }
 
     /// The user pressed a key or a button: what's inside their window is

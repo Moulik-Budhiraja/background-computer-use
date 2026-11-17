@@ -30,11 +30,13 @@ import CPrivate
 /// can't switch apps and leave it shut. While it's open the guard falls back
 /// to putting the user's app back after the fact, as before.
 ///
-/// This works on macOS 15. On 27.2 the list belongs to WindowServer and
-/// LaunchServices refuses it from anyone else (status -10663, and no list
-/// is kept; 26.7 answered the same to the one call tried there): the gate
-/// then gives up after `maxRefusals` tries and the guard puts the user's
-/// app back after the fact, as it always did.
+/// This works on macOS 15. On 27.2 LaunchServices refuses the list
+/// (status -10663; 26.7 answered the same), and the gate changes
+/// WindowServer's own list instead, one app at a time
+/// (SLPSAddToPermittedFrontPSNList). That list can't be read back, so the
+/// gate keeps a record of every entry it adds, written before the entry
+/// goes on. Opening it for the user adds the apps kept back, rather than
+/// taking everyone else off.
 ///
 /// The list outlives the process that set it, and a list left behind would
 /// lock the user out of those apps. So a helper process (`runWatchdogIfAsked`)
@@ -79,26 +81,60 @@ public final class FrontGate {
     /// macOS has the calls this needs.
     public static var available: Bool { ls != nil }
 
-    /// The list as it is now, nil for none (everyone permitted). About a microsecond.
-    private static func currentList() -> [CFTypeRef]? {
+    /// What the gate reads from and changes on this Mac, in one place so
+    /// tests can stand in for all of it (and read nothing of the Mac's).
+    struct System {
+        var runningApps: () -> [App] = FrontGate.lsRunningApps
+        var appListSeed: () -> Int64 = FrontGate.lsAppListSeed
+        var currentList: () -> [CFTypeRef]? = FrontGate.lsCurrentList
+        var setList: ([CFTypeRef]) -> Int32 = FrontGate.lsSetList
+        var frontPid: () -> pid_t = { BCUFrontProcessPID() }
+        /// WindowServer's own list (macOS 26 and later), changed one app at a time.
+        var windowServerListAvailable: () -> Bool = { BCUPermittedFrontAvailable() }
+        var processSerialNumber: (pid_t) -> UInt64 = { BCUProcessPSN($0) }
+        var updateWindowServerList: (_ psn: UInt64, _ add: Bool) -> Int32 = { BCUPermittedFrontUpdate($0, $1) }
+        /// Not a background-only process (those never come to the front).
+        var canComeForward: (pid_t) -> Bool = { NSRunningApplication(processIdentifier: $0)?.activationPolicy != .prohibited }
+        /// Write a file in full; whether it was.
+        var writeFile: (URL, String) -> Bool = { url, text in
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            return (try? text.write(to: url, atomically: true, encoding: .utf8)) != nil
+        }
+    }
+
+    /// How long WindowServer's list stays once no agent has an app to keep
+    /// back: taking it down is one call per entry.
+    nonisolated(unsafe) static var windowServerIdleClearMs = 30_000.0
+
+    nonisolated(unsafe) static var system = System()
+
+    /// The list as it is now, nil for none (everyone permitted).
+    private static func currentList() -> [CFTypeRef]? { system.currentList() }
+    private static func appListSeed() -> Int64 { system.appListSeed() }
+    private static func runningApps() -> [App] { system.runningApps() }
+    @discardableResult
+    private static func setList(_ asns: [CFTypeRef]) -> Int32 { system.setList(asns) }
+
+    /// About a microsecond.
+    private static func lsCurrentList() -> [CFTypeRef]? {
         guard let ls, let list = ls.copyMeta(session, ls.permittedKey)?.takeRetainedValue() as? [CFTypeRef], !list.isEmpty else { return nil }
         return list
     }
 
     /// Changes whenever an app starts or quits. About a microsecond.
-    private static func appListSeed() -> Int64 {
+    private static func lsAppListSeed() -> Int64 {
         guard let ls else { return 0 }
         return (ls.copyMeta(session, ls.seedKey)?.takeRetainedValue() as? NSNumber)?.int64Value ?? 0
     }
 
-    private struct App {
+    struct App {
         let asn: CFTypeRef
         let pid: pid_t
         let bundleID: String?
     }
 
     /// Every app LaunchServices knows, agents and menu bar items included.
-    private static func runningApps() -> [App] {
+    private static func lsRunningApps() -> [App] {
         guard let ls, let list = ls.copyApps(session)?.takeRetainedValue() as? [CFTypeRef] else { return [] }
         return list.map { asn in
             App(asn: asn,
@@ -110,8 +146,7 @@ public final class FrontGate {
     /// One round trip to launchservicesd, about a millisecond. LaunchServices'
     /// status: 0, or why not (on macOS 26.7 it's -10663, "attribute not
     /// settable", for a process without Apple's entitlement).
-    @discardableResult
-    private static func setList(_ asns: [CFTypeRef]) -> Int32 {
+    private static func lsSetList(_ asns: [CFTypeRef]) -> Int32 {
         if let setListForTests { return setListForTests(asns) }
         guard let ls else { return -1 }
         return ls.setMeta(session, ls.permittedKey, asns as CFArray)
@@ -136,9 +171,12 @@ public final class FrontGate {
         public var pids: Set<pid_t> = []
         /// Apps being launched for an agent, before they have a pid.
         public var bundleIDs: Set<String> = []
-        public init(pids: Set<pid_t> = [], bundleIDs: Set<String> = []) {
+        /// Of `pids`, the apps an agent's step is running in right now.
+        public var stepping: Set<pid_t> = []
+        public init(pids: Set<pid_t> = [], bundleIDs: Set<String> = [], stepping: Set<pid_t> = []) {
             self.pids = pids
             self.bundleIDs = bundleIDs
+            self.stepping = stepping
         }
         var isEmpty: Bool { pids.isEmpty && bundleIDs.isEmpty }
     }
@@ -156,7 +194,21 @@ public final class FrontGate {
     private var appliedList: [CFTypeRef] = []
     private var appliedSeed: Int64 = 0
     private var appliedTargets = Targets()
+    /// LaunchServices refused the list (macOS 26 and later): WindowServer's
+    /// own list is changed instead, one app at a time.
+    private var useWindowServer = false
+    /// Serial numbers this process put on WindowServer's list. They stay
+    /// there after it dies, so each is in the marker file before it goes on.
+    private var onWindowServerList: Set<UInt64> = []
+    /// Anything of this process's on either list.
+    private var hasListLocked: Bool { applied != nil || !onWindowServerList.isEmpty }
+    /// Since when agents have needed nothing kept back (WindowServer's list).
+    private var idleSinceMs: Double?
     private var liftedUntilMs = 0.0
+    /// Open for a key: for everyone but the apps an agent is stepping in.
+    private var keyLiftedUntilMs = 0.0
+    /// The apps an agent was stepping in at the last pass.
+    private var lastStepping: Set<pid_t> = []
     private var switcherOpen = false
     private var switcherSinceMs = 0.0
     private var pointerDown = false
@@ -210,7 +262,7 @@ public final class FrontGate {
 
     /// Any thread, once.
     public func start() {
-        guard Self.available else {
+        guard Self.available || Self.system.windowServerListAvailable() else {
             Log.info("gate: this macOS has no permitted-front list; apps that take the front are put back after the fact")
             return
         }
@@ -223,14 +275,11 @@ public final class FrontGate {
         if started { lock.unlock(); return }
         started = true
         lock.unlock()
-        // A list a crashed engine left (its watchdog should have cleared it).
-        if FileManager.default.fileExists(atPath: markerURL.path) {
-            if Self.currentList() != nil {
-                Self.setList([])
-                Log.info("gate: cleared the permitted-front list an earlier run left behind")
-            }
-            try? FileManager.default.removeItem(at: markerURL)
-        }
+        // Which engine runs now: an earlier engine's watchdog still trying
+        // to take its entries off stops, and this one takes them over.
+        _ = Self.system.writeFile(Self.engineURL, "\(getpid())\n")
+        Self.clearLeftovers()
+        adoptLeftovers()
         startWatchdog()
         let thread = Thread { [weak self] in
             while let self, self.pass() {}
@@ -240,11 +289,83 @@ public final class FrontGate {
         thread.start()
     }
 
+    /// A list a crashed engine left (its watchdog should have cleared it).
+    private static func clearLeftovers() {
+        // (A note the last run's watchdog left its engine.)
+        try? FileManager.default.removeItem(at: clearedURL)
+        guard FileManager.default.fileExists(atPath: markerURL.path) else { return }
+        let left = withRecordLock(wait: true) { () -> [UInt64] in
+            let psns = readRecord()
+            guard !psns.isEmpty else { return [] }
+            let left = takeOffRecorded(psns)
+            writeRecord(Set(left))
+            Log.info("gate: took \(psns.count - left.count) entries an earlier run left off WindowServer's permitted-front list\(left.isEmpty ? "" : "; \(left.count) wouldn't come off and stay recorded")")
+            return left
+        } ?? []
+        // Kept for the next try (the watchdog's, or the next launch's).
+        guard left.isEmpty else { return }
+        if currentList() != nil {
+            setList([])
+            Log.info("gate: cleared the permitted-front list an earlier run left behind")
+        }
+        try? FileManager.default.removeItem(at: markerURL)
+    }
+
+    static func clearLeftoversForTests() { clearLeftovers() }
+
+    /// Entries the cleanup at launch couldn't take off are this engine's:
+    /// LaunchServices reads them back as a list on 27.2, and taken for
+    /// another app's they'd be left on (and their record dropped) for good.
+    /// They come off with the rest of this engine's list.
+    private func adoptLeftovers() {
+        let left = Self.readRecord()
+        guard !left.isEmpty, Self.system.windowServerListAvailable() else { return }
+        lock.lock()
+        useWindowServer = true
+        onWindowServerList.formUnion(left)
+        lock.unlock()
+        Log.info("gate: \(left.count) entries an earlier run left on WindowServer's permitted-front list wouldn't come off; using that list, and they come off with the rest")
+    }
+
+    func adoptLeftoversForTests() { adoptLeftovers() }
+
+    /// Take recorded entries off WindowServer's list. Those that wouldn't
+    /// come off while their app still runs are returned, to stay recorded:
+    /// one left alone on the list would keep every other app back.
+    private static func takeOffRecorded(_ psns: [UInt64]) -> [UInt64] {
+        var failed: [UInt64] = []
+        for p in psns where system.updateWindowServerList(p, false) != 0 { failed.append(p) }
+        guard !failed.isEmpty else { return [] }
+        // Serial numbers aren't reused in a login session: an app that quit
+        // took its entry with it.
+        let running = Set(runningApps().map { system.processSerialNumber($0.pid) })
+        return failed.filter(running.contains)
+    }
+
+    /// The serial numbers the marker file names (one per line, hex): what
+    /// may be on WindowServer's list of this engine's.
+    private static func readRecord() -> [UInt64] {
+        guard let text = try? String(contentsOf: markerURL, encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").compactMap { UInt64($0, radix: 16) }
+    }
+
+    /// Written before an entry goes on, so a crash right after leaves a
+    /// record for the watchdog or the next engine. Gone when nothing's left.
+    @discardableResult
+    private static func writeRecord(_ psns: Set<UInt64>) -> Bool {
+        if psns.isEmpty {
+            try? FileManager.default.removeItem(at: markerURL)
+            return true
+        }
+        let text = psns.map { String($0, radix: 16) }.joined(separator: "\n") + "\n"
+        return system.writeFile(markerURL, text)
+    }
+
     /// Before the engine goes away: open the gate for good.
     public func stop() {
         lock.lock()
         stopping = true
-        let cleared = applied == nil || clearLocked()
+        let cleared = !hasListLocked || clearLocked()
         let helper = watchdog
         watchdog = nil
         try? heartbeat?.close()
@@ -266,11 +387,99 @@ public final class FrontGate {
     public func lift(ms: Double) {
         lock.lock()
         liftedUntilMs = max(liftedUntilMs, nowMs() + ms)
-        if applied != nil {
-            clearLocked()
-            stats.lifts += 1
-        }
+        openForUserLocked()
         lock.unlock()
+    }
+
+    /// A key that may switch apps (Return, a shortcut, a function key): every
+    /// app goes through but those an agent's step is running in right now.
+    /// What comes forward from those then is almost always the agent's doing
+    /// (Return on a link into that browser at that very moment opens it
+    /// without bringing it forward). A click lets everyone through: it may be
+    /// on that app's window.
+    public func liftForKey(ms: Double) {
+        lock.lock()
+        keyLiftedUntilMs = max(keyLiftedUntilMs, nowMs() + ms)
+        openForUserLocked(keeping: lastStepping)
+        lock.unlock()
+    }
+
+    /// Lock held. Let every app through but `keeping`: LaunchServices' list
+    /// goes (or is set again without them); on WindowServer's, the apps kept
+    /// back go on (one call each, where taking everyone else off would be one
+    /// per running app).
+    private func openForUserLocked(keeping: Set<pid_t> = []) {
+        guard let held = applied else { return }
+        let keep = held.intersection(keeping)
+        guard keep != held else { return }
+        stats.lifts += 1
+        guard useWindowServer else {
+            if keep.isEmpty { clearLocked() } else { applyLocked(Targets(pids: keep), seed: appliedSeed) }
+            return
+        }
+        let recorded = Self.withRecordLock(wait: true) { () -> Bool in
+            // The watchdog took the list down (after a stall): adding the
+            // apps kept back to what's left would let only them through.
+            // Leave it down; the next pass after this moment puts it back up.
+            if noteWatchdogClearLocked() { return false }
+            let psns = held.subtracting(keep).map(Self.system.processSerialNumber).filter { $0 != 0 && !onWindowServerList.contains($0) }
+            // An entry with no record could outlive this process with nothing
+            // to take it off: the rest of the list would come off and leave
+            // it alone on it, keeping every other app back.
+            guard Self.writeRecord(onWindowServerList.union(psns)) else { return false }
+            var allOn = true
+            for p in psns {
+                if Self.system.updateWindowServerList(p, true) == 0 { onWindowServerList.insert(p) } else { allOn = false }
+            }
+            return allOn
+        }
+        guard recorded == true else {
+            // Can't let them through by adding (no record, or WindowServer
+            // refused): take the whole list down.
+            clearLocked()
+            return
+        }
+        applied = keep.isEmpty ? nil : keep
+        appliedTargets = Targets(pids: keep)
+    }
+
+    /// Run `body` holding the lock the watchdog takes before its cleanup, so
+    /// neither sees the other's list and record half changed. `wait` false:
+    /// nil if someone holds it. A lock file that can't be opened runs `body`
+    /// without it.
+    static func withRecordLock<T>(wait: Bool, _ body: () -> T) -> T? {
+        try? FileManager.default.createDirectory(at: BCUPaths.supportDirectory, withIntermediateDirectories: true)
+        let fd = open(BCUPaths.supportDirectory.appendingPathComponent("front-gate.lock").path, O_RDWR | O_CREAT, 0o600)
+        guard fd >= 0 else { return body() }
+        defer { close(fd) }
+        guard flock(fd, wait ? LOCK_EX : LOCK_EX | LOCK_NB) == 0 else { return nil }
+        defer { flock(fd, LOCK_UN) }
+        return body()
+    }
+
+    /// The watchdog left this after a cleanup: the engine's next pass
+    /// starts again from what's still recorded.
+    private static var clearedURL: URL { BCUPaths.supportDirectory.appendingPathComponent("front-gate.cleared") }
+
+    /// Lock held. The watchdog took this engine's entries off (after a
+    /// stall), all of them (no record left) or some.
+    private var watchdogClearedLocked: Bool {
+        FileManager.default.fileExists(atPath: Self.clearedURL.path)
+            || (!onWindowServerList.isEmpty && !FileManager.default.fileExists(atPath: markerURL.path))
+    }
+
+    /// Lock and record lock held. Pick up what the watchdog took off: only
+    /// what it couldn't is on any more.
+    @discardableResult
+    private func noteWatchdogClearLocked() -> Bool {
+        guard watchdogClearedLocked else { return false }
+        // What it couldn't take off is still on, and still recorded.
+        onWindowServerList = Set(Self.readRecord())
+        try? FileManager.default.removeItem(at: Self.clearedURL)
+        applied = nil
+        appliedTargets = Targets()
+        appliedSeed = 0
+        return true
     }
 
     /// cmd+Tab went down (open) or command came up (closed): the switch
@@ -280,7 +489,7 @@ public final class FrontGate {
         if open {
             if !switcherOpen { switcherSinceMs = nowMs() }
             switcherOpen = true
-            if applied != nil { clearLocked(); stats.lifts += 1 }
+            openForUserLocked()
         } else if switcherOpen {
             switcherOpen = false
             // The app comes forward a moment after the key comes up.
@@ -298,7 +507,7 @@ public final class FrontGate {
         if down {
             if !pointerDown { pointerSinceMs = now }
             pointerDown = true
-            if applied != nil { clearLocked(); stats.lifts += 1 }
+            openForUserLocked()
         } else {
             pointerDown = false
         }
@@ -352,12 +561,15 @@ public final class FrontGate {
         stepLock.lock(); defer { stepLock.unlock() }
         let want = targets?() ?? Targets()
         let tapOK = tapWorking?() ?? false
-        let front = BCUFrontProcessPID()
+        let front = Self.system.frontPid()
         let now = nowMs()
         lock.lock()
         if stopping { lock.unlock(); return nil }
         beat(now)
-        let current = Self.currentList()
+        // On WindowServer's list LaunchServices reads back this process's own
+        // entries as a list; and it counts adds, so another app's entries and
+        // these don't undo each other. Nothing to tell apart there.
+        let current = useWindowServer ? nil : Self.currentList()
         // A list that isn't this process's: someone else is deciding who may
         // be in front. Leave it alone, and take no part until it's gone.
         if let current, applied == nil || !Self.isOurs(current, set: appliedList) {
@@ -373,21 +585,54 @@ public final class FrontGate {
             return 200_000
         }
         if foreign { foreign = false }
-        // The list was cleared from outside (the watchdog, after a stall).
-        if current == nil && applied != nil { applied = nil; appliedList = [] }
-
         let open = !tapOK || liftedLocked(now)
-        var wanted = open ? Targets() : want
-        // Never the app in front: whoever is there now, the user sees it.
-        wanted.pids.remove(front)
-        wanted.pids.remove(getpid())
-        if wanted.isEmpty {
-            if applied != nil { clearLocked() }
-        } else {
-            let seed = Self.appListSeed()
-            if applied == nil || wanted != appliedTargets || seed != appliedSeed { applyLocked(wanted, seed: seed) }
+        let keyOpen = now < keyLiftedUntilMs
+        lastStepping = want.stepping
+        /// What to keep back of `t` now: nothing while open for the user;
+        /// while open for a key, only the apps an agent is stepping in.
+        func narrowed(_ t: Targets) -> Targets {
+            if open { return Targets() }
+            var t = t
+            t.stepping = []
+            if keyOpen { t.pids.formIntersection(want.stepping); t.bundleIDs = [] }
+            return t
         }
-        let active = applied != nil || !want.isEmpty
+        if useWindowServer {
+            // The watchdog took this engine's entries off (after a stall).
+            if watchdogClearedLocked { _ = Self.withRecordLock(wait: true) { noteWatchdogClearLocked() } }
+            var held = want
+            held.pids.remove(front)
+            held.pids.remove(getpid())
+            if want.isEmpty { if idleSinceMs == nil { idleSinceMs = now } } else { idleSinceMs = nil }
+            if let since = idleSinceMs, now - since >= Self.windowServerIdleClearMs {
+                // Taking the list down is one call per entry, and an app
+                // already off is refused until the rest are: only once
+                // agents have needed nothing kept back for a while.
+                if hasListLocked { clearLocked() }
+            } else if hasListLocked || !held.isEmpty {
+                // Everyone on (the apps kept back too) while it's open for
+                // the user, while there's nothing to keep back, and while the
+                // app kept back is in front anyway (the guard puts the user's
+                // app back, which is on the list).
+                let target = held.isEmpty ? Targets() : narrowed(held)
+                let seed = Self.appListSeed()
+                if onWindowServerList.isEmpty || target != appliedTargets || seed != appliedSeed { applyWindowServerLocked(target, seed: seed) }
+            }
+        } else {
+            // The list was cleared from outside (the watchdog, after a stall).
+            if current == nil && applied != nil { applied = nil; appliedList = [] }
+            var wanted = narrowed(want)
+            // Never the app in front: whoever is there now, the user sees it.
+            wanted.pids.remove(front)
+            wanted.pids.remove(getpid())
+            if wanted.isEmpty {
+                if applied != nil { clearLocked() }
+            } else {
+                let seed = Self.appListSeed()
+                if applied == nil || wanted != appliedTargets || seed != appliedSeed { applyLocked(wanted, seed: seed) }
+            }
+        }
+        let active = hasListLocked || !want.isEmpty
         lock.unlock()
         // A new app must be on the list before it finishes launching, and an
         // agent's app off it before it next shows a window.
@@ -422,16 +667,89 @@ public final class FrontGate {
             return
         }
         if applied != nil || Self.currentList() != nil { clearLocked() }
+        // macOS 26 and later keep the list in WindowServer, which takes it
+        // from anyone one app at a time.
+        if Self.system.windowServerListAvailable() {
+            useWindowServer = true
+            refusals = 0
+            DispatchQueue.global().async { Log.info("gate: LaunchServices won't take the permitted-front list (status \(status)); using WindowServer's") }
+            applyWindowServerLocked(wanted, seed: seed)
+            return
+        }
         refusals += 1
         guard refusals >= Self.maxRefusals else { return }
-        // This macOS doesn't let the list be set: no gate here, for as long
-        // as this process runs. The guard puts apps back after the fact.
+        giveUpLocked(status)
+    }
+
+    /// Lock held. WindowServer's list: every running app on it but the ones
+    /// kept back (none while it's open for the user).
+    private func applyWindowServerLocked(_ target: Targets, seed: Int64) {
+        let apps = Self.runningApps()
+        let out = Set(apps.filter { target.pids.contains($0.pid) || ($0.bundleID.map(target.bundleIDs.contains) ?? false) }.map(\.pid))
+        appliedTargets = target
+        appliedSeed = seed
+        if out.isEmpty && !target.isEmpty {
+            // None of them is running (yet): nothing to keep back.
+            if hasListLocked { clearLocked() }
+            return
+        }
+        var everyone = Set<UInt64>(), want = Set<UInt64>()
+        for app in apps {
+            let p = Self.system.processSerialNumber(app.pid)
+            guard p != 0 else { continue }
+            everyone.insert(p)
+            // (Background-only processes never come forward: no call for them.)
+            if !out.contains(app.pid) && Self.system.canComeForward(app.pid) { want.insert(p) }
+        }
+        guard !want.isEmpty else {
+            if hasListLocked { clearLocked() }
+            return
+        }
+        let status = Self.withRecordLock(wait: true) { () -> Int32 in
+            noteWatchdogClearLocked()
+            var status: Int32 = 0
+            var adds = want.subtracting(onWindowServerList)
+            // No entry goes on without a record (see `openForUserLocked`).
+            if !adds.isEmpty && !Self.writeRecord(onWindowServerList.union(adds)) {
+                adds = []
+                status = -2
+            }
+            for p in adds {
+                let r = Self.system.updateWindowServerList(p, true)
+                if r == 0 { onWindowServerList.insert(p) } else { status = r }
+            }
+            for p in onWindowServerList.subtracting(want) {
+                let r = Self.system.updateWindowServerList(p, false)
+                // An app that quit took its entry with it.
+                if r == 0 || !everyone.contains(p) { onWindowServerList.remove(p) } else { status = r }
+            }
+            Self.writeRecord(onWindowServerList)
+            return status
+        } ?? -3
+        applied = out.isEmpty || onWindowServerList.isEmpty ? nil : out
+        if status == 0 {
+            refusals = 0
+            stats.applies += 1
+            return
+        }
+        // Asked again on the next pass.
+        appliedSeed = 0
+        refusals += 1
+        guard refusals >= Self.maxRefusals else { return }
+        clearLocked()
+        giveUpLocked(status)
+    }
+
+    /// Lock held. This macOS doesn't let the list be set: no gate here, for
+    /// as long as this process runs. The guard puts apps back after the fact.
+    private func giveUpLocked(_ status: Int32) {
         stopping = true
         let helper = watchdog
         watchdog = nil
         try? heartbeat?.close()
         heartbeat = nil
-        try? FileManager.default.removeItem(at: markerURL)
+        // (Entries that wouldn't come off stay recorded for the next engine.)
+        if onWindowServerList.isEmpty { try? FileManager.default.removeItem(at: markerURL) }
         DispatchQueue.global().async {
             helper?.terminate()
             Log.info("gate: macOS won't take the permitted-front list (status \(status)); the gate is off, and an agent's app that takes the front is put back after the fact")
@@ -444,11 +762,33 @@ public final class FrontGate {
     /// list and leave it alone for good).
     @discardableResult
     private func clearLocked() -> Bool {
-        for _ in 0..<2 {
-            if Self.setList([]) == 0 || Self.currentList() == nil {
-                applied = nil
-                appliedList = []
-                return true
+        if useWindowServer {
+            let takeOff = {
+                self.noteWatchdogClearLocked()
+                var everyone: Set<UInt64>?
+                // The app in front last: until the list is gone, an app already
+                // off it is refused the front.
+                let front = Self.system.processSerialNumber(Self.system.frontPid())
+                let order = self.onWindowServerList.filter { $0 != front } + self.onWindowServerList.filter { $0 == front }
+                for p in order {
+                    if Self.system.updateWindowServerList(p, false) == 0 { self.onWindowServerList.remove(p); continue }
+                    // An app that quit took its entry with it.
+                    if everyone == nil { everyone = Set(Self.runningApps().map { Self.system.processSerialNumber($0.pid) }) }
+                    if everyone?.contains(p) == false { self.onWindowServerList.remove(p) }
+                }
+                Self.writeRecord(self.onWindowServerList)
+            }
+            if Self.withRecordLock(wait: true, takeOff) == nil { takeOff() }
+            applied = nil
+            appliedTargets = Targets()
+            if onWindowServerList.isEmpty { return true }
+        } else {
+            for _ in 0..<2 {
+                if Self.setList([]) == 0 || Self.currentList() == nil {
+                    applied = nil
+                    appliedList = []
+                    return true
+                }
             }
         }
         let now = nowMs()
@@ -498,7 +838,7 @@ public final class FrontGate {
         heartbeat = nil
         watchdogFailures += 1
         let giveUp = watchdogFailures > 3
-        if applied != nil { clearLocked() }
+        if hasListLocked { clearLocked() }
         if giveUp { stopping = true }
         lock.unlock()
         guard !wasStopping else { return }
@@ -515,11 +855,11 @@ public final class FrontGate {
         guard now - lastHeartbeatMs > 400 else { return }
         lastHeartbeatMs = now
         guard let heartbeat else {
-            if applied != nil { clearLocked() }
+            if hasListLocked { clearLocked() }
             return
         }
         var byte: UInt8 = 1
-        if write(heartbeat.fileDescriptor, &byte, 1) != 1, applied != nil { clearLocked() }
+        if write(heartbeat.fileDescriptor, &byte, 1) != 1, hasListLocked { clearLocked() }
         if now - stats.sinceMs > 60_000 {
             if stats.applies > 0 || stats.lifts > 0 {
                 Log.info("gate: in the last minute, set the list \(stats.applies) times and opened it for the user \(stats.lifts) times")
@@ -527,6 +867,41 @@ public final class FrontGate {
             stats = (0, 0, now)
         }
     }
+
+    /// The watchdog's cleanup: the list this engine left, if any. Whether
+    /// it ran (false: try again shortly).
+    @discardableResult
+    static func watchdogClear() -> Bool {
+        let marker = markerURL.path
+        // WindowServer's list: the entries the engine recorded, and the
+        // record (the engine sees it gone and starts again from nothing).
+        // Never in the middle of the engine's update (it holds the lock
+        // from reading the record to writing it again): try again shortly.
+        // 0: no record; 1: all off; 2: some wouldn't come off (kept recorded).
+        let took = withRecordLock(wait: false) { () -> Int in
+            let psns = readRecord()
+            guard !psns.isEmpty else { return 0 }
+            let left = takeOffRecorded(psns)
+            writeRecord(Set(left))
+            // For the engine, if it's still there: it starts again from the record.
+            FileManager.default.createFile(atPath: clearedURL.path, contents: nil)
+            return left.isEmpty ? 1 : 2
+        }
+        guard let took, took != 2 else { return false }
+        if took == 1 { return true }
+        guard watchdogMayClear(markerExists: FileManager.default.fileExists(atPath: marker), listExists: currentList() != nil) else { return true }
+        setList([])
+        if currentList() == nil { try? FileManager.default.removeItem(atPath: marker) }
+        return true
+    }
+
+    /// Whether the watchdog, its engine gone, keeps trying to take recorded
+    /// entries off. `owner`: the engine that last started (nil: none since).
+    static func watchdogKeepsTrying(cleared: Bool, owner: pid_t?, engine: pid_t) -> Bool {
+        !cleared && (owner == nil || owner == engine)
+    }
+
+    private static var engineURL: URL { BCUPaths.supportDirectory.appendingPathComponent("front-gate.engine") }
 
     /// Call first thing in `main`: when this process was started as the
     /// gate's watchdog, it runs that and never returns.
@@ -537,11 +912,19 @@ public final class FrontGate {
         // both processes): clear on the way out, like on any other exit.
         // The handler only sets a flag; `poll` returns when a signal lands.
         for s in [SIGTERM, SIGINT, SIGHUP] { signal(s) { _ in watchdogToldToGo = 1 } }
+        let engine = getppid()
+        /// On the way out: until every recorded entry is off (the engine may
+        /// be finishing an update, or an entry won't come off yet), or a new
+        /// engine has started and taken them over.
         func clear() {
-            let marker = markerURL.path
-            guard watchdogMayClear(markerExists: FileManager.default.fileExists(atPath: marker), listExists: currentList() != nil) else { return }
-            setList([])
-            if currentList() == nil { try? FileManager.default.removeItem(atPath: marker) }
+            var pause: UInt32 = 20_000
+            while true {
+                let cleared = watchdogClear()
+                let owner = (try? String(contentsOf: engineURL, encoding: .utf8)).flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                guard watchdogKeepsTrying(cleared: cleared, owner: owner, engine: engine) else { return }
+                usleep(pause)
+                pause = min(pause * 2, 2_000_000)
+            }
         }
         var fd = pollfd(fd: 0, events: Int16(POLLIN), revents: 0)
         var buffer = [UInt8](repeating: 0, count: 64)
@@ -552,7 +935,8 @@ public final class FrontGate {
             if watchdogToldToGo != 0 { clear(); exit(0) }
             if r == 0 {
                 // The engine hasn't answered for 3 s: let the user through.
-                clear()
+                // One try (the next comes in 3 s): the engine may be back.
+                watchdogClear()
                 continue
             }
             if r < 0 {

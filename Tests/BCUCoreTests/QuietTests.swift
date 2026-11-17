@@ -202,25 +202,29 @@ final class FrontGateTests: XCTestCase {
 
     /// macOS 26.7 answers -10663 (attribute not settable) to setting the
     /// list. The gate has to give up there, not ask again every 5 ms.
+    /// (With no WindowServer list to fall back on either. All made up.)
     func testAMacOSThatRefusesTheListTurnsTheGateOff() throws {
-        try XCTSkipUnless(FrontGate.available, "no LaunchServices calls here")
-        let others = ["com.apple.finder", "com.apple.dock"].compactMap {
-            NSRunningApplication.runningApplications(withBundleIdentifier: $0).first?.processIdentifier
-        }
-        try XCTSkipUnless(others.count == 2, "needs Finder and the Dock running")
+        let others: [pid_t] = [202, 303]
         var asked = 0
-        FrontGate.setListForTests = { list in
+        var system = FrontGate.System()
+        system.runningApps = { [101, 202, 303].map { FrontGate.App(asn: "\($0)" as CFString, pid: $0, bundleID: "test.app.\($0)") } }
+        system.appListSeed = { 1 }
+        system.currentList = { nil }
+        system.frontPid = { 101 }
+        system.setList = { list in
             // (Clearing a list that isn't there is asked for too; count the real ones.)
             if !list.isEmpty { asked += 1 }
             return -10663
         }
-        defer { FrontGate.setListForTests = nil }
+        system.windowServerListAvailable = { false }
+        system.updateWindowServerList = { _, _ in XCTFail("WindowServer's list was changed"); return -1 }
+        FrontGate.system = system
+        defer { FrontGate.system = FrontGate.System() }
         let gate = FrontGate()
         gate.targets = { FrontGate.Targets(pids: Set(others)) }
         gate.tapWorking = { true }
         var passes = 0
         while gate.passForTests() && passes < 20 { passes += 1 }
-        try XCTSkipIf(asked == 0, "another app keeps a list of its own on this Mac")
         XCTAssertEqual(asked, 3)
         XCTAssertLessThan(passes, 20, "the gate's thread never ended")
         XCTAssertFalse(gate.isOn)

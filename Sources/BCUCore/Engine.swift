@@ -1048,10 +1048,24 @@ public final class Engine {
     private func handBack(_ scope: KeyScope, _ w: AgentWindow) {
         let t0 = nowMs()
         // The user isn't in the app: the window keeps key until the agent's
-        // next step (see `FocusGuard.park`).
-        if !userIsIn(w.pid) && scope.keepKey() {
-            focusGuard.park(w.pid, window: w.id, owner: sessionID)
-            return
+        // next step (see `FocusGuard.park`) while it has something open that
+        // losing key would close; else key goes to the user's window there
+        // (`KeyScope.afterStep`).
+        if !userIsIn(w.pid) {
+            let popupOpen = !popupWindows(of: w, frame: AX.window(pid: w.pid, id: w.id).flatMap(AX.frame)).isEmpty
+            switch KeyScope.afterStep(popupOpen: popupOpen, userWindow: focusGuard.userWindow(of: w.pid)) {
+            case .park:
+                if scope.keepKey() {
+                    focusGuard.park(w.pid, window: w.id, owner: sessionID)
+                    return
+                }
+            case .handTo(let user):
+                if BCUFrontProcessPID() != w.pid {
+                    focusGuard.forgetParked(w.pid)
+                    if !scope.handOff(to: user) { Log.info("swap: COULD NOT hand key to the user's window \(user) in \(w.appName) after the step") }
+                    return
+                }
+            }
         }
         focusGuard.forgetParked(w.pid)
         let confirmed = scope.exit()

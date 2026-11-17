@@ -124,6 +124,36 @@ public final class KeyScope {
 
     deinit { exit() }
 
+    /// After an agent's step in an app the user isn't in: what becomes of key.
+    public enum AfterStep: Equatable {
+        /// The agent's window keeps it until its next step (`FocusGuard.park`).
+        case park
+        /// Key goes to the user's window in the app.
+        case handTo(CGWindowID)
+    }
+
+    /// The agent's window keeps key only while it has a menu, dropdown or
+    /// suggestion list open: those close when their window loses key, and the
+    /// agent's next step would find them gone. Otherwise key goes to the
+    /// user's window, because the app treats the window that last had key as
+    /// its current one: a browser opens a link from another app there, and
+    /// the user's link would land in the agent's hidden window.
+    public static func afterStep(popupOpen: Bool, userWindow: CGWindowID?) -> AfterStep {
+        guard !popupOpen, let userWindow else { return .park }
+        return .handTo(userWindow)
+    }
+
+    /// Hand key to `user` (another window of the app) instead of back to
+    /// where it came from. The app stays inactive. Whether `user` has it now.
+    @discardableResult
+    public func handOff(to user: CGWindowID) -> Bool {
+        guard !exited else { return false }
+        exited = true
+        Self.postRecords(pid: pid, from: target, to: user, settle: 5)
+        Self.awaitKey(pid: pid, target: user, budgetMs: 250)
+        return AX.focusedWindowID(pid) == user
+    }
+
     @discardableResult
     static func postRecords(pid: pid_t, from current: CGWindowID?, to target: CGWindowID, settle: Double = settleMs) -> Bool {
         var ok = true

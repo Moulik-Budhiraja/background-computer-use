@@ -209,3 +209,27 @@ BOOL BCUAXGetWindowID(AXUIElementRef element, uint32_t *outWindowID) {
     if (!f) return NO;
     return f(element, outWindowID) == kAXErrorSuccess && *outWindowID != 0;
 }
+
+#pragma mark - Permitted-front list through WindowServer
+
+typedef int32_t (*PermittedFrontFn)(const void *psn);
+
+BOOL BCUPermittedFrontAvailable(void) {
+    return Sym("SLPSAddToPermittedFrontPSNList") != NULL && Sym("SLPSRemoveFromPermittedFrontPSNList") != NULL
+        && Sym("GetProcessForPID") != NULL;
+}
+
+uint64_t BCUProcessPSN(pid_t pid) {
+    GetProcessForPIDFn forPid = (GetProcessForPIDFn)Sym("GetProcessForPID");
+    if (!forPid || pid <= 0) return 0;
+    uint32_t psn[2] = {0, 0};
+    if (forPid(pid, psn) != 0) return 0;
+    return ((uint64_t)psn[0] << 32) | psn[1];
+}
+
+int BCUPermittedFrontUpdate(uint64_t value, BOOL add) {
+    PermittedFrontFn fn = (PermittedFrontFn)Sym(add ? "SLPSAddToPermittedFrontPSNList" : "SLPSRemoveFromPermittedFrontPSNList");
+    if (!fn || value == 0) return -1;
+    uint32_t psn[2] = {(uint32_t)(value >> 32), (uint32_t)value};
+    return fn(psn);
+}
