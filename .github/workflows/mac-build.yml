@@ -1,0 +1,13 @@
+name: Mac build
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  build:
+    # The runner the Mac release builds on, with its toolchain.
+    runs-on: [self-hosted, macos-ephemeral]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: swift build -c release
