@@ -269,6 +269,32 @@ final class FrontGateWindowServerTests: XCTestCase {
         gate.stop()
     }
 
+    /// An entry the launch's cleanup couldn't take off stays the new
+    /// engine's: on 27.2 LaunchServices reads it back, and taken for another
+    /// app's list it would be left (and its record dropped) for good.
+    func testTheNextEngineKeepsWhatTheCleanupLeft() {
+        let apps = [user, agent, other]
+        FrontGate.system.currentList = { [unowned self] in
+            let on = apps.filter { list.contains(psn($0)) }
+            return on.isEmpty ? nil : on.map { "\($0)" as CFString }
+        }
+        let crashed = makeGate()
+        for _ in 0..<3 { _ = crashed.passForTests() }
+        let update = FrontGate.system.updateWindowServerList
+        FrontGate.system.updateWindowServerList = { [unowned self] p, add in
+            !add && p == psn(other) ? -1 : update(p, add)
+        }
+        FrontGate.clearLeftoversForTests()
+        XCTAssertEqual(list, [psn(other)])
+        FrontGate.system.updateWindowServerList = update
+        let gate = makeGate()
+        gate.adoptLeftoversForTests()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        XCTAssertTrue(gate.blocks(agent))
+        gate.stop()
+        XCTAssertEqual(list, [])
+    }
+
     /// The app kept back can't be put on for the user's click: the whole
     /// list comes down, so the click still gets them there.
     func testAFailedAddForAClickTakesTheListDown() {
