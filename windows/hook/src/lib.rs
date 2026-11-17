@@ -17,9 +17,8 @@
 //!   creates go to that agent's screen;
 //! - kept windows: the agents' windows, put back whenever the app moves them
 //!   onto one of the user's screens;
-//! - their popups (menus, dropdowns, bubbles): on a hidden screen the app
-//!   puts them on a display, so they go back over their window, where the
-//!   app first placed them.
+//! - their popups (menus, dropdowns, bubbles): one that shows on the user's
+//!   screen goes back over its window, where the app first placed it.
 //!
 //! This code runs inside the user's apps, so it never panics out (every
 //! callback is wrapped in `catch_unwind`) and does nothing when it isn't sure.
@@ -91,8 +90,7 @@ pub struct Table {
     pub user_window: u64,
     pub opens: [Open; MAX_OPENS],
     pub kept: [Kept; MAX_KEPT],
-    /// The agent screens that are real monitors (none on hidden screens):
-    /// every other monitor is the user's.
+    /// The agent screens: every other monitor is the user's.
     pub areas: [RECT; MAX_AREAS],
     pub area_count: u32,
     pub _pad: u32,
@@ -230,6 +228,17 @@ pub fn place(hwnd: HWND, area: RECT, index: u32, from: From) {
             let _ = GetWindowRect(hwnd, &mut r);
         }
         let (x, y, w, h) = slot(area, index, r.right - r.left, r.bottom - r.top);
+        if zoomed && from == From::Inside {
+            // Inside, this runs while the app is showing the window maximized.
+            // Restoring it under the app then crashes Chromium (Helium 143,
+            // which reopens maximized: gone at once, no crash report). So ask
+            // the app to restore it once it's done, as a click on Restore
+            // would; when it does, this moves the restored window before it's
+            // drawn. Meanwhile, move it off the user's screen as it is.
+            let _ = PostMessageW(Some(hwnd), WM_SYSCOMMAND, windows::Win32::Foundation::WPARAM(SC_RESTORE as usize), LPARAM(0));
+            let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
+            return;
+        }
         if zoomed && from != From::OutsideAsync {
             wp.showCmd = SW_SHOWNOACTIVATE.0 as u32;
             wp.flags = WINDOWPLACEMENT_FLAGS(0);
@@ -476,10 +485,10 @@ fn agent_owner(hwnd: HWND, table: &Table, now: u64) -> Option<HWND> {
     (table.kept(owner).is_some() || caught(owner).is_some_and(|c| table.open_active(c.open, now))).then_some(owner)
 }
 
-/// A popup of an agent window on a hidden screen: keep it over its window.
-/// Where the app put it there is remembered, and it goes back to that spot
-/// when the app moves it onto a display (Chromium keeps its bubbles and
-/// menus on one); else to the agent's last click, else near the top left.
+/// A popup of an agent window: keep it over its window, off the user's
+/// screen. Where the app first put it is remembered, and it goes back to that
+/// spot when the app moves it onto the user's screen; else to the agent's
+/// last click, else near the top left.
 fn keep_popup(hwnd: HWND, owner: HWND, table: &Table, now: u64) {
     let areas = table.agent_areas();
     let (mut r, mut f) = (RECT::default(), RECT::default());
