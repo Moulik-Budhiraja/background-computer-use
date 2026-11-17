@@ -1022,6 +1022,9 @@ public final class WindowManager {
     }
     private var fitTries: [CGWindowID: (count: Int, lastMs: Double)] = [:]
     private var seenOnAgent: [CGWindowID: Double] = [:]
+    /// When a new window in an app this session acted on was first seen on
+    /// the user's screen; -1 once judged.
+    private var seenOnUser: [CGWindowID: Double] = [:]
     /// For a window first seen on this display that wasn't there when this
     /// session's last step on its app began: when that step began.
     private var spawnedAfter: [CGWindowID: Double] = [:]
@@ -1049,9 +1052,6 @@ public final class WindowManager {
         Log.info("fit \(w.appName) window \(w.id) from \(frame.short) to \(Int(x)),\(Int(y)) \(Int(size.width))x\(Int(size.height))")
     }
     private var opening: Set<pid_t> = []
-    /// A window counts as spawned by this session's action only this long
-    /// after the action began.
-    private static let catchWindowMs = 10_000.0
     /// A window a step opened on this display becomes the session's once
     /// it's been there this long, and is no longer looked at after
     /// `agentJudgeMs`.
@@ -1069,7 +1069,6 @@ public final class WindowManager {
         defer { lock.lock(); sweeping = false; lock.unlock() }
         guard display.isRunning else { return }
 
-        let tainted = Set(focusGuard.activeTaints)
         let onScreen = WindowList.all(onScreenOnly: true)
 
         // Reverse catch: apps place new windows next to their last window, so
@@ -1146,24 +1145,43 @@ public final class WindowManager {
                 }
                 continue
             }
-            // Only while the agent acts on the app and the user isn't in it:
-            // a window that appears in the app the user is using is theirs.
             lock.lock()
             let midOpen = opening.contains(info.pid) || Self.isOpening(info.pid)
             lock.unlock()
-            guard tainted.contains(info.pid), !midOpen, info.pid != front, info.pid != focusGuard.userFront else { continue }
+            guard !midOpen, !Self.isRegistered(info.id, byOtherThan: sessionKey),
+                  display.touchesUser(info.bounds), !display.holds(info.bounds),
+                  info.bounds.width > 40, info.bounds.height > 40 else { continue }
             // Only windows that appeared since this session began acting on
             // the app (another session's action, or none on record, says
             // nothing about which windows are new), and never another
-            // session's window.
+            // session's window. Noted when first seen: the session's next
+            // step notes the app's windows again, this one among them.
             lock.lock()
-            let known = knownBefore[info.pid]
+            if seenOnUser[info.id] == nil, let known = knownBefore[info.pid] {
+                seenOnUser[info.id] = nowMs()
+                if !known.ids.contains(info.id) { spawnedAfter[info.id] = known.ms }
+            }
+            let firstSeen = seenOnUser[info.id], agentBegan = spawnedAfter[info.id]
             lock.unlock()
-            guard let known, nowMs() - known.ms < Self.catchWindowMs, !known.ids.contains(info.id),
-                  !Self.isRegistered(info.id, byOtherThan: sessionKey),
-                  display.touchesUser(info.bounds), !display.holds(info.bounds),
-                  info.bounds.width > 40, info.bounds.height > 40,
-                  let ax = AX.window(pid: info.pid, id: info.id) else { continue }
+            guard let firstSeen, firstSeen > 0, agentBegan != nil else { continue }
+            let userInApp = info.pid == front && info.pid == focusGuard.userFront
+            guard let cause = NewWindow.fromUserScreen(NewWindow.Facts(
+                firstSeenMs: firstSeen, userInApp: userInApp,
+                userOpenInputMs: focusGuard.lastUserOpenInputMs, agentBeganMs: agentBegan), nowMs: nowMs()) else { continue }
+            // Judged once: a window the user's input explains stays theirs.
+            // The step's is looked at again until accessibility answers (an
+            // app can be busy while it shows a dialog), for at most
+            // `agentJudgeMs`.
+            func retire() { lock.lock(); seenOnUser[info.id] = -1; lock.unlock() }
+            guard cause == .agent, nowMs() - firstSeen < Self.agentJudgeMs else { retire(); continue }
+            guard let ax = AX.window(pid: info.pid, id: info.id) else { continue }
+            // In the app the user is in, only whole windows and dialogs: a
+            // browser's hover cards and bubbles over their window are
+            // windows too.
+            if userInApp {
+                guard let subrole = AX.string(ax, "AXSubrole") else { continue }
+                guard ["AXStandardWindow", "AXDialog", "AXSystemDialog"].contains(subrole) else { retire(); continue }
+            }
             // A dialog goes over the window it's about (where the agent
             // will find it listed with that window's elements), another
             // window to the next free place.

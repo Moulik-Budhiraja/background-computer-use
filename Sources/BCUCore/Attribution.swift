@@ -110,4 +110,26 @@ enum NewWindow {
         }
         return f.userInApp && f.userOpenInputMs >= began ? .user : .agent
     }
+
+    /// How long after the user's click or opening key the guard knows which
+    /// app it took them to.
+    static let guardLagMs = 400.0
+
+    /// Whose a window is that came up on the user's screen, in an app the
+    /// session acted on: `.agent` moves it to the agent display. nil: too
+    /// soon to tell.
+    ///
+    /// The same rule as on the agent display (`cause`). A step's window can
+    /// come up well after the step: a browser shows its Save panel about a
+    /// second after the press that asked for it, past the step's grace
+    /// period, and it sat over the user's work until the agent got to it.
+    /// Nor does the user being in the app make it theirs; only a click or
+    /// opening key of theirs since the step began does.
+    ///
+    /// Right after such a click it waits until the guard knows whether the
+    /// click took them to the app (a link clicked in another app).
+    static func fromUserScreen(_ f: Facts, nowMs: Double) -> Cause? {
+        if let began = f.agentBeganMs, f.userOpenInputMs >= began, nowMs - f.userOpenInputMs < guardLagMs { return nil }
+        return cause(f)
+    }
 }

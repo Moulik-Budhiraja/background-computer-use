@@ -157,3 +157,58 @@ final class NewWindowTests: XCTestCase {
         XCTAssertEqual(cause(userInApp: false, userInput: seen - 100), .unclear)
     }
 }
+
+/// Whose a window is that came up on the user's screen, in an app the
+/// session acted on. `.agent` moves it to the agent display. Times are
+/// milliseconds, the window was first seen at 10 000.
+final class NewWindowOnUserScreenTests: XCTestCase {
+    private let seen = 10_000.0
+
+    private func verdict(userInApp: Bool, userInput: Double = -1e9, agentBegan: Double?, age: Double = 0) -> NewWindow.Cause? {
+        NewWindow.fromUserScreen(NewWindow.Facts(firstSeenMs: seen, userInApp: userInApp, userOpenInputMs: userInput, agentBeganMs: agentBegan),
+                               nowMs: seen + age)
+    }
+
+    /// An agent pressed Save in a browser's print preview. The press took
+    /// 6 ms, and the Save panel came up about a second later, after the
+    /// step's grace period, on the user's screen. The user is in another
+    /// app and hasn't touched anything since.
+    func testASavePanelThatComesUpAfterTheStepEndedIsTheAgents() {
+        XCTAssertEqual(verdict(userInApp: false, agentBegan: seen - 1200), .agent)
+    }
+
+    /// The same while the user reads in that browser, with no click or
+    /// opening key since the agent's step began.
+    func testAWindowAnAgentsStepOpenedLeavesTheUsersScreenWhileTheyReadInThatApp() {
+        XCTAssertEqual(verdict(userInApp: true, userInput: seen - 20_000, agentBegan: seen - 1200), .agent)
+    }
+
+    /// The user clicked in another app 100 ms before the window came up:
+    /// the click may have opened it (a link), and the guard learns a moment
+    /// later whether it brought them to the app. Until then it waits.
+    func testItWaitsForTheGuardAfterAFreshClick() {
+        XCTAssertNil(verdict(userInApp: false, userInput: seen - 100, agentBegan: seen - 1200))
+        XCTAssertEqual(verdict(userInApp: false, userInput: seen - 100, agentBegan: seen - 1200, age: 300), .agent)
+    }
+
+    /// A click from 2 s ago, though after the step began, has already
+    /// shown up in where the guard takes the user to be.
+    func testAnOlderClickElsewhereDoesntHoldItBack() {
+        XCTAssertEqual(verdict(userInApp: false, userInput: seen - 2000, agentBegan: seen - 3000), .agent)
+    }
+
+    /// The user is in the app and clicked or pressed a shortcut there since
+    /// the step began: either could have opened it, so it stays with them.
+    func testAWindowEitherCouldHaveOpenedStaysWithTheUser() {
+        XCTAssertEqual(verdict(userInApp: true, userInput: seen - 500, agentBegan: seen - 1200), .user)
+    }
+
+    /// No step of the session's on the app, a step long ago, or a window
+    /// that was there before the step.
+    func testNoStepToExplainItLeavesItAlone() {
+        XCTAssertNotEqual(verdict(userInApp: false, agentBegan: nil), .agent)
+        XCTAssertNotEqual(verdict(userInApp: false, agentBegan: seen - 10_001), .agent)
+        XCTAssertNotEqual(verdict(userInApp: false, agentBegan: seen + 5), .agent)
+        XCTAssertEqual(verdict(userInApp: true, agentBegan: nil), .user)
+    }
+}
