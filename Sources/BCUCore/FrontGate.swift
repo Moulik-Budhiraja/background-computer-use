@@ -93,7 +93,13 @@ public final class FrontGate {
         var windowServerListAvailable: () -> Bool = { BCUPermittedFrontAvailable() }
         var processSerialNumber: (pid_t) -> UInt64 = { BCUProcessPSN($0) }
         var updateWindowServerList: (_ psn: UInt64, _ add: Bool) -> Int32 = { BCUPermittedFrontUpdate($0, $1) }
+        /// Not a background-only process (those never come to the front).
+        var canComeForward: (pid_t) -> Bool = { NSRunningApplication(processIdentifier: $0)?.activationPolicy != .prohibited }
     }
+
+    /// How long WindowServer's list stays once no agent has an app to keep
+    /// back: taking it down is one call per entry.
+    nonisolated(unsafe) static var windowServerIdleClearMs = 30_000.0
 
     nonisolated(unsafe) static var system = System()
 
