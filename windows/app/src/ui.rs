@@ -18,7 +18,7 @@ use windows::core::{PCWSTR, w};
 
 use crate::gfx::{self, Align, Canvas, Font, Frame, rgb, rgba};
 use crate::sessions::{self, View};
-use crate::{engine, monitor, setup};
+use crate::{engine, monitor, onboarding, setup};
 
 // ---------- look ----------
 
@@ -41,7 +41,6 @@ const G_COLLAPSE: u32 = 0xE73F;
 const G_CHECK: u32 = 0xE73E;
 const G_MONITOR: u32 = 0xE7F4;
 const G_HAND: u32 = 0xE7C9;
-const G_HIDDEN: u32 = 0xED1A;
 
 #[derive(Clone, Copy)]
 struct Theme {
@@ -135,7 +134,6 @@ enum Hit {
     Stop,
     More,
     Collapse,
-    Setup,
     Tile(usize),
     Resume(usize),
     Done(usize),
@@ -220,12 +218,6 @@ fn hit(layout: &Layout, x: f32, y: f32, viewer: bool) -> Hit {
     if layout.last.contains(x, y) {
         return if viewer { Hit::Collapse } else { Hit::More };
     }
-    if let Some(p) = layout.placeholder
-        && needs_setup()
-        && setup_button(p).contains(x, y)
-    {
-        return Hit::Setup;
-    }
     for (i, t) in layout.tiles.iter().enumerate() {
         if let Some(b) = t.banner
             && R::new(b.x + b.w - 30.0, b.y, 30.0, b.h).contains(x, y)
@@ -249,18 +241,9 @@ fn paused_circle(r: R) -> (f32, f32) {
     (r.cx(), r.cy() - (44.0 + 10.0 + 15.0) / 2.0 + 22.0)
 }
 
-/// No agent monitor, and not over Remote Desktop (where agents get hidden screens).
-fn needs_setup() -> bool {
-    !monitor::installed() && !monitor::hidden_mode()
-}
-
-fn setup_button(p: R) -> R {
-    R::new(p.cx() - 40.0, p.cy() + 22.0, 80.0, 26.0)
-}
-
 // ---------- drawing ----------
 
-fn tally(c: &Canvas, cx: f32, cy: f32, v: Option<&View>, waiting: bool, active: bool, paused: bool, needs_setup: bool) {
+fn tally(c: &Canvas, cx: f32, cy: f32, v: Option<&View>, waiting: bool, active: bool, paused: bool) {
     let _ = v;
     let dot = |color: u32| {
         c.fill_circle(cx, cy, 7.0, rgba(color, 0.2));
@@ -273,15 +256,13 @@ fn tally(c: &Canvas, cx: f32, cy: f32, v: Option<&View>, waiting: bool, active: 
     } else if paused {
         c.fill_round(cx - 3.5, cy - 4.0, 2.5, 8.0, 1.0, rgb(QUIET));
         c.fill_round(cx + 1.0, cy - 4.0, 2.5, 8.0, 1.0, rgb(QUIET));
-    } else if needs_setup {
-        dot(NEEDS);
     } else {
         c.stroke_circle(cx, cy, 3.25, rgb(QUIET), 1.5);
     }
 }
 
 fn view_tally(c: &Canvas, cx: f32, cy: f32, v: &View) {
-    tally(c, cx, cy, Some(v), v.handoff.is_some(), v.active(), v.paused, false);
+    tally(c, cx, cy, Some(v), v.handoff.is_some(), v.active(), v.paused);
 }
 
 fn icon_button(c: &Canvas, t: &Theme, r: R, glyph: u32, hovered: bool, enabled: bool) {
@@ -439,20 +420,10 @@ impl Paint<'_> {
     fn placeholder(&self, p: R) {
         let c = self.c;
         c.fill_round(p.x, p.y, p.w, p.h, 8.0, rgb(MONITOR));
-        if monitor::installed() {
-            c.glyph(G_MONITOR, p.cx(), p.cy() - 12.0, 20.0, rgba(0xFFFFFF, 0.45));
-            c.text("Nothing running", p.cx(), p.cy() + 14.0, p.w - 20.0, Font::Semibold, 12.0, rgba(0xFFFFFF, 0.45), Align::Center);
-        } else if monitor::hidden_mode() {
-            c.glyph(G_MONITOR, p.cx(), p.cy() - 22.0, 20.0, rgba(0xFFFFFF, 0.45));
-            c.text("Nothing running", p.cx(), p.cy() + 4.0, p.w - 20.0, Font::Semibold, 12.0, rgba(0xFFFFFF, 0.45), Align::Center);
-            c.text("Over Remote Desktop, agents work in hidden windows", p.cx(), p.cy() + 24.0, p.w - 20.0, Font::Semibold, 11.0, rgba(0xFFFFFF, 0.35), Align::Center);
-        } else {
-            c.glyph(G_HIDDEN, p.cx(), p.cy() - 26.0, 20.0, rgba(0xFFFFFF, 0.45));
-            c.text("Agent screens aren't set up", p.cx(), p.cy() + 2.0, p.w - 20.0, Font::Semibold, 13.0, rgba(0xFFFFFF, 0.88), Align::Center);
-            let b = setup_button(p);
-            c.fill_round(b.x, b.y, b.w, b.h, 13.0, rgba(0xFFFFFF, if self.hover == Hit::Setup { 0.22 } else { 0.14 }));
-            c.text("Set up", b.cx(), b.cy(), b.w, Font::Semibold, 12.0, rgb(0xFFFFFF), Align::Center);
-        }
+        c.glyph(G_MONITOR, p.cx(), p.cy() - 22.0, 20.0, rgba(0xFFFFFF, 0.45));
+        c.text("Nothing running", p.cx(), p.cy() + 4.0, p.w - 20.0, Font::Semibold, 12.0, rgba(0xFFFFFF, 0.45), Align::Center);
+        let note = if monitor::installed() { "Agents work on their own screen, which you don't see" } else { "The agent screen is off: choose Set up… in ⋯" };
+        c.text(note, p.cx(), p.cy() + 24.0, p.w - 20.0, Font::Semibold, 11.0, rgba(0xFFFFFF, 0.35), Align::Center);
         c.stroke_round(p.x, p.y, p.w, p.h, 8.0, self.t.outline, 0.5, None);
     }
 }
@@ -460,7 +431,6 @@ impl Paint<'_> {
 fn header_text(views: &[View]) -> String {
     let shown: Vec<&View> = views.iter().filter(|v| v.visible()).collect();
     match shown.len() {
-        0 if needs_setup() => "Setup needed".into(),
         0 => "Idle".into(),
         1 => shown[0].status_text(),
         n => {
@@ -661,7 +631,7 @@ fn tick() {
     for (id, w, h) in wanted {
         let has_windows = views.iter().any(|v| v.id == id && v.windows > 0);
         if let (true, Some(m)) = (has_windows, monitors.get(&id))
-            && let Some(f) = if monitor::on_screen(m) { gfx::capture_screen(*m, w, h) } else { gfx::capture_windows(*m, w, h) }
+            && let Some(f) = gfx::capture_screen(*m, w, h)
         {
             frames.insert(id, f);
         }
@@ -724,7 +694,7 @@ fn paint(hwnd: HWND, layout: &Layout, hover: Hit, views: &[View], viewer: bool) 
         let waiting = shown.iter().any(|v| v.handoff.is_some());
         let active = shown.iter().any(|v| v.active());
         let paused = all_paused;
-        tally(&c, PAD + 11.0, PAD + HEADER / 2.0, None, waiting, active, paused, shown.is_empty() && needs_setup());
+        tally(&c, PAD + 11.0, PAD + HEADER / 2.0, None, waiting, active, paused);
         c.text(&header_text(views), PAD + 24.0, PAD + HEADER / 2.0, layout.pause.x - PAD - 30.0, Font::Semibold, 12.0, t.secondary, Align::Left);
     }
     let paused_here = if viewer { layout.tiles[0].view.paused } else { all_paused };
@@ -819,10 +789,6 @@ unsafe extern "system" fn popover_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                     Hit::Pause => engine::set_paused(None, !engine::all_paused()),
                     Hit::Stop => engine::stop(None),
                     Hit::More => more_menu(hwnd, layout.last),
-                    Hit::Setup => {
-                        let _ = DestroyWindow(hwnd);
-                        std::thread::spawn(|| setup::run(false));
-                    }
                     Hit::Tile(i) => {
                         let id = layout.tiles[i].view.id.clone();
                         let _ = DestroyWindow(hwnd);
@@ -861,6 +827,7 @@ const M_LOGIN: usize = 1;
 const M_SETUP: usize = 2;
 const M_QUIT: usize = 3;
 const M_UPDATE: usize = 4;
+const M_SCREEN: usize = 5;
 
 /// ⋯: open at sign-in, setup, quit.
 fn more_menu(hwnd: HWND, anchor: R) {
@@ -869,6 +836,9 @@ fn more_menu(hwnd: HWND, anchor: R) {
         let login = setup::starts_at_sign_in();
         let _ = AppendMenuW(menu, MF_STRING | if login { MF_CHECKED } else { MF_UNCHECKED }, M_LOGIN, w!("Open at sign-in"));
         let _ = AppendMenuW(menu, MF_STRING, M_SETUP, w!("Set up…"));
+        let screen = if crate::tray::screen_on() { MF_CHECKED } else { MF_UNCHECKED };
+        let busy = if setup::busy() { MF_GRAYED } else { MF_ENABLED };
+        let _ = AppendMenuW(menu, MF_STRING | screen | busy, M_SCREEN, w!("Agent screen"));
         let update: Vec<u16> = match crate::updater::pending() {
             Some(v) => format!("Restart to update to {v}"),
             None => "Check for updates".into(),
@@ -891,7 +861,11 @@ fn more_menu(hwnd: HWND, anchor: R) {
             M_LOGIN => setup::set_start_at_sign_in(!login),
             M_SETUP => {
                 let _ = DestroyWindow(hwnd);
-                std::thread::spawn(|| setup::run(false));
+                onboarding::open(false);
+            }
+            M_SCREEN => {
+                let _ = DestroyWindow(hwnd);
+                crate::tray::virtual_screen_action();
             }
             M_UPDATE => {
                 let _ = DestroyWindow(hwnd);

@@ -16,15 +16,19 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::gfx::{Canvas, rgb};
-use crate::{engine, monitor, sessions, setup, ui, updater};
+use crate::{engine, monitor, onboarding, sessions, setup, ui, updater};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_APP_REFRESH: u32 = WM_APP + 2;
+const WM_APP_ONBOARD: u32 = WM_APP + 3;
+/// From `--virtual-screen on|off`: wparam 1 to turn the agent monitor on, 0 off.
+const WM_APP_SCREEN: u32 = WM_APP + 4;
 const ID_PAUSE: usize = 1;
 const ID_STOP: usize = 2;
 const ID_QUIT: usize = 3;
 const ID_SETUP: usize = 4;
 const ID_UPDATE: usize = 5;
+const ID_SCREEN: usize = 6;
 const ICON_TIMER: usize = 1;
 
 /// What the icon shows. Like the Mac's menu bar icon: one display shape with a
@@ -67,6 +71,86 @@ pub fn request_quit() {
     post(WM_CLOSE);
 }
 
+/// Asked for before the tray window exists (at start): opened once it does.
+static ONBOARD_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Show the onboarding (from any thread). It runs on the tray's thread.
+/// Starting at the agent screen's step, when that's all that's left to set up.
+static ONBOARD_AT_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn open_onboarding(at_screen: bool) {
+    ONBOARD_AT_SCREEN.store(at_screen, std::sync::atomic::Ordering::SeqCst);
+    ONBOARD_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+    post(WM_APP_ONBOARD);
+}
+
+/// Wake the tray thread to redraw what shows the setup (from any thread).
+pub fn refresh_windows() {
+    post(WM_APP_REFRESH);
+}
+
+/// `BackgroundComputerUse.exe --virtual-screen on|off`: have the running app
+/// do what its "Agent screen" menu item does.
+pub fn ask_running_for_virtual_screen(on: bool) {
+    unsafe {
+        if let Ok(hwnd) = FindWindowW(w!("BackgroundComputerUseTray"), PCWSTR::null()) {
+            let _ = PostMessageW(Some(hwnd), WM_APP_SCREEN, WPARAM(on as usize), LPARAM(0));
+        }
+    }
+}
+
+/// Whether the agent screen is on, as the "Agent screen" menu item shows it.
+pub fn screen_on() -> bool {
+    setup::screen_problem().is_none()
+}
+
+/// "Agent screen": turn it off, or explain and turn it on, off the UI thread,
+/// and say how it went.
+pub fn virtual_screen_action() {
+    if setup::busy() {
+        return;
+    }
+    let on = !screen_on();
+    // Turning it off would throw agents' windows onto the user's screen.
+    let windows_open = sessions::all().iter().any(|v| v.windows > 0);
+    std::thread::spawn(move || unsafe {
+        if windows_open && !on {
+            MessageBoxW(
+                None,
+                w!("Agents have windows open.
+
+Stop them from the tray icon first, then try again."),
+                w!("Background Computer Use"),
+                MB_OK | MB_ICONINFORMATION,
+            );
+            return;
+        }
+        if on {
+            let answer = MessageBoxW(
+                None,
+                w!("Turn on the agent screen?
+
+Agents work on it: a monitor that only exists in software, which you never see. Without it, they can't open windows.
+
+The first time, Windows asks for permission to install its driver. Your display may blink once. If your PC slows down with it on, it turns itself off again."),
+                w!("Background Computer Use"),
+                MB_OKCANCEL | MB_ICONINFORMATION,
+            );
+            if answer != IDOK {
+                return;
+            }
+        }
+        let result = if on { setup::enable_screen() } else { Ok(setup::disable_screen()) };
+        refresh_windows();
+        let (text, icon) = match result {
+            Ok(t) => (t, MB_ICONINFORMATION),
+            Err(e) => (e, MB_ICONWARNING),
+        };
+        let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        MessageBoxW(None, PCWSTR(text.as_ptr()), w!("Background Computer Use"), MB_OK | icon);
+    });
+}
+
 fn post(msg: u32) {
     if let Some(h) = *HWND_SLOT.lock().unwrap_or_else(|e| e.into_inner()) {
         unsafe {
@@ -103,6 +187,9 @@ pub fn run() {
         sessions::on_change(|| post(WM_APP_REFRESH));
         let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
         add_icon(hwnd);
+        if ONBOARD_PENDING.load(std::sync::atomic::Ordering::SeqCst) {
+            post(WM_APP_ONBOARD);
+        }
         // The working state lasts a few seconds past each call; check it runs out.
         SetTimer(Some(hwnd), ICON_TIMER, 500, None);
         let mut msg = MSG::default();
@@ -226,6 +313,9 @@ unsafe fn show_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, MF_STRING, ID_STOP, w!("Stop agents"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_SETUP, w!("Set up…"));
+        let screen = if screen_on() { MF_CHECKED } else { MF_UNCHECKED };
+        let busy = if setup::busy() { MF_GRAYED } else { MF_ENABLED };
+        let _ = AppendMenuW(menu, MF_STRING | screen | busy, ID_SCREEN, w!("Agent screen"));
         let update: Vec<u16> = match updater::pending() {
             Some(v) => format!("Restart to update to {v}"),
             None => "Check for updates".into(),
@@ -244,9 +334,8 @@ unsafe fn show_menu(hwnd: HWND) {
         match cmd.0 as usize {
             ID_PAUSE => engine::set_paused(None, !paused),
             ID_STOP => engine::stop(None),
-            ID_SETUP => {
-                std::thread::spawn(|| setup::run(false));
-            }
+            ID_SETUP => onboarding::open(false),
+            ID_SCREEN => virtual_screen_action(),
             ID_UPDATE => update_action(),
             ID_QUIT => request_quit(),
             _ => {}
@@ -277,6 +366,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_APP_REFRESH => {
                 refresh(hwnd, false);
                 ui::refresh();
+                onboarding::refresh();
+                LRESULT(0)
+            }
+            WM_APP_SCREEN => {
+                if (wparam.0 == 1) != screen_on() {
+                    virtual_screen_action();
+                }
+                LRESULT(0)
+            }
+            WM_APP_ONBOARD => {
+                if ONBOARD_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    onboarding::open(ONBOARD_AT_SCREEN.swap(false, std::sync::atomic::Ordering::SeqCst));
+                }
                 LRESULT(0)
             }
             WM_TIMER => {
@@ -331,7 +433,7 @@ fn session_changed(event: u32) {
         REMOTE_CONNECT => *disconnected = None,
         _ => {}
     }
-    // The screens changed: place the agent monitors again if they're back.
+    // The screens changed: place the agent monitor again if it's back.
     if matches!(event, CONSOLE_CONNECT | REMOTE_CONNECT) {
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_secs(2));

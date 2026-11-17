@@ -14,6 +14,7 @@ mod guard;
 mod input;
 mod monitor;
 mod offscreen;
+mod onboarding;
 mod pipe;
 mod sessions;
 mod setup;
@@ -49,6 +50,11 @@ fn main() {
         }
         return;
     }
+    if args.first().map(String::as_str) == Some("--virtual-screen") {
+        // Ask the running app to turn the agent monitor on or off, as its menu does.
+        tray::ask_running_for_virtual_screen(args.get(1).map(String::as_str) != Some("off"));
+        return;
+    }
     if args.first().map(String::as_str) == Some("--uninstall") {
         setup::uninstall(args.iter().any(|a| a == "--silent"));
         return;
@@ -64,13 +70,13 @@ fn main() {
             std::process::exit(1);
         }
     });
-    // One monitor per agent; calls wait for this.
+    // The agent screen, as it should be (an older version's four are set up
+    // again as one). Calls wait for this.
     std::thread::spawn(|| {
-        monitor::ensure_count();
-        monitor::arrange();
+        setup::start_screen();
         monitor::set_ready();
+        setup::on_launch();
     });
-    setup::offer_on_launch();
     tray::run();
 }
 
