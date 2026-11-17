@@ -94,6 +94,30 @@ public enum AX {
         return set(el, "AXSize", v) == .success
     }
 
+    /// The row a click on `el` would select, when selecting it is all the
+    /// click would do: `el` is a row of a native list, table or outline (or
+    /// something in one of its cells) and accessibility can set the row's
+    /// selection. Selecting it that way needs no key focus, which matters in
+    /// a sheet: its window can't be made key from outside the app while it's
+    /// up. Nil in web content, where clicking a row usually does more than
+    /// select it (opens an email, follows a link).
+    public static func selectableRow(_ el: AXUIElement) -> AXUIElement? {
+        var row: AXUIElement? = el
+        // Up from a cell, or from a text field or image in a cell.
+        for _ in 0..<3 {
+            guard let r = row, string(r, "AXRole") != "AXRow" else { break }
+            row = element(r, "AXParent")
+        }
+        guard let row, string(row, "AXRole") == "AXRow", isSettable(row, "AXSelected") else { return nil }
+        var up = element(row, "AXParent")
+        for _ in 0..<60 {
+            guard let p = up else { break }
+            if string(p, "AXRole") == "AXWebArea" { return nil }
+            up = element(p, "AXParent")
+        }
+        return row
+    }
+
     public static func isSettable(_ el: AXUIElement, _ name: String) -> Bool {
         var settable: DarwinBoolean = false
         return AXUIElementIsAttributeSettable(el, name as CFString, &settable) == .success && settable.boolValue

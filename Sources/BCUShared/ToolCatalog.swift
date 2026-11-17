@@ -31,7 +31,9 @@ public enum ToolCatalog {
     app partway; the error says how much was typed, so type the rest. Pass priority="now" only when the step \
     can't wait (a dialog or toast about to close, a hover then a click, a code about to expire).
     Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's \
-    elements in `get_window_state`; click their rows by number. In a browser, to go to a URL use \
+    elements in `get_window_state`; click their rows by number. A sheet over your window (a file picker, a save \
+    panel, an alert) is listed first: pick a file by clicking its row by number, then the panel's button. \
+    In a browser, to go to a URL use \
     `navigate` (it sends no keys, so it doesn't wait for the user to pause unless they're in that same browser); in a browser it doesn't support, \
     click the address bar, then `type_text` the URL followed by "\\n".
     5. When you already know the next few steps (fill a form and submit, type a URL and press Return), send \
