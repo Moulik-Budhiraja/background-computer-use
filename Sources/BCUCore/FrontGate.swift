@@ -886,6 +886,10 @@ public final class FrontGate {
         return true
     }
 
+    /// Whether the watchdog, its engine gone, keeps trying to take recorded
+    /// entries off. `owner`: the engine that last started (nil: none since).
+    static func watchdogKeepsTrying(cleared: Bool, owner: pid_t?, engine: pid_t) -> Bool { false }
+
     /// Call first thing in `main`: when this process was started as the
     /// gate's watchdog, it runs that and never returns.
     public static func runWatchdogIfAsked() {
