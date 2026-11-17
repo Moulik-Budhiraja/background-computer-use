@@ -325,8 +325,7 @@ impl Engine {
         });
     }
 
-    /// Where the agent points now, for the preview's cursor and for placing
-    /// the menus it opens on a hidden screen.
+    /// Where the agent points now, for the preview's cursor.
     fn point_at(&self, p: POINT) {
         sessions::update(&self.id, |v| v.pointer = Some((p, Instant::now())));
         guard::note_point(p);
@@ -346,38 +345,6 @@ impl Engine {
                 continue;
             }
             apps::place(w.hwnd, m.rect, n);
-        }
-    }
-
-    /// On a hidden screen a Chromium browser has to run with its occlusion
-    /// check off, or its windows come out blank. The switch to start the
-    /// browser with, if it isn't running yet. A browser already running
-    /// without it is restarted with it when the agent says the user agreed
-    /// (`restart`); `notes` says how that went.
-    fn browser_switch(&self, exe: &str, name: &str, restart: bool, notes: &mut Vec<String>) -> Fallible<Option<&'static str>> {
-        if !monitor::hidden_mode() || !browser::is_chromium(exe) {
-            return Ok(None);
-        }
-        match browser::state(exe) {
-            browser::State::Ready => Ok(None),
-            browser::State::NotRunning => Ok(Some(browser::SWITCH)),
-            browser::State::NeedsRestart if restart => {
-                let r = browser::restart(exe, name)?;
-                notes.push(format!("{name} restarted with {} of its {} windows back", r.windows_after, r.windows_before));
-                Ok(None)
-            }
-            browser::State::NeedsRestart => {
-                let instead = match win::default_browser() {
-                    Some((default, default_exe)) if !default_exe.eq_ignore_ascii_case(exe) => format!(
-                        "But {name} isn't the user's default browser, {default}, and isn't signed in to their accounts: unless the user asked for {name}, use {default}."
-                    ),
-                    _ => format!("Don't use a different browser instead: only {name} is signed in to the user's accounts."),
-                };
-                Err(format!(
-                    "{name} has to restart once before you can use it here. This is a Remote Desktop session, so your windows are off-screen, and {name} was started without the setting that keeps off-screen windows drawing: yours would come out blank. BCU can restart it with that setting; its windows and tabs come back, and open pages reload. \
-                     Ask the user first, for example: \"Can I restart {name}? Your windows and tabs will come back.\" If they agree, call open_window with app=\"{name}\" and restart_browser=true. {instead}"
-                ))
-            }
         }
     }
 
@@ -422,7 +389,6 @@ impl Engine {
         let pid = window.map(|w| w.pid);
         if acting && let Some(w) = window {
             guard::begin_action(w.pid);
-            guard::note_target(w.hwnd);
         }
         let mut result = self.dispatch(tool, &args).unwrap_or_else(ToolResult::error);
         if acting && let Some(pid) = pid {
@@ -491,18 +457,11 @@ impl Engine {
         let name = args.need_str("app")?;
         let app = apps::resolve(name)?;
         let mon = self.agent_monitor()?;
-        let mut restart_notes = Vec::new();
-        let restart = args.bool("restart_browser").unwrap_or(false);
-        let switch = match &app.path {
-            Some(path) => self.browser_switch(path, &app.name, restart, &mut restart_notes)?,
-            None => None,
-        };
         let index = self.windows.len();
         let (hwnd, mut notes) = {
             let _one_at_a_time = OPENING.lock().unwrap_or_else(|e| e.into_inner());
-            apps::open(&app, mon, index, switch)?
+            apps::open(&app, mon, index)?
         };
-        notes.splice(0..0, restart_notes);
         // Agents reach for whatever browser comes to mind; only the default
         // one has the user's logins.
         if let Some((default_name, default_exe)) = win::default_browser()
@@ -544,10 +503,6 @@ impl Engine {
             return Err(format!("the user is using window {id} right now. Pick another, or wait."));
         }
         let mon = self.agent_monitor()?;
-        // Its browser is running, so this only checks that it keeps drawing.
-        if let Some(exe) = win::exe_path(win::pid_tid(hwnd).0) {
-            self.browser_switch(&exe, &win::app_name(win::pid_tid(hwnd).0), false, &mut Vec::new())?;
-        }
         let mut home = RECT::default();
         unsafe {
             let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut home);
@@ -608,26 +563,21 @@ impl Engine {
     fn status(&self, _args: &Args) -> ToolResult {
         let mut lines = Vec::new();
         match monitor::of_session(&self.id).or_else(monitor::first) {
-            Some(m) if monitor::hidden_mode() => lines.push(format!(
-                "Your monitor: {}x{} pixels ({}). This is a Remote Desktop session, so your windows are kept off-screen instead of on an agent monitor; they work the same.",
+            Some(m) => lines.push(format!(
+                "Your monitor: {}x{} pixels ({}), a screen the user never sees.",
                 m.rect.right - m.rect.left,
                 m.rect.bottom - m.rect.top,
                 monitor::name(&m)
             )),
-            Some(m) => {
-                lines.push(format!("Your monitor: {}x{} pixels ({}).", m.rect.right - m.rect.left, m.rect.bottom - m.rect.top, monitor::name(&m)))
-            }
-            None => lines.push("Your monitor: MISSING. The Virtual Display Driver isn't installed or is off; open_window will fail until the user runs setup.".into()),
+            None => lines.push(format!(
+                "You have no screen to work on, so you can't open windows: {}",
+                crate::setup::screen_problem().unwrap_or_else(|| "the agent screen isn't on.".into())
+            )),
         }
         if let Some((name, exe)) = win::default_browser() {
             lines.push(format!(
                 "User's default browser: {name} ({exe}). Use it for anything on the web: it's signed in to the user's accounts, and other browsers here aren't."
             ));
-            if monitor::hidden_mode() && browser::is_chromium(&exe) && matches!(browser::state(&exe), browser::State::NeedsRestart) {
-                lines.push(format!(
-                    "{name} has to restart once before you can open windows in it here. When the task needs it, ask the user (\"Can I restart {name}? Your windows and tabs will come back.\"), then call open_window with app=\"{name}\" and restart_browser=true."
-                ));
-            }
         }
         if self.paused() {
             lines.push("Paused by the user.".into());

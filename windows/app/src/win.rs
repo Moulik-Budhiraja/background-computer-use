@@ -70,6 +70,10 @@ pub fn is_minimized(hwnd: HWND) -> bool {
     unsafe { IsIconic(hwnd).as_bool() }
 }
 
+pub fn is_maximized(hwnd: HWND) -> bool {
+    unsafe { IsZoomed(hwnd).as_bool() }
+}
+
 pub fn is_cloaked(hwnd: HWND) -> bool {
     let mut cloaked = 0u32;
     unsafe {

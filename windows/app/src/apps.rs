@@ -116,9 +116,8 @@ pub fn resolve(name: &str) -> Result<App, String> {
     if let Some(lnk) = start_menu_shortcut(name) {
         let display = lnk.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| name.into());
         // Knowing the program tells its windows apart and catches them as
-        // they open. A browser is started directly, so it can be given the
-        // switch it may need (browser.rs); other apps through the shortcut,
-        // which may carry arguments they need.
+        // they open. A browser is started directly; other apps through the
+        // shortcut, which may carry arguments they need.
         return Ok(match shortcut_target(&lnk) {
             Some(path) if crate::browser::is_browser(&path) => exe_app(&path, display),
             Some(path) => App { launch: lnk.to_string_lossy().into(), exe: Some(exe_file(&path)), path: Some(path), name: display },
@@ -193,14 +192,13 @@ pub fn show_in_taskbar(hwnd: HWND) {
     }
 }
 
-/// Open a new window of `app` on the agent monitor. `args` go to the app if
-/// it starts now (a browser that isn't running yet). Returns the window and
+/// Open a new window of `app` on the agent monitor. Returns the window and
 /// notes on what happened.
 ///
 /// The app's new windows are caught as it creates and shows them (see
 /// offscreen.rs), so they don't show on the user's screen; the loop here
 /// only finds which window is the agent's.
-pub fn open(app: &App, monitor: RECT, index: usize, args: Option<&str>) -> Result<(HWND, Vec<String>), String> {
+pub fn open(app: &App, monitor: RECT, index: usize) -> Result<(HWND, Vec<String>), String> {
     let known: HashSet<usize> = win::top_level_windows().into_iter().map(|h| h.0 as usize).collect();
     let mut notes = Vec::new();
     let t = Instant::now();
@@ -219,7 +217,7 @@ pub fn open(app: &App, monitor: RECT, index: usize, args: Option<&str>) -> Resul
     }
     let mut opening = offscreen::begin_open(&running, app.path.as_deref().or(app.exe.as_deref()), monitor, index);
     let result = (|| {
-        if let Some(pid) = launch(&app.launch, args)? {
+        if let Some(pid) = launch(&app.launch, None)? {
             opening.add_pid(pid);
         }
         let deadline = t + Duration::from_secs(15);
@@ -227,7 +225,11 @@ pub fn open(app: &App, monitor: RECT, index: usize, args: Option<&str>) -> Resul
         loop {
             if let Some((hwnd, since)) = found {
                 // offscreen.rs keeps it on the monitor from here; this is a backstop.
-                if !on_monitor(hwnd, &monitor) && !win::is_minimized(hwnd) {
+                // A window that opened maximized was only moved from inside
+                // the app (restoring it there crashes Chromium, see
+                // bcu_hook::place): restore it from here, once it's shown, or
+                // Windows can maximize it back onto the user's screen.
+                if (!on_monitor(hwnd, &monitor) || win::is_maximized(hwnd)) && !win::is_minimized(hwnd) {
                     place(hwnd, monitor, index);
                 }
                 if since.elapsed() > Duration::from_millis(500) {

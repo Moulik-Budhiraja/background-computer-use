@@ -1,18 +1,52 @@
-# The admin part of setup. Run elevated (the app's setup does).
-# 1. The "keep drawing" task: when a Remote Desktop session disconnects, Windows stops drawing it,
-#    so agents' screenshots freeze. The task moves the session onto the computer's own display
-#    (tscon), where it keeps drawing; the app locks it as soon as it arrives.
-# 2. The open-source Virtual Display Driver (MIT, github.com/VirtualDrivers/Virtual-Display-Driver)
-#    with four 1600x1000 monitors, one per agent session. Follows the project's own
-#    "Community Scripts/silent-install.ps1".
+# The parts of setup that need admin. The app runs this elevated, with one of:
+#   -Task    The "keep drawing" task, offered over Remote Desktop: when a session disconnects,
+#            Windows stops drawing it, so agents' screenshots freeze. The task moves the session
+#            onto the computer's own display (tscon), where it keeps drawing; the app locks it as
+#            soon as it arrives.
+#   -Driver  The open-source Virtual Display Driver (MIT, github.com/VirtualDrivers/Virtual-Display-Driver),
+#            for the agent screen the user can turn on. The app writes its settings
+#            (C:\VirtualDisplayDriver\vdd_settings.xml) first. Follows the project's own
+#            "Community Scripts/silent-install.ps1".
+#   -Remove  Uninstall both, and what older versions left: the driver and its monitors, the
+#            certificates trusted to install it, the task and its script.
+param([switch]$Task, [switch]$Driver, [switch]$Remove)
 $ErrorActionPreference = "Stop"
-Write-Output "whoami: $(whoami /groups | Select-String 'Mandatory Label')"
-
-# The task runs as SYSTEM, so its script goes where only admins can change it.
+$taskName = "Background Computer Use keep drawing"
 $taskDir = Join-Path $env:ProgramFiles "Background Computer Use"
-New-Item -ItemType Directory -Force $taskDir | Out-Null
-$taskScript = Join-Path $taskDir "keep-drawing.ps1"
-$taskScriptText = @'
+
+# The certificates in the driver's catalog (SignPath Foundation's, up to GlobalSign's root).
+function Get-CatalogCerts([string]$cat) {
+  $certs = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+  $certs.Import([System.IO.File]::ReadAllBytes($cat))
+  $certs
+}
+function Remove-Trust([string]$cat) {
+  foreach ($c in (Get-CatalogCerts $cat)) {
+    $path = "Cert:\LocalMachine\TrustedPublisher\$($c.Thumbprint)"
+    if (Test-Path $path) { Remove-Item $path; Write-Output "untrusted $($c.Subject)" }
+  }
+}
+
+if ($Remove) {
+  $ErrorActionPreference = "Continue"
+  $cat = Get-ChildItem "$env:SystemRoot\System32\DriverStore\FileRepository" -Recurse -Filter mttvdd.cat -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($cat) { Remove-Trust $cat.FullName }
+  foreach ($d in (Get-WindowsDriver -Online | Where-Object { $_.OriginalFileName -like '*\mttvdd.inf' })) {
+    pnputil /delete-driver $d.Driver /uninstall /force | Out-String | Write-Output
+  }
+  Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains 'Root\MttVDD' } | ForEach-Object {
+    pnputil /remove-device $_.InstanceId | Out-String | Write-Output
+  }
+  Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+  Remove-Item $taskDir, 'C:\VirtualDisplayDriver' -Recurse -Force -ErrorAction SilentlyContinue
+  exit 0
+}
+
+if ($Task) {
+  # The task runs as SYSTEM, so its script goes where only admins can change it.
+  New-Item -ItemType Directory -Force $taskDir | Out-Null
+  $taskScript = Join-Path $taskDir "keep-drawing.ps1"
+  $taskScriptText = @'
 # Run as SYSTEM by the "Background Computer Use keep drawing" task when a session disconnects.
 # If Background Computer Use runs in that session and nobody is signed in at the computer itself,
 # move the session onto the computer's own display so agents' windows keep drawing. The app
@@ -37,7 +71,7 @@ $console = [BcuWts]::WTSGetActiveConsoleSessionId()
 if ($console -ne $SessionId -and [BcuWts]::User($console)) { exit 0 }
 tscon.exe $SessionId /dest:console
 '@
-$taskXml = @"
+  $taskXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>Keeps Background Computer Use's agents working after Remote Desktop disconnects.</Description></RegistrationInfo>
@@ -64,57 +98,45 @@ $taskXml = @"
   </Actions>
 </Task>
 "@
-Register-ScheduledTask -TaskName "Background Computer Use keep drawing" -Xml $taskXml -Force | Out-Null
-# Written last: the app checks for this file to know the task is there (users can't query a SYSTEM task).
-Set-Content -Path $taskScript -Value $taskScriptText -Encoding UTF8
-Write-Output "keep-drawing task registered"
-
-# Already installed: installing again adds a second device, not a fix.
-if (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Enum\ROOT\DISPLAY\*" -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains 'Root\MttVDD' }) {
-  Write-Output "already installed"
-  exit 0
-}
-$NefConURL = "https://github.com/nefarius/nefcon/releases/download/v1.14.0/nefcon_v1.14.0.zip"
-$DriverURL = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip"
-$SettingsURL = "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/master/Virtual%20Display%20Driver%20(HDR)/vdd_settings.xml"
-
-# Settings first: four monitors, one mode, so Windows can't pick another.
-$cfgDir = "C:\VirtualDisplayDriver"
-New-Item -ItemType Directory -Path $cfgDir -Force | Out-Null
-[xml]$xml = (Invoke-WebRequest -Uri $SettingsURL -UseBasicParsing).Content
-$xml.vdd_settings.monitors.count = "4"
-$res = $xml.vdd_settings.resolutions
-$res.RemoveAll()
-$r = $xml.CreateElement("resolution")
-foreach ($kv in @(@("width", "1600"), @("height", "1000"), @("refresh_rate", "60"))) {
-  $e = $xml.CreateElement($kv[0]); $e.InnerText = $kv[1]; [void]$r.AppendChild($e)
-}
-[void]$res.AppendChild($r)
-$g = $xml.vdd_settings.global
-$g.RemoveAll()
-$e = $xml.CreateElement("g_refresh_rate"); $e.InnerText = "60"; [void]$g.AppendChild($e)
-$xml.Save("$cfgDir\vdd_settings.xml")
-Write-Output "wrote $cfgDir\vdd_settings.xml"
-
-$tmp = Join-Path $env:TEMP "VDDInstall"
-New-Item -ItemType Directory -Path $tmp -Force | Out-Null
-Invoke-WebRequest -Uri $NefConURL -OutFile "$tmp\nefcon.zip" -UseBasicParsing
-Expand-Archive "$tmp\nefcon.zip" -DestinationPath $tmp -Force
-Invoke-WebRequest -Uri $DriverURL -OutFile "$tmp\driver.zip" -UseBasicParsing
-Expand-Archive "$tmp\driver.zip" -DestinationPath $tmp -Force
-Get-ChildItem $tmp -Recurse -Include *.inf, *.cat, *.dll | ForEach-Object { Write-Output "  $($_.FullName)" }
-
-# The package is signed by SignPath; trust its certificates for driver installs.
-$cat = Get-ChildItem $tmp -Recurse -Filter mttvdd.cat | Select-Object -First 1
-$certs = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
-$certs.Import([System.IO.File]::ReadAllBytes($cat.FullName))
-foreach ($c in $certs) {
-  $f = Join-Path $tmp "$($c.Thumbprint).cer"
-  [System.IO.File]::WriteAllBytes($f, $c.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-  certutil -f -addstore TrustedPublisher $f | Out-String | Write-Output
+  Register-ScheduledTask -TaskName $taskName -Xml $taskXml -Force | Out-Null
+  # Written last: the app checks for this file to know the task is there (users can't query a SYSTEM task).
+  Set-Content -Path $taskScript -Value $taskScriptText -Encoding UTF8
+  Write-Output "keep-drawing task registered"
 }
 
-$inf = Get-ChildItem $tmp -Recurse -Filter MttVDD.inf | Select-Object -First 1
-& "$tmp\x64\nefconw.exe" install $inf.FullName "Root\MttVDD"
-Start-Sleep -Seconds 10
-Get-PnpDevice -Class Display | Format-Table -AutoSize Status, FriendlyName, InstanceId | Out-String | Write-Output
+if ($Driver) {
+  # Already installed: installing again adds a second device, not a fix.
+  if (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Enum\ROOT\DISPLAY\*" -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains 'Root\MttVDD' }) {
+    Write-Output "already installed"
+    exit 0
+  }
+  if (-not (Test-Path 'C:\VirtualDisplayDriver\vdd_settings.xml')) { throw "the app writes C:\VirtualDisplayDriver\vdd_settings.xml first" }
+  $NefConURL = "https://github.com/nefarius/nefcon/releases/download/v1.14.0/nefcon_v1.14.0.zip"
+  $DriverURL = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip"
+  $tmp = Join-Path $env:TEMP "VDDInstall"
+  New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+  $ProgressPreference = 'SilentlyContinue'
+  Invoke-WebRequest -Uri $NefConURL -OutFile "$tmp\nefcon.zip" -UseBasicParsing
+  Expand-Archive "$tmp\nefcon.zip" -DestinationPath $tmp -Force
+  Invoke-WebRequest -Uri $DriverURL -OutFile "$tmp\driver.zip" -UseBasicParsing
+  Expand-Archive "$tmp\driver.zip" -DestinationPath $tmp -Force
+
+  # The package is signed by SignPath. Trust its certificates just long enough to
+  # install it without a prompt, then take them out again.
+  $cat = Get-ChildItem $tmp -Recurse -Filter mttvdd.cat | Select-Object -First 1
+  foreach ($c in (Get-CatalogCerts $cat.FullName)) {
+    $f = Join-Path $tmp "$($c.Thumbprint).cer"
+    [System.IO.File]::WriteAllBytes($f, $c.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+    certutil -f -addstore TrustedPublisher $f | Out-Null
+  }
+  try {
+    $inf = Get-ChildItem $tmp -Recurse -Filter MttVDD.inf | Select-Object -First 1
+    & "$tmp\x64\nefconw.exe" install $inf.FullName "Root\MttVDD"
+    Start-Sleep -Seconds 5
+  } finally {
+    Remove-Trust $cat.FullName
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  Get-PnpDevice -Class Display | Format-Table -AutoSize Status, FriendlyName, InstanceId | Out-String | Write-Output
+}
+exit 0

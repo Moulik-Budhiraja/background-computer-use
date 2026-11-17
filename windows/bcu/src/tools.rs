@@ -1,7 +1,7 @@
 //! What agents are told: the server instructions and the tool definitions.
 //! The tool definitions are shared with the Mac app (shared/tools.json).
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use windows::Win32::UI::Shell::{ASSOCF_NONE, ASSOCSTR_FRIENDLYAPPNAME, AssocQueryStringW};
 use windows::core::{PWSTR, w};
 
@@ -9,24 +9,10 @@ const TOOLS_JSON: &str = include_str!("../../../shared/tools.json");
 
 /// The tool list with every {"macos": ..., "windows": ...} string resolved for Windows.
 pub fn tools() -> Vec<Value> {
-    let mut list = match serde_json::from_str::<Value>(TOOLS_JSON).map(resolve) {
+    match serde_json::from_str::<Value>(TOOLS_JSON).map(resolve) {
         Ok(Value::Array(list)) => list,
         _ => Vec::new(),
-    };
-    // Windows only: over Remote Desktop a browser started without BCU's
-    // switch has to restart once, after the user agrees.
-    if let Some(open) = list.iter_mut().find(|t| t["name"] == "open_window")
-        && let Some(props) = open["inputSchema"]["properties"].as_object_mut()
-    {
-        props.insert(
-            "restart_browser".into(),
-            json!({
-                "type": "boolean",
-                "description": "Restart the browser first, when open_window said it has to restart. Its windows and tabs come back. Only after the user agreed."
-            }),
-        );
     }
-    list
 }
 
 /// The user's default browser's name ("Helium"), from the https handler.
@@ -46,8 +32,7 @@ pub fn server_instructions() -> String {
     let browser = match default_browser() {
         Some(name) => format!(
             "The user's browser is {name}: use {name} for anything on the web. It's signed in to the user's accounts; \
-             other browsers on this PC aren't. If open_window says {name} has to restart, ask the user, then call \
-             open_window again with restart_browser=true. Don't switch to another browser instead.\n\n"
+             other browsers on this PC aren't. Don't switch to another browser instead.\n\n"
         ),
         None => String::new(),
     };
@@ -118,7 +103,7 @@ mod tests {
         let text = serde_json::to_string(&list).unwrap();
         assert!(!text.contains("\"macos\""), "a platform variant was left unresolved");
         let open = list.iter().find(|t| t["name"] == "open_window").unwrap();
-        assert_eq!(open["inputSchema"]["properties"]["restart_browser"]["type"], "boolean");
+        assert!(open["inputSchema"]["properties"].get("restart_browser").is_none());
         let press_key = list.iter().find(|t| t["name"] == "press_key").unwrap();
         assert_eq!(press_key["inputSchema"]["properties"]["modifiers"]["description"], "Any of ctrl, shift, alt, win.");
     }
