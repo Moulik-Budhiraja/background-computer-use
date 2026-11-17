@@ -1,0 +1,108 @@
+import XCTest
+@testable import BCUCore
+
+/// The gate on a macOS whose LaunchServices refuses the permitted-front list
+/// (27.2 answers -10663), where WindowServer's own list is changed one app
+/// at a time instead. Everything the gate reads or changes is made up here.
+final class FrontGateWindowServerTests: XCTestCase {
+    /// The user's app, an agent's app and one more, by pid.
+    let user: pid_t = 101, agent: pid_t = 202, other: pid_t = 303
+
+    /// WindowServer's list as the fake keeps it (serial numbers).
+    var list: Set<UInt64> = []
+    var calls = 0
+    var lsAsked = 0
+
+    func psn(_ pid: pid_t) -> UInt64 { 0x1_0000_0000 + UInt64(pid) }
+
+    override func setUp() {
+        super.setUp()
+        list = []
+        calls = 0
+        lsAsked = 0
+        let apps = [user, agent, other].map { FrontGate.App(asn: "\($0)" as CFString, pid: $0, bundleID: "test.app.\($0)") }
+        var system = FrontGate.System()
+        system.runningApps = { apps }
+        system.appListSeed = { 1 }
+        system.currentList = { nil }
+        system.setList = { [unowned self] _ in lsAsked += 1; return -10663 }
+        system.frontPid = { [unowned self] in user }
+        system.windowServerListAvailable = { true }
+        system.processSerialNumber = { [unowned self] in psn($0) }
+        system.updateWindowServerList = { [unowned self] p, add in
+            calls += 1
+            if add { list.insert(p) } else { list.remove(p) }
+            return 0
+        }
+        FrontGate.system = system
+    }
+
+    override func tearDown() {
+        FrontGate.system = FrontGate.System()
+        super.tearDown()
+    }
+
+    func makeGate() -> FrontGate {
+        let gate = FrontGate()
+        gate.targets = { [unowned self] in FrontGate.Targets(pids: [agent]) }
+        gate.tapWorking = { true }
+        return gate
+    }
+
+    /// Every app but the agent's is on WindowServer's list, so the agent's
+    /// app can't bring itself to the front.
+    func testTheAgentsAppIsKeptOffWindowServersList() {
+        let gate = makeGate()
+        for _ in 0..<5 { XCTAssertTrue(gate.passForTests()) }
+        XCTAssertEqual(list, [psn(user), psn(other)])
+        XCTAssertTrue(gate.blocks(agent))
+        gate.stop()
+    }
+
+    /// A click (or any key that could switch apps) puts the agent's app on
+    /// the list at once, before the event goes on, so the user can go to it.
+    func testTheUsersClickLetsTheAgentsAppThrough() {
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        let before = calls
+        gate.pointer(down: true, ms: 30)
+        XCTAssertTrue(list.contains(psn(agent)))
+        XCTAssertFalse(gate.blocks(agent))
+        XCTAssertLessThanOrEqual(calls - before, 1, "opening for the user takes one call per app kept back")
+        // Let go, and once the moment passes the agent's app is kept back again.
+        gate.pointer(down: false, ms: 30)
+        sleepMs(60)
+        _ = gate.passForTests()
+        XCTAssertEqual(list, [psn(user), psn(other)])
+        gate.stop()
+    }
+
+    /// Nothing of the gate's is left on the list once it stops, nor once no
+    /// agent has an app to keep back.
+    func testNothingIsLeftOnTheList() {
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        XCTAssertFalse(list.isEmpty)
+        gate.targets = { FrontGate.Targets() }
+        _ = gate.passForTests()
+        XCTAssertEqual(list, [])
+        gate.targets = { [unowned self] in FrontGate.Targets(pids: [agent]) }
+        _ = gate.passForTests()
+        XCTAssertFalse(list.isEmpty)
+        gate.stop()
+        XCTAssertEqual(list, [])
+    }
+
+    /// A process that died with entries on the list (they outlive it) leaves
+    /// a record; the next one takes those entries off before anything else.
+    func testAnEarlierRunsEntriesAreTakenOff() {
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        let left = list
+        XCTAssertFalse(left.isEmpty)
+        // As if the process died here: its record stays, the list stays.
+        FrontGate.clearLeftoversForTests()
+        XCTAssertEqual(list, [])
+        XCTAssertTrue(calls >= left.count)
+    }
+}
