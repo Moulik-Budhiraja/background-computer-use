@@ -288,13 +288,16 @@ public final class FrontGate {
     /// A list a crashed engine left (its watchdog should have cleared it).
     private static func clearLeftovers() {
         guard FileManager.default.fileExists(atPath: markerURL.path) else { return }
-        let psns = readRecord()
-        if !psns.isEmpty {
-            // Serial numbers aren't reused in a login session: an entry
-            // whose app has quit is gone already, and taking it off is a no-op.
-            for p in psns { _ = system.updateWindowServerList(p, false) }
-            Log.info("gate: took \(psns.count) entries an earlier run left off WindowServer's permitted-front list")
-        }
+        let left = withRecordLock(wait: true) { () -> [UInt64] in
+            let psns = readRecord()
+            guard !psns.isEmpty else { return [] }
+            let left = takeOffRecorded(psns)
+            writeRecord(Set(left))
+            Log.info("gate: took \(psns.count - left.count) entries an earlier run left off WindowServer's permitted-front list\(left.isEmpty ? "" : "; \(left.count) wouldn't come off and stay recorded")")
+            return left
+        } ?? []
+        // Kept for the next try (the watchdog's, or the next launch's).
+        guard left.isEmpty else { return }
         if currentList() != nil {
             setList([])
             Log.info("gate: cleared the permitted-front list an earlier run left behind")
@@ -303,6 +306,19 @@ public final class FrontGate {
     }
 
     static func clearLeftoversForTests() { clearLeftovers() }
+
+    /// Take recorded entries off WindowServer's list. Those that wouldn't
+    /// come off while their app still runs are returned, to stay recorded:
+    /// one left alone on the list would keep every other app back.
+    private static func takeOffRecorded(_ psns: [UInt64]) -> [UInt64] {
+        var failed: [UInt64] = []
+        for p in psns where system.updateWindowServerList(p, false) != 0 { failed.append(p) }
+        guard !failed.isEmpty else { return [] }
+        // Serial numbers aren't reused in a login session: an app that quit
+        // took its entry with it.
+        let running = Set(runningApps().map { system.processSerialNumber($0.pid) })
+        return failed.filter(running.contains)
+    }
 
     /// The serial numbers the marker file names (one per line, hex): what
     /// may be on WindowServer's list of this engine's.
@@ -386,11 +402,15 @@ public final class FrontGate {
             // to take it off: the rest of the list would come off and leave
             // it alone on it, keeping every other app back.
             guard Self.writeRecord(onWindowServerList.union(psns)) else { return false }
-            for p in psns where Self.system.updateWindowServerList(p, true) == 0 { onWindowServerList.insert(p) }
-            return true
+            var allOn = true
+            for p in psns {
+                if Self.system.updateWindowServerList(p, true) == 0 { onWindowServerList.insert(p) } else { allOn = false }
+            }
+            return allOn
         }
         guard recorded == true else {
-            // Can't let them through by adding: take the whole list down.
+            // Can't let them through by adding (no record, or WindowServer
+            // refused): take the whole list down.
             clearLocked()
             return
         }
@@ -820,15 +840,16 @@ public final class FrontGate {
         // record (the engine sees it gone and starts again from nothing).
         // Never in the middle of the engine's update (it holds the lock
         // from reading the record to writing it again): try again shortly.
-        let took = withRecordLock(wait: false) { () -> Bool in
+        // 0: no record; 1: all off; 2: some wouldn't come off (kept recorded).
+        let took = withRecordLock(wait: false) { () -> Int in
             let psns = readRecord()
-            guard !psns.isEmpty else { return false }
-            for p in psns { _ = system.updateWindowServerList(p, false) }
-            try? FileManager.default.removeItem(atPath: marker)
-            return true
+            guard !psns.isEmpty else { return 0 }
+            let left = takeOffRecorded(psns)
+            writeRecord(Set(left))
+            return left.isEmpty ? 1 : 2
         }
-        guard let took else { return false }
-        if took { return true }
+        guard let took, took != 2 else { return false }
+        if took == 1 { return true }
         guard watchdogMayClear(markerExists: FileManager.default.fileExists(atPath: marker), listExists: currentList() != nil) else { return true }
         setList([])
         if currentList() == nil { try? FileManager.default.removeItem(atPath: marker) }
