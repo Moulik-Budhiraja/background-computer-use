@@ -295,6 +295,16 @@ final class FrontGateWindowServerTests: XCTestCase {
         XCTAssertEqual(list, [])
     }
 
+    /// With entries still recorded, the watchdog keeps trying after its
+    /// engine is gone (nothing else would until the next launch), and stops
+    /// once they're off or a new engine has started (it takes them over).
+    func testTheWatchdogKeepsTryingUntilTheEntriesAreOffOrANewEngineStarts() {
+        XCTAssertTrue(FrontGate.watchdogKeepsTrying(cleared: false, owner: nil, engine: 50))
+        XCTAssertTrue(FrontGate.watchdogKeepsTrying(cleared: false, owner: 50, engine: 50))
+        XCTAssertFalse(FrontGate.watchdogKeepsTrying(cleared: false, owner: 60, engine: 50))
+        XCTAssertFalse(FrontGate.watchdogKeepsTrying(cleared: true, owner: 50, engine: 50))
+    }
+
     /// The app kept back can't be put on for the user's click: the whole
     /// list comes down, so the click still gets them there.
     func testAFailedAddForAClickTakesTheListDown() {
