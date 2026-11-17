@@ -599,7 +599,7 @@ public final class FrontGate {
         }
         if useWindowServer {
             // The watchdog took this engine's entries off (after a stall).
-            if watchdogClearedLocked { _ = Self.withRecordLock(wait: true) { noteWatchdogClearLocked() } }
+            if watchdogClearedLocked { _ = Self.withRecordLock(wait: true) { () -> Bool in noteWatchdogClearLocked() } }
             var held = want
             held.pids.remove(front)
             held.pids.remove(getpid())
@@ -760,25 +760,32 @@ public final class FrontGate {
     /// counts it as its own, so every later pass, `lift` and `stop` ask again
     /// (forgetting it would make the next pass take it for another app's
     /// list and leave it alone for good).
+    /// Lock held, and the record lock if it could be had. Every entry of
+    /// this engine's off WindowServer's list, the one of the app in front
+    /// last: until the list is gone, an app already off it is refused the front.
+    private func takeOffAllLocked() {
+        noteWatchdogClearLocked()
+        var everyone: Set<UInt64>?
+        let front = Self.system.processSerialNumber(Self.system.frontPid())
+        let others: [UInt64] = onWindowServerList.filter { $0 != front }.sorted()
+        let order: [UInt64] = onWindowServerList.contains(front) ? others + [front] : others
+        for p in order {
+            if Self.system.updateWindowServerList(p, false) == 0 { onWindowServerList.remove(p); continue }
+            // An app that quit took its entry with it.
+            if everyone == nil { everyone = Set(Self.runningApps().map { Self.system.processSerialNumber($0.pid) }) }
+            if everyone?.contains(p) == false { onWindowServerList.remove(p) }
+        }
+        Self.writeRecord(onWindowServerList)
+    }
+
     @discardableResult
     private func clearLocked() -> Bool {
         if useWindowServer {
-            let takeOff = {
-                self.noteWatchdogClearLocked()
-                var everyone: Set<UInt64>?
-                // The app in front last: until the list is gone, an app already
-                // off it is refused the front.
-                let front = Self.system.processSerialNumber(Self.system.frontPid())
-                let order = self.onWindowServerList.filter { $0 != front } + self.onWindowServerList.filter { $0 == front }
-                for p in order {
-                    if Self.system.updateWindowServerList(p, false) == 0 { self.onWindowServerList.remove(p); continue }
-                    // An app that quit took its entry with it.
-                    if everyone == nil { everyone = Set(Self.runningApps().map { Self.system.processSerialNumber($0.pid) }) }
-                    if everyone?.contains(p) == false { self.onWindowServerList.remove(p) }
-                }
-                Self.writeRecord(self.onWindowServerList)
+            let locked: Bool? = Self.withRecordLock(wait: true) { () -> Bool in
+                takeOffAllLocked()
+                return true
             }
-            if Self.withRecordLock(wait: true, takeOff) == nil { takeOff() }
+            if locked == nil { takeOffAllLocked() }
             applied = nil
             appliedTargets = Targets()
             if onWindowServerList.isEmpty { return true }
