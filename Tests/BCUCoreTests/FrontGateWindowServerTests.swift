@@ -152,6 +152,36 @@ final class FrontGateWindowServerTests: XCTestCase {
         gate.stop()
     }
 
+    /// Return or a shortcut while an agent's step runs in its app doesn't let
+    /// that app through: what comes forward then is almost always the agent's
+    /// doing. A click still does (it may be on that app's window).
+    func testAKeyDoesntLetThroughTheAppAnAgentIsSteppingIn() {
+        let gate = FrontGate()
+        gate.targets = { [unowned self] in FrontGate.Targets(pids: [agent], stepping: [agent]) }
+        gate.tapWorking = { true }
+        for _ in 0..<3 { _ = gate.passForTests() }
+        gate.liftForKey(ms: 2000)
+        XCTAssertFalse(list.contains(psn(agent)))
+        _ = gate.passForTests()
+        XCTAssertFalse(list.contains(psn(agent)))
+        XCTAssertTrue(gate.blocks(agent))
+        gate.pointer(down: true, ms: 30)
+        XCTAssertTrue(list.contains(psn(agent)))
+        gate.stop()
+    }
+
+    /// Between steps a key lets the agent's app through, as before (Return
+    /// on a link the user opens in that browser).
+    func testAKeyLetsTheAgentsAppThroughBetweenSteps() {
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        gate.liftForKey(ms: 2000)
+        XCTAssertTrue(list.contains(psn(agent)))
+        _ = gate.passForTests()
+        XCTAssertTrue(list.contains(psn(agent)))
+        gate.stop()
+    }
+
     /// A process that died with entries on the list (they outlive it) leaves
     /// a record; the next one takes those entries off before anything else.
     func testAnEarlierRunsEntriesAreTakenOff() {
