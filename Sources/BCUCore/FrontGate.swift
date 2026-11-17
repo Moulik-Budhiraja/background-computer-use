@@ -418,7 +418,10 @@ public final class FrontGate {
             return
         }
         let recorded = Self.withRecordLock(wait: true) { () -> Bool in
-            noteWatchdogClearLocked()
+            // The watchdog took the list down (after a stall): adding the
+            // apps kept back to what's left would let only them through.
+            // Leave it down; the next pass after this moment puts it back up.
+            if noteWatchdogClearLocked() { return false }
             let psns = held.subtracting(keep).map(Self.system.processSerialNumber).filter { $0 != 0 && !onWindowServerList.contains($0) }
             // An entry with no record could outlive this process with nothing
             // to take it off: the rest of the list would come off and leave
@@ -467,13 +470,16 @@ public final class FrontGate {
 
     /// Lock and record lock held. Pick up what the watchdog took off: only
     /// what it couldn't is on any more.
-    private func noteWatchdogClearLocked() {
-        guard watchdogClearedLocked else { return }
+    @discardableResult
+    private func noteWatchdogClearLocked() -> Bool {
+        guard watchdogClearedLocked else { return false }
         // What it couldn't take off is still on, and still recorded.
         onWindowServerList = Set(Self.readRecord())
         try? FileManager.default.removeItem(at: Self.clearedURL)
         applied = nil
         appliedTargets = Targets()
+        appliedSeed = 0
+        return true
     }
 
     /// cmd+Tab went down (open) or command came up (closed): the switch
