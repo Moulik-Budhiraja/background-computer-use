@@ -117,4 +117,8 @@ If a call fails with "Paused by the user", stop and tell the user you're waiting
 
 ## Finishing
 
-Call `release_window` on every window you opened or borrowed. It closes windows you opened and returns borrowed ones. Tell the user what you did in chat, with the specifics (what you sent, to whom, what changed). If they need to see the window, hand it off with a reason such as "The draft is ready for you to review" instead of releasing it.
+Call `release_window` on every window you borrowed. It puts the window back on the user's screen where it was.
+
+Close every window you opened once you're done with it, unless the user needs to see what's in it. Most windows only got you to the result: a page you read something from, a form you submitted, a setting you changed, a message you sent. Call `release_window` on those without `keep_open`, which closes them, and tell the user what you did in chat, with the specifics (what you sent, to whom, what changed). Don't leave a finished window open on your display with `keep_open`: the user never sees it there.
+
+Keep an opened window only when it holds what the user should look at: a draft for them to review, a page they asked you to find, something they have to finish themselves. Hand it off with a reason such as "The draft is ready for you to review" instead of releasing it.
