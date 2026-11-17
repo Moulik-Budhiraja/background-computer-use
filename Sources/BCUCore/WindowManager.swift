@@ -1169,12 +1169,19 @@ public final class WindowManager {
                 firstSeenMs: firstSeen, userInApp: userInApp,
                 userOpenInputMs: focusGuard.lastUserOpenInputMs, agentBeganMs: agentBegan), nowMs: nowMs()) else { continue }
             // Judged once: a window the user's input explains stays theirs.
-            lock.lock(); seenOnUser[info.id] = -1; lock.unlock()
+            // The step's is looked at again until accessibility answers (an
+            // app can be busy while it shows a dialog), for at most
+            // `agentJudgeMs`.
+            func retire() { lock.lock(); seenOnUser[info.id] = -1; lock.unlock() }
+            guard cause == .agent, nowMs() - firstSeen < Self.agentJudgeMs else { retire(); continue }
+            guard let ax = AX.window(pid: info.pid, id: info.id) else { continue }
             // In the app the user is in, only whole windows and dialogs: a
             // browser's hover cards and bubbles over their window are
             // windows too.
-            guard cause == .agent, let ax = AX.window(pid: info.pid, id: info.id),
-                  !userInApp || ["AXStandardWindow", "AXDialog", "AXSystemDialog"].contains(AX.string(ax, "AXSubrole") ?? "") else { continue }
+            if userInApp {
+                guard let subrole = AX.string(ax, "AXSubrole") else { continue }
+                guard ["AXStandardWindow", "AXDialog", "AXSystemDialog"].contains(subrole) else { retire(); continue }
+            }
             // A dialog goes over the window it's about (where the agent
             // will find it listed with that window's elements), another
             // window to the next free place.
