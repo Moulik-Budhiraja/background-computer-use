@@ -2,9 +2,12 @@ import AppKit
 import SwiftUI
 import BCUCore
 
-/// Every recorded frame across every agent display, oldest first, grouped
-/// the way Coast groups its timeline: a run per agent display, and within
-/// it a segment per stretch of frames in the same app.
+/// Every recorded frame across every agent display, grouped the way Coast
+/// groups its timeline: a run per agent display, and within it a segment
+/// per stretch of frames in the same app. Agents can work at the same time,
+/// so runs share one clock: each frame has a slot in the order of all
+/// frames by time, and runs that overlap go in lanes one above the other
+/// instead of one after the other.
 final class HistoryModel: ObservableObject {
     struct Item {
         let run: Int
@@ -26,6 +29,18 @@ final class HistoryModel: ObservableObject {
     private(set) var segmentOf: [Int] = []
     /// The agent did something between this frame and the one before.
     private(set) var acted: [Bool] = []
+    /// Item index to its place among all frames by time (0 is the oldest),
+    /// and back.
+    private(set) var slot: [Int] = []
+    private(set) var byTime: [Int] = []
+    /// Item index to the stretch of time it's in: runs that overlap share
+    /// one, and the track puts a gap between stretches.
+    private(set) var stretch: [Int] = []
+    /// Run index to its lane (0 is the top one), and to its items.
+    private(set) var laneOf: [Int] = []
+    private(set) var runItems: [ClosedRange<Int>] = []
+    /// The most runs that were ever recording at once.
+    @Published private(set) var lanes = 1
 
     @Published private(set) var loaded = false
     @Published private(set) var index = 0
@@ -58,7 +73,7 @@ final class HistoryModel: ObservableObject {
                 if let session, let last = self.items.lastIndex(where: { self.runs[$0.run].session == session }) {
                     self.index = last
                 } else {
-                    self.index = max(0, self.items.count - 1)
+                    self.index = self.byTime.last ?? 0
                 }
                 self.loaded = true
                 self.onItemsChanged?()
@@ -75,14 +90,22 @@ final class HistoryModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
             self.reloadPending = false
-            let atEnd = self.index >= self.items.count - 1
+            // On a run's newest frame: stay on it as the run grows, even
+            // while another agent records newer frames at the same time.
+            let following = self.atRunEnd ? self.currentRun?.id : nil
             let keep = self.current.map { (self.runs[$0.run].id, $0.frame.t) }
             let loaded = self.runs
             DispatchQueue.global(qos: .userInitiated).async {
                 let runs = self.store.all(reusing: loaded)
                 DispatchQueue.main.async {
-                    self.apply(runs, keep: atEnd ? nil : keep)
-                    if atEnd { self.index = max(0, self.items.count - 1) }
+                    self.apply(runs, keep: following == nil ? keep : nil)
+                    if let following {
+                        if let r = self.runs.firstIndex(where: { $0.id == following }) {
+                            self.index = self.runItems[r].upperBound
+                        } else {
+                            self.index = self.byTime.last ?? 0
+                        }
+                    }
                     self.onItemsChanged?()
                     self.onIndexChanged?(false)
                 }
@@ -116,6 +139,7 @@ final class HistoryModel: ObservableObject {
         self.segments = segments
         self.segmentOf = segmentOf
         self.acted = acted
+        placeOnClock()
         if let keep, let i = items.firstIndex(where: { runs[$0.run].id == keep.0 && $0.frame.t == keep.1 }) {
             index = i
         } else {
@@ -123,12 +147,65 @@ final class HistoryModel: ObservableObject {
         }
     }
 
+    /// Slots, stretches and lanes. Items are grouped by run, the runs oldest
+    /// first, and in time order within a run.
+    private func placeOnClock() {
+        var runItems: [ClosedRange<Int>] = []
+        var first = 0
+        for run in runs {
+            let n = run.frames.count
+            runItems.append(first...(first + max(n, 1) - 1))
+            first += n
+        }
+        // Each run takes the top lane that's free when it starts.
+        var laneEnds: [Double] = [], laneOf: [Int] = []
+        var stretchOfRun: [Int] = [], stretchEnd = -Double.infinity, stretches = -1
+        for range in runItems where items.indices.contains(range.upperBound) {
+            let from = items[range.lowerBound].frame.t, to = items[range.upperBound].frame.t
+            if let free = laneEnds.firstIndex(where: { $0 < from }) {
+                laneEnds[free] = to
+                laneOf.append(free)
+            } else {
+                laneEnds.append(to)
+                laneOf.append(laneEnds.count - 1)
+            }
+            if from > stretchEnd { stretches += 1 }
+            stretchEnd = max(stretchEnd, to)
+            stretchOfRun.append(stretches)
+        }
+        let byTime = items.indices.sorted { a, b in
+            let ta = items[a].frame.t, tb = items[b].frame.t
+            return ta != tb ? ta < tb : a < b
+        }
+        var slot = [Int](repeating: 0, count: items.count)
+        for (k, i) in byTime.enumerated() { slot[i] = k }
+        self.byTime = byTime
+        self.slot = slot
+        self.stretch = items.map { stretchOfRun[$0.run] }
+        self.laneOf = laneOf
+        self.runItems = runItems
+        let lanes = max(1, laneEnds.count)
+        if lanes != self.lanes { self.lanes = lanes }
+    }
+
+    /// The frame `by` away from item `i` in its own run; past the run's
+    /// ends, the frame `by` away in time across every run.
+    private func neighbour(_ i: Int, _ by: Int) -> Int? {
+        let j = i + by
+        if items.indices.contains(j), items[j].run == items[i].run { return j }
+        let s = slot[i] + by
+        return byTime.indices.contains(s) ? byTime[s] : nil
+    }
+
     // MARK: Moving
 
     var current: Item? { items.indices.contains(index) ? items[index] : nil }
     var currentRun: RecordedRun? { current.map { runs[$0.run] } }
     var isEmpty: Bool { items.isEmpty }
-    var atEnd: Bool { index >= items.count - 1 }
+    /// On the newest frame of all.
+    var atEnd: Bool { index == byTime.last ?? 0 }
+    /// On the newest frame of its run.
+    private var atRunEnd: Bool { index + 1 >= items.count || items[index + 1].run != items[index].run }
 
     /// From the track, as it scrolls: the track is already there.
     func scrubbed(to i: Int) {
@@ -145,23 +222,45 @@ final class HistoryModel: ObservableObject {
         onIndexChanged?(animated)
     }
 
-    func step(_ by: Int) { go(to: index + by, animated: false) }
+    func goToOldest() { if let i = byTime.first { go(to: i) } }
+    func goToNewest() { if let i = byTime.last { go(to: i) } }
 
-    /// The start of the previous segment, or of this one when partway into it.
+    /// A frame along the current run; past its ends, on in time.
+    func step(_ by: Int) {
+        guard items.indices.contains(index), let i = neighbour(index, by) else { return }
+        go(to: i, animated: false)
+    }
+
+    /// The start of the previous segment, or of this one when partway into
+    /// it. Before the run's first segment, the segment that came before in time.
     func previousSegment() {
-        guard !segmentOf.isEmpty else { return }
+        guard segmentOf.indices.contains(index) else { return }
         let s = segmentOf[index]
-        if index > segments[s].first { go(to: segments[s].first) } else if s > 0 { go(to: segments[s - 1].first) }
+        if index > segments[s].first {
+            go(to: segments[s].first)
+        } else if s > 0, segments[s - 1].run == segments[s].run {
+            go(to: segments[s - 1].first)
+        } else if let i = neighbour(index, -1) {
+            go(to: segments[segmentOf[i]].first)
+        }
     }
 
+    /// The start of the next segment in the run; after its last one, the
+    /// frame that came next in time.
     func nextSegment() {
-        guard !segmentOf.isEmpty else { return }
+        guard segmentOf.indices.contains(index) else { return }
         let s = segmentOf[index]
-        if s + 1 < segments.count { go(to: segments[s + 1].first) } else { go(to: items.count - 1) }
+        if s + 1 < segments.count, segments[s + 1].run == segments[s].run {
+            go(to: segments[s + 1].first)
+        } else if let i = neighbour(segments[s].last, 1) {
+            go(to: i)
+        } else {
+            goToNewest()
+        }
     }
 
-    var hasPreviousSegment: Bool { !segmentOf.isEmpty && (segmentOf[index] > 0 || index > 0) }
-    var hasNextSegment: Bool { !segmentOf.isEmpty && index < items.count - 1 }
+    var hasPreviousSegment: Bool { slot.indices.contains(index) && slot[index] > 0 }
+    var hasNextSegment: Bool { slot.indices.contains(index) && slot[index] < byTime.count - 1 }
 
     // MARK: What the header shows
 

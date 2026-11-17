@@ -83,6 +83,17 @@ enum HistorySelfTest {
         }
         RecordingTest.record(into: store, session: "11111111-aaaa", label: "Claude Code", size: size, frames: framesA, events: eventsA)
 
+        // Another agent in Mail at the same time, starting 40 s into the first.
+        var framesC: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+        var eventsC: [(t: Double, text: String?, point: CGPoint?, click: Bool)] = []
+        t = now - 3_600_000 + 40_350
+        for i in 0..<100 {
+            framesC.append((fake(size, app: "Mail", title: "Inbox", body: String("Re: Thursday's review, moved to 3 pm".prefix(i / 2)), field: nil, step: i), t, "Mail", "com.apple.mail"))
+            if i % 8 == 0 { eventsC.append((t - 120, "click (60 ms): Clicked \"Reply\"", CGPoint(x: 500, y: 200), true)) }
+            t += 1100 + Double(i % 5)
+        }
+        RecordingTest.record(into: store, session: "33333333-cccc", label: "Claude Code", size: size, frames: framesC, events: eventsC)
+
         var framesB: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
         var eventsB: [(t: Double, text: String?, point: CGPoint?, click: Bool)] = []
         t = now - 600_000
@@ -96,7 +107,7 @@ enum HistorySelfTest {
         // Read every frame back, and check it's that frame's picture: closer
         // to its own source than to the frames either side of it.
         var sources: [Int64: CGImage] = [:]
-        for f in framesA + framesB { sources[Int64(f.t)] = f.image }
+        for f in framesA + framesB + framesC { sources[Int64(f.t)] = f.image }
         let runs = store.all()
         var total = 0, ok = 0, wrong = 0, worst = 0.0, sum = 0.0
         for r in runs {

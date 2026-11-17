@@ -192,15 +192,22 @@ private final class PointerView: NSView {
 
 /// The timeline under the frame, like Coast's: frames as ticks left to
 /// right, oldest on the left, grouped into a capsule per app with its icon,
-/// a gap and a label where a new agent display starts, and a playhead
-/// fixed in the middle. Swipe or scroll to move through time; click or
-/// drag to jump.
+/// a label where an agent display starts, and a playhead fixed in the
+/// middle. Every frame has its own place in time across all agent displays,
+/// so displays that recorded at the same time line up, each in its own lane
+/// below the other; a gap stands for time when no agent was recording.
+/// Swipe or scroll to move through time; click or drag to jump, a click in
+/// a lane going to that lane's agent.
 final class HistoryTrackView: NSView {
     weak var model: HistoryModel?
     /// Points per frame; the zoom buttons change it.
     private(set) var spacing: CGFloat = 8
     static let spacings: [CGFloat] = [2, 4, 8, 14, 24]
     private static let runGap: CGFloat = 36
+    /// What a lane takes: its icons above, its capsules, its labels under.
+    static let laneHeight: CGFloat = 60
+    /// The top lane's capsules' center.
+    private static let firstMidY: CGFloat = 40
     /// Content x of the playhead.
     private var scrollX: CGFloat = 0
     private var animation: Timer?
@@ -214,20 +221,59 @@ final class HistoryTrackView: NSView {
     // MARK: Geometry
 
     private func contentX(_ i: Int) -> CGFloat {
-        guard let m = model, m.items.indices.contains(i) else { return 0 }
-        return CGFloat(i) * spacing + CGFloat(m.items[i].run) * Self.runGap
+        guard let m = model, m.slot.indices.contains(i) else { return 0 }
+        return CGFloat(m.slot[i]) * spacing + CGFloat(m.stretch[i]) * Self.runGap
     }
 
-    /// The frame nearest content x.
-    private func index(atContent x: CGFloat) -> Int {
-        guard let m = model, !m.items.isEmpty else { return 0 }
-        var lo = 0, hi = m.items.count - 1
+    private var lastContentX: CGFloat { model?.byTime.last.map(contentX) ?? 0 }
+
+    private func midY(lane: Int) -> CGFloat { Self.firstMidY + CGFloat(lane) * Self.laneHeight }
+
+    /// The lane at view y.
+    private func lane(atY y: CGFloat) -> Int {
+        let lanes = model?.lanes ?? 1
+        return min(max(0, Int(((y - Self.firstMidY) / Self.laneHeight).rounded())), lanes - 1)
+    }
+
+    /// Content x from first to last frame of run `r`, with half a frame either side.
+    private func span(ofRun r: Int) -> ClosedRange<CGFloat> {
+        guard let m = model else { return 0...0 }
+        let items = m.runItems[r]
+        return (contentX(items.lowerBound) - spacing / 2)...(contentX(items.upperBound) + spacing / 2)
+    }
+
+    /// Run `r`'s frame nearest content x (a run's frames are in time order).
+    private func nearest(inRun r: Int, toContent x: CGFloat) -> Int {
+        guard let m = model else { return 0 }
+        var lo = m.runItems[r].lowerBound, hi = m.runItems[r].upperBound
         while lo < hi {
             let mid = (lo + hi) / 2
             if contentX(mid) < x { lo = mid + 1 } else { hi = mid }
         }
-        if lo > 0, abs(contentX(lo - 1) - x) <= abs(contentX(lo) - x) { return lo - 1 }
+        if lo > m.runItems[r].lowerBound, abs(contentX(lo - 1) - x) <= abs(contentX(lo) - x) { return lo - 1 }
         return lo
+    }
+
+    /// The frame to show at content x. A click in a lane: that lane's run
+    /// if it was recording there. Scrubbing: the run already on screen while
+    /// it was recording there, so it stays with one agent. Else the top
+    /// lane's run recording there, else the nearest frame of any run.
+    private func frame(atContent x: CGFloat, lane: Int? = nil) -> Int? {
+        guard let m = model, !m.items.isEmpty else { return nil }
+        let recording = m.runItems.indices.filter { span(ofRun: $0).contains(x) }
+        if let lane, let r = recording.first(where: { m.laneOf[$0] == lane }) {
+            return nearest(inRun: r, toContent: x)
+        }
+        if lane == nil, let current = m.current?.run, recording.contains(current) {
+            return nearest(inRun: current, toContent: x)
+        }
+        if let r = recording.min(by: { m.laneOf[$0] < m.laneOf[$1] }) { return nearest(inRun: r, toContent: x) }
+        return m.runItems.indices
+            .map { r -> (Int, CGFloat) in
+                let i = nearest(inRun: r, toContent: x)
+                return (i, abs(contentX(i) - x))
+            }
+            .min(by: { $0.1 < $1.1 })?.0
     }
 
     private func viewX(_ i: Int) -> CGFloat { bounds.midX + contentX(i) - scrollX }
@@ -268,8 +314,8 @@ final class HistoryTrackView: NSView {
 
     private func moved() {
         guard let m = model, !m.items.isEmpty else { return }
-        scrollX = min(max(scrollX, contentX(0)), contentX(m.items.count - 1))
-        m.scrubbed(to: index(atContent: scrollX))
+        scrollX = min(max(scrollX, 0), lastContentX)
+        if let i = frame(atContent: scrollX) { m.scrubbed(to: i) }
         needsDisplay = true
     }
 
@@ -315,8 +361,8 @@ final class HistoryTrackView: NSView {
         dragged = false
         guard let m = model else { return }
         if wasDrag { settle(); return }
-        let x = convert(event.locationInWindow, from: nil).x
-        let i = index(atContent: scrollX + x - bounds.midX)
+        let p = convert(event.locationInWindow, from: nil)
+        guard let i = frame(atContent: scrollX + p.x - bounds.midX, lane: lane(atY: p.y)) else { return }
         if i == m.index { follow(animated: true) } else { m.go(to: i) }
     }
 
@@ -325,24 +371,25 @@ final class HistoryTrackView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let m = model, !m.items.isEmpty else { return }
         let ctx = NSGraphicsContext.current!.cgContext
-        let midY: CGFloat = 40, barH: CGFloat = 18
-        let lo = max(0, index(atContent: scrollX - bounds.width / 2 - 40) - 1)
-        let hi = min(m.items.count - 1, index(atContent: scrollX + bounds.width / 2 + 40) + 1)
+        let barH: CGFloat = 18
+        let left = scrollX - bounds.width / 2 - 40, right = scrollX + bounds.width / 2 + 40
         let current = m.segmentOf.indices.contains(m.index) ? m.segmentOf[m.index] : -1
+        let currentLane = m.current.map { m.laneOf[$0.run] } ?? 0
 
         // Where the recordings start.
-        let firstX = viewX(0)
+        let firstX = bounds.midX - scrollX
         if firstX - spacing / 2 > 0 {
             let text = "Recordings go back \(AppRecordings.store.retentionDays) days"
             let attrs = Self.attrs(11, .medium, .white.withAlphaComponent(0.32))
             let size = text.size(withAttributes: attrs)
-            text.draw(at: CGPoint(x: firstX - 22 - size.width, y: midY - size.height / 2), withAttributes: attrs)
+            text.draw(at: CGPoint(x: firstX - 22 - size.width, y: midY(lane: 0) - size.height / 2), withAttributes: attrs)
         }
 
-        // A capsule per segment, its frames as ticks inside.
-        let firstSeg = m.segmentOf[lo], lastSeg = m.segmentOf[hi]
-        for s in firstSeg...lastSeg {
-            let seg = m.segments[s]
+        // A capsule per segment in its run's lane, its frames as ticks inside.
+        for (s, seg) in m.segments.enumerated() {
+            let c0 = contentX(seg.first), c1 = contentX(seg.last)
+            guard c1 >= left, c0 <= right else { continue }
+            let midY = midY(lane: m.laneOf[seg.run])
             let x0 = viewX(seg.first) - spacing / 2 + 1, x1 = viewX(seg.last) + spacing / 2 - 1
             let rect = CGRect(x: x0, y: midY - barH / 2, width: max(3, x1 - x0), height: barH)
             let on = s == current
@@ -351,7 +398,14 @@ final class HistoryTrackView: NSView {
             ctx.fillPath()
             if spacing >= 4 {
                 ctx.setFillColor(NSColor.white.withAlphaComponent(on ? 0.42 : 0.24).cgColor)
-                for i in max(seg.first, lo)...min(seg.last, hi) {
+                // The segment's frames are in time order: start at the first in view.
+                var lo = seg.first, hi = seg.last
+                while lo < hi {
+                    let mid = (lo + hi) / 2
+                    if contentX(mid) < left { lo = mid + 1 } else { hi = mid }
+                }
+                for i in lo...seg.last {
+                    if contentX(i) > right { break }
                     let x = viewX(i)
                     let h: CGFloat = m.acted[i] ? 10 : 6
                     ctx.fill(CGRect(x: x - 0.5, y: midY - h / 2, width: 1, height: h))
@@ -366,26 +420,35 @@ final class HistoryTrackView: NSView {
             }
         }
 
-        // Each agent display's start: its agent and time, under the track.
+        // Each agent display's start: its agent and time, under its lane.
         let labelAttrs = Self.attrs(10.5, .semibold, .white.withAlphaComponent(0.5))
         let timeAttrs = Self.attrs(10.5, .medium, .white.withAlphaComponent(0.32))
-        var lastLabelEnd: CGFloat = -.infinity
-        for r in m.items[lo].run...m.items[hi].run {
-            guard let first = m.items.firstIndex(where: { $0.run == r }) else { continue }
-            let x = max(viewX(first) - spacing / 2, 6)
-            guard x > lastLabelEnd + 8, x < bounds.width else { continue }
+        var lastLabelEnd = [CGFloat](repeating: -.infinity, count: m.lanes)
+        for (r, items) in m.runItems.enumerated() {
+            guard contentX(items.upperBound) >= left, contentX(items.lowerBound) <= right else { continue }
+            let lane = m.laneOf[r]
+            let x = max(viewX(items.lowerBound) - spacing / 2, 6)
+            guard x > lastLabelEnd[lane] + 8, x < bounds.width else { continue }
+            let y = midY(lane: lane) + barH / 2 + 6
             let label = m.runs[r].label
-            label.draw(at: CGPoint(x: x, y: midY + barH / 2 + 6), withAttributes: labelAttrs)
+            label.draw(at: CGPoint(x: x, y: y), withAttributes: labelAttrs)
             let lw = label.size(withAttributes: labelAttrs).width
-            let time = HistoryModel.time(m.items[first].frame.t, seconds: false)
-            time.draw(at: CGPoint(x: x + lw + 5, y: midY + barH / 2 + 6), withAttributes: timeAttrs)
-            lastLabelEnd = x + lw + 5 + time.size(withAttributes: timeAttrs).width
+            let time = HistoryModel.time(m.items[items.lowerBound].frame.t, seconds: false)
+            time.draw(at: CGPoint(x: x + lw + 5, y: y), withAttributes: timeAttrs)
+            lastLabelEnd[lane] = x + lw + 5 + time.size(withAttributes: timeAttrs).width
         }
 
-        // The playhead.
-        ctx.setFillColor(NSColor.white.cgColor)
+        // The playhead: across every lane when there are several, marked
+        // on the lane of the frame shown.
         let px = bounds.midX.rounded()
-        ctx.addPath(CGPath(roundedRect: CGRect(x: px - 1, y: midY - barH / 2 - 5, width: 2, height: barH + 10), cornerWidth: 1, cornerHeight: 1, transform: nil))
+        if m.lanes > 1 {
+            ctx.setFillColor(NSColor.white.withAlphaComponent(0.35).cgColor)
+            let top = midY(lane: 0) - barH / 2 - 5, bottom = midY(lane: m.lanes - 1) + barH / 2 + 5
+            ctx.fill(CGRect(x: px - 0.5, y: top, width: 1, height: bottom - top))
+        }
+        ctx.setFillColor(NSColor.white.cgColor)
+        let y = midY(lane: currentLane)
+        ctx.addPath(CGPath(roundedRect: CGRect(x: px - 1, y: y - barH / 2 - 5, width: 2, height: barH + 10), cornerWidth: 1, cornerHeight: 1, transform: nil))
         ctx.fillPath()
     }
 
