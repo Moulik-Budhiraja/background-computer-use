@@ -216,6 +216,57 @@ final class FrontGateWindowServerTests: XCTestCase {
         gate.stop()
     }
 
+    /// An entry the watchdog couldn't take off (its app still running) stays
+    /// recorded, and the next try takes it off.
+    func testTheWatchdogKeepsWhatItCouldntTakeOff() {
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        var failOnce = true
+        let update = FrontGate.system.updateWindowServerList
+        FrontGate.system.updateWindowServerList = { [unowned self] p, add in
+            if !add && p == psn(other) && failOnce { failOnce = false; return -1 }
+            return update(p, add)
+        }
+        XCTAssertFalse(FrontGate.watchdogClear())
+        XCTAssertEqual(list, [psn(other)])
+        XCTAssertTrue(FrontGate.watchdogClear())
+        XCTAssertEqual(list, [])
+        gate.stop()
+    }
+
+    /// The same at the next launch.
+    func testTheNextLaunchKeepsWhatItCouldntTakeOff() {
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        var failOnce = true
+        let update = FrontGate.system.updateWindowServerList
+        FrontGate.system.updateWindowServerList = { [unowned self] p, add in
+            if !add && p == psn(other) && failOnce { failOnce = false; return -1 }
+            return update(p, add)
+        }
+        FrontGate.clearLeftoversForTests()
+        XCTAssertEqual(list, [psn(other)])
+        FrontGate.clearLeftoversForTests()
+        XCTAssertEqual(list, [])
+        gate.stop()
+    }
+
+    /// The app kept back can't be put on for the user's click: the whole
+    /// list comes down, so the click still gets them there.
+    func testAFailedAddForAClickTakesTheListDown() {
+        let update = FrontGate.system.updateWindowServerList
+        FrontGate.system.updateWindowServerList = { [unowned self] p, add in
+            add && p == psn(agent) ? -1 : update(p, add)
+        }
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        XCTAssertEqual(list, [psn(user), psn(other)])
+        gate.pointer(down: true, ms: 30)
+        XCTAssertEqual(list, [])
+        XCTAssertFalse(gate.blocks(agent))
+        gate.stop()
+    }
+
     /// A process that died with entries on the list (they outlive it) leaves
     /// a record; the next one takes those entries off before anything else.
     func testAnEarlierRunsEntriesAreTakenOff() {
