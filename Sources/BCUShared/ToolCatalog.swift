@@ -19,7 +19,7 @@ public enum ToolCatalog {
     4. Prefer `click` on an element and `set_value`: they work through accessibility. While the user is in \
     the same app, `type_text` writes into the field through accessibility too (pass `element` when you know \
     the field); only Return and Tab go as keys. Keys and pixel clicks make your window its app's key window. \
-    In an app the user isn't in, your window keeps key focus between steps; when the user is in it, key goes \
+    In an app the user isn't in, a field you focused stays focused for your next step and a menu you opened stays open; when the user is in it, key goes \
     straight back to them (their input is held for that moment and replayed). When the user is in that app, such a step first \
     waits for a pause in their clicking or scrolling (3 s at most, usually much less) and for them to stop \
     typing (however long they type: their typing goes first), and the result says how long; that's expected, \
