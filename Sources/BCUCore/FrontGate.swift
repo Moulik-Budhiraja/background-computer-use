@@ -95,6 +95,11 @@ public final class FrontGate {
         var updateWindowServerList: (_ psn: UInt64, _ add: Bool) -> Int32 = { BCUPermittedFrontUpdate($0, $1) }
         /// Not a background-only process (those never come to the front).
         var canComeForward: (pid_t) -> Bool = { NSRunningApplication(processIdentifier: $0)?.activationPolicy != .prohibited }
+        /// Write a file in full; whether it was.
+        var writeFile: (URL, String) -> Bool = { url, text in
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            return (try? text.write(to: url, atomically: true, encoding: .utf8)) != nil
+        }
     }
 
     /// How long WindowServer's list stays once no agent has an app to keep
@@ -308,14 +313,14 @@ public final class FrontGate {
 
     /// Written before an entry goes on, so a crash right after leaves a
     /// record for the watchdog or the next engine. Gone when nothing's left.
-    private static func writeRecord(_ psns: Set<UInt64>) {
+    @discardableResult
+    private static func writeRecord(_ psns: Set<UInt64>) -> Bool {
         if psns.isEmpty {
             try? FileManager.default.removeItem(at: markerURL)
-            return
+            return true
         }
-        try? FileManager.default.createDirectory(at: BCUPaths.supportDirectory, withIntermediateDirectories: true)
         let text = psns.map { String($0, radix: 16) }.joined(separator: "\n") + "\n"
-        try? text.write(to: markerURL, atomically: true, encoding: .utf8)
+        return system.writeFile(markerURL, text)
     }
 
     /// Before the engine goes away: open the gate for good.
@@ -761,6 +766,25 @@ public final class FrontGate {
 
     /// Call first thing in `main`: when this process was started as the
     /// gate's watchdog, it runs that and never returns.
+    /// The watchdog's cleanup: the list this engine left, if any. Whether
+    /// it ran (false: try again shortly).
+    @discardableResult
+    static func watchdogClear() -> Bool {
+        let marker = markerURL.path
+        // WindowServer's list: the entries the engine recorded, and the
+        // record (the engine sees it gone and starts again from nothing).
+        let psns = readRecord()
+        if !psns.isEmpty {
+            for p in psns { _ = system.updateWindowServerList(p, false) }
+            try? FileManager.default.removeItem(atPath: marker)
+            return true
+        }
+        guard watchdogMayClear(markerExists: FileManager.default.fileExists(atPath: marker), listExists: currentList() != nil) else { return true }
+        setList([])
+        if currentList() == nil { try? FileManager.default.removeItem(atPath: marker) }
+        return true
+    }
+
     public static func runWatchdogIfAsked() {
         guard CommandLine.arguments.contains(watchdogFlag) else { return }
         signal(SIGPIPE, SIG_IGN)
@@ -768,20 +792,7 @@ public final class FrontGate {
         // both processes): clear on the way out, like on any other exit.
         // The handler only sets a flag; `poll` returns when a signal lands.
         for s in [SIGTERM, SIGINT, SIGHUP] { signal(s) { _ in watchdogToldToGo = 1 } }
-        func clear() {
-            let marker = markerURL.path
-            // WindowServer's list: the entries the engine recorded, and the
-            // record (the engine sees it gone and starts again from nothing).
-            let psns = readRecord()
-            if !psns.isEmpty {
-                for p in psns { _ = system.updateWindowServerList(p, false) }
-                try? FileManager.default.removeItem(atPath: marker)
-                return
-            }
-            guard watchdogMayClear(markerExists: FileManager.default.fileExists(atPath: marker), listExists: currentList() != nil) else { return }
-            setList([])
-            if currentList() == nil { try? FileManager.default.removeItem(atPath: marker) }
-        }
+        func clear() { watchdogClear() }
         var fd = pollfd(fd: 0, events: Int16(POLLIN), revents: 0)
         var buffer = [UInt8](repeating: 0, count: 64)
         while true {
