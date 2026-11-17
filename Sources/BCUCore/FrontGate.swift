@@ -166,9 +166,12 @@ public final class FrontGate {
         public var pids: Set<pid_t> = []
         /// Apps being launched for an agent, before they have a pid.
         public var bundleIDs: Set<String> = []
-        public init(pids: Set<pid_t> = [], bundleIDs: Set<String> = []) {
+        /// Of `pids`, the apps an agent's step is running in right now.
+        public var stepping: Set<pid_t> = []
+        public init(pids: Set<pid_t> = [], bundleIDs: Set<String> = [], stepping: Set<pid_t> = []) {
             self.pids = pids
             self.bundleIDs = bundleIDs
+            self.stepping = stepping
         }
         var isEmpty: Bool { pids.isEmpty && bundleIDs.isEmpty }
     }
@@ -340,6 +343,9 @@ public final class FrontGate {
         openForUserLocked()
         lock.unlock()
     }
+
+    /// A key that may switch apps (Return, a shortcut, a function key).
+    public func liftForKey(ms: Double) { lift(ms: ms) }
 
     /// Lock held. Let every app through: LaunchServices' list goes; on
     /// WindowServer's, the apps kept back go on too (one call each, where
