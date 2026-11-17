@@ -77,6 +77,10 @@ final class ScreenFreeze {
         let captureMs: Double
     }
 
+    /// What to compare of a window whose content changes on its own (a
+    /// video), given its chrome and its content area (window-local points).
+    static func liveChrome(_ chrome: [CGRect]?, content: CGRect, size: CGSize) -> [CGRect] { chrome ?? [] }
+
     /// Cover `userWindow` (the app's key window, on the user's display) and
     /// the menu bar above it. Nil when neither is on screen.
     static func begin(userWindow: CGWindowID) -> ScreenFreeze? {
