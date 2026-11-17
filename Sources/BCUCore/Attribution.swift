@@ -89,6 +89,8 @@ enum NewWindow {
         /// When the session's last step on the app began, if the window
         /// wasn't there before it. nil: no such step.
         var agentBeganMs: Double?
+        /// The step is still running, or in its grace period.
+        var stepActive = false
     }
 
     /// How long after an agent's step began a new window is the step's.
@@ -109,5 +111,16 @@ enum NewWindow {
             return f.userInApp ? .user : .unclear
         }
         return f.userInApp && f.userOpenInputMs >= began ? .user : .agent
+    }
+
+    /// Whose a window is that came up on the user's screen, in an app the
+    /// session acted on: `.agent` moves it to the agent display. nil: too
+    /// soon to tell.
+    ///
+    /// Only while the step is running or in its grace period, and the user
+    /// isn't in the app.
+    static func fromUserScreen(_ f: Facts, nowMs: Double) -> Cause? {
+        guard f.stepActive, !f.userInApp, let began = f.agentBeganMs, f.firstSeenMs >= began, f.firstSeenMs - began < agentMs else { return .unclear }
+        return .agent
     }
 }

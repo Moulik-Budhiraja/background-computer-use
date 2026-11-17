@@ -1049,9 +1049,6 @@ public final class WindowManager {
         Log.info("fit \(w.appName) window \(w.id) from \(frame.short) to \(Int(x)),\(Int(y)) \(Int(size.width))x\(Int(size.height))")
     }
     private var opening: Set<pid_t> = []
-    /// A window counts as spawned by this session's action only this long
-    /// after the action began.
-    private static let catchWindowMs = 10_000.0
     /// A window a step opened on this display becomes the session's once
     /// it's been there this long, and is no longer looked at after
     /// `agentJudgeMs`.
@@ -1151,7 +1148,7 @@ public final class WindowManager {
             lock.lock()
             let midOpen = opening.contains(info.pid) || Self.isOpening(info.pid)
             lock.unlock()
-            guard tainted.contains(info.pid), !midOpen, info.pid != front, info.pid != focusGuard.userFront else { continue }
+            guard !midOpen else { continue }
             // Only windows that appeared since this session began acting on
             // the app (another session's action, or none on record, says
             // nothing about which windows are new), and never another
@@ -1159,10 +1156,14 @@ public final class WindowManager {
             lock.lock()
             let known = knownBefore[info.pid]
             lock.unlock()
-            guard let known, nowMs() - known.ms < Self.catchWindowMs, !known.ids.contains(info.id),
+            guard let known, !known.ids.contains(info.id),
                   !Self.isRegistered(info.id, byOtherThan: sessionKey),
                   display.touchesUser(info.bounds), !display.holds(info.bounds),
                   info.bounds.width > 40, info.bounds.height > 40,
+                  NewWindow.fromUserScreen(NewWindow.Facts(
+                    firstSeenMs: nowMs(), userInApp: info.pid == front || info.pid == focusGuard.userFront,
+                    userOpenInputMs: focusGuard.lastUserOpenInputMs, agentBeganMs: known.ms,
+                    stepActive: tainted.contains(info.pid)), nowMs: nowMs()) == .agent,
                   let ax = AX.window(pid: info.pid, id: info.id) else { continue }
             // A dialog goes over the window it's about (where the agent
             // will find it listed with that window's elements), another
