@@ -124,6 +124,16 @@ public final class KeyScope {
 
     deinit { exit() }
 
+    /// After an agent's step in an app the user isn't in: what becomes of key.
+    public enum AfterStep: Equatable {
+        /// The agent's window keeps it until its next step (`FocusGuard.park`).
+        case park
+        /// Key goes to the user's window in the app.
+        case handTo(CGWindowID)
+    }
+
+    public static func afterStep(popupOpen: Bool, userWindow: CGWindowID?) -> AfterStep { .park }
+
     @discardableResult
     static func postRecords(pid: pid_t, from current: CGWindowID?, to target: CGWindowID, settle: Double = settleMs) -> Bool {
         var ok = true
