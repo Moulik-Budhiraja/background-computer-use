@@ -182,6 +182,40 @@ final class FrontGateWindowServerTests: XCTestCase {
         gate.stop()
     }
 
+    /// Entries outlive the process, so none goes on unless the record that
+    /// lets the watchdog or the next launch take it off was written.
+    func testNothingGoesOnWithoutARecord() {
+        FrontGate.system.writeFile = { _, _ in false }
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        XCTAssertEqual(list, [])
+        XCTAssertFalse(gate.blocks(agent))
+        gate.stop()
+    }
+
+    /// The watchdog's cleanup (after a stall) can't run in the middle of an
+    /// update: a resumed update would put back a record of entries the
+    /// watchdog took off, and the gate would count them on for good. Once
+    /// the update is done it runs, and the next pass sees it.
+    func testTheWatchdogWaitsForAnUpdateInProgress() {
+        var midUpdate: Bool?
+        let update = FrontGate.system.updateWindowServerList
+        FrontGate.system.updateWindowServerList = { p, add in
+            let r = update(p, add)
+            if add && midUpdate == nil { midUpdate = FrontGate.watchdogClear() }
+            return r
+        }
+        let gate = makeGate()
+        _ = gate.passForTests()
+        XCTAssertEqual(midUpdate, false)
+        XCTAssertEqual(list, [psn(user), psn(other)])
+        XCTAssertTrue(FrontGate.watchdogClear())
+        XCTAssertEqual(list, [])
+        _ = gate.passForTests()
+        XCTAssertEqual(list, [psn(user), psn(other)])
+        gate.stop()
+    }
+
     /// A process that died with entries on the list (they outlive it) leaves
     /// a record; the next one takes those entries off before anything else.
     func testAnEarlierRunsEntriesAreTakenOff() {
