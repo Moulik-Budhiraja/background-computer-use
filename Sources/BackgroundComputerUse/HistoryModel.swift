@@ -92,22 +92,23 @@ final class HistoryModel: ObservableObject {
             self.reloadPending = false
             // On a run's newest frame: stay on it as the run grows, even
             // while another agent records newer frames at the same time.
-            let following = self.atRunEnd ? self.currentRun?.id : nil
-            // Opened before anything was recorded: follow the first recording.
-            let wasEmpty = self.items.isEmpty
+            let following = self.atRunEnd && self.currentRun?.isLive == true ? self.currentRun?.id : nil
+            // On the newest frame of all (a run that has ended, or nothing
+            // recorded yet): go on to whatever is newest, a new recording too.
+            let newest = self.atEnd || self.items.isEmpty
             let keep = self.current.map { (self.runs[$0.run].id, $0.frame.t) }
             let loaded = self.runs
             DispatchQueue.global(qos: .userInitiated).async {
                 let runs = self.store.all(reusing: loaded)
                 DispatchQueue.main.async {
-                    self.apply(runs, keep: following == nil ? keep : nil)
+                    self.apply(runs, keep: following == nil && !newest ? keep : nil)
                     if let following {
                         if let r = self.runs.firstIndex(where: { $0.id == following }) {
                             self.index = self.runItems[r].upperBound
                         } else {
                             self.index = self.byTime.last ?? 0
                         }
-                    } else if wasEmpty {
+                    } else if newest {
                         self.index = self.byTime.last ?? 0
                     }
                     self.onItemsChanged?()
@@ -216,7 +217,7 @@ final class HistoryModel: ObservableObject {
     var isEmpty: Bool { items.isEmpty }
     /// On the newest frame of all.
     var atEnd: Bool { index == byTime.last ?? 0 }
-    /// On the newest frame of its run.
+    /// On the newest frame of its run (the one a live run is following).
     private var atRunEnd: Bool { index + 1 >= items.count || items[index + 1].run != items[index].run }
 
     /// From the track, as it scrolls: the track is already there.

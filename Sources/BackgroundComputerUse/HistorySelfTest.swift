@@ -190,8 +190,22 @@ enum HistorySelfTest {
         pruned.zoomTrack(-2)
         spin(0.5)
         snapshot(prunedHost, to: out.appendingPathComponent("history-after-limit.png"))
-        let prunedOK = clockOrder(pruned.model, "after the size limit")
+        var prunedOK = clockOrder(pruned.model, "after the size limit")
         RecordingTest.applyLimit(store, bytes: nil)
+        // On the newest frame when a new recording starts: History goes on to it.
+        pruned.model.goToNewest()
+        spin(0.3)
+        var framesD: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+        t = wallMs() - 5_000
+        for i in 0..<4 {
+            framesD.append((fake(size, app: "Calendar", title: "Today", body: "", field: nil, step: i), t, "Calendar", "com.apple.iCal"))
+            t += 1000
+        }
+        RecordingTest.record(into: store, session: "44444444-dddd", label: "Agent", size: size, frames: framesD, events: [])
+        spin(2.0)
+        let followedNew = pruned.model.currentRun?.session == "44444444-dddd" && pruned.model.atEnd
+        print("a new recording after the newest frame: \(followedNew ? "followed" : "WRONG, stayed on \(pruned.model.currentRun?.session ?? "-")")")
+        prunedOK = prunedOK && followedNew
         exit(ok == total && total > 0 && wrong == 0 && limitOK && clockOK && prunedOK ? 0 : 1)
     }
 
