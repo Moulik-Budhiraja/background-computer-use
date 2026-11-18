@@ -76,12 +76,16 @@ final class AudioClaimTests: XCTestCase {
     func testNotesSayWhatHappened() {
         let c = AudioClaims()
         let quiet: (pid_t) -> Bool = { _ in false }
-        let noElement = c.silence([claim(1, pid: 100)], why: "started using", playing: quiet)
+        let loud: (pid_t) -> Bool = { _ in true }
+        let noElement = c.silence([claim(1, pid: 100)], why: "started using", settleMs: 50, playing: loud)
         XCTAssertTrue(noElement[0].contains("stop it now"), noElement[0])
         // An element that can't be pressed (no such process).
-        let dead = c.silence([claim(2, pid: 100, mute: AXUIElementCreateApplication(999_999))], why: "started using", playing: quiet)
+        let dead = c.silence([claim(2, pid: 100, mute: AXUIElementCreateApplication(999_999))], why: "started using", settleMs: 50, playing: loud)
         XCTAssertTrue(dead[0].contains("couldn't be pressed"), dead[0])
-        XCTAssertEqual(c.takeNotes().count, 2)
+        // Already quiet: nothing is pressed (a toggle would play it again).
+        let stopped = c.silence([claim(3, pid: 100, mute: AXUIElementCreateApplication(999_999))], why: "started using", playing: quiet)
+        XCTAssertTrue(stopped[0].contains("already stopped"), stopped[0])
+        XCTAssertEqual(c.takeNotes().count, 3)
         XCTAssertTrue(c.takeNotes().isEmpty)
     }
 

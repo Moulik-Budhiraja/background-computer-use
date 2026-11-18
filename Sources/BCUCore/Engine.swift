@@ -1413,7 +1413,8 @@ public final class Engine {
         }
         let label = mute.flatMap { n in [AX.string(n.element, "AXTitle"), AX.string(n.element, "AXDescription")].compactMap { $0 }.first { !$0.isEmpty } }
         let muteName = mute.map { "element \($0.index)" + (label.map { " \"\($0)\"" } ?? "") } ?? ""
-        audioClaims.add(AudioClaims.Claim(window: w.id, pid: w.pid, appName: w.appName, mute: mute?.element, muteName: muteName))
+        audioClaims.add(AudioClaims.Claim(window: w.id, pid: w.pid, appName: w.appName, mute: mute?.element, muteName: muteName,
+                                          muteLook: mute.map { AudioClaims.look($0.element) }))
         focusGuard.onUserInput(for: "audio-\(sessionID)") { [weak self] input in
             self?.audioClaims.userInput(input) { hit, why in self?.giveSoundBack(hit, why: why) }
         }

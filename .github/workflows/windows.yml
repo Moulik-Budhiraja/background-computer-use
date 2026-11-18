@@ -23,7 +23,16 @@ jobs:
       - name: Test
         shell: pwsh
         working-directory: windows
-        run: cargo test --locked -p background-computer-use -p bcu -p bcu-hook
+        # build.ps1 installed Rust under the temp folder (BCU_FRESH_RUST) and
+        # put it on PATH for its own step only.
+        run: |
+          $tools = Join-Path ([IO.Path]::GetTempPath()) 'bcu-rust'
+          if (Test-Path (Join-Path $tools 'cargo\bin\cargo.exe')) {
+            $env:RUSTUP_HOME = Join-Path $tools 'rustup'
+            $env:CARGO_HOME = Join-Path $tools 'cargo'
+            $env:PATH = "$(Join-Path $env:CARGO_HOME 'bin');$env:PATH"
+          }
+          cargo test --locked -p background-computer-use -p bcu -p bcu-hook
       - uses: actions/upload-artifact@v4
         with:
           name: installer

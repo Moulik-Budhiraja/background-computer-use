@@ -18,6 +18,10 @@ final class AudioClaims {
         /// one (a tab's mute button shows only once it plays).
         let mute: AXUIElement?
         let muteName: String
+        /// What the element read when it was named (title, description,
+        /// value): a toggle that reads otherwise now ("Unmute tab", "Play")
+        /// has already been pressed, and pressing it again would play.
+        var muteLook: String? = nil
     }
 
     private let lock = NSLock()
@@ -131,9 +135,21 @@ final class AudioClaims {
     /// mute takes Helium 0.1–0.3 s and Safari 0.35–0.65 s to be heard, and
     /// a press can succeed and do nothing (the page changed under it).
     /// Returns a note per claim, also kept for the agent's next call.
+    /// What an element reads, to tell whether a toggle has flipped.
+    static func look(_ element: AXUIElement) -> String {
+        ["AXTitle", "AXDescription", "AXValue"].map { AX.attr(element, $0).map { "\($0)" } ?? "" }.joined(separator: "|")
+    }
+
     func silence(_ hit: [Claim], why: String, settleMs: Double = 600,
                  playing: (pid_t) -> Bool = { pid in NSRunningApplication(processIdentifier: pid).map(SessionAudio.isPlaying) ?? false }) -> [String] {
-        let pressed = hit.map { c in c.mute.map { AX.perform($0, "AXPress") } }
+        // Nothing to silence when the app is already quiet, or when the named
+        // toggle reads otherwise than when it was named (the agent paused or
+        // muted since): pressing it then would play the agent's sound again.
+        let quietBefore = Set(hit.map(\.pid)).filter { !playing($0) }
+        let flipped = hit.map { c in
+            quietBefore.contains(c.pid) || (c.mute.map { m in c.muteLook.map { $0 != Self.look(m) } ?? false } ?? false)
+        }
+        let pressed = zip(hit, flipped).map { c, flip in flip ? AXError.success : c.mute.map { AX.perform($0, "AXPress") } }
         let pids = Set(hit.map(\.pid))
         let deadline = nowMs() + settleMs
         var loud = pids.filter(playing)
@@ -141,9 +157,11 @@ final class AudioClaims {
             usleep(20_000)
             loud = loud.filter(playing)
         }
-        let notes = zip(hit, pressed).map { c, err -> String in
+        let notes = zip(zip(hit, pressed), flipped).map { pair, flip -> String in
+            let (c, err) = pair
             let back = "The user \(why) \(c.appName), so it plays on their speakers again"
             guard let err else {
+                if flip { return "\(back). Your sound there had already stopped. \(Self.again)" }
                 return "\(back). You hadn't named an element to silence your sound with: if it's still playing in window \(c.window), stop it now."
             }
             if err != .success {
@@ -151,6 +169,9 @@ final class AudioClaims {
             }
             if loud.contains(c.pid) {
                 return "\(back). \(c.muteName.prefix(1).uppercased() + c.muteName.dropFirst()) in window \(c.window) was pressed, but \(c.appName) still seemed to make sound after it: make sure yours has stopped. \(Self.again)"
+            }
+            if flip {
+                return "\(back). Your sound there had already stopped, so \(c.muteName) in window \(c.window) wasn't pressed (it would have played it again). \(Self.again)"
             }
             return "\(back), and your sound there was silenced with \(c.muteName) in window \(c.window). \(Self.again)"
         }
