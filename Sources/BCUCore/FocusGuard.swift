@@ -84,7 +84,7 @@ public final class FocusGuard {
     /// A media key going down (NX_SUBTYPE_AUX_CONTROL_BUTTONS): play (16),
     /// next (17), previous (18), fast-forward (19), rewind (20). Volume and
     /// brightness keys don't count.
-    private static func isMediaKeyDown(_ event: CGEvent) -> Bool {
+    static func isMediaKeyDown(_ event: CGEvent) -> Bool {
         guard let e = NSEvent(cgEvent: event), e.subtype.rawValue == 8 else { return false }
         let code = (e.data1 & 0xFFFF_0000) >> 16
         let down = ((e.data1 & 0xFF00) >> 8) == 0xA
