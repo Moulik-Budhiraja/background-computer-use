@@ -552,7 +552,7 @@ enum HostInput {
             let key = a.string("key") ?? ""
             guard let keyCode = keyCode(code: code, key: key) else { throw ToolError("unknown key code \(code)") }
             // cmd+Q would quit the whole app, the user's own windows included.
-            if flags.contains(.maskCommand) && keyCode == 12 { return }
+            if flags.contains(.maskCommand) && keyCode == ((try? KeyMap.code(for: "q", command: true).0) ?? 12) { return }
             guard let e = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: down) else { return }
             if modifierCodes.contains(keyCode) {
                 e.type = .flagsChanged
