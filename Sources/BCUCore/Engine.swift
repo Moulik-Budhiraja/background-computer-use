@@ -1360,7 +1360,7 @@ public final class Engine {
         var pids = Set(ws.filter { !$0.withUser }.map(\.pid)).filter { onAgent[$0] == true }
         pids.formUnion(audioClaims.pids(open: Set(ws.map(\.id))))
         // The last claimed window closed: stop reading while nothing plays.
-        if audioClaims.isEmpty && audio.keepRecording { audio.keepRecording = false }
+        if audioClaims.isIdle && audio.keepRecording { audio.keepRecording = false }
         return pids.sorted().compactMap { NSRunningApplication(processIdentifier: $0) }
     }
 
@@ -1429,7 +1429,8 @@ public final class Engine {
         _ = audioClaims.silence(hit, why: why) { [audio] pid in
             audio.soundWithin(ms: 60) ?? (NSRunningApplication(processIdentifier: pid).map(SessionAudio.isPlaying) ?? false)
         }
-        audio.keepRecording = !audioClaims.isEmpty
+        audioClaims.finish(hit)
+        audio.keepRecording = !audioClaims.isIdle
         audio.routeNow(audioApps())
         if audioClaims.isEmpty { focusGuard.onUserInput(for: "audio-\(sessionID)", nil) }
         for name in Set(hit.map(\.appName)).sorted() { log("Gave \(name)'s sound back to you") }

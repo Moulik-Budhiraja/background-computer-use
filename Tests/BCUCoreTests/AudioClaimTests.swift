@@ -21,7 +21,12 @@ final class AudioClaimTests: XCTestCase {
     func testKeyInTheAppEndsItsClaims() {
         let c = AudioClaims()
         c.add(claim(1, pid: 100)); c.add(claim(2, pid: 100)); c.add(claim(3, pid: 200))
-        XCTAssertEqual(Set(released(by: .key(front: 100), in: c)?.map(\.window) ?? []), [1, 2])
+        let hit = released(by: .key(front: 100), in: c) ?? []
+        XCTAssertEqual(Set(hit.map(\.window)), [1, 2])
+        // Still muted while their sound is silenced, then not.
+        XCTAssertEqual(c.pids(open: [1, 2, 3]), [100, 200])
+        XCTAssertFalse(c.isIdle)
+        c.finish(hit)
         XCTAssertEqual(c.pids(open: [1, 2, 3]), [200])
     }
 
@@ -37,8 +42,12 @@ final class AudioClaimTests: XCTestCase {
     func testMediaKeyEndsEveryClaim() {
         let c = AudioClaims()
         c.add(claim(1, pid: 100)); c.add(claim(3, pid: 200))
-        XCTAssertEqual(Set(released(by: .mediaKey, in: c)?.map(\.window) ?? []), [1, 3])
+        let hit = released(by: .mediaKey, in: c) ?? []
+        XCTAssertEqual(Set(hit.map(\.window)), [1, 3])
         XCTAssertTrue(c.isEmpty)
+        XCTAssertFalse(c.isIdle)
+        c.finish(hit)
+        XCTAssertTrue(c.isIdle)
     }
 
     /// With no claims, input does nothing (and costs nothing on the tap).

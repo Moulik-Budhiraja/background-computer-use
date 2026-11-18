@@ -22,6 +22,10 @@ final class AudioClaims {
 
     private let lock = NSLock()
     private var claims: [CGWindowID: Claim] = [:]
+    /// Claims the user has ended whose sound is still being silenced: their
+    /// apps stay muted until `finish`, so a routing pass in between doesn't
+    /// let the agent's sound out early.
+    private var releasing: [CGWindowID: Claim] = [:]
     private var notes: [String] = []
     /// Off the input tap's thread: finding the window under a click and
     /// pressing the mute element take milliseconds.
@@ -42,7 +46,10 @@ final class AudioClaims {
         return sessions.contains { c in c.lock.lock(); defer { c.lock.unlock() }; return c.claims.values.contains { $0.pid == pid } }
     }
 
+    /// No claim the user's input can end.
     var isEmpty: Bool { lock.lock(); defer { lock.unlock() }; return claims.isEmpty }
+    /// No claim, ended or not, whose app is still muted.
+    var isIdle: Bool { lock.lock(); defer { lock.unlock() }; return claims.isEmpty && releasing.isEmpty }
 
     func add(_ claim: Claim) {
         lock.lock(); claims[claim.window] = claim; lock.unlock()
@@ -52,11 +59,16 @@ final class AudioClaims {
         lock.lock(); defer { lock.unlock() }; return claims[window] != nil
     }
 
-    /// The claimed apps, dropping claims on windows that are gone.
+    /// The apps to keep muted, dropping claims on windows that are gone.
     func pids(open: Set<CGWindowID>) -> Set<pid_t> {
         lock.lock(); defer { lock.unlock() }
         claims = claims.filter { open.contains($0.key) }
-        return Set(claims.values.map(\.pid))
+        return Set(claims.values.map(\.pid)).union(releasing.values.map(\.pid))
+    }
+
+    /// These ended claims' sound has been dealt with: their apps can play.
+    func finish(_ hit: [Claim]) {
+        lock.lock(); for c in hit { releasing[c.window] = nil }; lock.unlock()
     }
 
     /// What happened since the agent's last call, for its next result.
@@ -86,7 +98,7 @@ final class AudioClaims {
             self.lock.lock()
             let hit = self.claims.values.filter { pid == nil || $0.pid == pid }
             if !hit.isEmpty { Log.info("audio: user input \(input) in pid \(pid.map(String.init) ?? "any") ends \(hit.count) claim(s)") }
-            for c in hit { self.claims[c.window] = nil }
+            for c in hit { self.claims[c.window] = nil; self.releasing[c.window] = c }
             self.lock.unlock()
             if !hit.isEmpty { release(hit, pid == nil ? "pressed a media key, which can play sound in" : "started using") }
         }
@@ -146,6 +158,6 @@ final class AudioClaims {
     static let again = "To play sound in it again, pause yours, call capture_audio, then unmute and play."
 
     func clear() {
-        lock.lock(); claims = [:]; lock.unlock()
+        lock.lock(); claims = [:]; releasing = [:]; lock.unlock()
     }
 }
