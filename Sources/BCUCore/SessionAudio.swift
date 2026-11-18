@@ -198,7 +198,8 @@ public final class SessionAudio {
 
     /// What routing did for this app (after `routeNow`).
     public func state(of app: NSRunningApplication) -> State {
-        queue.sync {
+        guard #available(macOS 14.2, *) else { return .failed("macOS before 14.2 has no process taps") }
+        return queue.sync {
             let ids = Self.audioProcesses(of: [app])
             if ids.isEmpty { return .notOpenedYet }
             guard tapID != kAudioObjectUnknown, Set(ids).isSubset(of: processes) else {

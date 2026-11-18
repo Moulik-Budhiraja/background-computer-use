@@ -1391,6 +1391,9 @@ public final class Engine {
     private func captureAudio(_ args: Args) throws -> ToolResult {
         let (w, _) = try agentWindow(args)
         guard let app = NSRunningApplication(processIdentifier: w.pid) else { throw ToolError("\(w.appName) isn't running") }
+        guard #available(macOS 14.2, *) else {
+            throw ToolError("This Mac's macOS is older than 14.2, which can't keep one app's sound off the speakers. Don't play sound; if the task needs it, tell the user.")
+        }
         // Only agents' windows: muted anyway, but only once the app starts
         // playing, and the first ~0.7 s gets out. A claim reads the tap from now.
         let agentsOnly = Self.appsOnAgent(checking: [w.pid])[w.pid] == true && !w.withUser
