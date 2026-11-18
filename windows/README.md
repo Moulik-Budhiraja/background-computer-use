@@ -50,7 +50,9 @@ The first launch opens a setup window, like the Mac app's onboarding: what the a
 
 Built: keeping new windows off the user's screen from inside the app (`bcu_hook.dll`), the MCP server (`bcu.exe mcp`), the pipe between it and the app, the UI Automation listing and diff, posted click/type/key/scroll/drag, set_value, perform_action, batch, screenshots, open_window, borrow_window, release_window, handoff/take_back, the focus guard, the agent screen (shared, a thread per agent session), the tray icon and its live preview, and the first-run setup window.
 
-Not yet: taking over an agent's monitor from the expanded view, `press_menu_item`, `navigate`, sound, crash cleanup, testing on a real PC with a real agent. Agents share one agent screen, so their windows can cover each other.
+Not yet: taking over an agent's monitor from the expanded view, `press_menu_item`, `navigate`, sound, testing on a real PC with a real agent. Agents share one agent screen; each agent window gets its own place on it, offset from the others, so none is wholly covered (a covered window stops drawing).
+
+Windows go back to the user when an agent is done with them: when its `bcu mcp` disconnects (10 s later), on Stop and Quit (a window that won't close, say because it asks about saving, goes to the user's screen with its dialog), and when the user signs out or shuts down. The app saves its agents' windows to `%APPDATA%\BackgroundComputerUse\agent-windows.json` as they change, so if it crashes or is killed, the next start puts them back too: borrowed ones exactly where they were, maximized or minimized, and the rest on the user's screen, with their taskbar buttons.
 
 ## Install, updates and releases
 

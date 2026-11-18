@@ -192,13 +192,18 @@ pub fn exe_matches(want: &[u16; EXE_LEN], have: &[u16; EXE_LEN]) -> bool {
 // ---------- placing windows (shared with the tray app) ----------
 
 /// Where the n-th agent window goes on its screen, keeping its size if it fits.
+/// Every agent's windows share the screen, and a window that's wholly
+/// covered stops drawing (Chromium), so each slot is offset from the others
+/// (24 places, cascading down and then across) and a window is shrunk to fit
+/// at its offset rather than pushed back over the first slot.
 pub fn slot(area: RECT, index: u32, w: i32, h: i32) -> (i32, i32, i32, i32) {
     let aw = area.right - area.left;
     let ah = area.bottom - area.top;
-    let w = w.clamp(400, (aw - 40).max(400));
-    let h = h.clamp(300, (ah - 40).max(300));
     let step = (index % 6) as i32 * 30;
-    let x = (area.left + 20 + step).min(area.right - w);
+    let dx = step + (index / 6 % 4) as i32 * 60;
+    let w = w.clamp(400, (aw - 40 - dx).max(400));
+    let h = h.clamp(300, (ah - 40 - step).max(300));
+    let x = (area.left + 20 + dx).min(area.right - w);
     let y = (area.top + 20 + step).min(area.bottom - h);
     (x, y, w, h)
 }
@@ -215,12 +220,19 @@ pub enum From {
 
 /// Move `hwnd` to its slot on `area`. A maximized window is restored into
 /// the slot without being activated, except from `OutsideAsync`, where that
-/// would wait on the app; it's then moved as it is.
+/// would wait on the app; it's then moved as it is. A minimized one is
+/// restored into the slot only from `Outside` (a borrowed window), and left
+/// alone otherwise.
 pub fn place(hwnd: HWND, area: RECT, index: u32, from: From) {
     unsafe {
         let mut wp = WINDOWPLACEMENT { length: size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
         let _ = GetWindowPlacement(hwnd, &mut wp);
-        let zoomed = IsZoomed(hwnd).as_bool();
+        let iconic = IsIconic(hwnd).as_bool();
+        if iconic && from != From::Outside {
+            return;
+        }
+        // Treated like a maximized one: restored into the slot, without activating it.
+        let zoomed = IsZoomed(hwnd).as_bool() || iconic;
         let mut r = RECT::default();
         if zoomed {
             r = wp.rcNormalPosition;
@@ -637,6 +649,21 @@ mod tests {
         let (x, y, w, h) = slot(area, 0, 5000, 5000);
         assert_eq!((w, h), (1560, 960));
         assert!(x + w <= area.right && y + h <= area.bottom);
+    }
+
+    #[test]
+    fn slots_never_sit_on_each_other() {
+        let area = RECT { left: 1920, top: 1080, right: 3520, bottom: 2080 };
+        // Even windows as big as the screen get a place of their own.
+        for (w, h) in [(900, 500), (5000, 5000)] {
+            let places: Vec<_> = (0..24).map(|i| slot(area, i, w, h)).collect();
+            for (i, a) in places.iter().enumerate() {
+                assert!(a.0 >= area.left && a.1 >= area.top && a.0 + a.2 <= area.right && a.1 + a.3 <= area.bottom, "slot {i} {a:?}");
+                for b in &places[i + 1..] {
+                    assert!((a.0, a.1) != (b.0, b.1), "{a:?} and {b:?}");
+                }
+            }
+        }
     }
 
     #[test]

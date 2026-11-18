@@ -98,6 +98,8 @@ pub fn serve() -> Result<(), String> {
 fn serve_connection(file: std::fs::File) {
     let Ok(mut writer) = file.try_clone() else { return };
     let reader = BufReader::new(file);
+    // Sessions that end when this connection does (a `bcu mcp`'s).
+    let mut live: Vec<String> = Vec::new();
     for line in reader.lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -107,7 +109,14 @@ fn serve_connection(file: std::fs::File) {
             Ok(v) => {
                 let id = v.get("id").cloned().unwrap_or(Value::Null);
                 let tool = v["tool"].as_str().unwrap_or("").to_string();
-                let args: Map<String, Value> = v["args"].as_object().cloned().unwrap_or_default();
+                let mut args: Map<String, Value> = v["args"].as_object().cloned().unwrap_or_default();
+                if args.remove("_live").and_then(|l| l.as_bool()) == Some(true)
+                    && let Some(session) = args.get("_session").and_then(Value::as_str)
+                    && !live.iter().any(|s| s == session)
+                {
+                    engine::connected(session);
+                    live.push(session.to_string());
+                }
                 let (tx, rx) = mpsc::channel();
                 engine::submit(Request { tool, args, reply: tx });
                 (id, rx.recv().unwrap_or_else(|_| ToolResult::error("the app is shutting down")))
@@ -128,5 +137,8 @@ fn serve_connection(file: std::fs::File) {
         if writer.write_all(&bytes).is_err() {
             break;
         }
+    }
+    for session in live {
+        engine::disconnected(&session);
     }
 }

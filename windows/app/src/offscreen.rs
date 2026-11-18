@@ -14,19 +14,19 @@
 //! Both read the table in shared memory this module writes (`bcu_hook::Shared`).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use bcu_hook::{EXE_LEN, From, Kept, MAX_AREAS, Open, Shared};
-use windows::Win32::Foundation::{HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{HMODULE, WAIT_ABANDONED, WAIT_OBJECT_0, HWND, INVALID_HANDLE_VALUE, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE};
 use windows::Win32::System::SystemInformation::GetTickCount64;
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent, WINEVENTPROC};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::HSTRING;
+use windows::core::{HSTRING, w};
 
 use crate::win;
 
@@ -68,10 +68,20 @@ fn now_ms() -> u64 {
     unsafe { GetTickCount64() }
 }
 
+/// Whether this is the only copy of the app running (a second one exits
+/// once it finds the pipe taken, and must not touch the first one's windows).
+static ALONE: AtomicBool = AtomicBool::new(false);
+
 /// Create the shared table and, if bcu_hook.dll is next to the app, the
 /// thread that hooks it into apps. Call once at start.
 pub fn start() {
     unsafe {
+        // Held for the app's lifetime; Windows lets go of it when the app
+        // exits or dies. A copy that's quitting for an update gets a moment.
+        if let Ok(instance) = CreateMutexW(None, false, w!("Local\\BackgroundComputerUse-instance")) {
+            let got = WaitForSingleObject(instance, 3000);
+            ALONE.store(got == WAIT_OBJECT_0 || got == WAIT_ABANDONED, Ordering::Relaxed);
+        }
         let Ok(mapping) = CreateFileMappingW(INVALID_HANDLE_VALUE, None, PAGE_READWRITE, 0, Shared::SIZE as u32, bcu_hook::MAPPING) else {
             eprintln!("offscreen: couldn't create the shared table");
             return;
@@ -82,6 +92,12 @@ pub fn start() {
         }
         // The mapping stays open for the app's lifetime.
         let _ = SHARED.set(view.Value as usize);
+    }
+    // Apps the DLL is still loaded in keep the table alive after the app
+    // crashed or was killed, and would keep pulling its windows back onto
+    // the agent screen: start empty.
+    if ALONE.load(Ordering::Relaxed) {
+        write(|t| *t = unsafe { std::mem::zeroed() });
     }
     let dll = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("bcu_hook.dll")));
     let Some(dll) = dll.filter(|p| p.exists()) else {
@@ -282,6 +298,11 @@ fn hook_for_open(id: u32, pid: u32, wait: bool) -> bool {
 
 /// An agent window: keep it on `area` from now on.
 pub fn keep(hwnd: HWND, area: RECT, index: usize) {
+    save(|list| {
+        if !list.iter().any(|s| s.hwnd == hwnd.0 as usize as u64) {
+            list.push(Saved { hwnd: hwnd.0 as usize as u64, pid: win::pid_tid(hwnd).0, home: None });
+        }
+    });
     refresh_areas();
     let h = hwnd.0 as usize as u64;
     write(|t| {
@@ -304,6 +325,7 @@ pub fn keep(hwnd: HWND, area: RECT, index: usize) {
 /// No longer an agent window (released, handed off, closed).
 pub fn forget(hwnd: HWND) {
     let h = hwnd.0 as usize as u64;
+    save(|list| list.retain(|s| s.hwnd != h));
     write(|t| {
         for k in t.kept.iter_mut().filter(|k| k.hwnd == h) {
             k.hwnd = 0;
@@ -425,5 +447,126 @@ fn may_move(h: usize) -> bool {
             moves.push((h, Instant::now(), 1));
             true
         }
+    }
+}
+
+// ---------- after a crash ----------
+
+/// An agent window, saved to a file while it's the agent's, so the windows
+/// aren't stranded on the agent screen without a taskbar button if the app
+/// dies (a crash, a kill, a quit that ran out of time).
+struct Saved {
+    hwnd: u64,
+    pid: u32,
+    /// Where a borrowed window was: its WINDOWPLACEMENT.
+    home: Option<WINDOWPLACEMENT>,
+}
+
+static SAVED: Mutex<Vec<Saved>> = Mutex::new(Vec::new());
+
+fn saved_path() -> std::path::PathBuf {
+    crate::setup::support_dir().join("agent-windows.json")
+}
+
+fn save(f: impl FnOnce(&mut Vec<Saved>)) {
+    if !ALONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut list = SAVED.lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut list);
+    let path = saved_path();
+    if list.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let json = serde_json::Value::Array(list.iter().map(to_json).collect()).to_string();
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// A borrowed window: where to put it back.
+pub fn set_home(hwnd: HWND, home: &WINDOWPLACEMENT) {
+    save(|list| {
+        if let Some(s) = list.iter_mut().find(|s| s.hwnd == hwnd.0 as usize as u64) {
+            s.home = Some(*home);
+        }
+    });
+}
+
+fn to_json(s: &Saved) -> serde_json::Value {
+    let home = s.home.map(|p| {
+        let r = p.rcNormalPosition;
+        serde_json::json!([p.flags.0, p.showCmd, p.ptMinPosition.x, p.ptMinPosition.y, p.ptMaxPosition.x, p.ptMaxPosition.y, r.left, r.top, r.right, r.bottom])
+    });
+    serde_json::json!({"hwnd": s.hwnd, "pid": s.pid, "home": home})
+}
+
+fn from_json(v: &serde_json::Value) -> Option<Saved> {
+    let home = match v.get("home").and_then(|h| h.as_array()) {
+        Some(a) if a.len() == 10 => {
+            let n: Vec<i64> = a.iter().map(|x| x.as_i64()).collect::<Option<_>>()?;
+            Some(WINDOWPLACEMENT {
+                length: size_of::<WINDOWPLACEMENT>() as u32,
+                flags: WINDOWPLACEMENT_FLAGS(n[0] as u32),
+                showCmd: n[1] as u32,
+                ptMinPosition: POINT { x: n[2] as i32, y: n[3] as i32 },
+                ptMaxPosition: POINT { x: n[4] as i32, y: n[5] as i32 },
+                rcNormalPosition: RECT { left: n[6] as i32, top: n[7] as i32, right: n[8] as i32, bottom: n[9] as i32 },
+            })
+        }
+        _ => None,
+    };
+    Some(Saved { hwnd: v.get("hwnd")?.as_u64()?, pid: v.get("pid")?.as_u64()? as u32, home })
+}
+
+/// At start: the windows agents had when the app last stopped without
+/// letting them go go back to the user: borrowed ones where they were, the
+/// rest to the middle of the user's screen, with their taskbar buttons.
+pub fn recover() {
+    if !ALONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let path = saved_path();
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let _ = std::fs::remove_file(&path);
+    let list: Vec<Saved> = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.as_array().map(|a| a.iter().filter_map(from_json).collect()))
+        .unwrap_or_default();
+    for s in list {
+        let hwnd = HWND(s.hwnd as usize as *mut _);
+        // The same window, not a new one that got its handle.
+        if !win::exists(hwnd) || !win::is_visible(hwnd) || win::pid_tid(hwnd).0 != s.pid {
+            continue;
+        }
+        match &s.home {
+            Some(home) => crate::apps::put_back(hwnd, home),
+            None => crate::apps::to_user_screen(hwnd),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_windows_round_trip() {
+        let home = WINDOWPLACEMENT {
+            length: size_of::<WINDOWPLACEMENT>() as u32,
+            flags: WINDOWPLACEMENT_FLAGS(2),
+            showCmd: 3,
+            ptMinPosition: POINT { x: -1, y: -1 },
+            ptMaxPosition: POINT { x: -8, y: -8 },
+            rcNormalPosition: RECT { left: -1900, top: 10, right: -100, bottom: 900 },
+        };
+        for s in [Saved { hwnd: 0x1234, pid: 77, home: Some(home) }, Saved { hwnd: 0x55, pid: 9, home: None }] {
+            let back = from_json(&serde_json::from_str(&to_json(&s).to_string()).unwrap()).unwrap();
+            assert_eq!((back.hwnd, back.pid, back.home), (s.hwnd, s.pid, s.home));
+        }
+        assert!(from_json(&serde_json::json!({"pid": 1})).is_none());
     }
 }

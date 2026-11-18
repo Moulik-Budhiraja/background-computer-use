@@ -118,6 +118,19 @@ pub fn add(id: &str, label: String) {
     changed();
 }
 
+/// The session ended (its agent disconnected), or is being started again.
+pub fn remove(id: &str) {
+    let removed = {
+        let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let before = views.len();
+        views.retain(|v| v.id != id);
+        views.len() != before
+    };
+    if removed {
+        changed();
+    }
+}
+
 pub fn update(id: &str, f: impl FnOnce(&mut View)) {
     {
         let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());

@@ -10,9 +10,7 @@ use serde_json::{Map, Value, json};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx};
 use windows::Win32::UI::Accessibility::*;
-use windows::Win32::UI::WindowsAndMessaging::{
-    PostMessageW, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, WM_CLOSE,
-};
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WINDOWPLACEMENT, WM_CLOSE};
 use windows::core::BSTR;
 
 use crate::snapshot::{self, Node, Snapshot};
@@ -71,8 +69,10 @@ struct AgentWindow {
     kind: Kind,
     /// When the agent got it, for the tray's app order.
     opened: Instant,
-    /// Where a borrowed window was, to put it back.
-    home: Option<RECT>,
+    /// Its place on the agent screen (see `take_slot`).
+    slot: usize,
+    /// Where a borrowed window was, and whether maximized or minimized, to put it back.
+    home: Option<WINDOWPLACEMENT>,
     /// Why the agent handed it to the user, while it's handed off.
     handoff: Option<String>,
 }
@@ -98,6 +98,81 @@ enum Job {
     HandBack,
     /// Close the session's windows, then say so on the channel if there is one.
     Stop(Option<mpsc::Sender<()>>),
+    /// The user is signing out or shutting down: give every window to the
+    /// user as it is (no closing, which could ask about saving), then say so.
+    Surrender(mpsc::Sender<()>),
+    /// The agent disconnected: close its windows and end the session.
+    End,
+}
+
+/// Places on the agent screen in use, by every session's windows (true =
+/// taken). Each window gets its own: all agents share the screen, and a
+/// window exactly under another stops drawing.
+static SLOTS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+
+fn lowest_free(used: &[bool]) -> usize {
+    used.iter().position(|u| !u).unwrap_or(used.len())
+}
+
+fn take_slot() -> usize {
+    let mut used = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let i = lowest_free(&used);
+    if i == used.len() {
+        used.push(true);
+    } else {
+        used[i] = true;
+    }
+    i
+}
+
+fn free_slot(i: usize) {
+    if let Some(u) = SLOTS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(i) {
+        *u = false;
+    }
+}
+
+/// `bcu mcp` connections open per session: (session, connections, a count
+/// of connects). A session whose last one closes ends after `GRACE`, unless
+/// it connects again meanwhile.
+static LIVE: Mutex<Vec<(String, usize, u64)>> = Mutex::new(Vec::new());
+const GRACE: Duration = Duration::from_secs(10);
+
+/// A `bcu mcp` connection started carrying calls for `session` (from the pipe threads).
+pub fn connected(session: &str) {
+    let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    match live.iter_mut().find(|(s, _, _)| s == session) {
+        Some(entry) => {
+            entry.1 += 1;
+            entry.2 += 1;
+        }
+        None => live.push((session.to_string(), 1, 1)),
+    }
+}
+
+/// That connection closed: the agent quit, or its MCP client restarted it.
+pub fn disconnected(session: &str) {
+    let generation = {
+        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = live.iter_mut().find(|(s, _, _)| s == session) else { return };
+        entry.1 = entry.1.saturating_sub(1);
+        if entry.1 > 0 {
+            return;
+        }
+        entry.2
+    };
+    let session = session.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(GRACE);
+        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = live.iter().position(|(s, n, g)| *s == session && *n == 0 && *g == generation) {
+            live.remove(i);
+            drop(live);
+            // A new call for it starts a new session.
+            if let Some(tx) = queues().remove(&session) {
+                let _ = tx.send(Job::End);
+            }
+        }
+    });
 }
 
 /// Set when the app is quitting: batches stop between steps and waits end early.
@@ -124,8 +199,19 @@ pub fn submit(r: Request) {
     let id = r.args.get("_session").and_then(Value::as_str).unwrap_or("cli").to_string();
     let client = r.args.get("_client").and_then(Value::as_str).map(String::from);
     let mut queues = queues();
-    let tx = queues.entry(id.clone()).or_insert_with(|| spawn(id.clone(), client.as_deref()));
-    if let Err(mpsc::SendError(Job::Call(r))) = tx.send(Job::Call(r)) {
+    let mut job = Job::Call(r);
+    // A session thread that died (a panic outside a call) is started again.
+    for _ in 0..2 {
+        let tx = queues.entry(id.clone()).or_insert_with(|| spawn(id.clone(), client.as_deref()));
+        match tx.send(job) {
+            Ok(()) => return,
+            Err(mpsc::SendError(back)) => {
+                queues.remove(&id);
+                job = back;
+            }
+        }
+    }
+    if let Job::Call(r) = job {
         let _ = r.reply.send(ToolResult::error("the session's engine stopped; try again"));
     }
 }
@@ -145,13 +231,27 @@ pub fn stop(session: Option<&str>) {
 
 /// Before the app quits (Quit, or an update): stop every session's call at the
 /// next step, close their windows and give borrowed ones back, and wait for
-/// that, `limit` at most.
+/// that, `limit` at most. The sessions do this side by side.
 pub fn stop_for_quit(limit: Duration) {
     QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
+    on_every_session(limit, |tx| Job::Stop(Some(tx)));
+}
+
+/// The user is signing out or shutting down (WM_QUERYENDSESSION): give every
+/// agent window to the user now, before apps save where their windows were,
+/// so none reopens on the agent screen. `limit` at most.
+pub fn surrender_for_end_of_session(limit: Duration) {
+    QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
+    on_every_session(limit, Job::Surrender);
+    // Shutting down can still be cancelled.
+    QUITTING.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn on_every_session(limit: Duration, job: impl Fn(mpsc::Sender<()>) -> Job) {
     let (tx, rx) = mpsc::channel();
     let mut sent = 0;
     for q in queues().values() {
-        if q.send(Job::Stop(Some(tx.clone()))).is_ok() {
+        if q.send(job(tx.clone())).is_ok() {
             sent += 1;
         }
     }
@@ -198,6 +298,7 @@ fn describe(tool: &str) -> &'static str {
 }
 
 fn spawn(id: String, client: Option<&str>) -> mpsc::Sender<Job> {
+    sessions::remove(&id);
     sessions::add(&id, sessions::label_for(client));
     let (tx, rx) = mpsc::channel::<Job>();
     std::thread::Builder::new()
@@ -233,7 +334,11 @@ fn run_session(id: String, rx: mpsc::Receiver<Job>) {
                     v.busy = Some(busy);
                     v.last_call = Some(Instant::now());
                 });
-                let result = engine.call(&r.tool, &r.args);
+                // A bug in one call fails that call, not the session.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.call(&r.tool, &r.args))).unwrap_or_else(|e| {
+                    let what = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default();
+                    ToolResult::error(format!("{} failed inside the app: {what}. Try again; if it keeps failing, try another way.", r.tool))
+                });
                 let _ = r.reply.send(result);
                 last_call = Instant::now();
                 engine.publish(|v| {
@@ -252,6 +357,19 @@ fn run_session(id: String, rx: mpsc::Receiver<Job>) {
                 engine.hand_back();
                 engine.publish(|v| v.paused = false);
             }
+            Ok(Job::Surrender(done)) => {
+                let ids: Vec<u64> = engine.windows.keys().copied().collect();
+                for w in ids {
+                    engine.give_up(w);
+                }
+                engine.publish(|_| {});
+                let _ = done.send(());
+            }
+            Ok(Job::End) => {
+                engine.stop_all();
+                sessions::remove(&id);
+                return;
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -266,6 +384,7 @@ fn run_session(id: String, rx: mpsc::Receiver<Job>) {
                 let alive = win::exists(w.hwnd);
                 if !alive {
                     guard::remove_agent_window(w.hwnd);
+                    free_slot(w.slot);
                 }
                 alive
             });
@@ -340,31 +459,53 @@ impl Engine {
             return;
         }
         let Some(m) = monitor::of_session(&self.id) else { return };
-        for (n, w) in self.windows.values().enumerate() {
+        for w in self.windows.values() {
             if w.handed_off() || w.kind == Kind::Adopted || win::is_minimized(w.hwnd) || !monitor::on_user_screen(&win::frame(w.hwnd)) {
                 continue;
             }
-            apps::place(w.hwnd, m.rect, n);
+            apps::place(w.hwnd, m.rect, w.slot);
         }
     }
 
-    /// Stop from the tray: close the windows agents opened, return borrowed ones.
+    /// Stop (the tray's, a quit's, or the agent disconnecting): close the
+    /// windows agents opened, return borrowed ones. All at once, a few
+    /// seconds at most: a window that won't close (an app asking whether to
+    /// save) goes to the user's screen instead, for them to answer.
     pub fn stop_all(&mut self) {
-        // Ask every opened window to close first, so they close together.
-        for w in self.windows.values().filter(|w| w.kind == Kind::Opened) {
+        let closing: Vec<HWND> = self.windows.values().filter(|w| w.kind == Kind::Opened).map(|w| w.hwnd).collect();
+        for hwnd in &closing {
             unsafe {
-                let _ = PostMessageW(Some(w.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(Some(*hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
             }
+        }
+        let t = Instant::now();
+        while closing.iter().any(|h| win::exists(*h) && win::is_visible(*h)) && t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(50));
         }
         let ids: Vec<u64> = self.windows.keys().copied().collect();
         for id in ids {
-            let mut args = Map::new();
-            args.insert("window_id".into(), json!(id));
-            let _ = self.release_window(&Args(&args));
+            self.give_up(id);
         }
-        if self.windows.is_empty() {
-            monitor::release(&self.id);
+        monitor::release(&self.id);
+    }
+
+    /// The window is no longer the agent's. One that's still showing goes
+    /// back to the user: a borrowed one where it was, any other to the
+    /// middle of their screen, with its taskbar button.
+    fn give_up(&mut self, id: u64) -> Option<AgentWindow> {
+        let w = self.windows.remove(&id)?;
+        self.snapshots.remove(&id);
+        self.last_action.remove(&id);
+        guard::remove_agent_window(w.hwnd);
+        free_slot(w.slot);
+        if w.kind != Kind::Adopted && win::exists(w.hwnd) && win::is_visible(w.hwnd) {
+            match &w.home {
+                Some(home) => apps::put_back(w.hwnd, home),
+                None if w.handed_off() => apps::show_in_taskbar(w.hwnd),
+                None => apps::to_user_screen(w.hwnd),
+            }
         }
+        Some(w)
     }
 
     /// The user is done with what the agent handed them: back to the agent's monitor.
@@ -438,9 +579,7 @@ impl Engine {
             return Err(format!("window {id} isn't one of yours. Use open_window or borrow_window first, or list_windows."));
         };
         if !win::exists(w.hwnd) {
-            guard::remove_agent_window(w.hwnd);
-            self.windows.remove(&id);
-            self.snapshots.remove(&id);
+            self.give_up(id);
             return Err(format!("window {id} no longer exists"));
         }
         if w.handed_off() {
@@ -457,11 +596,12 @@ impl Engine {
         let name = args.need_str("app")?;
         let app = apps::resolve(name)?;
         let mon = self.agent_monitor()?;
-        let index = self.windows.len();
-        let (hwnd, mut notes) = {
+        let slot = take_slot();
+        let opened = {
             let _one_at_a_time = OPENING.lock().unwrap_or_else(|e| e.into_inner());
-            apps::open(&app, mon, index)?
+            apps::open(&app, mon, slot)
         };
+        let (hwnd, mut notes) = opened.inspect_err(|_| free_slot(slot))?;
         // Agents reach for whatever browser comes to mind; only the default
         // one has the user's logins.
         if let Some((default_name, default_exe)) = win::default_browser()
@@ -476,7 +616,7 @@ impl Engine {
         }
         let pid = win::pid_tid(hwnd).0;
         let id = win::id(hwnd);
-        self.windows.insert(id, AgentWindow { hwnd, pid, app: app.name.clone(), kind: Kind::Opened, opened: Instant::now(), home: None, handoff: None });
+        self.windows.insert(id, AgentWindow { hwnd, pid, app: app.name.clone(), kind: Kind::Opened, opened: Instant::now(), slot, home: None, handoff: None });
         let f = win::frame(hwnd);
         Ok(ToolResult::ok(format!(
             "Opened window {id} of {} on your monitor ({}x{}). Next: get_window_state window_id={id}.\nNotes: {}",
@@ -502,16 +642,29 @@ impl Engine {
         if win::foreground() == hwnd {
             return Err(format!("the user is using window {id} right now. Pick another, or wait."));
         }
-        let mon = self.agent_monitor()?;
-        let mut home = RECT::default();
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut home);
-        }
         let pid = win::pid_tid(hwnd).0;
-        guard::add_agent_window(hwnd, mon, self.windows.len());
-        apps::place(hwnd, mon, self.windows.len());
+        // Windows drops this app's moves and input to an app running as
+        // administrator (UIPI): the window would stay on the user's screen.
+        if win::above_us(pid) {
+            return Err(format!(
+                "{} runs as administrator, so Windows doesn't let this app move window {id} or send it input. Ask the user to do this part, or to restart the app without admin rights.",
+                win::app_name(pid)
+            ));
+        }
+        let mon = self.agent_monitor()?;
+        let home = apps::placement(hwnd);
+        let slot = take_slot();
+        guard::add_agent_window(hwnd, mon, slot);
+        crate::offscreen::set_home(hwnd, &home);
+        apps::place(hwnd, mon, slot);
         apps::hide_from_taskbar(hwnd);
-        self.windows.insert(id, AgentWindow { hwnd, pid, app: win::app_name(pid), kind: Kind::Borrowed, opened: Instant::now(), home: Some(home), handoff: None });
+        let w = AgentWindow { hwnd, pid, app: win::app_name(pid), kind: Kind::Borrowed, opened: Instant::now(), slot, home: Some(home), handoff: None };
+        if !apps::on_monitor(hwnd, &mon) || win::is_minimized(hwnd) {
+            self.windows.insert(id, w);
+            self.give_up(id);
+            return Err(format!("window {id} of {} didn't move onto your monitor, so it was left with the user.", win::app_name(pid)));
+        }
+        self.windows.insert(id, w);
         Ok(ToolResult::ok(format!("Borrowed window {id} of {} onto your monitor. release_window puts it back where it was.", win::app_name(pid))))
     }
 
@@ -520,16 +673,8 @@ impl Engine {
         let id = self.window(args)?;
         let reason = args.need_str("reason")?.to_string();
         let w = self.windows.get_mut(&id).unwrap();
-        let work = primary_work_area();
-        let f = win::frame(w.hwnd);
-        let (fw, fh) = ((f.right - f.left).min(work.right - work.left), (f.bottom - f.top).min(work.bottom - work.top));
-        let x = work.left + (work.right - work.left - fw) / 2;
-        let y = work.top + (work.bottom - work.top - fh) / 2;
         guard::remove_agent_window(w.hwnd);
-        unsafe {
-            let _ = SetWindowPos(w.hwnd, None, x, y, fw, fh, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-        apps::show_in_taskbar(w.hwnd);
+        apps::to_user_screen(w.hwnd);
         w.handoff = Some(reason.clone());
         Ok(ToolResult::ok(format!("Handed window {id} to the user: \"{reason}\". It's on their screen now. Stop here; call take_back when they say they're done.")))
     }
@@ -537,8 +682,8 @@ impl Engine {
     fn take_back(&mut self, args: &Args) -> Fallible<ToolResult> {
         let id = args.need_int("window_id")? as u64;
         let mon = self.agent_monitor()?;
-        let index = self.windows.len();
         let w = self.windows.get_mut(&id).ok_or_else(|| format!("window {id} isn't one of yours"))?;
+        let index = w.slot;
         if !w.handed_off() {
             return Err(format!("window {id} isn't handed off"));
         }
@@ -663,7 +808,7 @@ impl Engine {
             return Err(format!("{id} is not a window"));
         }
         let pid = win::pid_tid(hwnd).0;
-        self.windows.insert(id, AgentWindow { hwnd, pid, app: win::app_name(pid), kind: Kind::Adopted, opened: Instant::now(), home: None, handoff: None });
+        self.windows.insert(id, AgentWindow { hwnd, pid, app: win::app_name(pid), kind: Kind::Adopted, opened: Instant::now(), slot: take_slot(), home: None, handoff: None });
         Ok(ToolResult::ok(format!("Adopted window {id} of {} for testing. It stays where it is.", win::app_name(pid))))
     }
 
@@ -970,21 +1115,12 @@ impl Engine {
                 ));
             }
         }
-        let w = self.windows.remove(&id).unwrap();
-        self.snapshots.remove(&id);
-        guard::remove_agent_window(w.hwnd);
+        let w = self.give_up(id).unwrap();
         let text = match w.kind {
             Kind::Opened if !keep => format!("Closed window {id}."),
-            Kind::Borrowed => {
-                if let Some(r) = w.home {
-                    unsafe {
-                        let _ = SetWindowPos(w.hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
-                    }
-                }
-                apps::show_in_taskbar(w.hwnd);
-                format!("Returned window {id} to the user.")
-            }
-            _ => format!("Released window {id}."),
+            Kind::Opened => format!("Left window {id} open, on the user's screen now."),
+            Kind::Borrowed => format!("Returned window {id} to the user."),
+            Kind::Adopted => format!("Released window {id}."),
         };
         Ok(ToolResult::ok(text))
     }
@@ -1105,12 +1241,14 @@ fn press(n: &Node) -> Fallible<Option<&'static str>> {
     Ok(None)
 }
 
-/// The primary monitor's work area (without the taskbar).
-fn primary_work_area() -> RECT {
-    use windows::Win32::UI::WindowsAndMessaging::{SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW};
-    let mut r = RECT::default();
-    unsafe {
-        let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut r as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slots_go_to_the_lowest_free_place() {
+        assert_eq!(lowest_free(&[]), 0);
+        assert_eq!(lowest_free(&[true, true]), 2);
+        assert_eq!(lowest_free(&[true, false, true]), 1);
     }
-    r
 }
