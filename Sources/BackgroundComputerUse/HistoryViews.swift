@@ -204,10 +204,22 @@ final class HistoryTrackView: NSView {
     private(set) var spacing: CGFloat = 8
     static let spacings: [CGFloat] = [2, 4, 8, 14, 24]
     private static let runGap: CGFloat = 36
-    /// What a lane takes: its icons above, its capsules, its labels under.
-    static let laneHeight: CGFloat = 60
+    /// What a lane takes: its icons above, its capsules, a row of activity
+    /// marks, its labels under.
+    static let laneHeight: CGFloat = 70
     /// The top lane's capsules' center.
     private static let firstMidY: CGFloat = 40
+    private static let barH: CGFloat = 18
+    /// Under a lane's capsules: its marks, then its labels.
+    private static let markDY = barH / 2 + 6
+    private static let labelDY = markDY + 6
+
+    private static let markColors: [HistoryModel.Mark.Kind: NSColor] = [
+        .read: .white.withAlphaComponent(0.28),
+        .action: .white.withAlphaComponent(0.8),
+        .note: NSColor(srgbRed: 0xF0 / 255, green: 0x9A / 255, blue: 0x0A / 255, alpha: 1),
+        .error: .systemRed,
+    ]
     /// Content x of the playhead.
     private var scrollX: CGFloat = 0
     private var animation: Timer?
@@ -271,6 +283,12 @@ final class HistoryTrackView: NSView {
         guard !scrolling, dragStart == nil else { return }
         scrollX = h.edge ? lastContentX : max(contentX(at), contentX(m.index))
     }
+    /// Where the pointer is, for the mark under it: in window points, since
+    /// the track can grow (a lane more) under a still pointer.
+    private var pointer: CGPoint?
+    private var tracking: NSTrackingArea?
+    /// For `--history-render`: the mark at this item shows as hovered.
+    private var testHover: Int?
 
     override var isFlipped: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -457,6 +475,66 @@ final class HistoryTrackView: NSView {
         return ok && scrollX > next
     }
 
+    /// A dot in a lane's row of marks: the marks (by item) it stands for.
+    /// Marks closer than a few points (zoomed out) merge into one dot, with
+    /// the color of the one that matters most.
+    private struct Dot {
+        let x: CGFloat
+        let lane: Int
+        var kind: HistoryModel.Mark.Kind
+        var items: [Int]
+    }
+
+    /// The dots between content x `left` and `right`. Drawing and hovering
+    /// both use these, so the dot under the pointer is the one drawn there.
+    private func dots(from left: CGFloat, to right: CGFloat) -> [Dot] {
+        guard let m = model else { return [] }
+        var dots: [Dot] = []
+        // A run's frames are in time order, so its marks go left to right.
+        var lastOfRun: [Int: Int] = [:]
+        for mark in m.marks {
+            let c = contentX(mark.item)
+            guard c >= left, c <= right else { continue }
+            let run = m.items[mark.item].run
+            let x = viewX(mark.item)
+            if let d = lastOfRun[run], x - dots[d].x < 5 {
+                dots[d].kind = max(dots[d].kind, mark.kind)
+                dots[d].items.append(mark.item)
+                continue
+            }
+            dots.append(Dot(x: x, lane: m.laneOf[run], kind: mark.kind, items: [mark.item]))
+            lastOfRun[run] = dots.count - 1
+        }
+        return dots
+    }
+
+    /// What a dot's callout says: the last line of the dot's color (the
+    /// error, the note, the action behind it), and how many more lines the
+    /// tooltip lists.
+    private func callout(for d: Dot) -> String? {
+        guard let m = model else { return nil }
+        let marks = d.items.compactMap { m.mark(at: $0) }
+        guard let mark = marks.last(where: { $0.kind == d.kind }) else { return nil }
+        var text = mark.lines[mark.kinds.lastIndex(of: mark.kind) ?? mark.lines.count - 1]
+        let more = marks.reduce(0) { $0 + $1.lines.count } - 1
+        if more > 0 { text += "  +\(more)" }
+        return text
+    }
+
+    /// For the self-test: the callout of the dot that the mark at item `i`
+    /// is drawn in, as it's on screen now.
+    func calloutForTest(_ i: Int) -> String? {
+        let half = bounds.width / 2 + 40
+        return dots(from: scrollX - half, to: scrollX + half).first { $0.items.contains(i) }.flatMap(callout)
+    }
+
+    /// The dot under view point `p`: in a lane's row of marks, the nearest
+    /// within a few points.
+    private func dot(at p: CGPoint, in dots: [Dot]) -> Dot? {
+        dots.filter { abs(p.y - (midY(lane: $0.lane) + Self.markDY)) <= 9 && abs($0.x - p.x) < 7 }
+            .min { abs($0.x - p.x) < abs($1.x - p.x) }
+    }
+
     // MARK: Following the model
 
     /// The model moved (keys, chevrons, a reload): bring the playhead there.
@@ -535,6 +613,33 @@ final class HistoryTrackView: NSView {
 
     // MARK: Input
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        // activeAlways: this app is never active.
+        let t = NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(t)
+        tracking = t
+    }
+
+    // The dot under the pointer is worked out as the track draws, so it
+    // stays right when the track moves or zooms under a still pointer.
+    override func mouseMoved(with event: NSEvent) {
+        pointer = event.locationInWindow
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointer = nil
+        needsDisplay = true
+    }
+
+    /// For `--history-render`: show the callout of the mark at item `i`.
+    func hoverForTest(_ i: Int?) {
+        testHover = i
+        needsDisplay = true
+    }
+
     /// Two fingers to the right (or the wheel) go back in time, like Coast.
     override func scrollWheel(with event: NSEvent) {
         animation?.invalidate()
@@ -581,6 +686,8 @@ final class HistoryTrackView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        // A drag sends no mouseMoved: keep the pointer for the hovered dot.
+        pointer = event.locationInWindow
         guard let s = dragStart else { return }
         let x = convert(event.locationInWindow, from: nil).x
         if abs(x - s.x) > 3 { dragged = true }
@@ -590,6 +697,8 @@ final class HistoryTrackView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        pointer = event.locationInWindow
+        needsDisplay = true
         let wasDrag = dragged
         dragStart = nil
         dragged = false
@@ -606,7 +715,7 @@ final class HistoryTrackView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let m = model, !m.items.isEmpty else { return }
         let ctx = NSGraphicsContext.current!.cgContext
-        let barH: CGFloat = 18
+        let barH = Self.barH
         let left = scrollX - bounds.width / 2 - 40, right = scrollX + bounds.width / 2 + 40
         let current = m.segmentOf.indices.contains(m.index) ? m.segmentOf[m.index] : -1
         let currentLane = m.current.map { m.laneOf[$0.run] } ?? 0
@@ -655,6 +764,14 @@ final class HistoryTrackView: NSView {
             }
         }
 
+        // What the agent did, as a dot under the frame that shows it.
+        let visibleDots = dots(from: left, to: right)
+        for d in visibleDots {
+            let r: CGFloat = d.kind == .read ? 1.5 : 2.5
+            ctx.setFillColor(Self.markColors[d.kind]!.cgColor)
+            ctx.fillEllipse(in: CGRect(x: d.x - r, y: midY(lane: d.lane) + Self.markDY - r, width: r * 2, height: r * 2))
+        }
+
         // Each agent display's start: its agent and time, under its lane.
         let labelAttrs = Self.attrs(10.5, .semibold, .white.withAlphaComponent(0.5))
         let timeAttrs = Self.attrs(10.5, .medium, .white.withAlphaComponent(0.32))
@@ -666,7 +783,7 @@ final class HistoryTrackView: NSView {
             let lane = m.laneOf[r]
             let x = max(viewX(items.lowerBound) - spacing / 2, 6)
             guard x > lastLabelEnd[lane] + 8, x < bounds.width else { continue }
-            let y = midY(lane: lane) + barH / 2 + 6
+            let y = midY(lane: lane) + Self.labelDY
             let label = m.runs[r].label
             label.draw(at: CGPoint(x: x, y: y), withAttributes: labelAttrs)
             let lw = label.size(withAttributes: labelAttrs).width
@@ -687,6 +804,38 @@ final class HistoryTrackView: NSView {
         let y = midY(lane: currentLane)
         ctx.addPath(CGPath(roundedRect: CGRect(x: px - 1, y: y - barH / 2 - 5, width: 2, height: barH + 10), cornerWidth: 1, cornerHeight: 1, transform: nil))
         ctx.fillPath()
+
+        // The hovered dot: what happened there, in a callout over its lane's
+        // icons. The line that matters most (an error, a note, the last
+        // action), and how many more the tooltip lists. Not while the track
+        // is moving under the pointer.
+        let still = !scrolling && dragStart == nil && animation?.isValid != true
+        let hovered = testHover.flatMap { i in visibleDots.first { $0.items.contains(i) } }
+            ?? (still ? pointer.flatMap { dot(at: convert($0, from: nil), in: visibleDots) } : nil)
+        let marks = hovered?.items.compactMap { m.mark(at: $0) } ?? []
+        let tip = marks.isEmpty ? nil : {
+            let all = marks.flatMap(\.lines), lines = all.suffix(12)
+            return (all.count > lines.count ? "…\n" : "") + lines.joined(separator: "\n")
+        }()
+        if tip != toolTip { DispatchQueue.main.async { [weak self] in self?.toolTip = tip } }
+        if let d = hovered, let text = callout(for: d) {
+            let attrs = Self.attrs(11, .medium, .white)
+            let pad: CGFloat = 8, h: CGFloat = 20
+            let w = min(text.size(withAttributes: attrs).width + pad * 2, bounds.width - 8)
+            let box = CGRect(x: min(max(d.x - w / 2, 4), bounds.width - 4 - w), y: midY(lane: d.lane) - 36, width: w, height: h)
+            ctx.setFillColor(NSColor(white: 0.12, alpha: 0.96).cgColor)
+            ctx.addPath(CGPath(roundedRect: box, cornerWidth: 6, cornerHeight: 6, transform: nil))
+            ctx.fillPath()
+            ctx.setStrokeColor(Self.markColors[d.kind]!.withAlphaComponent(0.7).cgColor)
+            ctx.setLineWidth(1)
+            ctx.addPath(CGPath(roundedRect: box.insetBy(dx: 0.5, dy: 0.5), cornerWidth: 5.5, cornerHeight: 5.5, transform: nil))
+            ctx.strokePath()
+            let style = NSMutableParagraphStyle()
+            style.lineBreakMode = .byTruncatingTail
+            var a = attrs
+            a[.paragraphStyle] = style
+            (text as NSString).draw(with: box.insetBy(dx: pad, dy: 3), options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: a)
+        }
     }
 
     private static func attrs(_ size: CGFloat, _ weight: NSFont.Weight, _ color: NSColor) -> [NSAttributedString.Key: Any] {

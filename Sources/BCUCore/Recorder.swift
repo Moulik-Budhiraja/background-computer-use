@@ -88,6 +88,10 @@ public final class RecordedRun {
         lock.lock()
         _chunks.removeAll { $0.file == c.file }
         _frames.removeAll { $0.t >= c.from && $0.t <= c.to }
+        // What the agent did up to a dropped frame belonged to it: don't let
+        // it land on a later frame. The oldest chunks go first. Pointer
+        // positions stay: a later frame draws the cursor where it last was.
+        if !_frames.contains(where: { $0.t < c.from }) { _events.removeAll { $0.point == nil && $0.t <= c.to } }
         lock.unlock()
         decodeLock.lock(); generators[c.file] = nil; decodeLock.unlock()
     }
@@ -184,8 +188,15 @@ public final class RecordedRun {
         }
         // Frames whose picture is gone (a crash before their JPEG was written).
         let staged = Set(((try? FileManager.default.contentsOfDirectory(atPath: run.stagingDir.path)) ?? []))
+        let listed = run._frames
         run._frames.removeAll { f in
             !run._chunks.contains { f.t >= $0.from && f.t <= $0.to } && !staged.contains("\(Int64(f.t)).jpg")
+        }
+        // What the agent did up to a frame that's gone from the start
+        // (deleted by the size limit) belonged to it: don't let it land on a
+        // later frame. Pointer positions stay, for the cursor.
+        if let first = run._frames.map(\.t).min(), let gone = listed.map(\.t).filter({ $0 < first }).max() {
+            run._events.removeAll { $0.point == nil && $0.t <= gone }
         }
         run._frames.sort { $0.t < $1.t }
         return run
@@ -828,7 +839,8 @@ public enum RecordingTest {
         for f in frames {
             while e < events.count && events[e].t <= f.t {
                 let ev = events[e]
-                if let text = ev.text { w.note(text, error: false, t: ev.t) }
+                // A text starting with "!" is recorded as an error, without the "!".
+                if let text = ev.text { w.note(text.hasPrefix("!") ? String(text.dropFirst()) : text, error: text.hasPrefix("!"), t: ev.t) }
                 if let p = ev.point { w.pointer(p, click: ev.click, t: ev.t) }
                 e += 1
             }

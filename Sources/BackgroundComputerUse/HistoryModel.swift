@@ -46,6 +46,31 @@ final class HistoryModel: ObservableObject {
     /// The most runs that were ever recording at once.
     @Published private(set) var lanes = 1
 
+    /// What happened at a frame, from the session's activity: the tool calls
+    /// that landed between it and the frame before, and notes such as a
+    /// handoff or the user taking over.
+    struct Mark {
+        enum Kind: Int, Comparable {
+            /// Looking without changing anything: get_window_state, screenshot…
+            case read
+            /// A tool that acted: a click, typing, a key, a navigation…
+            case action
+            /// Not a tool call: the user took over, a handoff, a new display…
+            case note
+            case error
+            static func < (a: Kind, b: Kind) -> Bool { a.rawValue < b.rawValue }
+        }
+        let item: Int
+        /// Oldest first, tidied.
+        var lines: [String]
+        /// Each line's kind, so the callout can show the one behind the color.
+        var kinds: [Kind]
+        /// The one that matters most, for the dot's color.
+        var kind: Kind
+    }
+    /// By item, oldest first; at most one per item.
+    private(set) var marks: [Mark] = []
+
     @Published private(set) var loaded = false
     @Published private(set) var index = 0
     @Published var highlightText = false
@@ -168,6 +193,7 @@ final class HistoryModel: ObservableObject {
         self.segmentOf = segmentOf
         self.acted = acted
         placeOnClock(runItems)
+        self.marks = Self.marks(self.runs, items: items)
         if let keep, let i = items.firstIndex(where: { self.runs[$0.run].id == keep.0 && $0.frame.t == keep.1 }) {
             index = i
         } else {
@@ -243,6 +269,59 @@ final class HistoryModel: ObservableObject {
         if items.indices.contains(j), items[j].run == items[i].run { return j }
         let s = slot[i] + by
         return byTime.indices.contains(s) ? byTime[s] : nil
+    }
+
+    /// Each run's activity, put on the first frame at or after it (the frame
+    /// that shows what it did), or the run's last frame for what came after.
+    static func marks(_ runs: [RecordedRun], items: [Item]) -> [Mark] {
+        var marks: [Mark] = []
+        var first = 0
+        while first < items.count {
+            let r = items[first].run
+            var last = first
+            while last + 1 < items.count && items[last + 1].run == r { last += 1 }
+            var at = first
+            for e in runs[r].events.sorted(by: { $0.t < $1.t }) {
+                guard let text = e.text, !text.isEmpty else { continue }
+                while at < last && items[at].frame.t < e.t { at += 1 }
+                let kind = kind(of: text, error: e.isError)
+                // The last mark's item only: holding the mark itself would
+                // copy its growing arrays on every append.
+                if marks.last?.item == at {
+                    let k = marks.count - 1
+                    marks[k].lines.append(tidy(text))
+                    marks[k].kinds.append(kind)
+                    marks[k].kind = max(marks[k].kind, kind)
+                } else {
+                    marks.append(Mark(item: at, lines: [tidy(text)], kinds: [kind], kind: kind))
+                }
+            }
+            first = last + 1
+        }
+        return marks
+    }
+
+    private static let reads: Set<String> = ["get_window_state", "screenshot", "status", "list_windows", "list_apps", "guard_report"]
+
+    /// Tool calls read "click (120 ms): …", "click failed after 120 ms: …",
+    /// or, inside a batch, "click: …"; anything else is a note.
+    /// Built once: every live reload classifies every event.
+    private static let toolCall = #/^([a-z_]+)(?: \(\d+ ms\):| failed after|:)/#
+
+    static func kind(of text: String, error: Bool) -> Mark.Kind {
+        if error { return .error }
+        guard let m = text.firstMatch(of: toolCall) else { return .note }
+        return reads.contains(String(m.1)) ? .read : .action
+    }
+
+    /// The mark at item `i`, if any.
+    func mark(at i: Int) -> Mark? {
+        var lo = 0, hi = marks.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if marks[mid].item < i { lo = mid + 1 } else { hi = mid }
+        }
+        return lo < marks.count && marks[lo].item == i ? marks[lo] : nil
     }
 
     // MARK: Moving
