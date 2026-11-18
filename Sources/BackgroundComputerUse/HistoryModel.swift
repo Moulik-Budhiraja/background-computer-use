@@ -305,9 +305,12 @@ final class HistoryModel: ObservableObject {
 
     /// Tool calls read "click (120 ms): …", "click failed after 120 ms: …",
     /// or, inside a batch, "click: …"; anything else is a note.
+    /// Built once: every live reload classifies every event.
+    private static let toolCall = #/^([a-z_]+)(?: \(\d+ ms\):| failed after|:)/#
+
     static func kind(of text: String, error: Bool) -> Mark.Kind {
         if error { return .error }
-        guard let m = text.firstMatch(of: #/^([a-z_]+)(?: \(\d+ ms\):| failed after|:)/#) else { return .note }
+        guard let m = text.firstMatch(of: toolCall) else { return .note }
         return reads.contains(String(m.1)) ? .read : .action
     }
 
