@@ -81,6 +81,7 @@ pub fn start() {
             return;
         }
         // The mapping stays open for the app's lifetime.
+        (*(view.Value as *const Shared)).init();
         let _ = SHARED.set(view.Value as usize);
     }
     let dll = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("bcu_hook.dll")));

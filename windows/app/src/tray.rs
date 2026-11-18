@@ -185,7 +185,7 @@ pub fn run() {
         .expect("tray window");
         *HWND_SLOT.lock().unwrap() = Some(hwnd.0 as usize);
         sessions::on_change(|| post(WM_APP_REFRESH));
-        let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+        watch_sessions();
         add_icon(hwnd);
         if ONBOARD_PENDING.load(std::sync::atomic::Ordering::SeqCst) {
             post(WM_APP_ONBOARD);
@@ -391,10 +391,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 PostQuitMessage(0);
                 LRESULT(0)
             }
-            WM_WTSSESSION_CHANGE => {
-                session_changed(wparam.0 as u32);
-                LRESULT(0)
-            }
             WM_SETTINGCHANGE => {
                 // The light/dark switch arrives as "ImmersiveColorSet".
                 std::thread::sleep(Duration::from_millis(50));
@@ -411,6 +407,48 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
     }
+}
+
+/// Session changes arrive on a window of their own thread, so the console
+/// is locked (`session_changed`) even while the tray's loop is busy, in a
+/// menu, a message box or quitting.
+fn watch_sessions() {
+    unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if msg == WM_WTSSESSION_CHANGE {
+            session_changed(wparam.0 as u32);
+            return LRESULT(0);
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+    std::thread::Builder::new()
+        .name("session-watch".into())
+        .spawn(|| unsafe {
+            let instance = GetModuleHandleW(None).unwrap_or_default();
+            let class = WNDCLASSW { lpfnWndProc: Some(proc), hInstance: instance.into(), lpszClassName: w!("BackgroundComputerUseSessions"), ..Default::default() };
+            RegisterClassW(&class);
+            let Ok(hwnd) = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                w!("BackgroundComputerUseSessions"),
+                PCWSTR::null(),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            ) else {
+                return;
+            };
+            let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                DispatchMessageW(&msg);
+            }
+        })
+        .expect("session watch thread");
 }
 
 /// When Remote Desktop disconnects, the keep-drawing task (install-monitor.ps1)

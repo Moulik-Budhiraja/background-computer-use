@@ -6,13 +6,14 @@
 #   -Driver  The open-source Virtual Display Driver (MIT, github.com/VirtualDrivers/Virtual-Display-Driver),
 #            for the agent screen the user can turn on. The app writes its settings
 #            (C:\VirtualDisplayDriver\vdd_settings.xml) first. Follows the project's own
-#            "Community Scripts/silent-install.ps1".
+#            "Community Scripts/silent-install.ps1", with the downloads pinned by SHA-256.
 #   -Remove  Uninstall both, and what older versions left: the driver and its monitors, the
 #            certificates trusted to install it, the task and its script.
 param([switch]$Task, [switch]$Driver, [switch]$Remove)
 $ErrorActionPreference = "Stop"
 $taskName = "Background Computer Use keep drawing"
-$taskDir = Join-Path $env:ProgramFiles "Background Computer Use"
+# Not $env:ProgramFiles: the user can set that for their own programs, this one included.
+$taskDir = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) "Background Computer Use"
 
 # The certificates in the driver's catalog (SignPath Foundation's, up to GlobalSign's root).
 function Get-CatalogCerts([string]$cat) {
@@ -111,31 +112,58 @@ if ($Driver) {
     exit 0
   }
   if (-not (Test-Path 'C:\VirtualDisplayDriver\vdd_settings.xml')) { throw "the app writes C:\VirtualDisplayDriver\vdd_settings.xml first" }
+  # Windows PowerShell 5.1 may not offer TLS 1.2, which GitHub requires.
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  # The releases this was tested with, pinned by SHA-256: nefcon 1.14.0 and Virtual Display Driver 25.7.23.
+  $release = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23"
   $NefConURL = "https://github.com/nefarius/nefcon/releases/download/v1.14.0/nefcon_v1.14.0.zip"
-  $DriverURL = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip"
-  $tmp = Join-Path $env:TEMP "VDDInstall"
-  New-Item -ItemType Directory -Path $tmp -Force | Out-Null
-  $ProgressPreference = 'SilentlyContinue'
-  Invoke-WebRequest -Uri $NefConURL -OutFile "$tmp\nefcon.zip" -UseBasicParsing
-  Expand-Archive "$tmp\nefcon.zip" -DestinationPath $tmp -Force
-  Invoke-WebRequest -Uri $DriverURL -OutFile "$tmp\driver.zip" -UseBasicParsing
-  Expand-Archive "$tmp\driver.zip" -DestinationPath $tmp -Force
-
-  # The package is signed by SignPath. Trust its certificates just long enough to
-  # install it without a prompt, then take them out again.
-  $cat = Get-ChildItem $tmp -Recurse -Filter mttvdd.cat | Select-Object -First 1
-  foreach ($c in (Get-CatalogCerts $cat.FullName)) {
-    $f = Join-Path $tmp "$($c.Thumbprint).cer"
-    [System.IO.File]::WriteAllBytes($f, $c.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-    certutil -f -addstore TrustedPublisher $f | Out-Null
+  $NefConHash = "a15557da24a9efca203158de3b43b0eaf982db231f0194031f1ed428bc13e669"
+  # The computer's own processor, even when this PowerShell runs emulated.
+  $arch = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').PROCESSOR_ARCHITECTURE
+  switch ($arch) {
+    'AMD64' { $DriverURL = "$release/VirtualDisplayDriver-x86.Driver.Only.zip"; $DriverHash = "e24210692b442b39af763536330ce78b423f19342b7a7792c26de3944e418b3a"; $NefConDir = "x64" }
+    'ARM64' { $DriverURL = "$release/VirtualDisplayDriver-ARM64.Driver.Only.zip"; $DriverHash = "dcd487161469c726bab60f174a7e7f70ee02afd437cad0d5c0e6755953de5a25"; $NefConDir = "ARM64" }
+    default { throw "the Virtual Display Driver isn't made for this PC's processor ($arch)" }
   }
+  # The one certificate trusted for the install: SignPath Foundation's, which signs the driver's catalog.
+  $Publisher = "3CF8CF26D8BA266C3A483AB7D26D4A818E317D76"
+  # Downloaded where only admins can write, not the user's TEMP, which their programs can change while this runs.
+  $tmp = Join-Path $taskDir "driver-download"
+  Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Force $tmp | Out-Null
+  $ProgressPreference = 'SilentlyContinue'
+  function Get-Pinned([string]$url, [string]$hash, [string]$dir) {
+    $zip = "$dir.zip"
+    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+    $got = (Get-FileHash $zip -Algorithm SHA256).Hash
+    if ($got -ne $hash) { throw "$url isn't the expected file (SHA-256 $got)" }
+    Expand-Archive $zip -DestinationPath $dir -Force
+  }
+
+  $trusted = "Cert:\LocalMachine\TrustedPublisher\$Publisher"
+  $added = $false
   try {
-    $inf = Get-ChildItem $tmp -Recurse -Filter MttVDD.inf | Select-Object -First 1
-    & "$tmp\x64\nefconw.exe" install $inf.FullName "Root\MttVDD"
+    Get-Pinned $NefConURL $NefConHash "$tmp\nefcon"
+    Get-Pinned $DriverURL $DriverHash "$tmp\driver"
+    # The package is signed by SignPath. Trust its certificate just long enough to
+    # install it without a prompt, then take it out again.
+    $cat = Get-ChildItem "$tmp\driver" -Recurse -Filter mttvdd.cat | Select-Object -First 1
+    $cert = Get-CatalogCerts $cat.FullName | Where-Object { $_.Thumbprint -eq $Publisher } | Select-Object -First 1
+    if (-not $cert) { throw "the driver's catalog doesn't carry the expected publisher's certificate" }
+    if (-not (Test-Path $trusted)) {
+      $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("TrustedPublisher", "LocalMachine")
+      $store.Open("ReadWrite")
+      $store.Add($cert)
+      $store.Close()
+      $added = $true
+    }
+    $inf = Get-ChildItem "$tmp\driver" -Recurse -Filter MttVDD.inf | Select-Object -First 1
+    & "$tmp\nefcon\$NefConDir\nefconw.exe" install $inf.FullName "Root\MttVDD"
     Start-Sleep -Seconds 5
   } finally {
-    Remove-Trust $cat.FullName
+    if ($added) { Remove-Item $trusted -ErrorAction SilentlyContinue }
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not (Get-ChildItem $taskDir -ErrorAction SilentlyContinue)) { Remove-Item $taskDir -ErrorAction SilentlyContinue }
   }
   Get-PnpDevice -Class Display | Format-Table -AutoSize Status, FriendlyName, InstanceId | Out-String | Write-Output
 }

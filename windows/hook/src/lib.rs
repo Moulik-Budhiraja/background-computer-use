@@ -41,8 +41,13 @@ use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, w};
 
+/// The table's layout. Bump it with any change to `Shared` or what's in it:
+/// it's in the mapping's name, so a DLL an older app left loaded in an app
+/// never reads a newer table (or the other way round), and `Shared::read`
+/// checks it again.
+pub const LAYOUT: u32 = 2;
 /// The shared memory's name. "Local\" is per Windows session, like the app.
-pub const MAPPING: PCWSTR = w!("Local\\BackgroundComputerUse-windows");
+pub const MAPPING: PCWSTR = w!("Local\\BackgroundComputerUse-windows-2");
 /// The callback's exported name, for GetProcAddress.
 pub const CALLBACK: &[u8] = b"bcu_win_event\0";
 
@@ -105,6 +110,10 @@ pub struct Table {
 /// write happened meanwhile.
 #[repr(C)]
 pub struct Shared {
+    /// `LAYOUT` and `SIZE`, set by the tray app once it has created the
+    /// table. Until then, or if they don't match, there's no table.
+    layout: AtomicU32,
+    size: AtomicU32,
     seq: AtomicU32,
     _pad: u32,
     table: UnsafeCell<Table>,
@@ -115,7 +124,16 @@ unsafe impl Sync for Shared {}
 impl Shared {
     pub const SIZE: usize = size_of::<Shared>();
 
+    /// The tray app's side, once the mapping is created.
+    pub fn init(&self) {
+        self.size.store(Self::SIZE as u32, Ordering::Relaxed);
+        self.layout.store(LAYOUT, Ordering::Release);
+    }
+
     pub fn read(&self) -> Option<Table> {
+        if self.layout.load(Ordering::Acquire) != LAYOUT || self.size.load(Ordering::Relaxed) != Self::SIZE as u32 {
+            return None;
+        }
         for _ in 0..100 {
             let before = self.seq.load(Ordering::Acquire);
             if before & 1 == 0 {
@@ -655,7 +673,22 @@ mod tests {
     #[test]
     fn the_table_round_trips_through_the_lock() {
         let s: Shared = unsafe { std::mem::zeroed() };
+        s.init();
         s.write(|t| t.user_window = 5);
         assert_eq!(s.read().unwrap().user_window, 5);
+    }
+
+    #[test]
+    fn a_table_of_another_layout_is_ignored() {
+        let s: Shared = unsafe { std::mem::zeroed() };
+        s.write(|t| t.user_window = 5);
+        // Not set up yet.
+        assert!(s.read().is_none());
+        s.init();
+        s.layout.store(LAYOUT + 1, Ordering::Relaxed);
+        assert!(s.read().is_none());
+        s.init();
+        s.size.store(Shared::SIZE as u32 - 8, Ordering::Relaxed);
+        assert!(s.read().is_none());
     }
 }

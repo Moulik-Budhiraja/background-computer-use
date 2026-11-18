@@ -16,6 +16,7 @@ dependencies = [
  "ed25519-dalek",
  "png",
  "serde_json",
+ "sha2",
  "windows",
 ]
 

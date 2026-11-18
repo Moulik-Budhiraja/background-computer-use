@@ -381,11 +381,16 @@ fn render_adapter() -> Option<String> {
     None
 }
 
+/// The install-monitor.ps1 this app was built with.
+const SCRIPT: &[u8] = include_bytes!("../install-monitor.ps1");
+
 /// install-monitor.ps1 with `args`, elevated: Windows shows its own admin
 /// prompt. Returns whether it ran and succeeded.
 fn elevated(args: &str) -> bool {
     let script = exe_dir().join("install-monitor.ps1");
-    let params = HSTRING::from(format!("-NoProfile -ExecutionPolicy Bypass -File \"{}\" {args}", script.display()));
+    let command = elevated_command(&script.display().to_string(), &sha256_hex(SCRIPT), args);
+    let encoded: Vec<u8> = command.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let params = HSTRING::from(format!("-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}", crate::capture::base64(&encoded)));
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS,
@@ -405,6 +410,27 @@ fn elevated(args: &str) -> bool {
         let _ = CloseHandle(info.hProcess);
         ok && code == 0
     }
+}
+
+/// What the elevated PowerShell runs. The script's folder is the user's to
+/// change, so any of their programs could edit it while Windows asks for
+/// admin: the elevated side reads it once, checks it's the copy this app was
+/// built with, and runs what it read.
+fn elevated_command(script: &str, sha256: &str, args: &str) -> String {
+    let script = script.replace('\'', "''");
+    format!(
+        "$ErrorActionPreference = 'Stop'\n\
+         $b = [IO.File]::ReadAllBytes('{script}')\n\
+         $h = -join ([Security.Cryptography.SHA256]::Create().ComputeHash($b) | ForEach-Object {{ $_.ToString('x2') }})\n\
+         if ($h -ne '{sha256}') {{ exit 3 }}\n\
+         & ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF))) {args}\n\
+         exit 0\n"
+    )
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
@@ -501,7 +527,16 @@ fn quit_running() {
 
 #[cfg(test)]
 mod tests {
-    use super::slowed;
+    use super::{elevated_command, sha256_hex, slowed};
+
+    #[test]
+    fn the_elevated_command_checks_the_script() {
+        assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        let c = elevated_command(r"C:\Users\o'neil\install-monitor.ps1", "ab12", "-Driver");
+        assert!(c.contains(r"ReadAllBytes('C:\Users\o''neil\install-monitor.ps1')"));
+        assert!(c.contains("if ($h -ne 'ab12') { exit 3 }"));
+        assert!(c.contains(" -Driver\n"));
+    }
 
     #[test]
     fn slowdown_needs_a_real_drop() {
