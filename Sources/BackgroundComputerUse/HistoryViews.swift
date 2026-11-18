@@ -283,7 +283,8 @@ final class HistoryTrackView: NSView {
         guard !scrolling, dragStart == nil else { return }
         scrollX = h.edge ? lastContentX : max(contentX(at), contentX(m.index))
     }
-    /// Where the pointer is over the track, for the mark under it.
+    /// Where the pointer is, for the mark under it: in window points, since
+    /// the track can grow (a lane more) under a still pointer.
     private var pointer: CGPoint?
     private var tracking: NSTrackingArea?
     /// For `--history-render`: the mark at this item shows as hovered.
@@ -624,7 +625,7 @@ final class HistoryTrackView: NSView {
     // The dot under the pointer is worked out as the track draws, so it
     // stays right when the track moves or zooms under a still pointer.
     override func mouseMoved(with event: NSEvent) {
-        pointer = convert(event.locationInWindow, from: nil)
+        pointer = event.locationInWindow
         needsDisplay = true
     }
 
@@ -686,7 +687,7 @@ final class HistoryTrackView: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         // A drag sends no mouseMoved: keep the pointer for the hovered dot.
-        pointer = convert(event.locationInWindow, from: nil)
+        pointer = event.locationInWindow
         guard let s = dragStart else { return }
         let x = convert(event.locationInWindow, from: nil).x
         if abs(x - s.x) > 3 { dragged = true }
@@ -696,7 +697,7 @@ final class HistoryTrackView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        pointer = convert(event.locationInWindow, from: nil)
+        pointer = event.locationInWindow
         needsDisplay = true
         let wasDrag = dragged
         dragStart = nil
@@ -810,7 +811,7 @@ final class HistoryTrackView: NSView {
         // is moving under the pointer.
         let still = !scrolling && dragStart == nil && animation?.isValid != true
         let hovered = testHover.flatMap { i in visibleDots.first { $0.items.contains(i) } }
-            ?? (still ? pointer.flatMap { dot(at: $0, in: visibleDots) } : nil)
+            ?? (still ? pointer.flatMap { dot(at: convert($0, from: nil), in: visibleDots) } : nil)
         let marks = hovered?.items.compactMap { m.mark(at: $0) } ?? []
         let tip = marks.isEmpty ? nil : {
             let all = marks.flatMap(\.lines), lines = all.suffix(12)
