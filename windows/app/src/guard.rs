@@ -56,6 +56,9 @@ unsafe impl Send for State {}
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 /// Set while the user's window is being put back; keys the user presses meanwhile are held.
 static RESTORING: AtomicBool = AtomicBool::new(false);
+/// Set while a shortcut marks modifiers down in a thread the user is typing
+/// into (input::press_key); the user's keys are held until it's over.
+static HOLDING: AtomicBool = AtomicBool::new(false);
 static RESTORE_TX: OnceLock<Mutex<std::sync::mpsc::Sender<String>>> = OnceLock::new();
 static START: OnceLock<Instant> = OnceLock::new();
 
@@ -204,6 +207,24 @@ pub fn give_back(reason: &str) {
     request_restore(reason);
 }
 
+/// Hold the user's keys until `release_keys`, for a shortcut whose modifiers
+/// would otherwise apply to them too.
+pub fn hold_keys() {
+    HOLDING.store(true, Ordering::Release);
+}
+
+/// Stop holding and replay what was held into the user's window.
+pub fn release_keys() {
+    let held = {
+        let s = state();
+        HOLDING.store(false, Ordering::Release);
+        !s.held.is_empty()
+    };
+    if held {
+        request_restore("keys held during a shortcut");
+    }
+}
+
 fn request_restore(reason: &str) {
     if !RESTORING.swap(true, Ordering::AcqRel)
         && let Some(tx) = RESTORE_TX.get()
@@ -242,6 +263,51 @@ fn wait_for_foreground(hwnd: HWND, ms: u64) -> bool {
     win::foreground() == hwnd
 }
 
+/// Ask Windows to put `hwnd` in front, and wait until it is.
+fn switch_to(hwnd: HWND) -> bool {
+    for _ in 0..3 {
+        unsafe {
+            SwitchToThisWindow(hwnd, true);
+        }
+        if wait_for_foreground(hwnd, 40) {
+            return true;
+        }
+        // Join the current foreground thread's input queue for the call.
+        let (_, fg_tid) = win::pid_tid(win::foreground());
+        unsafe {
+            let me = GetCurrentThreadId();
+            let attached = AttachThreadInput(me, fg_tid, true).as_bool();
+            let _ = SetForegroundWindow(hwnd);
+            if attached {
+                let _ = AttachThreadInput(me, fg_tid, false);
+            }
+        }
+        if wait_for_foreground(hwnd, 40) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The topmost window on the user's screen that's neither an agent's nor an
+/// app an agent is acting on, for when the user's own window is gone.
+fn other_user_window(except: HWND) -> Option<HWND> {
+    let me = std::process::id();
+    let all = win::top_level_windows();
+    let (fence, candidates) = {
+        let s = state();
+        (s.fence.clone(), all.into_iter().filter(|h| *h != except && !agent_caused(&s, *h)).collect::<Vec<_>>())
+    };
+    candidates.into_iter().find(|h| {
+        if !win::is_app_window(*h) || win::is_minimized(*h) || win::pid_tid(*h).0 == me {
+            return false;
+        }
+        let f = win::frame(*h);
+        let center = POINT { x: (f.left + f.right) / 2, y: (f.top + f.bottom) / 2 };
+        !fence.iter().any(|r| inside(r, center))
+    })
+}
+
 /// Put the user's window back in front, then replay the keys held meanwhile.
 /// Runs on the restore thread, so the hooks keep answering (and holding keys)
 /// while it waits for Windows to switch.
@@ -253,36 +319,28 @@ fn restore(reason: &str) {
     let needed = agent != user && agent_caused(&state(), agent);
     let t = Instant::now();
     let mut ok = !needed;
-    if needed && !user.0.is_null() && win::exists(user) {
-        for _ in 0..3 {
-            unsafe {
-                SwitchToThisWindow(user, true);
-            }
-            if wait_for_foreground(user, 40) {
-                ok = true;
-                break;
-            }
-            // Join the current foreground thread's input queue for the call.
-            let (_, fg_tid) = win::pid_tid(win::foreground());
-            unsafe {
-                let me = GetCurrentThreadId();
-                let attached = AttachThreadInput(me, fg_tid, true).as_bool();
-                let _ = SetForegroundWindow(user);
-                if attached {
-                    let _ = AttachThreadInput(me, fg_tid, false);
-                }
-            }
-            if wait_for_foreground(user, 40) {
-                ok = true;
-                break;
-            }
+    let mut fallback = false;
+    if needed {
+        ok = !user.0.is_null() && win::exists(user) && switch_to(user);
+        // The user's window is gone or won't come forward: their next window down.
+        if !ok && let Some(other) = other_user_window(user) && switch_to(other) {
+            ok = true;
+            fallback = true;
+            state().user_window = other;
+            offscreen::set_user_window(other);
         }
     }
     if needed {
         let note = format!(
             "{} took the foreground ({reason}); {} in {:.1} ms",
             describe(agent),
-            if ok { "gave it back to the user's window" } else { "COULD NOT give it back" },
+            if !ok {
+                "COULD NOT give it back"
+            } else if fallback {
+                "the user's window was gone or wouldn't come back, so gave it to their next window"
+            } else {
+                "gave it back to the user's window"
+            },
             t.elapsed().as_secs_f64() * 1000.0
         );
         let mut s = state();
@@ -292,12 +350,32 @@ fn restore(reason: &str) {
         }
         s.action_notes.push((win::pid_tid(agent).0, note));
     }
-    replay_held();
+    // Replay only into a window that's the user's; never into an agent's.
+    let fg = win::foreground();
+    if !fg.0.is_null() && !agent_caused(&state(), fg) {
+        replay_held();
+    } else {
+        drop_held(win::pid_tid(agent).0);
+    }
 }
 
 fn describe(hwnd: HWND) -> String {
     let pid = win::pid_tid(hwnd).0;
     format!("{} \"{}\"", win::app_name(pid), win::title(hwnd).chars().take(60).collect::<String>())
+}
+
+/// Throw away the held keys: no window of the user's could be put in front,
+/// and replaying them would type into the agent's window.
+fn drop_held(pid: u32) {
+    let mut s = state();
+    let n = s.held.len();
+    s.held.clear();
+    RESTORING.store(false, Ordering::Release);
+    if n > 0 {
+        let note = format!("dropped {n} key event(s) the user pressed, since their window couldn't be put back in front");
+        s.events.push(format!("{} {note}", stamp()));
+        s.action_notes.push((pid, note));
+    }
 }
 
 /// Replay held keys into whatever is in front now (the user's window), in
@@ -308,7 +386,8 @@ fn replay_held() {
     loop {
         let held: Vec<KBDLLHOOKSTRUCT> = {
             let mut s = state();
-            if s.held.is_empty() {
+            // While a shortcut holds keys, its release replays them.
+            if s.held.is_empty() || HOLDING.load(Ordering::Acquire) {
                 RESTORING.store(false, Ordering::Release);
                 if total > 0 {
                     s.events.push(format!("{} replayed {total} held key event(s) into the user's window", stamp()));
@@ -388,11 +467,13 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             }
             // An agent window is in front, or the user's is being put back:
             // hold the key and replay it once the user's window is in front.
+            // Or a shortcut has modifiers down in the thread the user types into.
             let restoring = RESTORING.load(Ordering::Acquire);
-            if restoring || (fg != s.user_window && agent_caused(&s, fg)) {
+            let holding = HOLDING.load(Ordering::Acquire);
+            if restoring || holding || (fg != s.user_window && agent_caused(&s, fg)) {
                 s.held.push_back(k);
                 drop(s);
-                if !restoring {
+                if !restoring && !holding {
                     request_restore("the user was typing");
                 }
                 return LRESULT(1);

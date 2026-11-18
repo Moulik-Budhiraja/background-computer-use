@@ -8,6 +8,9 @@
 //! which reflects the thread's own input state, not the posted messages. So for
 //! the length of a shortcut we share the target thread's input state
 //! (AttachThreadInput) and mark the modifiers down in it (SetKeyboardState).
+//! That state is the whole thread's, so if the user is typing into a window
+//! on the same thread (a browser's other windows), their keys are held until
+//! the shortcut is over, and only the modifier bits we set are put back.
 
 use std::time::{Duration, Instant};
 
@@ -18,7 +21,7 @@ use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::win;
+use crate::{guard, win};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Button {
@@ -160,11 +163,16 @@ fn key_lparam(vk: VIRTUAL_KEY, up: bool, alt: bool) -> LPARAM {
     LPARAM(l as i32 as isize)
 }
 
+/// The text with Windows line endings (`\r\n`) made one `\n`, so each line break is one Enter.
+fn one_enter_per_line(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 /// Type text into the focused element of the agent's window. `\n` presses Enter, `\t` Tab.
 pub fn type_text(hwnd: HWND, text: &str) -> Result<(), String> {
     let target = focus_target(hwnd);
     let mut posted = 0;
-    for c in text.chars() {
+    for c in one_enter_per_line(text).chars() {
         match c {
             '\n' | '\r' => {
                 key_messages(target, VK_RETURN, false)?;
@@ -206,9 +214,41 @@ fn key_messages(target: HWND, vk: VIRTUAL_KEY, alt: bool) -> Result<(), String> 
     post(target, up, vk.0 as usize, key_lparam(vk, true, alt))
 }
 
-pub fn key_for(name: &str) -> Result<VIRTUAL_KEY, String> {
+/// VkKeyScanW's answer split into the key and the modifiers the character
+/// needs: the high byte's bits are Shift (1), Ctrl (2) and Alt (4).
+fn split_key_scan(scan: i16) -> (VIRTUAL_KEY, Vec<VIRTUAL_KEY>) {
+    let shift_state = (scan as u16) >> 8;
+    let mods = [(1, VK_SHIFT), (2, VK_CONTROL), (4, VK_MENU)]
+        .into_iter()
+        .filter(|(bit, _)| shift_state & bit != 0)
+        .map(|(_, vk)| vk)
+        .collect();
+    (VIRTUAL_KEY(scan as u16 & 0xff), mods)
+}
+
+/// The key for a name, and the modifiers it needs to make that character
+/// ("A" and "?" need Shift).
+pub fn key_for(name: &str) -> Result<(VIRTUAL_KEY, Vec<VIRTUAL_KEY>), String> {
     let k = name.to_lowercase();
-    Ok(match k.as_str() {
+    let mut c = name.chars();
+    if let (Some(c), None) = (c.next(), c.next()) {
+        if c.is_ascii_alphanumeric() {
+            let shift = if c.is_ascii_uppercase() { vec![VK_SHIFT] } else { vec![] };
+            return Ok((VIRTUAL_KEY(c.to_ascii_uppercase() as u16), shift));
+        }
+        if c != ' ' {
+            let scan = unsafe { VkKeyScanW(c as u16) };
+            if scan == -1 {
+                return Err(format!("no key for {c:?} on this keyboard layout"));
+            }
+            return Ok(split_key_scan(scan));
+        }
+    }
+    Ok((named_key(&k).ok_or_else(|| format!("unknown key {name}"))?, Vec::new()))
+}
+
+fn named_key(k: &str) -> Option<VIRTUAL_KEY> {
+    Some(match k {
         "return" | "enter" => VK_RETURN,
         "tab" => VK_TAB,
         "space" => VK_SPACE,
@@ -224,22 +264,11 @@ pub fn key_for(name: &str) -> Result<VIRTUAL_KEY, String> {
         "page_up" => VK_PRIOR,
         "page_down" => VK_NEXT,
         "insert" => VK_INSERT,
-        _ if k.chars().count() == 1 => {
-            let c = k.chars().next().unwrap();
-            if c.is_ascii_alphanumeric() {
-                VIRTUAL_KEY(c.to_ascii_uppercase() as u16)
-            } else {
-                let scan = unsafe { VkKeyScanW(c as u16) };
-                if scan == -1 {
-                    return Err(format!("no key for {c:?} on this keyboard layout"));
-                }
-                VIRTUAL_KEY((scan & 0xff) as u16)
-            }
-        }
+        " " => VK_SPACE,
         _ if k.starts_with('f') && k[1..].parse::<u16>().is_ok_and(|n| (1..=24).contains(&n)) => {
             VIRTUAL_KEY(VK_F1.0 + k[1..].parse::<u16>().unwrap() - 1)
         }
-        _ => return Err(format!("unknown key {name}")),
+        _ => return None,
     })
 }
 
@@ -261,20 +290,31 @@ pub fn press_key(hwnd: HWND, key: VIRTUAL_KEY, modifiers: &[VIRTUAL_KEY]) -> Res
     let (_, target_tid) = win::pid_tid(target);
     let my_tid = unsafe { GetCurrentThreadId() };
     let attached = !modifiers.is_empty() && unsafe { AttachThreadInput(my_tid, target_tid, true) }.as_bool();
+    // The modifiers we mark down apply to every window on the target's thread;
+    // if the user is typing into one, hold their keys until we're done.
+    let holding = attached && win::pid_tid(win::foreground()).1 == target_tid;
+    if holding {
+        guard::hold_keys();
+    }
+    let touched: Vec<usize> = modifiers
+        .iter()
+        .flat_map(|m| {
+            let side = match *m {
+                VK_CONTROL => VK_LCONTROL,
+                VK_SHIFT => VK_LSHIFT,
+                VK_MENU => VK_LMENU,
+                other => other,
+            };
+            [m.0 as usize, side.0 as usize]
+        })
+        .collect();
     let mut saved = [0u8; 256];
     if attached {
         unsafe {
             let _ = GetKeyboardState(&mut saved);
             let mut state = saved;
-            for m in modifiers {
-                state[m.0 as usize] |= 0x80;
-                let side = match *m {
-                    VK_CONTROL => VK_LCONTROL,
-                    VK_SHIFT => VK_LSHIFT,
-                    VK_MENU => VK_LMENU,
-                    other => other,
-                };
-                state[side.0 as usize] |= 0x80;
+            for &i in &touched {
+                state[i] |= 0x80;
             }
             let _ = SetKeyboardState(&state);
         }
@@ -294,9 +334,49 @@ pub fn press_key(hwnd: HWND, key: VIRTUAL_KEY, modifiers: &[VIRTUAL_KEY]) -> Res
     drain(target, modifiers.len() * 2 + 2);
     if attached {
         unsafe {
-            let _ = SetKeyboardState(&saved);
+            // Put back only the modifier bits we set; the rest may have changed since.
+            let mut now = [0u8; 256];
+            let _ = GetKeyboardState(&mut now);
+            for &i in &touched {
+                now[i] = saved[i];
+            }
+            let _ = SetKeyboardState(&now);
             let _ = AttachThreadInput(my_tid, target_tid, false);
         }
     }
+    if holding {
+        guard::release_keys();
+    }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crlf_is_one_enter() {
+        assert_eq!(one_enter_per_line("a\r\nb"), "a\nb");
+        assert_eq!(one_enter_per_line("a\nb\rc"), "a\nb\rc");
+        // A literal backslash-n (a Windows path) stays as typed.
+        assert_eq!(one_enter_per_line("C:\\notes\\new.txt"), "C:\\notes\\new.txt");
+    }
+
+    #[test]
+    fn key_scan_keeps_shift() {
+        // "?" on US English: the "/" key (VK_OEM_2) with Shift.
+        assert_eq!(split_key_scan(0x01bf), (VK_OEM_2, vec![VK_SHIFT]));
+        // "/" alone.
+        assert_eq!(split_key_scan(0x00bf), (VK_OEM_2, vec![]));
+        // AltGr characters need Ctrl and Alt.
+        assert_eq!(split_key_scan(0x0651), (VIRTUAL_KEY(0x51), vec![VK_CONTROL, VK_MENU]));
+    }
+
+    #[test]
+    fn uppercase_letters_add_shift() {
+        assert_eq!(key_for("A").unwrap(), (VIRTUAL_KEY(b'A' as u16), vec![VK_SHIFT]));
+        assert_eq!(key_for("a").unwrap(), (VIRTUAL_KEY(b'A' as u16), vec![]));
+        assert_eq!(key_for("End").unwrap(), (VK_END, vec![]));
+        assert_eq!(key_for("F5").unwrap(), (VK_F5, vec![]));
+    }
 }

@@ -828,17 +828,16 @@ impl Engine {
     fn type_text(&mut self, args: &Args) -> Fallible<ToolResult> {
         let id = self.window(args)?;
         let hwnd = self.windows[&id].hwnd;
-        let text = args.need_str("text")?.replace("\\n", "\n");
+        let text = args.need_str("text")?;
         if args.int("element").is_some() {
-            // Focus the field the way a person would: click it, then put the
-            // caret at the end so the text is added after what's there.
+            // Focus the field the way a person would: click it. (No Ctrl+End to
+            // move the caret: in a spreadsheet or document it jumps to the end.)
             let n = self.node(id, args)?;
             let p = self.element_point(id, &n).ok_or_else(|| format!("element {} is outside the visible window. Scroll it into view first.", n.index))?;
             self.point_at(p);
             input::click(self.target(id, p).unwrap_or(hwnd), p, input::Button::Left, 1)?;
-            input::press_key(hwnd, input::key_for("end")?, &[input::modifier_for("ctrl")?])?;
         }
-        input::type_text(hwnd, &text)?;
+        input::type_text(hwnd, text)?;
         Ok(ToolResult::ok(format!("Typed {} characters.", text.chars().count())))
     }
 
@@ -846,14 +845,19 @@ impl Engine {
         let id = self.window(args)?;
         let hwnd = self.windows[&id].hwnd;
         let key_name = args.need_str("key")?;
-        let key = input::key_for(key_name)?;
+        let (key, needs) = input::key_for(key_name)?;
         let names: Vec<String> = args
             .0
             .get("modifiers")
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(|m| m.as_str().map(String::from)).collect())
             .unwrap_or_default();
-        let mods = names.iter().map(|m| input::modifier_for(m)).collect::<Fallible<Vec<_>>>()?;
+        let mut mods = names.iter().map(|m| input::modifier_for(m)).collect::<Fallible<Vec<_>>>()?;
+        for m in needs {
+            if !mods.contains(&m) {
+                mods.push(m);
+            }
+        }
         input::press_key(hwnd, key, &mods)?;
         let mut combo = names.clone();
         combo.push(key_name.to_string());
