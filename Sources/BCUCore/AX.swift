@@ -126,7 +126,7 @@ public enum AX {
             }
             guard passiveContent.contains(role), let parent = element(node, "AXParent") else { return nil }
             if string(parent, "AXRole") == "AXList", isSettable(parent, "AXSelectedChildren") {
-                return .item(node, list: parent, name: string(el, "AXValue") ?? string(el, "AXTitle"))
+                return .item(node, list: parent, name: name(of: node))
             }
             node = parent
         }
@@ -135,9 +135,24 @@ public enum AX {
 
     public enum Selectable {
         case row(AXUIElement)
-        /// `name`: the text clicked on, to find the item again (a picker's
-        /// column redraws as it selects).
+        /// `name`: the item's text (a file name), to find it again (a
+        /// picker's column redraws as it selects).
         case item(AXUIElement, list: AXUIElement, name: String?)
+    }
+
+    /// An item's text, from it or the content in it (a file name next to an
+    /// icon), to find it again after its list redraws.
+    private static func name(of item: AXUIElement) -> String? {
+        var queue = [item]
+        for _ in 0..<12 {
+            guard !queue.isEmpty else { break }
+            let el = queue.removeFirst()
+            let role = string(el, "AXRole")
+            let value = role == "AXTextField" || role == "AXStaticText" ? string(el, "AXValue") : nil
+            if let text = value ?? string(el, "AXTitle"), !text.isEmpty { return text }
+            queue.append(contentsOf: children(el))
+        }
+        return nil
     }
 
     /// What a click on a row's or a list item's content only selects it through.
@@ -185,12 +200,7 @@ public enum AX {
         case .row(let row):
             return bool(row, "AXSelected") == true
         case .item(let item, let list, let name):
-            func says(_ el: AXUIElement) -> Bool {
-                guard let name, !name.isEmpty else { return false }
-                var all = children(el)
-                all.append(el)
-                return all.contains { (string($0, "AXValue") ?? string($0, "AXTitle")) == name }
-            }
+            func says(_ el: AXUIElement) -> Bool { name != nil && self.name(of: el) == name }
             return elements(list, "AXSelectedChildren").contains { CFEqual($0, item) || says($0) }
         }
     }
