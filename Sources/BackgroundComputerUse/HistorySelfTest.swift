@@ -248,6 +248,10 @@ enum HistorySelfTest {
         let sane = heldBefore != nil && heldAfter.held && heldAfter.time == heldBefore
         prunedOK = prunedOK && sane
         print("held playhead after the size limit: \(sane ? "same time" : "WRONG, held \(heldAfter.held), time \(heldAfter.time) was \(heldBefore ?? -1)")")
+        // The deleted frames' events went with them, not onto the first frame left.
+        let piled = pruned.model.marks.map(\.lines.count).max() ?? 0
+        prunedOK = prunedOK && piled <= 4
+        print("most lines on one frame after the size limit: \(piled) -> \(piled <= 4 ? "ok" : "WRONG")")
         RecordingTest.applyLimit(store, bytes: nil)
         // On the newest frame when a new recording starts: History goes on to it.
         pruned.model.goToNewest()

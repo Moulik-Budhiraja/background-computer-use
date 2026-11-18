@@ -685,6 +685,8 @@ final class HistoryTrackView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        // A drag sends no mouseMoved: keep the pointer for the hovered dot.
+        pointer = convert(event.locationInWindow, from: nil)
         guard let s = dragStart else { return }
         let x = convert(event.locationInWindow, from: nil).x
         if abs(x - s.x) > 3 { dragged = true }
@@ -694,6 +696,8 @@ final class HistoryTrackView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        pointer = convert(event.locationInWindow, from: nil)
+        needsDisplay = true
         let wasDrag = dragged
         dragStart = nil
         dragged = false
