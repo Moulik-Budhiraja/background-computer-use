@@ -94,19 +94,18 @@ public enum AX {
         return set(el, "AXSize", v) == .success
     }
 
-    /// What a plain click on `el` would select, when selecting it is all the
-    /// click would do: a row of a native table or outline, or an item of a
-    /// native list (a file picker's column), reached from `el` or passive
-    /// content of it (a cell, its label or icon). Selecting it through
-    /// accessibility needs no key focus, which matters in a sheet: its
-    /// window can't be made key from outside the app while it's up.
+    /// What a plain click on `el` in a sheet (a file picker, a save panel)
+    /// would select, when selecting it is all the click would do: a row of
+    /// a native table or outline, or an item of a native list (a picker's
+    /// column), reached from `el` or passive content of it (a cell, its
+    /// label or icon, a file name). A sheet's window can't be made key from
+    /// outside the app while it's up, so a click there can't land; selecting
+    /// through accessibility needs no key focus.
     ///
-    /// Nil for a control in a row (a checkbox, a button), which a click
-    /// operates rather than selects, and for a field that can be edited,
-    /// except in a sheet: a file picker shows its file names as editable
-    /// fields, and a click there could never reach them anyway. Nil in web
-    /// content, where clicking a row usually does more than select it
-    /// (opens an email, follows a link).
+    /// Nil outside a sheet, where a real click also moves keyboard focus to
+    /// the list, which later keys rely on. Nil for a control in a row (a
+    /// checkbox, a button), which a click operates rather than selects, and
+    /// in web content, where clicking a row usually does more than select it.
     public static func selectable(_ el: AXUIElement) -> Selectable? {
         // Web content, or a sheet, above it?
         var inSheet = false
@@ -118,14 +117,14 @@ public enum AX {
             if role == "AXSheet" { inSheet = true }
             up = element(p, "AXParent")
         }
+        guard inSheet else { return nil }
         var node = el
         for _ in 0..<4 {
             let role = string(node, "AXRole") ?? ""
             if role == "AXRow" {
                 return isSettable(node, "AXSelected") ? .row(node) : nil
             }
-            guard passiveContent.contains(role), role != "AXTextField" || inSheet || !isSettable(node, "AXValue"),
-                  let parent = element(node, "AXParent") else { return nil }
+            guard passiveContent.contains(role), let parent = element(node, "AXParent") else { return nil }
             if string(parent, "AXRole") == "AXList", isSettable(parent, "AXSelectedChildren") {
                 return .item(node, list: parent, name: string(el, "AXValue") ?? string(el, "AXTitle"))
             }
