@@ -27,6 +27,21 @@ final class AudioClaims {
     /// pressing the mute element take milliseconds.
     private let queue = DispatchQueue(label: "bcu.audio.claims", qos: .userInteractive)
 
+    /// Every session's claims, to tell whose sound a claimed app plays.
+    private static let all = NSHashTable<AudioClaims>.weakObjects()
+    private static let allLock = NSLock()
+
+    init() {
+        Self.allLock.lock(); Self.all.add(self); Self.allLock.unlock()
+    }
+
+    /// Some session has this app claimed: it's muted, and the user hasn't
+    /// used it since, so the sound it plays is an agent's.
+    static func claimed(_ pid: pid_t) -> Bool {
+        allLock.lock(); let sessions = all.allObjects; allLock.unlock()
+        return sessions.contains { c in c.lock.lock(); defer { c.lock.unlock() }; return c.claims.values.contains { $0.pid == pid } }
+    }
+
     var isEmpty: Bool { lock.lock(); defer { lock.unlock() }; return claims.isEmpty }
 
     func add(_ claim: Claim) {
@@ -117,7 +132,7 @@ final class AudioClaims {
                 return "\(back), but \(c.muteName) in window \(c.window) couldn't be pressed (\(AX.errorName(err))): if your sound is still playing there, stop it now."
             }
             if loud.contains(c.pid) {
-                return "\(back). \(c.muteName) in window \(c.window) was pressed, but \(c.appName) was still making sound after it: if yours is still playing, stop it now."
+                return "\(back). \(c.muteName.prefix(1).uppercased() + c.muteName.dropFirst()) in window \(c.window) was pressed, but \(c.appName) was still making sound after it: if yours is still playing, stop it now."
             }
             return "\(back), and your sound there was silenced with \(c.muteName) in window \(c.window). To play sound in it again, call capture_audio again, then unmute."
         }

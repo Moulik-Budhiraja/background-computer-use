@@ -104,4 +104,16 @@ final class AudioClaimTests: XCTestCase {
         XCTAssertFalse(FocusGuard.isMediaKeyDown(event(7, down: true)))   // mute
         XCTAssertFalse(FocusGuard.isMediaKeyDown(event(2, down: true)))   // brightness up
     }
+
+    /// A claimed app's sound is an agent's, whichever session claimed it.
+    func testClaimedAcrossSessions() {
+        let a = AudioClaims(), b = AudioClaims()
+        a.add(claim(1, pid: 4242))
+        XCTAssertTrue(AudioClaims.claimed(4242))
+        XCTAssertFalse(AudioClaims.claimed(4343))
+        b.add(claim(2, pid: 4343))
+        XCTAssertTrue(AudioClaims.claimed(4343))
+        a.clear()
+        XCTAssertFalse(AudioClaims.claimed(4242))
+    }
 }

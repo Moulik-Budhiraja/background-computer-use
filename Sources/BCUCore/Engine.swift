@@ -1396,10 +1396,11 @@ public final class Engine {
             }
             mute = n
         }
-        // Already claimed: the app is muted, and any sound in it is the
-        // agent's (the user would have ended the claim), so just take the element.
+        // Already claimed (this window, or the app by any session): the app
+        // is muted, and its sound is an agent's (the user would have ended
+        // the claim), so don't take it for the user's.
         let renewing = audioClaims.has(w.id)
-        if !renewing && SessionAudio.isPlaying(app) {
+        if !renewing && !AudioClaims.claimed(w.pid) && SessionAudio.isPlaying(app) {
             throw ToolError("\(w.appName) is playing sound right now, probably the user's, so it can't be muted without muting theirs. If it's yours, silence it, then call this again. Otherwise wait until it stops.")
         }
         let label = mute.flatMap { n in [AX.string(n.element, "AXTitle"), AX.string(n.element, "AXDescription")].compactMap { $0 }.first { !$0.isEmpty } }
