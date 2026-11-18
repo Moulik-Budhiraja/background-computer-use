@@ -73,6 +73,15 @@ public final class WindowManager {
         return registeredAnywhere[id].map { $0.session != session } ?? false
     }
 
+    /// Claims a window for `session` unless another session has it, in one
+    /// step, so two sessions borrowing it at once can't both get it.
+    static func claim(_ id: CGWindowID, pid: pid_t, for session: String) -> Bool {
+        sharedLock.lock(); defer { sharedLock.unlock() }
+        if let owner = registeredAnywhere[id], owner.session != session { return false }
+        registeredAnywhere[id] = (session, pid)
+        return true
+    }
+
     /// Some session's window, as of right now.
     static func isRegistered(_ id: CGWindowID) -> Bool {
         sharedLock.lock(); defer { sharedLock.unlock() }
@@ -685,7 +694,7 @@ public final class WindowManager {
         guard let ax = AX.window(pid: info.pid, id: id) else { throw ToolError("window \(id) isn't reachable through accessibility") }
         let original = AX.frame(ax) ?? info.bounds
         let app = NSRunningApplication(processIdentifier: info.pid)
-        if Self.isRegistered(id, byOtherThan: sessionKey) { throw ToolError("window \(id) is another agent's") }
+        guard Self.claim(id, pid: info.pid, for: sessionKey) else { throw ToolError("window \(id) is another agent's") }
         // Every other window of the app is the user's, not one this spawned.
         noteBefore(pid: info.pid)
         focusGuard.beginAction(pid: info.pid, cause: "borrowing a window")

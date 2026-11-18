@@ -187,19 +187,25 @@ public final class HostServer {
             let e = try engine(a)
             if a.bool("on") ?? true {
                 guard e.display.isRunning else { throw ToolError("that session has no display yet") }
+                // Each client counts once: the agent gets the display back
+                // only when every client (and the menu bar's viewer) that
+                // took it over has given it back.
                 lock.lock()
                 let existing = c.remotes[e.sessionID]
                 lock.unlock()
-                if existing == nil {
-                    let remote = makeRemote(e, c)
-                    lock.lock(); c.remotes[e.sessionID] = remote; lock.unlock()
-                }
-                e.setUserInControl(true)
+                guard existing == nil else { return ["ok": true] }
+                let remote = makeRemote(e, c)
+                lock.lock()
+                let raced = c.remotes[e.sessionID] != nil
+                if !raced { c.remotes[e.sessionID] = remote }
+                lock.unlock()
+                if !raced { e.setUserInControl(true) }
             } else {
                 lock.lock()
                 let remote = c.remotes.removeValue(forKey: e.sessionID)
                 lock.unlock()
-                remote?.end()
+                guard let remote else { return ["ok": true] }
+                remote.end()
                 e.setUserInControl(false)
             }
             return ["ok": true]

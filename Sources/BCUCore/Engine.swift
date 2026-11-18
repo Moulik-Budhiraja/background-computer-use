@@ -107,7 +107,8 @@ public final class Engine {
     private var batching = false
     private var _activity: [ActivityItem] = []
     private var _paused = false
-    private var _userInControl = false
+    /// How many viewers (the menu bar's, host apps') have taken over the display.
+    private var controllers = 0
     private lazy var testRemote = RemoteControl(engine: self)
     private var _waitingReason: String?
     private var _busy: String?
@@ -300,7 +301,7 @@ public final class Engine {
 
     public var status: EngineStatus {
         stateLock.lock(); defer { stateLock.unlock() }
-        if _userInControl { return .userInControl }
+        if controllers > 0 { return .userInControl }
         if _paused { return .paused }
         if let r = _waitingReason { return .waiting(r) }
         if let handoff = windows.windows.first(where: { $0.handedOff }) {
@@ -354,17 +355,23 @@ public final class Engine {
     /// agent's actions are refused until they give it back.
     public var userInControl: Bool {
         stateLock.lock(); defer { stateLock.unlock() }
-        return _userInControl
+        return controllers > 0
     }
 
+    /// A viewer took over the display (`true`) or gave it back (`false`).
+    /// Each viewer that takes it gives it back once; the agent gets it back
+    /// only when the last one has.
     public func setUserInControl(_ value: Bool) {
         stateLock.lock()
-        let was = _userInControl
-        _userInControl = value
+        let was = controllers > 0
+        controllers = Self.controllers(controllers, taking: value)
+        let now = controllers > 0
         stateLock.unlock()
-        windows.userArranging = value
-        if was != value { log(value ? "You took over the agent display" : "You gave the agent display back") }
+        windows.userArranging = now
+        if was != now { log(now ? "You took over the agent display" : "You gave the agent display back") }
     }
+
+    static func controllers(_ n: Int, taking: Bool) -> Int { taking ? n + 1 : max(0, n - 1) }
 
     /// The user is done: move handed-off windows back to the agent display and resume.
     public func handBack() {

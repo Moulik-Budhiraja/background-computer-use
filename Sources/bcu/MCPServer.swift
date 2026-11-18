@@ -13,8 +13,18 @@ final class MCPServer {
     private final class Lane {
         let queue: DispatchQueue
         var client: SocketClient?
+        /// Calls finished, so an idle close can tell none came since. On `queue`.
+        var calls = 0
         init(_ session: String) { queue = DispatchQueue(label: "bcu.mcp.\(session)") }
     }
+    /// A subagent's or other Codex thread's lane closes its connection after
+    /// this long without a call. Nothing says when a subagent is done, and
+    /// the app keeps a session's windows and display while a connection
+    /// carries it; once none does, it releases them after its grace period
+    /// unless the session calls again. A call after the close reconnects,
+    /// so one that's only been thinking a long time loses nothing as long
+    /// as it calls within that grace.
+    static let laneIdleS = 15 * 60
     private var lanes: [String: Lane] = [:]
     /// This agent's session: its own display and windows in the app.
     private let sessionID: String
@@ -96,9 +106,22 @@ final class MCPServer {
             lanes[caller] = lane
             lane.queue.async {
                 self.reply(id, result: self.callTool(name, arguments, session: caller, lane: lane))
+                if caller != self.sessionID { self.closeWhenIdle(lane) }
             }
         default:
             replyError(id, code: -32601, message: "method not found: \(method)")
+        }
+    }
+
+    /// On the lane's queue, after a call: let its connection go if no other
+    /// call comes for `laneIdleS`. The main session's lane stays open as
+    /// long as this process: its agent may be waiting on the user.
+    private func closeWhenIdle(_ lane: Lane) {
+        lane.calls += 1
+        let calls = lane.calls
+        lane.queue.asyncAfter(deadline: .now() + .seconds(Self.laneIdleS)) {
+            guard lane.calls == calls else { return }
+            lane.client = nil
         }
     }
 
