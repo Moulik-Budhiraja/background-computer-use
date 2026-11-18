@@ -144,6 +144,7 @@ enum HistorySelfTest {
         controller.model.go(to: 200, animated: false)
         spin(1.0)
         snapshot(host, to: out.appendingPathComponent("history-zoomed-out.png"))
+        let clockOK = clockOrder(controller.model, "recorded")
 
         // Retention: a run that ended 8 days ago goes; recent ones stay.
         let old = store.directory.appendingPathComponent("20200101-000000-old")
@@ -167,8 +168,32 @@ enum HistorySelfTest {
         let leftFrames = left.reduce(0) { $0 + $1.frames.count }
         let limitOK = after <= before / 2 && newestKept?.0 == newest?.0 && newestKept?.1 == newest?.1 && decodedAfter == leftFrames && leftFrames < total
         print("size limit: \(before / 1024) KB -> \(after / 1024) KB (limit \(before / 2048) KB), \(leftFrames) frames left from \(firstLeft), all decode: \(decodedAfter == leftFrames), newest run whole: \(newestKept?.1 == newest?.1) -> \(limitOK ? "ok" : "WRONG")")
+        // The limit took the first run's oldest frames, so it now starts
+        // after the Mail run that started later: lanes and gaps still follow
+        // the clock.
+        let (pruned, prunedHost) = offscreenViewer()
+        pruned.model.load()
+        spin(1.5)
+        pruned.zoomTrack(-2)
+        spin(0.5)
+        snapshot(prunedHost, to: out.appendingPathComponent("history-after-limit.png"))
+        let prunedOK = clockOrder(pruned.model, "after the size limit")
         RecordingTest.applyLimit(store, bytes: nil)
-        exit(ok == total && total > 0 && wrong == 0 && limitOK ? 0 : 1)
+        exit(ok == total && total > 0 && wrong == 0 && limitOK && clockOK && prunedOK ? 0 : 1)
+    }
+
+    /// Frames further right are later (gaps only go forward in time), and
+    /// runs that share a lane never overlap.
+    private static func clockOrder(_ m: HistoryModel, _ when: String) -> Bool {
+        let forward = zip(m.byTime, m.byTime.dropFirst()).allSatisfy { m.stretch[$0] <= m.stretch[$1] }
+        func span(_ r: Int) -> ClosedRange<Double> { m.items[m.runItems[r].lowerBound].frame.t...m.items[m.runItems[r].upperBound].frame.t }
+        var overlapping = 0
+        for a in m.runItems.indices {
+            for b in m.runItems.indices where a < b && m.laneOf[a] == m.laneOf[b] && span(a).overlaps(span(b)) { overlapping += 1 }
+        }
+        let firsts = m.runItems.map { HistoryModel.time(m.items[$0.lowerBound].frame.t, seconds: true) }
+        print("clock \(when): runs starting \(firsts.joined(separator: ", ")), lanes \(m.laneOf), \(m.lanes) lanes, gaps forward: \(forward), runs overlapping in a lane: \(overlapping) -> \(forward && overlapping == 0 ? "ok" : "WRONG")")
+        return forward && overlapping == 0
     }
 
     /// Mean gray difference between two pictures, at 160×100.

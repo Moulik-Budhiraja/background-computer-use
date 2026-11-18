@@ -114,10 +114,14 @@ final class HistoryModel: ObservableObject {
     }
 
     private func apply(_ runs: [RecordedRun], keep: (String, Double)?) {
-        self.runs = runs
+        // A live run gains frames on the recorder's queue: read each run's
+        // frames once, and build everything from that read. A run with none
+        // left (all pruned) isn't shown.
+        let taken = runs.map { ($0, $0.frames) }.filter { !$0.1.isEmpty }
+        self.runs = taken.map(\.0)
         var items: [Item] = [], segments: [Segment] = [], segmentOf: [Int] = [], acted: [Bool] = []
-        for (r, run) in runs.enumerated() {
-            let frames = run.frames
+        var runItems: [ClosedRange<Int>] = []
+        for (r, (run, frames)) in taken.enumerated() {
             let actions = run.events.filter { $0.text != nil }.map(\.t)
             var a = 0
             var prevT = run.start
@@ -134,12 +138,13 @@ final class HistoryModel: ObservableObject {
                 }
                 segmentOf.append(segments.count - 1)
             }
+            runItems.append((items.count - frames.count)...(items.count - 1))
         }
         self.items = items
         self.segments = segments
         self.segmentOf = segmentOf
         self.acted = acted
-        placeOnClock()
+        placeOnClock(runItems)
         if let keep, let i = items.firstIndex(where: { runs[$0.run].id == keep.0 && $0.frame.t == keep.1 }) {
             index = i
         } else {
@@ -147,31 +152,34 @@ final class HistoryModel: ObservableObject {
         }
     }
 
-    /// Slots, stretches and lanes. Items are grouped by run, the runs oldest
-    /// first, and in time order within a run.
-    private func placeOnClock() {
-        var runItems: [ClosedRange<Int>] = []
-        var first = 0
-        for run in runs {
-            let n = run.frames.count
-            runItems.append(first...(first + max(n, 1) - 1))
-            first += n
+    /// Slots, stretches and lanes. Items are grouped by run (`runItems`,
+    /// every run with at least one), and in time order within a run.
+    private func placeOnClock(_ runItems: [ClosedRange<Int>]) {
+        // Runs in the order of their first frame, which can differ from the
+        // order they started in (a late first capture, pruned chunks): lanes
+        // and stretches are handed out along the clock. Each run takes the
+        // top lane that's free when it starts.
+        let order = runItems.indices.sorted { a, b in
+            let ta = items[runItems[a].lowerBound].frame.t, tb = items[runItems[b].lowerBound].frame.t
+            return ta != tb ? ta < tb : a < b
         }
-        // Each run takes the top lane that's free when it starts.
-        var laneEnds: [Double] = [], laneOf: [Int] = []
-        var stretchOfRun: [Int] = [], stretchEnd = -Double.infinity, stretches = -1
-        for range in runItems where items.indices.contains(range.upperBound) {
+        var laneEnds: [Double] = []
+        var laneOf = [Int](repeating: 0, count: runItems.count)
+        var stretchOfRun = [Int](repeating: 0, count: runItems.count)
+        var stretchEnd = -Double.infinity, stretches = -1
+        for r in order {
+            let range = runItems[r]
             let from = items[range.lowerBound].frame.t, to = items[range.upperBound].frame.t
             if let free = laneEnds.firstIndex(where: { $0 < from }) {
                 laneEnds[free] = to
-                laneOf.append(free)
+                laneOf[r] = free
             } else {
                 laneEnds.append(to)
-                laneOf.append(laneEnds.count - 1)
+                laneOf[r] = laneEnds.count - 1
             }
             if from > stretchEnd { stretches += 1 }
             stretchEnd = max(stretchEnd, to)
-            stretchOfRun.append(stretches)
+            stretchOfRun[r] = stretches
         }
         let byTime = items.indices.sorted { a, b in
             let ta = items[a].frame.t, tb = items[b].frame.t

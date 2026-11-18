@@ -424,7 +424,9 @@ final class HistoryTrackView: NSView {
         let labelAttrs = Self.attrs(10.5, .semibold, .white.withAlphaComponent(0.5))
         let timeAttrs = Self.attrs(10.5, .medium, .white.withAlphaComponent(0.32))
         var lastLabelEnd = [CGFloat](repeating: -.infinity, count: m.lanes)
-        for (r, items) in m.runItems.enumerated() {
+        // Left to right, which isn't always the order the runs started in.
+        for r in m.runItems.indices.sorted(by: { contentX(m.runItems[$0].lowerBound) < contentX(m.runItems[$1].lowerBound) }) {
+            let items = m.runItems[r]
             guard contentX(items.upperBound) >= left, contentX(items.lowerBound) <= right else { continue }
             let lane = m.laneOf[r]
             let x = max(viewX(items.lowerBound) - spacing / 2, 6)
