@@ -443,7 +443,7 @@ public final class WindowManager {
         // Without a New Window menu item there's nothing safe to press (see
         // below): say so before holding the user's input.
         if scripted == nil, trigger != "key", Self.newWindowMenuItem(pid: pid) == nil {
-            throw ToolError("\(name) has no New Window menu item, so no window was opened. It may not support multiple windows: use list_windows with app=\"\(name)\" and borrow_window.")
+            throw ToolError("\(name) has no menu item for a new window, so no window was opened. It may not support multiple windows: use list_windows with app=\"\(name)\" and borrow_window.")
         }
         if scripted == nil { hold?.start() }
         var scope: KeyScope?
@@ -521,7 +521,7 @@ public final class WindowManager {
                 how = "cmd+N"
                 caught = catcher.waitForWindow(timeoutMs: 5000)
             } else {
-                how = "nothing: it has no New Window menu item"
+                how = "nothing: it has no menu item for a new window"
             }
         }
         // Give key back right away: while the new window is key, the user's
@@ -636,28 +636,39 @@ public final class WindowManager {
         let title: String
     }
 
-    /// The app's "New Window" menu item, else its plain cmd+N item.
+    /// The app's menu item for a new window (see `newWindowRank`).
     static func newWindowMenuItem(pid: pid_t) -> MenuItemRef? {
         guard let bar = AX.element(AX.app(pid), "AXMenuBar") else { return nil }
-        var cmdN: MenuItemRef?
+        var best: (rank: Int, item: MenuItemRef)?
         for top in AX.children(bar) {
             for menu in AX.children(top) {
                 for item in AX.children(menu) {
                     let title = AX.string(item, "AXTitle") ?? ""
-                    let enabled = AX.bool(item, "AXEnabled") ?? true
-                    guard enabled, !title.isEmpty else { continue }
-                    let lower = title.lowercased()
-                    if lower == "new window" { return MenuItemRef(element: item, title: title) }
-                    let char = AX.string(item, "AXMenuItemCmdChar") ?? ""
-                    let mods = (AX.attr(item, "AXMenuItemCmdModifiers") as? NSNumber)?.intValue ?? -1
-                    if cmdN == nil && char.uppercased() == "N" && mods == 0
-                        && !lower.contains("private") && !lower.contains("incognito") {
-                        cmdN = MenuItemRef(element: item, title: title)
-                    }
+                    guard AX.bool(item, "AXEnabled") ?? true,
+                          let rank = newWindowRank(title: title, key: AX.string(item, "AXMenuItemCmdChar") ?? "",
+                                                   modifiers: (AX.attr(item, "AXMenuItemCmdModifiers") as? NSNumber)?.intValue ?? -1)
+                    else { continue }
+                    if rank == 0 { return MenuItemRef(element: item, title: title) }
+                    if best == nil || rank < best!.rank { best = (rank, MenuItemRef(element: item, title: title)) }
                 }
             }
         }
-        return cmdN
+        return best?.item
+    }
+
+    /// Whether a menu item opens a new window, best first: 0 "New Window",
+    /// 1 one that names a window ("New Finder Window", "New Viewer Window"),
+    /// 2 a document app's plain "New" (cmd+N); nil for anything else. Not
+    /// any cmd+N item: in many apps it makes something inside the window that
+    /// has key, often the user's ("New Chat", "New Message" in Messages,
+    /// "New Note", "New Event").
+    static func newWindowRank(title: String, key: String, modifiers: Int) -> Int? {
+        let lower = title.lowercased().trimmingCharacters(in: .whitespaces)
+        if lower.isEmpty || lower.contains("private") || lower.contains("incognito") { return nil }
+        if lower == "new window" { return 0 }
+        if lower.hasSuffix(" window") && (lower.hasPrefix("new ") || lower.hasPrefix("open ")) { return 1 }
+        if key.uppercased() == "N" && modifiers == 0 && (lower == "new" || lower == "new document") { return 2 }
+        return nil
     }
 
     /// Move a window onto the agent display, keeping its size where it fits.
