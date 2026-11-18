@@ -493,8 +493,13 @@ final class HistoryTrackView: NSView {
         guard let i = Self.spacings.firstIndex(of: spacing) else { return }
         let next = min(max(0, i + step), Self.spacings.count - 1)
         spacing = Self.spacings[next]
-        held = nil
-        scrollX = contentX(model?.index ?? 0)
+        // A held playhead keeps its time (or the live edge) at the new scale.
+        if let h = held, let m = model, let at = item(h.at) {
+            scrollX = h.edge ? lastContentX : max(contentX(at), contentX(m.index))
+        } else {
+            held = nil
+            scrollX = contentX(model?.index ?? 0)
+        }
         needsDisplay = true
     }
 

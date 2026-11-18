@@ -333,6 +333,15 @@ enum HistorySelfTest {
                 track.endDragForTest()
                 dragOK = dragOK && vm2.current?.frame.t == shownT && track.heldForTest.held
                 print("a reload mid-drag on a quiet live agent: \(dragOK ? "kept the earlier frame" : "WRONG, followed it")")
+                // Zooming keeps the hold: the quiet agent's next frame doesn't pull History back.
+                let heldTime = track.heldForTest.time
+                track.zoom(-1)
+                quiet.add(fake(size, app: "Photos", title: "All", body: "zoomed", field: nil, step: 5), t: wallMs(), app: "Photos", bundleID: "com.apple.Photos")
+                spin(1.5)
+                let zoomKept = track.heldForTest.held && track.heldForTest.time == heldTime && vm2.current?.frame.t == shownT
+                track.zoom(1)
+                print("zooming while held back on a quiet live agent: \(zoomKept ? "kept the hold" : "WRONG, let go")")
+                dragOK = dragOK && zoomKept
                 // A second gesture moves on; a reload doesn't put back the first's hold.
                 let settled = track.holdForTest(from: first)
                 _ = track.dragForTest(from: nil, by: step * 2.3)
