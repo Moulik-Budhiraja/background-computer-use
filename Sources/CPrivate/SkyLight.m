@@ -122,6 +122,14 @@ int BCUPostMakeKeyRecords(pid_t pid, uint32_t windowID) {
     return status;
 }
 
+extern int responsibility_get_pid_responsible_for_pid(pid_t pid) __attribute__((weak_import));
+
+pid_t BCUResponsiblePID(pid_t pid) {
+    if (!responsibility_get_pid_responsible_for_pid) return 0;
+    int r = responsibility_get_pid_responsible_for_pid(pid);
+    return r > 0 ? r : 0;
+}
+
 pid_t BCUFrontProcessPID(void) {
     GetFrontProcessFn front = (GetFrontProcessFn)Sym("_SLPSGetFrontProcess");
     GetProcessPIDFn toPid = (GetProcessPIDFn)Sym("GetProcessPID");

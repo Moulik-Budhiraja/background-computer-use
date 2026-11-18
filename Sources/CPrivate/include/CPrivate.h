@@ -52,6 +52,9 @@ int BCUPostMakeKeyRecords(pid_t pid, uint32_t windowID);
 /// The pid WindowServer considers frontmost (0 if unknown). Unlike
 /// NSWorkspace, this doesn't wait for our run loop to see the change.
 pid_t BCUFrontProcessPID(void);
+/// The app responsible for a process (a WebKit GPU process plays an app's
+/// sound under its own pid): `pid` itself for an app, or 0 if unknown.
+pid_t BCUResponsiblePID(pid_t pid);
 
 /// SLPSSetFrontProcessWithOptions. Used only to give the front back to the
 /// user's app after another app activated itself. 0x200 = user generated.

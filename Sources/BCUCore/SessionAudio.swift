@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import CoreAudio
+import CPrivate
 
 /// Sound from apps that only the agent is using (every window on an agent
 /// display) is muted on the speakers and recorded to a file that exists for
@@ -308,7 +309,9 @@ public final class SessionAudio {
     }
 
     /// Every Core Audio process object belonging to these apps: the apps
-    /// themselves and helpers whose bundle ID extends theirs.
+    /// themselves, helpers whose bundle ID extends theirs (Chromium's), and
+    /// processes they're responsible for (WebKit's GPU process, which plays
+    /// the sound of Safari and of any app showing web content).
     static func audioProcesses(of apps: [NSRunningApplication]) -> [AudioObjectID] {
         guard !apps.isEmpty else { return [] }
         let pids = Set(apps.map(\.processIdentifier))
@@ -322,7 +325,9 @@ public final class SessionAudio {
             var pid: pid_t = 0
             var psize = UInt32(MemoryLayout<pid_t>.size)
             var paddr = address(kAudioProcessPropertyPID)
-            if AudioObjectGetPropertyData(id, &paddr, 0, nil, &psize, &pid) == noErr, pids.contains(pid) { return true }
+            if AudioObjectGetPropertyData(id, &paddr, 0, nil, &psize, &pid) == noErr {
+                if pids.contains(pid) || pids.contains(BCUResponsiblePID(pid)) { return true }
+            }
             var bundle: CFString = "" as CFString
             var bsize = UInt32(MemoryLayout<CFString>.size)
             var baddr = address(kAudioProcessPropertyBundleID)
