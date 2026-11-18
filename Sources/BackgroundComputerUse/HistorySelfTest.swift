@@ -154,6 +154,9 @@ enum HistorySelfTest {
             let ok = controller.trackViewForTest.scrubForwardForTest(from: from, steps: 12)
             clockOK = clockOK && ok
             print("scrub forward past a sparse run's frames: \(ok ? "ok" : "WRONG")")
+            let back = controller.trackViewForTest.recenterForTest(from: from)
+            clockOK = clockOK && back
+            print("jump to the frame shown after a held scrub: \(back ? "ok" : "WRONG")")
         } else {
             clockOK = false
             print("scrub forward: no sparse frame to start from -> WRONG")

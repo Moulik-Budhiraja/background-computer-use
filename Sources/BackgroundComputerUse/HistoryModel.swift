@@ -49,6 +49,8 @@ final class HistoryModel: ObservableObject {
     /// The track and the frame view follow the model through these.
     var onItemsChanged: (() -> Void)?
     var onIndexChanged: ((_ animated: Bool) -> Void)?
+    /// A jump to the frame already shown.
+    var onRecenter: ((_ animated: Bool) -> Void)?
 
     private var observer: NSObjectProtocol?
     private var reloadPending = false
@@ -230,7 +232,9 @@ final class HistoryModel: ObservableObject {
     func go(to i: Int, animated: Bool = true) {
         guard !items.isEmpty else { return }
         let i = min(max(0, i), items.count - 1)
-        guard i != index else { return }
+        // Already showing it: the playhead may still be elsewhere (a scrub
+        // past an agent's last frame), so bring it back to the frame.
+        guard i != index else { onRecenter?(animated); return }
         index = i
         onIndexChanged?(animated)
     }

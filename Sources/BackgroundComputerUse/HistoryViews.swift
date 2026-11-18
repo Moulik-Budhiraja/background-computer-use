@@ -300,6 +300,20 @@ final class HistoryTrackView: NSView {
 
     private func viewX(_ i: Int) -> CGFloat { bounds.midX + contentX(i) - scrollX }
 
+    /// For the self-test: scrub a little past item `i` (it stays shown and
+    /// the playhead is held), then jump to `i`. True when the playhead is
+    /// back on its frame.
+    func recenterForTest(from i: Int) -> Bool {
+        guard let m = model, m.items.indices.contains(i) else { return false }
+        m.go(to: i, animated: false)
+        scrollX += spacing * 0.6
+        moved()
+        settle(animated: false)
+        guard m.index == i, abs(scrollX - contentX(i)) > spacing / 2 else { return false }
+        m.go(to: i, animated: false)
+        return abs(scrollX - contentX(i)) < 0.5
+    }
+
     /// For the self-test: from item `i`, scrub forward in steps smaller than
     /// a frame, as a mouse wheel does, settling after each. True when the
     /// playhead never went back, stayed with `i`'s run while it recorded,
@@ -342,6 +356,12 @@ final class HistoryTrackView: NSView {
             self.needsDisplay = true
             if k >= 1 { t.invalidate() }
         }
+    }
+
+    /// Onto the frame shown, even when a scrub left the playhead past it.
+    func recenter(animated: Bool) {
+        heldAt = nil
+        follow(animated: animated)
     }
 
     func zoom(_ step: Int) {

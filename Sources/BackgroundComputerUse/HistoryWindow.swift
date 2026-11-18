@@ -22,6 +22,7 @@ final class HistoryWindowController {
         trackView.model = model
         frameView.onScroll = { [weak self] e in self?.trackView.scrollWheel(with: e) }
         model.onItemsChanged = { [weak self] in self?.trackView.needsDisplay = true }
+        model.onRecenter = { [weak self] animated in self?.trackView.recenter(animated: animated) }
         model.onIndexChanged = { [weak self] animated in
             self?.trackView.follow(animated: animated)
             self?.showCurrent()
