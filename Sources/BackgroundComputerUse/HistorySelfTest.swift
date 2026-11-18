@@ -384,6 +384,16 @@ enum HistorySelfTest {
                     let draggedEdge = track.heldForTest.edge && vm2.currentRun?.session == "bbbb0000-eeee"
                     keptEdge = keptEdge && draggedEdge
                     print("dragging at the live edge through a reload: \(draggedEdge ? "still at the edge" : "WRONG, let go of the edge")")
+                    // Dragging at the edge, the quiet agent's next frame is the newest of all.
+                    _ = track.dragForTest(from: nil, by: 10_000)
+                    let ownT = wallMs()
+                    quiet.add(fake(size, app: "Photos", title: "All", body: "own", field: nil, step: 6), t: ownT, app: "Photos", bundleID: "com.apple.Photos")
+                    spin(1.5)
+                    _ = track.dragForTest(from: nil, by: 1)
+                    track.endDragForTest()
+                    let onOwn = vm2.current?.frame.t == ownT.rounded() && !vm2.holdingPast
+                    keptEdge = keptEdge && onOwn
+                    print("dragging at the edge, the agent's own frame is newest: \(onOwn ? "on it" : "WRONG, fell back")")
                     quiet.finish(packing: 2.0)
                     var framesN: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
                     let after = wallMs()

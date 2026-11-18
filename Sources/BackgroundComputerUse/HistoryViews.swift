@@ -251,13 +251,14 @@ final class HistoryTrackView: NSView {
         // the old newest frame was pruned. Once its frame is the newest of
         // all, there's nothing to hold.
         if h.edge, let shown = key(m.index), shown.run == h.frame.run {
+            // Onto the new edge, mid-gesture too: the gesture goes on from there.
+            let shift = lastContentX - scrollX
+            scrollX = lastContentX
+            if let d = dragStart { dragStart = (d.x, d.scrollX + shift) }
             if let newest = m.byTime.last, newest != m.index, let at = key(newest) {
                 held = (shown, at, true)
-                // Onto the new edge, mid-gesture too: the gesture goes on from there.
-                let shift = lastContentX - scrollX
-                scrollX = lastContentX
-                if let d = dragStart { dragStart = (d.x, d.scrollX + shift) }
             } else {
+                // Its own frame is the newest now: the edge, nothing to hold.
                 held = nil
             }
             return
