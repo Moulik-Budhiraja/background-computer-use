@@ -349,7 +349,17 @@ enum HistorySelfTest {
                 RecordingTest.record(into: store, session: "dddd0000-aaaa", label: "Agent", size: size, frames: framesM, events: [])
                 spin(1.5)
                 var handedOff = false
+                var keptEdge = false
                 if let newestQuiet = vm2.items.indices.last(where: isQuiet), track.holdAtEdgeForTest(from: newestQuiet) {
+                    // It records a frame, and the other agent newer ones, in one reload.
+                    quiet.add(fake(size, app: "Photos", title: "All", body: "edge", field: nil, step: 3), t: wallMs(), app: "Photos", bundleID: "com.apple.Photos")
+                    var framesM2: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+                    let then = wallMs()
+                    for i in 0..<3 { framesM2.append((fake(size, app: "Music", title: "Queue", body: "m\(i)", field: nil, step: i), then + 10 + Double(i) * 10, "Music", "com.apple.Music")) }
+                    RecordingTest.record(into: store, session: "dddd1111-aaaa", label: "Agent", size: size, frames: framesM2, events: [])
+                    spin(1.5)
+                    keptEdge = track.heldForTest.edge && vm2.currentRun?.session == "bbbb0000-eeee"
+                    print("at the live edge, the quiet agent and another record: \(keptEdge ? "still at the edge" : "WRONG, let go of the edge")")
                     quiet.finish(packing: 2.0)
                     var framesN: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
                     let after = wallMs()
@@ -360,7 +370,7 @@ enum HistorySelfTest {
                     spin(2.0)
                 }
                 print("held at the live edge, the agent stops: \(handedOff ? "went on to the newest" : "WRONG, stayed on \(vm2.currentRun?.session ?? "-")")")
-                gestureOK = dragOK && kept && handedOff
+                gestureOK = dragOK && kept && keptEdge && handedOff
             }
         }
         exit(ok == total && total > 0 && wrong == 0 && limitOK && clockOK && prunedOK && liveOK && gestureOK ? 0 : 1)

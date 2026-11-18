@@ -246,6 +246,14 @@ final class HistoryTrackView: NSView {
     func itemsChanged() {
         defer { needsDisplay = true }
         guard let h = held, let m = model else { return }
+        // At the live edge following a quiet agent: it recorded a frame, but
+        // another agent has newer ones still. Still at the edge.
+        if h.edge, let shown = key(m.index), shown != h.frame, shown.run == h.frame.run,
+           let newest = m.byTime.last, newest != m.index, let at = key(newest) {
+            held = (shown, at, true)
+            if !scrolling, dragStart == nil { scrollX = lastContentX }
+            return
+        }
         guard key(m.index) == h.frame, let at = item(h.at) else {
             held = nil
             return
