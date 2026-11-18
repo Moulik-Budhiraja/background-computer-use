@@ -440,6 +440,11 @@ public final class WindowManager {
         // browsers) open it straight on the agent display, so no anchor is
         // needed and nothing ever reaches the user's screen.
         let scripted = trigger == nil || trigger == "script" ? Self.scriptableBrowser(pid: pid, bundleID: bundleID) : nil
+        // Without a New Window menu item there's nothing safe to press (see
+        // below): say so before holding the user's input.
+        if scripted == nil, trigger != "key", Self.newWindowMenuItem(pid: pid) == nil {
+            throw ToolError("\(name) has no New Window menu item, so no window was opened. It may not support multiple windows: use list_windows with app=\"\(name)\" and borrow_window.")
+        }
         if scripted == nil { hold?.start() }
         var scope: KeyScope?
         if scripted == nil, placement.contains(.anchor), let anchor = anchorWindow(pid: pid) {
@@ -501,15 +506,23 @@ public final class WindowManager {
             }
         }
         if scriptFailed {
-            hold?.start()
+            // Only a menu item the app names: a bare cmd+N goes to the app's
+            // key window, which is often the user's, and in an app without
+            // such an item it does something else there (a new thread, a new
+            // note) while their input is held waiting for a window.
             if trigger != "key", let item = Self.newWindowMenuItem(pid: pid) {
+                hold?.start()
                 let err = AX.perform(item.element, "AXPress")
                 how = "menu \"\(item.title)\"" + (err == .success ? "" : " (\(AX.errorName(err)))")
-            } else {
+                caught = catcher.waitForWindow(timeoutMs: 5000)
+            } else if trigger == "key" {
+                hold?.start()
                 try Input.pressKey(pid: pid, key: "n", modifiers: ["cmd"])
                 how = "cmd+N"
+                caught = catcher.waitForWindow(timeoutMs: 5000)
+            } else {
+                how = "nothing: it has no New Window menu item"
             }
-            caught = catcher.waitForWindow(timeoutMs: 5000)
         }
         // Give key back right away: while the new window is key, the user's
         // window in the same app is blurred.
