@@ -1394,6 +1394,17 @@ public final class Engine {
         // Only agents' windows: muted anyway, but only once the app starts
         // playing, and the first ~0.7 s gets out. A claim reads the tap from now.
         let agentsOnly = Self.appsOnAgent(checking: [w.pid])[w.pid] == true && !w.withUser
+        // Not while macOS is still to ask the user: with its prompt up,
+        // starting and stopping the recorder each block for about two
+        // minutes, and the user taking the app back would wait that long.
+        switch BCUAudioCapturePreflight() {
+        case 1:
+            throw ToolError("System Audio Recording is off for Background Computer Use (System Settings > Privacy & Security > Screen & System Audio Recording), so your sound can't be kept off the user's speakers. Don't play sound; if the task needs it, tell the user.")
+        case 2:
+            BCUAudioCaptureRequest()
+            throw ToolError("macOS is asking the user to allow System Audio Recording for Background Computer Use. Until they do, your sound can't be kept off their speakers: don't play sound yet, and call this again once they've answered.")
+        default: break
+        }
         var mute: AXNode?
         if args.int("mute_element") != nil {
             var muteArgs = args.raw

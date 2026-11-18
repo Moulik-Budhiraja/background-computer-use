@@ -55,6 +55,11 @@ pid_t BCUFrontProcessPID(void);
 /// The app responsible for a process (a WebKit GPU process plays an app's
 /// sound under its own pid): `pid` itself for an app, or 0 if unknown.
 pid_t BCUResponsiblePID(pid_t pid);
+/// System Audio Recording for this app: 0 allowed, 1 denied, 2 not asked
+/// yet, -1 unknown (TCC's preflight isn't there).
+int BCUAudioCapturePreflight(void);
+/// Ask for System Audio Recording (macOS shows its prompt); doesn't wait.
+void BCUAudioCaptureRequest(void);
 
 /// SLPSSetFrontProcessWithOptions. Used only to give the front back to the
 /// user's app after another app activated itself. 0x200 = user generated.
