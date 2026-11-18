@@ -9,7 +9,7 @@ permissions:
   contents: read
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: [self-hosted, windows]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
