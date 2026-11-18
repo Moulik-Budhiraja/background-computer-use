@@ -110,10 +110,11 @@ final class AudioClaims {
 
     /// Silence each claim's sound with its element (accessibility only, so
     /// it doesn't touch the user's focus), then wait up to `settleMs` for
-    /// the apps to go quiet: a press can succeed and do nothing (the page
-    /// changed under the element), and the app is still muted meanwhile.
+    /// the apps to go quiet, with the app still muted meanwhile: a tab's
+    /// mute takes Helium 0.1–0.3 s and Safari 0.35–0.65 s to be heard, and
+    /// a press can succeed and do nothing (the page changed under it).
     /// Returns a note per claim, also kept for the agent's next call.
-    func silence(_ hit: [Claim], why: String, settleMs: Double = 250,
+    func silence(_ hit: [Claim], why: String, settleMs: Double = 600,
                  playing: (pid_t) -> Bool = { pid in NSRunningApplication(processIdentifier: pid).map(SessionAudio.isPlaying) ?? false }) -> [String] {
         let pressed = hit.map { c in c.mute.map { AX.perform($0, "AXPress") } }
         let pids = Set(hit.map(\.pid))
