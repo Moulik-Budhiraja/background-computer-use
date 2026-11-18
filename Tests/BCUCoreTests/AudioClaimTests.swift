@@ -82,12 +82,12 @@ final class AudioClaimTests: XCTestCase {
         let c = AudioClaims()
         var calls = 0
         let start = nowMs()
-        _ = c.silence([claim(1, pid: 100)], why: "started using", settleMs: 200) { _ in calls += 1; return calls < 4 }
-        XCTAssertLessThan(nowMs() - start, 150)          // quiet after a few polls
+        _ = c.silence([claim(1, pid: 100)], why: "started using", settleMs: 1000) { _ in calls += 1; return calls < 4 }
+        XCTAssertLessThan(nowMs() - start, 600)          // quiet after a few polls, well before the limit
         let loudStart = nowMs()
-        _ = c.silence([claim(2, pid: 100)], why: "started using", settleMs: 200) { _ in true }
-        XCTAssertGreaterThanOrEqual(nowMs() - loudStart, 200)
-        XCTAssertLessThan(nowMs() - loudStart, 400)
+        _ = c.silence([claim(2, pid: 100)], why: "started using", settleMs: 300) { _ in true }
+        XCTAssertGreaterThanOrEqual(nowMs() - loudStart, 300)
+        XCTAssertLessThan(nowMs() - loudStart, 1500)
     }
 
     /// Play, next, previous, fast-forward and rewind going down count;

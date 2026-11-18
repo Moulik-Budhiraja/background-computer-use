@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import os
 import CoreAudio
 import CPrivate
 
@@ -38,6 +39,20 @@ public final class SessionAudio {
         }
     }
     private var _keepRecording = false
+
+    /// When the tap last carried sound (not silence), while the recorder
+    /// reads it. IO thread writes, any thread reads.
+    private let lastSound = OSAllocatedUnfairLock(initialState: -Double.infinity)
+    private let reading = OSAllocatedUnfairLock(initialState: false)
+
+    /// Whether the routed apps made any sound in the last `ms`, or nil when
+    /// the recorder isn't reading the tap and so can't tell. Sharper than
+    /// `isPlaying`: an app keeps its output running for a while after it
+    /// goes silent (WebKit for seconds).
+    public func soundWithin(ms: Double) -> Bool? {
+        guard reading.withLock({ $0 }) else { return nil }
+        return nowMs() - lastSound.withLock { $0 } < ms
+    }
 
     private let queue = DispatchQueue(label: "bcu.audio")
     /// The recorder's callback. Separate from `queue`, because stopping the
@@ -250,15 +265,30 @@ public final class SessionAudio {
             guard let self, all.count >= tapBuffers else { return }
             for i in 0..<tapBuffers { tapList[i] = all[all.count - tapBuffers + i] }
             guard let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: tapList.unsafePointer, deallocator: nil) else { return }
+            if Self.audible(buffer) { self.lastSound.withLock { $0 = nowMs() } }
             self.write(buffer)
         }
         guard err == noErr, let proc else { throw ToolError("couldn't read the tap (\(err))") }
         procID = proc
         err = AudioDeviceStart(agg, proc)
         guard err == noErr else { throw ToolError("couldn't start reading the tap (\(err))") }
+        reading.withLock { $0 = true }
+    }
+
+    /// Any sample louder than about -66 dBFS.
+    private static func audible(_ buffer: AVAudioPCMBuffer) -> Bool {
+        guard let channels = buffer.floatChannelData else { return false }
+        let n = Int(buffer.frameLength) * (buffer.format.isInterleaved ? Int(buffer.format.channelCount) : 1)
+        let lists = buffer.format.isInterleaved ? 1 : Int(buffer.format.channelCount)
+        for c in 0..<lists {
+            let d = channels[c]
+            for i in 0..<n where abs(d[i]) > 0.0005 { return true }
+        }
+        return false
     }
 
     private func stopRecorder() {
+        reading.withLock { $0 = false }
         if aggregateID != kAudioObjectUnknown {
             if let procID {
                 AudioDeviceStop(aggregateID, procID)

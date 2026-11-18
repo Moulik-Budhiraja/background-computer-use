@@ -1424,7 +1424,11 @@ public final class Engine {
     /// The user is using a claimed app: silence the agent's sound, then
     /// stop muting the app. Off the input tap's thread.
     private func giveSoundBack(_ hit: [AudioClaims.Claim], why: String) {
-        _ = audioClaims.silence(hit, why: why)
+        // Quiet once the tap has carried no sound for 150 ms; without the
+        // recorder running, once the app's output has stopped.
+        _ = audioClaims.silence(hit, why: why) { [audio] pid in
+            audio.soundWithin(ms: 150) ?? (NSRunningApplication(processIdentifier: pid).map(SessionAudio.isPlaying) ?? false)
+        }
         audio.keepRecording = !audioClaims.isEmpty
         audio.routeNow(audioApps())
         if audioClaims.isEmpty { focusGuard.onUserInput(for: "audio-\(sessionID)", nil) }
