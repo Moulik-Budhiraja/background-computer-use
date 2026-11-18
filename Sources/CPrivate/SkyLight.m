@@ -122,6 +122,30 @@ int BCUPostMakeKeyRecords(pid_t pid, uint32_t windowID) {
     return status;
 }
 
+extern int responsibility_get_pid_responsible_for_pid(pid_t pid) __attribute__((weak_import));
+
+pid_t BCUResponsiblePID(pid_t pid) {
+    if (!responsibility_get_pid_responsible_for_pid) return 0;
+    int r = responsibility_get_pid_responsible_for_pid(pid);
+    return r > 0 ? r : 0;
+}
+
+static void *TCCSym(const char *name) {
+    static void *tcc;
+    if (!tcc) tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/TCC", RTLD_LAZY);
+    return tcc ? dlsym(tcc, name) : NULL;
+}
+
+int BCUAudioCapturePreflight(void) {
+    int (*preflight)(CFStringRef, CFDictionaryRef) = TCCSym("TCCAccessPreflight");
+    return preflight ? preflight(CFSTR("kTCCServiceAudioCapture"), NULL) : -1;
+}
+
+void BCUAudioCaptureRequest(void) {
+    void (*request)(CFStringRef, CFDictionaryRef, void (^)(Boolean)) = TCCSym("TCCAccessRequest");
+    if (request) request(CFSTR("kTCCServiceAudioCapture"), NULL, ^(Boolean granted) { (void)granted; });
+}
+
 pid_t BCUFrontProcessPID(void) {
     GetFrontProcessFn front = (GetFrontProcessFn)Sym("_SLPSGetFrontProcess");
     GetProcessPIDFn toPid = (GetProcessPIDFn)Sym("GetProcessPID");
