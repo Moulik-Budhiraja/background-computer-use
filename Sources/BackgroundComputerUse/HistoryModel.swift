@@ -39,6 +39,10 @@ final class HistoryModel: ObservableObject {
     /// Run index to its lane (0 is the top one), and to its items.
     private(set) var laneOf: [Int] = []
     private(set) var runItems: [ClosedRange<Int>] = []
+    /// Run index to when it stopped recording (the newest frame of all for
+    /// a live one): an agent whose screen doesn't change records no frames,
+    /// but is still recording.
+    private(set) var runEnds: [Double] = []
     /// The most runs that were ever recording at once.
     @Published private(set) var lanes = 1
 
@@ -174,9 +178,14 @@ final class HistoryModel: ObservableObject {
         var laneOf = [Int](repeating: 0, count: runItems.count)
         var stretchOfRun = [Int](repeating: 0, count: runItems.count)
         var stretchEnd = -Double.infinity, stretches = -1
+        let newest = items.map(\.frame.t).max() ?? 0
+        let runEnds = runItems.indices.map { r -> Double in
+            let last = items[runItems[r].upperBound].frame.t
+            return max(last, runs[r].isLive ? newest : runs[r].end)
+        }
         for r in order {
             let range = runItems[r]
-            let from = items[range.lowerBound].frame.t, to = items[range.upperBound].frame.t
+            let from = items[range.lowerBound].frame.t, to = runEnds[r]
             if let free = laneEnds.firstIndex(where: { $0 < from }) {
                 laneEnds[free] = to
                 laneOf[r] = free
@@ -199,8 +208,19 @@ final class HistoryModel: ObservableObject {
         self.stretch = items.map { stretchOfRun[$0.run] }
         self.laneOf = laneOf
         self.runItems = runItems
+        self.runEnds = runEnds
         let lanes = max(1, laneEnds.count)
         if lanes != self.lanes { self.lanes = lanes }
+    }
+
+    /// The newest frame of all at or before time `t`.
+    func lastItem(atOrBefore t: Double) -> Int? {
+        var lo = 0, hi = byTime.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if items[byTime[mid]].frame.t <= t { lo = mid + 1 } else { hi = mid }
+        }
+        return lo > 0 ? byTime[lo - 1] : nil
     }
 
     /// The frame `by` away from item `i` in its own run; past the run's

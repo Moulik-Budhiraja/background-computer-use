@@ -162,6 +162,14 @@ enum HistorySelfTest {
             print("scrub forward: no sparse frame to start from -> WRONG")
         }
 
+        // Hold the playhead past a Mail frame before the size limit below
+        // closes up the clock: it has to stay on the timeline.
+        var heldBefore: Double?
+        if let mail = m.items.indices.last(where: { m.items[$0].frame.app == "Mail" && $0 + 1 < m.items.count && m.items[$0 + 1].run == m.items[$0].run && m.slot[$0 + 1] - m.slot[$0] >= 3 }),
+           controller.trackViewForTest.holdForTest(from: mail) {
+            heldBefore = controller.trackViewForTest.heldForTest.time
+        }
+
         // Retention: a run that ended 8 days ago goes; recent ones stay.
         let old = store.directory.appendingPathComponent("20200101-000000-old")
         try? FileManager.default.createDirectory(at: old, withIntermediateDirectories: true)
@@ -194,6 +202,11 @@ enum HistorySelfTest {
         spin(0.5)
         snapshot(prunedHost, to: out.appendingPathComponent("history-after-limit.png"))
         var prunedOK = clockOrder(pruned.model, "after the size limit")
+        spin(1.0)
+        let heldAfter = controller.trackViewForTest.heldForTest
+        let sane = heldBefore != nil && heldAfter.held && heldAfter.time == heldBefore
+        prunedOK = prunedOK && sane
+        print("held playhead after the size limit: \(sane ? "same time" : "WRONG, held \(heldAfter.held), time \(heldAfter.time) was \(heldBefore ?? -1)")")
         RecordingTest.applyLimit(store, bytes: nil)
         // On the newest frame when a new recording starts: History goes on to it.
         pruned.model.goToNewest()
@@ -209,6 +222,22 @@ enum HistorySelfTest {
         let followedNew = pruned.model.currentRun?.session == "44444444-dddd" && pruned.model.atEnd
         print("a new recording after the newest frame: \(followedNew ? "followed" : "WRONG, stayed on \(pruned.model.currentRun?.session ?? "-")")")
         prunedOK = prunedOK && followedNew
+        // An agent whose screen didn't change records one frame, but its
+        // recording goes on: another agent recording then gets its own lane.
+        let quiet = wallMs() - 4_000
+        RecordingTest.record(into: store, session: "55555555-eeee", label: "Agent", size: size,
+                             frames: [(fake(size, app: "Calendar", title: "Week", body: "", field: nil, step: 0), quiet, "Calendar", "com.apple.iCal")],
+                             events: [], end: quiet + 3_500)
+        var framesF: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+        for i in 0..<3 { framesF.append((fake(size, app: "Notes", title: "List", body: String(i), field: nil, step: i), quiet + 1_000 + Double(i) * 500, "Notes", "com.apple.Notes")) }
+        RecordingTest.record(into: store, session: "66666666-ffff", label: "Agent", size: size, frames: framesF, events: [])
+        spin(2.0)
+        let pm = pruned.model
+        let laneE = pm.runs.indices.first { pm.runs[$0].session == "55555555-eeee" }.map { pm.laneOf[$0] }
+        let laneF = pm.runs.indices.first { pm.runs[$0].session == "66666666-ffff" }.map { pm.laneOf[$0] }
+        let ownLane = laneE != nil && laneF != nil && laneE != laneF
+        print("a quiet agent still recording keeps its lane: \(ownLane ? "ok" : "WRONG, lanes \(String(describing: laneE)) \(String(describing: laneF))")")
+        prunedOK = prunedOK && ownLane
         exit(ok == total && total > 0 && wrong == 0 && limitOK && clockOK && prunedOK ? 0 : 1)
     }
 

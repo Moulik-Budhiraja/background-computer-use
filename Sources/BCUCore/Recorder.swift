@@ -73,6 +73,8 @@ public final class RecordedRun {
     public var end: Double { lock.lock(); defer { lock.unlock() }; return _end ?? _frames.last?.t ?? start }
 
     func setLive(_ live: Bool) { lock.lock(); _live = live; if !live, _end == nil { _end = wallMs() }; lock.unlock() }
+    /// Test support: when a made-up run's recording ended.
+    func setEnd(_ t: Double) { lock.lock(); _end = t; lock.unlock(); writeMeta() }
     func append(_ f: RecordedFrame) { lock.lock(); _frames.append(f); lock.unlock() }
     func append(_ e: RecordedEvent) { lock.lock(); _events.append(e); lock.unlock() }
     func append(_ c: RecordedChunk) { lock.lock(); _chunks.append(c); lock.unlock() }
@@ -787,9 +789,9 @@ public final class SessionRecorder {
 public enum RecordingTest {
     public static func record(into store: Recordings, session: String, label: String, size: CGSize,
                               frames: [(image: CGImage, t: Double, app: String, bundleID: String?)],
-                              events: [(t: Double, text: String?, point: CGPoint?, click: Bool)]) {
+                              events: [(t: Double, text: String?, point: CGPoint?, click: Bool)], end: Double? = nil) {
         let q = DispatchQueue(label: "bcu.recorder.test")
-        guard let first = frames.first,
+        guard let first = frames.first, let last = frames.last,
               let w = RunWriter(store: store, id: SessionRecorder.runID(session: session, date: Date(timeIntervalSince1970: first.t / 1000)),
                                 session: session, label: label, start: first.t - 500, size: size, compactQueue: q) else { return }
         var e = 0
@@ -805,6 +807,8 @@ public enum RecordingTest {
         let done = DispatchSemaphore(value: 0)
         w.finish { done.signal() }
         done.wait()
+        // Its recording ended with its last frame, not when the test wrote it.
+        w.run.setEnd(end ?? last.t + 500)
     }
 
     /// A size limit in bytes for a test, applied now; blocks until done. nil goes back to `limitMB`.
