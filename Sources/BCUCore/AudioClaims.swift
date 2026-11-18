@@ -149,7 +149,7 @@ final class AudioClaims {
         let flipped = hit.map { c in
             quietBefore.contains(c.pid) || (c.mute.map { m in c.muteLook.map { $0 != Self.look(m) } ?? false } ?? false)
         }
-        let pressed = zip(hit, flipped).map { c, flip in flip ? AXError.success : c.mute.map { AX.perform($0, "AXPress") } }
+        let pressed = zip(hit, flipped).map { c, flip in c.mute.map { flip ? AXError.success : AX.perform($0, "AXPress") } }
         let pids = Set(hit.map(\.pid))
         let deadline = nowMs() + settleMs
         var loud = pids.filter(playing)
