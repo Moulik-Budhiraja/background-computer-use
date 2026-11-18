@@ -259,16 +259,37 @@ enum HistorySelfTest {
                 spin(1.5)
                 let stayed = vm.current.map { vm.runs[$0.run].session == "77777777-aaaa" && $0.frame.t == base.rounded() } == true
                 print("held on a live agent's unchanged frame, then it records: \(stayed ? "stayed" : "WRONG, moved")")
-                live.finish(packing: 0.5)
-                let next = wallMs() + 1
+                // Back at the live edge, held on the same unchanged frame while
+                // another agent records: its next frame is followed.
+                var framesJ: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+                let soon = wallMs()
+                for i in 0..<3 { framesJ.append((fake(size, app: "Books", title: "Shelf", body: String(i), field: nil, step: i), soon + 10 + Double(i) * 10, "Books", "com.apple.iBooksX")) }
+                RecordingTest.record(into: store, session: "aaaa0000-dddd", label: "Agent", size: size, frames: framesJ, events: [])
+                spin(1.5)
+                var edgeOK = false
+                let aLast = soon + 200
+                if let newestA = vm.items.indices.last(where: { vm.runs[vm.items[$0].run].session == "77777777-aaaa" }),
+                   viewer.trackViewForTest.holdAtEdgeForTest(from: newestA) {
+                    live.add(fake(size, app: "Maps", title: "Map", body: "moved again", field: nil, step: 2), t: aLast, app: "Maps", bundleID: "com.apple.Maps")
+                    spin(1.5)
+                    edgeOK = vm.current.map { vm.runs[$0.run].session == "77777777-aaaa" && $0.frame.t == aLast.rounded() } == true
+                }
+                print("held at the live edge on a live agent, then it records: \(edgeOK ? "followed" : "WRONG, stayed")")
+                // It stops while its video is still packing, and another run
+                // starts right after: History goes on to it, and they share a lane.
+                live.finish(packing: 2.0)
+                let next = max(wallMs(), aLast) + 1
                 var framesH: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
-                for i in 0..<3 { framesH.append((fake(size, app: "Maps", title: "Map", body: "next \(i)", field: nil, step: i), next + Double(i) * 300, "Maps", "com.apple.Maps")) }
+                for i in 0..<3 { framesH.append((fake(size, app: "Maps", title: "Map", body: "next \(i)", field: nil, step: i), next + Double(i) * 30, "Maps", "com.apple.Maps")) }
                 RecordingTest.record(into: store, session: "99999999-cccc", label: "Agent", size: size, frames: framesH, events: [])
-                spin(2.0)
+                spin(1.2)
+                let movedOn = vm.currentRun?.session == "99999999-cccc"
+                print("the run stopped while packing, another started: \(movedOn ? "moved on to it" : "WRONG, stayed on \(vm.currentRun?.session ?? "-")")")
+                spin(2.5)
                 let lane = { (session: String) in vm.runs.indices.first { vm.runs[$0].session == session }.map { vm.laneOf[$0] } }
                 let shared = lane("77777777-aaaa") != nil && lane("77777777-aaaa") == lane("99999999-cccc")
                 print("a run that starts as another stops shares its lane: \(shared ? "ok" : "WRONG")")
-                liveOK = stayed && shared
+                liveOK = stayed && edgeOK && movedOn && shared
             } else {
                 print("live agent: couldn't hold the playhead -> WRONG")
             }

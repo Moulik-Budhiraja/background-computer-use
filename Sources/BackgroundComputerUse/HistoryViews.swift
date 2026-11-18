@@ -221,8 +221,11 @@ final class HistoryTrackView: NSView {
     /// through reloads too. Kept as frames (run, time), since a reload can
     /// renumber items and the size limit can close up the clock: `frame`
     /// is the one shown, `at` the newest frame of all at the playhead.
-    private var held: (frame: FrameKey, at: FrameKey)? {
-        didSet { model?.holdingPast = held != nil }
+    /// `edge`: the playhead was at the newest frame of all (the live edge),
+    /// which isn't looking back: History keeps following, and the playhead
+    /// stays at the edge as it moves.
+    private var held: (frame: FrameKey, at: FrameKey, edge: Bool)? {
+        didSet { model?.holdingPast = held.map { !$0.edge } ?? false }
     }
     private struct FrameKey: Equatable { let run: String; let t: Double }
 
@@ -244,7 +247,7 @@ final class HistoryTrackView: NSView {
             held = nil
             return
         }
-        scrollX = max(contentX(at), contentX(m.index))
+        scrollX = h.edge ? lastContentX : max(contentX(at), contentX(m.index))
     }
 
     override var isFlipped: Bool { true }
@@ -337,6 +340,17 @@ final class HistoryTrackView: NSView {
         moved()
         settle(animated: false)
         return held != nil
+    }
+
+    /// For the self-test: from item `i`, scrub to the newest frame of all and
+    /// let it settle. True when `i` is still shown there, held.
+    func holdAtEdgeForTest(from i: Int) -> Bool {
+        guard let m = model, m.items.indices.contains(i) else { return false }
+        m.go(to: i, animated: false)
+        scrollX = lastContentX
+        moved()
+        settle(animated: false)
+        return held != nil && m.index == i
     }
 
     /// For the self-test: whether the playhead is held, and its time.
@@ -465,7 +479,7 @@ final class HistoryTrackView: NSView {
         held = nil
         guard let m = model, m.items.indices.contains(m.index), abs(contentX(m.index) - scrollX) <= spacing / 2 else {
             if let m = model, let shown = key(m.index), let at = m.lastItem(atOrBefore: playheadTime).flatMap(key) {
-                held = (shown, at)
+                held = (shown, at, key(m.byTime.last ?? -1) == at)
             }
             needsDisplay = true
             return

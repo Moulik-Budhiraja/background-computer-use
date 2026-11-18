@@ -103,7 +103,9 @@ final class HistoryModel: ObservableObject {
             // while another agent records newer frames at the same time.
             // Not while the user holds the playhead at an earlier time (on a
             // run's newest frame only because it hadn't changed since).
-            let following = self.atRunEnd && self.currentRun?.isLive == true && !self.holdingPast ? self.currentRun?.id : nil
+            // A run still capturing: one that stopped is only packing its video.
+            let capturing = self.currentRun.map { $0.isLive && $0.stoppedAt == nil } ?? false
+            let following = self.atRunEnd && capturing && !self.holdingPast ? self.currentRun?.id : nil
             // On the newest frame of all (a run that has ended, or nothing
             // recorded yet): go on to whatever is newest, a new recording too.
             let newest = (self.atEnd && !self.holdingPast) || self.items.isEmpty
