@@ -144,7 +144,20 @@ enum HistorySelfTest {
         controller.model.go(to: 200, animated: false)
         spin(1.0)
         snapshot(host, to: out.appendingPathComponent("history-zoomed-out.png"))
-        let clockOK = clockOrder(controller.model, "recorded")
+        var clockOK = clockOrder(controller.model, "recorded")
+        // Scrubbing the Mail run where the other run's frames sit between its
+        // own: the playhead moves on instead of snapping back.
+        let m = controller.model
+        if let from = m.items.indices.first(where: { i in
+            m.items[i].frame.app == "Mail" && i + 1 < m.items.count && m.items[i + 1].run == m.items[i].run && m.slot[i + 1] - m.slot[i] >= 3
+        }) {
+            let ok = controller.trackViewForTest.scrubForwardForTest(from: from, steps: 12)
+            clockOK = clockOK && ok
+            print("scrub forward past a sparse run's frames: \(ok ? "ok" : "WRONG")")
+        } else {
+            clockOK = false
+            print("scrub forward: no sparse frame to start from -> WRONG")
+        }
 
         // Retention: a run that ended 8 days ago goes; recent ones stay.
         let old = store.directory.appendingPathComponent("20200101-000000-old")

@@ -214,6 +214,8 @@ final class HistoryTrackView: NSView {
     private var dragStart: (x: CGFloat, scrollX: CGFloat)?
     private var dragged = false
     private var scrolling = false
+    /// The model is following a scrub: the track is already where it should be.
+    private var holding = false
 
     override var isFlipped: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -254,10 +256,24 @@ final class HistoryTrackView: NSView {
         return lo
     }
 
+    /// Run `r`'s screen at content x: its newest frame at or before x (an
+    /// unchanged screen records no new frame), or its first one.
+    private func latest(inRun r: Int, atContent x: CGFloat) -> Int {
+        guard let m = model else { return 0 }
+        let range = m.runItems[r]
+        var lo = range.lowerBound, hi = range.upperBound
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if contentX(mid) <= x + spacing / 2 { lo = mid } else { hi = mid - 1 }
+        }
+        return lo
+    }
+
     /// The frame to show at content x. A click in a lane: that lane's run
     /// if it was recording there. Scrubbing: the run already on screen while
-    /// it was recording there, so it stays with one agent. Else the top
-    /// lane's run recording there, else the nearest frame of any run.
+    /// it was recording there, as its screen was at x, so it stays with one
+    /// agent. Else the top lane's run recording there, else the nearest
+    /// frame of any run.
     private func frame(atContent x: CGFloat, lane: Int? = nil) -> Int? {
         guard let m = model, !m.items.isEmpty else { return nil }
         let recording = m.runItems.indices.filter { span(ofRun: $0).contains(x) }
@@ -265,7 +281,7 @@ final class HistoryTrackView: NSView {
             return nearest(inRun: r, toContent: x)
         }
         if lane == nil, let current = m.current?.run, recording.contains(current) {
-            return nearest(inRun: current, toContent: x)
+            return latest(inRun: current, atContent: x)
         }
         if let r = recording.min(by: { m.laneOf[$0] < m.laneOf[$1] }) { return nearest(inRun: r, toContent: x) }
         return m.runItems.indices
@@ -278,11 +294,31 @@ final class HistoryTrackView: NSView {
 
     private func viewX(_ i: Int) -> CGFloat { bounds.midX + contentX(i) - scrollX }
 
+    /// For the self-test: from item `i`, scrub forward in steps smaller than
+    /// a frame, as a mouse wheel does, settling after each. True when the
+    /// playhead never went back, stayed with `i`'s run while it recorded,
+    /// and got past that run's next frame.
+    func scrubForwardForTest(from i: Int, steps: Int) -> Bool {
+        guard let m = model, m.items.indices.contains(i), i + 1 < m.items.count, m.items[i + 1].run == m.items[i].run else { return false }
+        m.go(to: i, animated: false)
+        let run = m.items[i].run, next = contentX(i + 1)
+        var last = scrollX, ok = true
+        for _ in 0..<steps {
+            scrollX += spacing * 0.6
+            moved()
+            settle(animated: false)
+            if scrollX < last - 0.5 { ok = false }
+            if span(ofRun: run).contains(scrollX), m.items[m.index].run != run { ok = false }
+            last = scrollX
+        }
+        return ok && scrollX > next
+    }
+
     // MARK: Following the model
 
     /// The model moved (keys, chevrons, a reload): bring the playhead there.
     func follow(animated: Bool) {
-        guard let m = model, !scrolling, dragStart == nil else { needsDisplay = true; return }
+        guard let m = model, !scrolling, dragStart == nil, !holding else { needsDisplay = true; return }
         let target = contentX(m.index)
         animation?.invalidate()
         if !animated || abs(target - scrollX) < 1 {
@@ -315,7 +351,11 @@ final class HistoryTrackView: NSView {
     private func moved() {
         guard let m = model, !m.items.isEmpty else { return }
         scrollX = min(max(scrollX, 0), lastContentX)
-        if let i = frame(atContent: scrollX) { m.scrubbed(to: i) }
+        if let i = frame(atContent: scrollX) {
+            holding = true
+            m.scrubbed(to: i)
+            holding = false
+        }
         needsDisplay = true
     }
 
@@ -335,9 +375,17 @@ final class HistoryTrackView: NSView {
     }
 
     /// Done scrolling: line the playhead up with the frame it's on.
-    private func settle() {
+    /// After a scrub: onto the frame shown when it's the one at the playhead.
+    /// When it's further back (an agent whose screen didn't change for a
+    /// while), the playhead stays where it was put, or every small step
+    /// forward would land back on that old frame.
+    private func settle(animated: Bool = true) {
         scrolling = false
-        follow(animated: true)
+        guard let m = model, m.items.indices.contains(m.index), abs(contentX(m.index) - scrollX) <= spacing / 2 else {
+            needsDisplay = true
+            return
+        }
+        follow(animated: animated)
     }
 
     override func mouseDown(with event: NSEvent) {
