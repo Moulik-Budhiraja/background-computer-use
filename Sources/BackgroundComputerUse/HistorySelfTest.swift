@@ -266,8 +266,17 @@ enum HistorySelfTest {
                 for i in 0..<3 { framesJ.append((fake(size, app: "Books", title: "Shelf", body: String(i), field: nil, step: i), soon + 10 + Double(i) * 10, "Books", "com.apple.iBooksX")) }
                 RecordingTest.record(into: store, session: "aaaa0000-dddd", label: "Agent", size: size, frames: framesJ, events: [])
                 spin(1.5)
-                var edgeOK = false
+                var edgeOK = false, reopened = false
                 let aLast = soon + 200
+                if let newestA = vm.items.indices.last(where: { vm.runs[vm.items[$0].run].session == "77777777-aaaa" }) {
+                    // Opening History again starts from the newest frame, not the hold.
+                    let heldNewest = viewer.trackViewForTest.holdForTest(from: newestA)
+                    viewer.open(session: "77777777-aaaa")
+                    spin(1.0)
+                    reopened = heldNewest && !viewer.trackViewForTest.heldForTest.held && !vm.holdingPast
+                        && vm.current.map { vm.runs[$0.run].session == "77777777-aaaa" } == true
+                    print("reopened while held: \(reopened ? "let go of the hold" : "WRONG, still held")")
+                }
                 if let newestA = vm.items.indices.last(where: { vm.runs[vm.items[$0].run].session == "77777777-aaaa" }),
                    viewer.trackViewForTest.holdAtEdgeForTest(from: newestA) {
                     live.add(fake(size, app: "Maps", title: "Map", body: "moved again", field: nil, step: 2), t: aLast, app: "Maps", bundleID: "com.apple.Maps")
@@ -289,7 +298,7 @@ enum HistorySelfTest {
                 let lane = { (session: String) in vm.runs.indices.first { vm.runs[$0].session == session }.map { vm.laneOf[$0] } }
                 let shared = lane("77777777-aaaa") != nil && lane("77777777-aaaa") == lane("99999999-cccc")
                 print("a run that starts as another stops shares its lane: \(shared ? "ok" : "WRONG")")
-                liveOK = stayed && edgeOK && movedOn && shared
+                liveOK = stayed && reopened && edgeOK && movedOn && shared
             } else {
                 print("live agent: couldn't hold the playhead -> WRONG")
             }

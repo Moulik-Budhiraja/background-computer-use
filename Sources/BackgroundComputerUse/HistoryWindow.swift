@@ -50,7 +50,7 @@ final class HistoryWindowController {
 
     /// Opens on the newest frame, or `session`'s newest.
     func show(session: String? = nil) {
-        if panel != nil { model.load(session: session); return }
+        if panel != nil { open(session: session); return }
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main ?? NSScreen.screens[0]
 
@@ -101,6 +101,13 @@ final class HistoryWindowController {
             guard let self, let panel = self.panel, e.window === panel else { return e }
             return self.handleKey(e) ? nil : e
         }
+        open(session: session)
+    }
+
+    /// Loads at the newest frame (of `session`), letting go of any playhead a
+    /// scrub held from before: opening is a jump, not a reload.
+    func open(session: String? = nil) {
+        trackView.releaseHold()
         model.load(session: session)
     }
 

@@ -414,6 +414,9 @@ final class HistoryTrackView: NSView {
         }
     }
 
+    /// Forget a held playhead: the next move goes onto the frame shown.
+    func releaseHold() { held = nil }
+
     /// Onto the frame shown, even when a scrub left the playhead past it.
     func recenter(animated: Bool) {
         held = nil
