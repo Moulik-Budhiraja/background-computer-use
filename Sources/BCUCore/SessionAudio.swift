@@ -24,6 +24,12 @@ public final class SessionAudio {
         set { stateLock.lock(); _routedApps = newValue; stateLock.unlock() }
     }
     private var _routedApps: [String] = []
+    /// The pids of the apps routed now. Any thread.
+    public var routedPids: Set<pid_t> {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _routedPids }
+        set { stateLock.lock(); _routedPids = newValue; stateLock.unlock() }
+    }
+    private var _routedPids: Set<pid_t> = []
     private let stateLock = NSLock()
 
     /// Read the tap even while nothing plays. A muted tap only mutes once a
@@ -184,6 +190,7 @@ public final class SessionAudio {
                 Log.info("audio: removed \(self.url.lastPathComponent)")
             }
             self.routedApps = []
+            self.routedPids = []
         }
     }
 
@@ -197,6 +204,7 @@ public final class SessionAudio {
         guard #available(macOS 14.2, *) else { return }
         let wanted = Self.audioProcesses(of: apps)
         let names = apps.compactMap(\.localizedName).sorted()
+        let pids = Set(apps.map(\.processIdentifier))
         defer { updateRecorder() }
         if wanted.isEmpty {
             if tapID != kAudioObjectUnknown {
@@ -204,6 +212,7 @@ public final class SessionAudio {
                 Log.info("audio: stopped routing")
             }
             routedApps = []
+            routedPids = []
             return
         }
         if wanted == processes, tapID != kAudioObjectUnknown { return }
@@ -219,6 +228,7 @@ public final class SessionAudio {
                 tapDescription = d
                 setProcesses(wanted)
                 routedApps = names
+                routedPids = pids
                 Log.info("audio: now muting \(names.joined(separator: ", "))")
                 return
             }
@@ -239,6 +249,7 @@ public final class SessionAudio {
         tapDescription = d
         setProcesses(wanted)
         routedApps = names
+        routedPids = pids
         failedAt = nil
         Log.info("audio: muted \(names.joined(separator: ", ")) on the speakers")
     }
