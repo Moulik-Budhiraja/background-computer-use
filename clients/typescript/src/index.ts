@@ -132,6 +132,8 @@ type Pending = { resolve: (v: any) => void; reject: (e: Error) => void }
 // One connection to the engine.
 export class EngineClient extends EventEmitter<Events> {
   private buffer = ''
+  // Characters at the start of `buffer` known to hold no newline.
+  private scanned = 0
   private nextId = 1
   private pending = new Map<number, Pending>()
   private closed = false
@@ -183,7 +185,7 @@ export class EngineClient extends EventEmitter<Events> {
     const id = this.nextId++
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, { resolve, reject })
-      this.socket.write(JSON.stringify({ id, op, ...params }) + '\n')
+      this.socket.write(JSON.stringify({ ...params, id, op }) + '\n')
     })
   }
 
@@ -265,50 +267,64 @@ export class EngineClient extends EventEmitter<Events> {
     opts: { fps?: number; maxWidth?: number; quality?: number; window?: number; exclude?: number } = {}
   ): Promise<FrameStream> {
     const conn = await EngineClient.connect({ path: this.path })
-    const { stream } = await conn.request<{ stream: number }>('frames', {
-      session,
-      fps: opts.fps,
-      max_width: opts.maxWidth,
-      quality: opts.quality,
-      window: opts.window,
-      exclude: opts.exclude
-    })
+    let stream: number
+    try {
+      ;({ stream } = await conn.request<{ stream: number }>('frames', {
+        session,
+        fps: opts.fps,
+        max_width: opts.maxWidth,
+        quality: opts.quality,
+        window: opts.window,
+        exclude: opts.exclude
+      }))
+    } catch (e) {
+      conn.close()
+      throw e
+    }
     const s = new FrameStream(conn, stream, () => this.streams.delete(s))
     this.streams.add(s)
     return s
   }
 
+  // Search only what's new and cut the buffer once per chunk, so a
+  // multi-megabyte frame arriving in small chunks isn't rescanned each time.
   private read(chunk: string): void {
     this.buffer += chunk
+    let start = 0
     let nl: number
-    while ((nl = this.buffer.indexOf('\n')) >= 0) {
-      const line = this.buffer.slice(0, nl)
-      this.buffer = this.buffer.slice(nl + 1)
-      if (!line) continue
-      let msg: any
-      try {
-        msg = JSON.parse(line)
-      } catch {
-        continue
-      }
-      if (msg.event) {
-        if (msg.event === 'sessions') {
-          const e = msg as SessionsEvent
-          this.emit('sessions', e.sessions, e.engine)
-        } else {
-          this.emit(msg.event, msg)
-        }
-        continue
-      }
-      const p = this.pending.get(msg.id)
-      if (!p) continue
-      this.pending.delete(msg.id)
-      if (msg.ok) {
-        const { id: _id, ok: _ok, ...rest } = msg
-        p.resolve(rest)
+    while ((nl = this.buffer.indexOf('\n', Math.max(start, this.scanned))) >= 0) {
+      const line = this.buffer.slice(start, nl)
+      start = nl + 1
+      if (line) this.handle(line)
+    }
+    if (start > 0) this.buffer = this.buffer.slice(start)
+    this.scanned = this.buffer.length
+  }
+
+  private handle(line: string): void {
+    let msg: any
+    try {
+      msg = JSON.parse(line)
+    } catch {
+      return
+    }
+    if (msg.event) {
+      if (msg.event === 'sessions') {
+        const e = msg as SessionsEvent
+        this.emit('sessions', e.sessions, e.engine)
       } else {
-        p.reject(new Error(msg.error ?? 'engine error'))
+        this.emit(msg.event, msg)
       }
+      return
+    }
+    const p = this.pending.get(msg.id)
+    if (!p) return
+    this.pending.delete(msg.id)
+    if (msg.ok) {
+      const { id: _id, ok: _ok, ...rest } = msg
+      p.resolve(rest)
+    } else {
+      p.reject(new Error(msg.error ?? 'engine error'))
     }
   }
 

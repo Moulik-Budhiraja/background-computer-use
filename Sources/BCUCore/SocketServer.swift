@@ -11,6 +11,11 @@ public final class SocketConnection {
     private let lock = NSLock()
     private var closed = false
     private var queued = 0
+    /// Writer queue only: the fd was closed, so a write queued after that
+    /// must not land on whatever file reuses its number.
+    private var fdClosed = false
+    /// Lines a client may leave unread before it counts as stuck and is dropped.
+    static let maxBacklog = 1000
     private var closeHandlers: [() -> Void] = []
 
     init(fd: Int32, id: Int) {
@@ -38,9 +43,19 @@ public final class SocketConnection {
     func send(_ line: Data) {
         lock.lock()
         if closed { lock.unlock(); return }
+        if queued >= Self.maxBacklog {
+            // Under the lock: `finish` can't have closed the fd yet. Its
+            // reader then sees the end and runs `finish` as usual.
+            closed = true
+            shutdown(fd, SHUT_RDWR)
+            lock.unlock()
+            Log.info("socket client \(id) stopped reading; dropping it")
+            return
+        }
         queued += 1
         lock.unlock()
         writer.async {
+            if self.fdClosed { self.lock.lock(); self.queued -= 1; self.lock.unlock(); return }
             let ok = line.withUnsafeBytes { raw -> Bool in
                 var offset = 0
                 while offset < raw.count {
@@ -72,7 +87,10 @@ public final class SocketConnection {
         lock.unlock()
         for h in handlers { h() }
         // After queued writes, so a last reply still goes out.
-        writer.async { close(self.fd) }
+        writer.async {
+            self.fdClosed = true
+            close(self.fd)
+        }
     }
 }
 
@@ -139,6 +157,10 @@ public final class SocketServer {
             // A client that went away mid-reply must not kill the engine with SIGPIPE.
             var on: Int32 = 1
             setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+            // A client that stops reading fails the write after this, and is
+            // dropped, instead of holding its writer queue forever.
+            var sendTimeout = timeval(tv_sec: 10, tv_usec: 0)
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, socklen_t(MemoryLayout<timeval>.size))
             idLock.lock(); nextID += 1; let id = nextID; idLock.unlock()
             let connection = SocketConnection(fd: client, id: id)
             let thread = Thread { [weak self] in
@@ -151,7 +173,7 @@ public final class SocketServer {
     }
 
     private func serve(_ connection: SocketConnection) {
-        var buffer = Data()
+        var buffer = LineBuffer()
         var chunk = [UInt8](repeating: 0, count: 65536)
         var sessions: Set<String> = []
         defer { for s in sessions { sessionHandler?(s, false) } }
@@ -160,10 +182,13 @@ public final class SocketServer {
             if n < 0 && errno == EINTR { continue }
             if n <= 0 { return }
             buffer.append(chunk, count: n)
-            while let newline = buffer.firstIndex(of: 0x0A) {
-                let line = buffer.subdata(in: buffer.startIndex..<newline)
-                buffer.removeSubrange(buffer.startIndex...newline)
-                guard let request = WireCodec.decode(line) else { continue }
+            while let line = buffer.nextLine() {
+                if line.isEmpty { continue }
+                guard let request = WireCodec.decode(line) else {
+                    // No id to answer with; the client takes an id-less reply as its own.
+                    connection.send(["id": NSNull(), "ok": false, "error": "bad request: each line must be one JSON object"])
+                    continue
+                }
                 let id = request["id"] ?? 0
                 if let op = request["op"] as? String {
                     let reply = hostHandler?(op, request, connection)

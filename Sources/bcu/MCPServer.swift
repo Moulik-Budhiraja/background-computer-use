@@ -24,7 +24,13 @@ final class MCPServer {
     private let label: String?
     /// The engine's own tool list and instructions, when it has them: a host
     /// app's `bcu` may talk to an engine of another version.
-    private var catalog: (tools: [JSONObject], instructions: String)?
+    private var catalog: (tools: [JSONObject], instructions: String)? {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _catalog }
+        set { stateLock.lock(); _catalog = newValue; stateLock.unlock() }
+    }
+    private var _catalog: (tools: [JSONObject], instructions: String)?
+    /// Guards the catalog and the lanes, which lanes and lookups reach from their own threads.
+    private let stateLock = NSLock()
     /// The agent's name from `initialize` (e.g. "claude-code"), for the menu bar.
     private var clientName: String?
     /// Claude Code subagents share this connection; this tells their calls apart.
@@ -75,7 +81,7 @@ final class MCPServer {
             catalog = Self.engineCatalog()
             reply(id, result: [
                 "protocolVersion": version,
-                "capabilities": ["tools": ["listChanged": false]],
+                "capabilities": ["tools": ["listChanged": true]],
                 "serverInfo": ["name": "background-computer-use", "version": Self.appVersion],
                 "instructions": catalog?.instructions ?? ToolCatalog.serverInstructions,
             ])
@@ -86,20 +92,39 @@ final class MCPServer {
         case "tools/call":
             let name = params["name"] as? String ?? ""
             let arguments = params["arguments"] as? JSONObject ?? [:]
-            let caller = callerSession(params["_meta"] as? JSONObject ?? [:])
             // Maintenance and test tools are for `bcu call` on a debug run only.
             if name.hasPrefix("admin_") {
                 reply(id, result: ["content": [["type": "text", "text": "unknown tool \(name)"]], "isError": true])
                 return
             }
-            let lane = lanes[caller] ?? Lane(caller)
-            lanes[caller] = lane
-            lane.queue.async {
-                self.reply(id, result: self.callTool(name, arguments, session: caller, lane: lane))
+            let meta = params["_meta"] as? JSONObject ?? [:]
+            let dispatch = {
+                let caller = self.callerSession(meta)
+                let lane = self.lane(caller)
+                lane.queue.async {
+                    self.reply(id, result: self.callTool(name, arguments, session: caller, lane: lane))
+                }
+            }
+            // Telling a subagent's call apart can wait for its transcript to
+            // land; do that off this thread so other agents' calls go on.
+            if subagents != nil, meta["claudecode/toolUseId"] != nil {
+                lookupQueue.async(execute: dispatch)
+            } else {
+                dispatch()
             }
         default:
             replyError(id, code: -32601, message: "method not found: \(method)")
         }
+    }
+
+    private let lookupQueue = DispatchQueue(label: "bcu.mcp.lookup", attributes: .concurrent)
+
+    private func lane(_ session: String) -> Lane {
+        stateLock.lock(); defer { stateLock.unlock() }
+        if let lane = lanes[session] { return lane }
+        let lane = Lane(session)
+        lanes[session] = lane
+        return lane
     }
 
     /// The session a call belongs to. Every agent gets its own (its own
@@ -110,8 +135,11 @@ final class MCPServer {
             return "\(sessionID)/\(agent)"
         }
         if let thread = meta["threadId"] as? String {
+            stateLock.lock()
             if mainThread == nil { mainThread = thread }
-            if thread != mainThread { return "\(sessionID)/\(thread)" }
+            let main = mainThread
+            stateLock.unlock()
+            if thread != main { return "\(sessionID)/\(thread)" }
         }
         return sessionID
     }
@@ -132,16 +160,33 @@ final class MCPServer {
 
     /// The running engine's tools and instructions, if it's up and new enough to say.
     private static func engineCatalog() -> (tools: [JSONObject], instructions: String)? {
-        guard let client = try? SocketClient(), let reply = try? client.request(["op": "catalog"]),
+        guard let client = try? SocketClient(), let reply = try? client.request(["op": "catalog"], timeout: 5),
               reply["ok"] as? Bool == true, let tools = reply["tools"] as? [JSONObject],
               let instructions = reply["instructions"] as? String else { return nil }
         return (tools, instructions)
     }
 
+    /// The engine was down at `initialize`, so the agent got this `bcu`'s
+    /// own tool list. Now it's up: fetch the engine's, and tell the client
+    /// to list the tools again if they differ.
+    private func refreshCatalogIfMissing() {
+        guard catalog == nil, let fresh = Self.engineCatalog() else { return }
+        stateLock.lock()
+        let first = _catalog == nil
+        if first { _catalog = fresh }
+        stateLock.unlock()
+        if first, !(fresh.tools as NSArray).isEqual(ToolCatalog.tools as NSArray) {
+            send(["jsonrpc": "2.0", "method": "notifications/tools/list_changed"])
+        }
+    }
+
     private func callWithReconnect(_ name: String, _ arguments: JSONObject, session: String, lane: Lane) throws -> ToolResult {
         for attempt in 0..<2 {
             do {
-                if lane.client == nil { lane.client = try connect() }
+                if lane.client == nil {
+                    lane.client = try connect()
+                    refreshCatalogIfMissing()
+                }
                 var args = arguments
                 args["_session"] = session
                 if session != sessionID { args["_parent"] = sessionID }
