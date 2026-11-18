@@ -648,8 +648,18 @@ public final class WindowManager {
                           let rank = newWindowRank(title: title, key: AX.string(item, "AXMenuItemCmdChar") ?? "",
                                                    modifiers: (AX.attr(item, "AXMenuItemCmdModifiers") as? NSNumber)?.intValue ?? -1)
                     else { continue }
-                    if rank == 0 { return MenuItemRef(element: item, title: title) }
-                    if best == nil || rank < best!.rank { best = (rank, MenuItemRef(element: item, title: title)) }
+                    // A submenu ("New Window" in Terminal: one per profile):
+                    // its cmd+N item, else its first one that names a window.
+                    var ref = MenuItemRef(element: item, title: title)
+                    let subitems = AX.children(item).flatMap { AX.children($0) }.filter { AX.bool($0, "AXEnabled") ?? true }
+                    if !subitems.isEmpty {
+                        let n = subitems.first { (AX.string($0, "AXMenuItemCmdChar") ?? "").uppercased() == "N" }
+                            ?? subitems.first { (AX.string($0, "AXTitle") ?? "").lowercased().contains("window") }
+                        guard let n else { continue }
+                        ref = MenuItemRef(element: n, title: "\(title) > \(AX.string(n, "AXTitle") ?? "")")
+                    }
+                    if rank == 0 { return ref }
+                    if best == nil || rank < best!.rank { best = (rank, ref) }
                 }
             }
         }
