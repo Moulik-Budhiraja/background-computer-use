@@ -42,6 +42,55 @@ public final class FocusGuard {
     private var pressHooks: [String: () -> Void] = [:]
     private let pressLock = NSLock()
 
+    /// What the user pressed, for `onUserInput`.
+    public enum UserInput {
+        /// A key (not a modifier alone), going to this app.
+        case key(front: pid_t)
+        /// A mouse button, at this point (global, top-left origin).
+        case click(at: CGPoint)
+        /// Play, next, previous, fast-forward or rewind on the keyboard:
+        /// it goes to whichever app last played, not to the front one.
+        case mediaKey
+    }
+    /// Like `onUserPress`, saying what was pressed and where. Called from
+    /// the input tap: `hook` must return at once. One per owner; nil removes it.
+    public func onUserInput(for owner: String, _ hook: ((UserInput) -> Void)?) {
+        pressLock.lock(); inputHooks[owner] = hook; pressLock.unlock()
+    }
+    private var inputHooks: [String: (UserInput) -> Void] = [:]
+
+    /// Tap thread.
+    private func userInput(_ type: CGEventType, _ event: CGEvent) {
+        pressLock.lock(); let hooks = Array(inputHooks.values); pressLock.unlock()
+        guard !hooks.isEmpty else { return }
+        let input: UserInput
+        if type == .keyDown {
+            // cmd+Tab goes to the app switcher, not the front app.
+            if event.flags.contains(.maskCommand) && event.getIntegerValueField(.keyboardEventKeycode) == 48 { return }
+            input = .key(front: BCUFrontProcessPID())
+        } else if Self.isMouseDown(type) {
+            input = .click(at: event.location)
+        } else if type == Self.systemDefined, Self.isMediaKeyDown(event) {
+            input = .mediaKey
+        } else {
+            return
+        }
+        for hook in hooks { hook(input) }
+    }
+
+    /// NX_SYSDEFINED: media, volume and brightness keys.
+    static let systemDefined = CGEventType(rawValue: 14)!
+
+    /// A media key going down (NX_SUBTYPE_AUX_CONTROL_BUTTONS): play (16),
+    /// next (17), previous (18), fast-forward (19), rewind (20). Volume and
+    /// brightness keys don't count.
+    private static func isMediaKeyDown(_ event: CGEvent) -> Bool {
+        guard let e = NSEvent(cgEvent: event), e.subtype.rawValue == 8 else { return false }
+        let code = (e.data1 & 0xFFFF_0000) >> 16
+        let down = ((e.data1 & 0xFF00) >> 8) == 0xA
+        return down && (16...20).contains(code)
+    }
+
     private func userPressed() {
         pressLock.lock(); let hooks = Array(pressHooks.values); pressLock.unlock()
         for hook in hooks { hook() }
@@ -224,7 +273,7 @@ public final class FocusGuard {
         guard tap == nil else { return }
         let types: [CGEventType] = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
                                     .leftMouseDown, .rightMouseDown, .otherMouseDown, .leftMouseUp, .rightMouseUp, .otherMouseUp, .scrollWheel, .tabletPointer,
-                                    .keyDown, .keyUp, .flagsChanged]
+                                    .keyDown, .keyUp, .flagsChanged, Self.systemDefined]
         let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
         guard let port = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
                                            eventsOfInterest: mask, callback: guardTapCallback, userInfo: nil) else {
@@ -1072,6 +1121,7 @@ public final class FocusGuard {
         }
         activity.note(type, event)
         if type == .keyDown || Self.isMouseDown(type) { userPressed() }
+        userInput(type, event)
         switch type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .tabletPointer:
             let p = event.location

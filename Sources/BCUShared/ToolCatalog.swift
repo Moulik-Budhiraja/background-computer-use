@@ -61,8 +61,24 @@ public enum ToolCatalog {
     /// A string that differs by platform is written {"macos": ..., "windows": ...}.
     public static let tools: [JSONObject] = {
         let json = try? JSONSerialization.jsonObject(with: Data(PackageResources.tools_json))
-        return (resolvePlatform(json ?? []) as? [JSONObject]) ?? []
+        return ((resolvePlatform(json ?? []) as? [JSONObject]) ?? []) + macOnly
     }()
+
+    /// Tools the Windows app doesn't have.
+    static let macOnly: [JSONObject] = [
+        [
+            "name": "capture_audio",
+            "description": "Call before you play sound (a video, music, a call) in an app the user also has windows in, such as their browser. Sound comes from the app as a whole, so it plays on the user's speakers otherwise. This mutes the app on their speakers and records it to a file for you, until the user clicks or types in that app or presses a media key: then mute_element is pressed to silence yours, the app plays on their speakers again, and your next call says so. Once your window shows a mute or pause button for your sound (a browser tab's mute button appears only once it plays), call this again with it as mute_element. Fails while the app is already playing sound. Apps only you have windows in are always muted and recorded.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "window_id": ["type": "integer", "description": "Your window that will play the sound."],
+                    "mute_element": ["type": "integer", "description": "An element in that window that silences your sound when pressed: the tab's mute button, or the player's mute or pause button."],
+                ],
+                "required": ["window_id"],
+            ] as JSONObject,
+        ],
+    ]
 
     private static func resolvePlatform(_ value: Any) -> Any {
         if let object = value as? JSONObject {

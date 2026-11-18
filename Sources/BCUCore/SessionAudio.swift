@@ -5,7 +5,8 @@ import CoreAudio
 /// Sound from apps that only the agent is using (every window on an agent
 /// display) is muted on the speakers and recorded to a file that exists for
 /// as long as the session's display does. Apps the user also has windows in
-/// play normally.
+/// play normally, unless the agent claims one before playing sound in it
+/// (see `Engine.claimAudio`).
 ///
 /// Uses a Core Audio process tap: the apps' audio processes (helpers
 /// included, matched by bundle ID) are mixed to stereo, muted, and read
@@ -48,6 +49,24 @@ public final class SessionAudio {
     /// Route these apps' audio to the file (empty stops the tap).
     public func route(_ apps: [NSRunningApplication]) {
         queue.async { self.apply(apps) }
+    }
+
+    /// `route`, done by the time it returns: before the agent plays sound
+    /// it asked to have muted, or before a user who's taken an app back
+    /// starts theirs.
+    public func routeNow(_ apps: [NSRunningApplication]) {
+        queue.sync { self.apply(apps) }
+    }
+
+    /// Any of the app's audio processes (helpers included) is sending sound
+    /// to an output right now.
+    public static func isPlaying(_ app: NSRunningApplication) -> Bool {
+        audioProcesses(of: [app]).contains { id in
+            var running: UInt32 = 0
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            var addr = address(kAudioProcessPropertyIsRunningOutput)
+            return AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &running) == noErr && running != 0
+        }
     }
 
     /// Stop and delete the file.

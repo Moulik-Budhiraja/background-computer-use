@@ -43,6 +43,8 @@ public final class Engine {
     public let windows: WindowManager
     /// Sound from apps only this session uses goes here instead of the speakers.
     public let audio: SessionAudio
+    /// Apps the user also uses whose sound this session asked to have muted.
+    let audioClaims = AudioClaims()
     /// Keeps what the display showed, for the history viewer.
     let recorder: SessionRecorder
 
@@ -227,6 +229,7 @@ public final class Engine {
                 self.display.stop()
             }
             self.snapshots.removeAll()
+            self.endAudioClaims()
             self.audio.end()
             self.log("Gave up the agent display: no windows for a while")
         }
@@ -283,6 +286,7 @@ public final class Engine {
         recorder.stop()
         windows.stopWatchdog()
         display.stop(remove: true)
+        endAudioClaims()
         audio.end()
     }
 
@@ -439,6 +443,8 @@ public final class Engine {
                     result.text += "\n[other agents] " + agentWaitNotes.map(Self.sentence).joined(separator: " ") + " That's expected: the step ran, don't repeat it."
                     agentWaitNotes = []
                 }
+                let soundNotes = audioClaims.takeNotes()
+                if !soundNotes.isEmpty { result.text += "\n[sound] " + soundNotes.joined(separator: " ") }
                 if monitored, let focusNote = focusReport() {
                     focusGuard.record("\(tool): \(focusNote)")
                     result.text += "\n[focus guard] \(focusNote)"
@@ -533,6 +539,7 @@ public final class Engine {
         case "handoff": return try handoff(args)
         case "take_back": return try takeBack(args)
         case "guard_report": return guardReport()
+        case "capture_audio": return try captureAudio(args)
         case "batch": return try batch(args)
         // Maintenance, not in the agent tool catalog.
         case "admin_close_window":
@@ -1340,6 +1347,88 @@ public final class Engine {
             for w in ws { lines.append("  \(w.id): \(w.appName) [\(w.kind.rawValue)\(w.handedOff ? ", handed off" : "")] \"\(WindowList.info(w.id)?.title ?? "")\"") }
         }
         return ToolResult(text: lines.joined(separator: "\n"))
+    }
+
+    // MARK: Sound
+
+    /// The apps whose sound goes to this session's file: those only agents
+    /// have windows in (`onAgent`, from `Engine.appsOnAgent`) and the ones
+    /// it claimed. Any thread.
+    func audioApps(onAgent: [pid_t: Bool]? = nil) -> [NSRunningApplication] {
+        let onAgent = onAgent ?? Self.appsOnAgent()
+        let ws = windows.windows
+        var pids = Set(ws.filter { !$0.withUser }.map(\.pid)).filter { onAgent[$0] == true }
+        pids.formUnion(audioClaims.pids(open: Set(ws.map(\.id))))
+        return pids.sorted().compactMap { NSRunningApplication(processIdentifier: $0) }
+    }
+
+    /// For each app with a window, whether every one of its windows (hidden
+    /// and minimized ones included) is on an agent display.
+    static func appsOnAgent() -> [pid_t: Bool] {
+        let displays = AgentDisplay.running.map(\.bounds)
+        var onAgent: [pid_t: Bool] = [:]
+        for w in WindowList.all() where w.layer == 0 && w.bounds.width > 40 && w.bounds.height > 40 {
+            let c = CGPoint(x: w.bounds.midX, y: w.bounds.midY)
+            let mine = displays.contains { $0.contains(c) }
+            onAgent[w.pid] = (onAgent[w.pid] ?? true) && mine
+        }
+        return onAgent
+    }
+
+    /// Before the agent plays sound in an app the user also has windows in:
+    /// mute the app on the speakers and record it, until the user uses it.
+    private func captureAudio(_ args: Args) throws -> ToolResult {
+        let (w, _) = try agentWindow(args)
+        guard let app = NSRunningApplication(processIdentifier: w.pid) else { throw ToolError("\(w.appName) isn't running") }
+        if Self.appsOnAgent()[w.pid] == true && !w.withUser {
+            audio.routeNow(audioApps())
+            return ToolResult(text: "Only agents have windows in \(w.appName), so its sound already stays off the user's speakers and is recorded to \(audio.url.path). Play it now.")
+        }
+        var mute: AXNode?
+        if args.int("mute_element") != nil {
+            var muteArgs = args.raw
+            muteArgs["element"] = muteArgs["mute_element"]
+            let n = try node(Args(muteArgs), window: w)
+            guard n.actions.contains("AXPress") else {
+                throw ToolError("element \(n.index) can't be pressed through accessibility (its actions: \(n.actions.joined(separator: ", "))). Name a mute or pause button.")
+            }
+            mute = n
+        }
+        // Already claimed: the app is muted, and any sound in it is the
+        // agent's (the user would have ended the claim), so just take the element.
+        let renewing = audioClaims.has(w.id)
+        if !renewing && SessionAudio.isPlaying(app) {
+            throw ToolError("\(w.appName) is playing sound right now, probably the user's, so it can't be muted without muting theirs. If it's yours, silence it, then call this again. Otherwise wait until it stops.")
+        }
+        let label = mute.flatMap { n in [AX.string(n.element, "AXTitle"), AX.string(n.element, "AXDescription")].compactMap { $0 }.first { !$0.isEmpty } }
+        let muteName = mute.map { "element \($0.index)" + (label.map { " \"\($0)\"" } ?? "") } ?? ""
+        audioClaims.add(AudioClaims.Claim(window: w.id, pid: w.pid, appName: w.appName, mute: mute?.element, muteName: muteName))
+        focusGuard.onUserInput(for: "audio-\(sessionID)") { [weak self] input in
+            self?.audioClaims.userInput(input) { hit, why in self?.giveSoundBack(hit, why: why) }
+        }
+        if renewing {
+            return ToolResult(text: mute == nil ? "\(w.appName) is still muted on the user's speakers." : "\(w.appName) is still muted on the user's speakers; when the user starts using it, \(muteName) is pressed to silence yours.")
+        }
+        audio.routeNow(audioApps())
+        log("Muted \(w.appName) on your speakers while the agent plays sound in it")
+        let then = mute == nil
+            ? "Once your window has a mute or pause button for it (a tab's mute button shows only once it plays), call this again with it as mute_element: when the user starts using \(w.appName), it plays on their speakers again, and that button is pressed to silence yours first."
+            : "When the user starts using \(w.appName), \(muteName) is pressed to silence yours and the app plays on their speakers again; you're told on your next call."
+        return ToolResult(text: "\(w.appName)'s sound is muted on the user's speakers and recorded to \(audio.url.path). Play yours now. " + then)
+    }
+
+    /// The user is using a claimed app: silence the agent's sound, then
+    /// stop muting the app. Off the input tap's thread.
+    private func giveSoundBack(_ hit: [AudioClaims.Claim], why: String) {
+        _ = audioClaims.silence(hit, why: why)
+        audio.routeNow(audioApps())
+        if audioClaims.isEmpty { focusGuard.onUserInput(for: "audio-\(sessionID)", nil) }
+        for name in Set(hit.map(\.appName)).sorted() { log("Gave \(name)'s sound back to you") }
+    }
+
+    private func endAudioClaims() {
+        audioClaims.clear()
+        focusGuard.onUserInput(for: "audio-\(sessionID)", nil)
     }
 
     private func listApps() -> ToolResult {
