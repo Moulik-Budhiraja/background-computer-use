@@ -246,12 +246,17 @@ final class HistoryTrackView: NSView {
     func itemsChanged() {
         defer { needsDisplay = true }
         guard let h = held, let m = model else { return }
-        // At the live edge following a quiet agent: it recorded a frame, but
-        // another agent has newer ones still. Still at the edge.
-        if h.edge, let shown = key(m.index), shown != h.frame, shown.run == h.frame.run,
-           let newest = m.byTime.last, newest != m.index, let at = key(newest) {
-            held = (shown, at, true)
-            if !scrolling, dragStart == nil { scrollX = lastContentX }
+        // At the live edge on a quiet agent's frame (or the frame it moved on
+        // to): still at the edge, anchored to whatever is newest now, even if
+        // the old newest frame was pruned. Once its frame is the newest of
+        // all, there's nothing to hold.
+        if h.edge, let shown = key(m.index), shown.run == h.frame.run {
+            if let newest = m.byTime.last, newest != m.index, let at = key(newest) {
+                held = (shown, at, true)
+                if !scrolling, dragStart == nil { scrollX = lastContentX }
+            } else {
+                held = nil
+            }
             return
         }
         guard key(m.index) == h.frame, let at = item(h.at) else {
@@ -400,6 +405,15 @@ final class HistoryTrackView: NSView {
         moved()
         settle(animated: false)
         return held == nil && m.index == j && abs(scrollX - contentX(j)) < 0.5
+    }
+
+    /// For the self-test: the frame an edge hold is anchored to is pruned,
+    /// and the items change. True when it's still at the live edge.
+    func pruneEdgeAnchorForTest() -> Bool {
+        guard let h = held, h.edge else { return false }
+        held = (h.frame, FrameKey(run: "pruned", t: 0), true)
+        itemsChanged()
+        return held?.edge == true && abs(scrollX - lastContentX) < 0.5
     }
 
     /// For the self-test: whether the playhead is held, and its time.

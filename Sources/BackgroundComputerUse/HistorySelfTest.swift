@@ -360,6 +360,9 @@ enum HistorySelfTest {
                     spin(1.5)
                     keptEdge = track.heldForTest.edge && vm2.currentRun?.session == "bbbb0000-eeee"
                     print("at the live edge, the quiet agent and another record: \(keptEdge ? "still at the edge" : "WRONG, let go of the edge")")
+                    let survivedPrune = track.pruneEdgeAnchorForTest()
+                    keptEdge = keptEdge && survivedPrune
+                    print("at the live edge, its anchor frame pruned: \(survivedPrune ? "still at the edge" : "WRONG, let go of the edge")")
                     quiet.finish(packing: 2.0)
                     var framesN: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
                     let after = wallMs()
