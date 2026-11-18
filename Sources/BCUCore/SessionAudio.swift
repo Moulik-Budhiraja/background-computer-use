@@ -51,6 +51,13 @@ public final class SessionAudio {
         queue.async { self.apply(apps) }
     }
 
+    /// `route`, with the apps worked out when it runs: a list taken before
+    /// a `routeNow` and applied after it would undo it (an app the user
+    /// just took back muted again until the next tick).
+    public func route(_ apps: @escaping () -> [NSRunningApplication]) {
+        queue.async { self.apply(apps()) }
+    }
+
     /// `route`, done by the time it returns: before the agent plays sound
     /// it asked to have muted, or before a user who's taken an app back
     /// starts theirs.

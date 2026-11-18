@@ -346,7 +346,7 @@ public final class Hub {
         let engines = self.engines.filter { $0.display.isRunning }
         guard !engines.isEmpty else { return }
         let onAgent = Engine.appsOnAgent()
-        for e in engines { e.audio.route(e.audioApps(onAgent: onAgent)) }
+        for e in engines { e.audio.route { e.audioApps(onAgent: onAgent) } }
     }
 
     /// Sessions whose agent has gone away (its display removed, nothing open)
