@@ -784,17 +784,27 @@ final class ClickCatcherView: NSView {
 
 private struct HandoffBanner: View {
     @ObservedObject var model: PopoverModel
+    /// The whole reason, not just its first two lines. A click toggles it.
+    @State private var expanded = false
 
     var body: some View {
+        let reason = model.handoffReason ?? ""
         HStack(spacing: 10) {
             RoundedRectangle(cornerRadius: 8)
                 .fill(Theme.needs.opacity(0.14))
                 .frame(width: 28, height: 28)
                 .overlay(Image(systemName: "hand.raised").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.needsInk))
-            Text(model.handoffReason ?? "")
+            Text(reason)
                 .font(.system(size: 13, weight: .semibold))
-                .lineLimit(2)
+                .lineLimit(expanded ? nil : 2)
+                .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                // The reason can be longer than two lines: hover shows all of
+                // it, and a click opens it in place (the popover grows to fit).
+                .overlay {
+                    ClickCatcher(help: reason, onHover: { _ in }, action: { expanded.toggle() })
+                }
+                .onChange(of: reason) { expanded = false }
             Button { model.engine.handBack() } label: {
                 Circle().fill(Color.accentColor).frame(width: 28, height: 28)
                     .overlay(Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).foregroundStyle(.white))
