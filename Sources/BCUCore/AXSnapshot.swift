@@ -105,8 +105,10 @@ public enum AXSnapshot {
         }
 
         var bounds = windowFrame
+        // Walked on their own, so not again as part of the window.
+        var walkedApart = Set<AXUIElement>()
         func walk(_ el: AXUIElement, depth: Int, indent: Int) {
-            guard visited < 6000, depth < 60 else { return }
+            guard visited < 6000, depth < 60, !walkedApart.contains(el) else { return }
             visited += 1
             let raw = read(el)
             var childIndent = indent
@@ -152,10 +154,26 @@ public enum AXSnapshot {
             for child in raw.children { walk(child, depth: depth + 1, indent: childIndent) }
         }
 
+        // A sheet (a file picker, a save panel, an alert) is the window's last
+        // child, after everything else in it, and in a big web page the walk
+        // would hit max_elements or its visit budget before getting there.
+        // The window takes no input until the sheet is answered: list it first.
+        let sheets = AX.children(window).filter { AX.string($0, "AXRole") == "AXSheet" }
+        for sheet in sheets {
+            // A sheet can reach past a small window's edges.
+            bounds = AX.frame(sheet).map { $0.union(windowFrame) } ?? windowFrame
+            entries.append(Entry(element: nil, indent: "", body: "Sheet over this window (the window behind it takes no input until it closes):", node: nil))
+            walk(sheet, depth: 0, indent: 1)
+            walkedApart.insert(sheet)
+        }
+        bounds = windowFrame
+        if !sheets.isEmpty {
+            entries.append(Entry(element: nil, indent: "", body: "The window behind the sheet:", node: nil))
+        }
         walk(window, depth: 0, indent: 0)
         // Popups the window opened (suggestion lists, menus, dropdowns) are
         // separate windows; list them after it so their rows can be pressed.
-        for popup in popups {
+        for popup in popups where !walkedApart.contains(popup) {
             bounds = AX.frame(popup) ?? windowFrame
             entries.append(Entry(element: nil, indent: "", body: "Popup over this window:", node: nil))
             walk(popup, depth: 0, indent: 1)

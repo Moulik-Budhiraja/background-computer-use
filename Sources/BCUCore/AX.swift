@@ -94,6 +94,117 @@ public enum AX {
         return set(el, "AXSize", v) == .success
     }
 
+    /// What a plain click on `el` in a sheet (a file picker, a save panel)
+    /// would select, when selecting it is all the click would do: a row of
+    /// a native table or outline, or an item of a native list (a picker's
+    /// column), reached from `el` or passive content of it (a cell, its
+    /// label or icon, a file name). A sheet's window can't be made key from
+    /// outside the app while it's up, so a click there can't land; selecting
+    /// through accessibility needs no key focus.
+    ///
+    /// Nil outside a sheet, where a real click also moves keyboard focus to
+    /// the list, which later keys rely on. Nil for a control in a row (a
+    /// checkbox, a button), which a click operates rather than selects, and
+    /// in web content, where clicking a row usually does more than select it.
+    public static func selectable(_ el: AXUIElement) -> Selectable? {
+        // Web content, or a sheet, above it?
+        var inSheet = false
+        var up = element(el, "AXParent")
+        for _ in 0..<60 {
+            guard let p = up else { break }
+            let role = string(p, "AXRole")
+            if role == "AXWebArea" { return nil }
+            if role == "AXSheet" { inSheet = true }
+            up = element(p, "AXParent")
+        }
+        guard inSheet else { return nil }
+        var node = el
+        for _ in 0..<4 {
+            let role = string(node, "AXRole") ?? ""
+            if role == "AXRow" {
+                return isSettable(node, "AXSelected") ? .row(node) : nil
+            }
+            guard passiveContent.contains(role), let parent = element(node, "AXParent") else { return nil }
+            if string(parent, "AXRole") == "AXList", isSettable(parent, "AXSelectedChildren") {
+                return .item(node, list: parent, name: name(of: node))
+            }
+            node = parent
+        }
+        return nil
+    }
+
+    public enum Selectable {
+        case row(AXUIElement)
+        /// `name`: the item's text (a file name), to find it again (a
+        /// picker's column redraws as it selects).
+        case item(AXUIElement, list: AXUIElement, name: String?)
+    }
+
+    /// An item's text, from it or the content in it (a file name next to an
+    /// icon), to find it again after its list redraws.
+    private static func name(of item: AXUIElement) -> String? {
+        var queue = [item]
+        for _ in 0..<12 {
+            guard !queue.isEmpty else { break }
+            let el = queue.removeFirst()
+            let role = string(el, "AXRole")
+            let value = role == "AXTextField" || role == "AXStaticText" ? string(el, "AXValue") : nil
+            if let text = value ?? string(el, "AXTitle"), !text.isEmpty { return text }
+            queue.append(contentsOf: children(el))
+        }
+        return nil
+    }
+
+    /// What a click on a row's or a list item's content only selects it through.
+    private static let passiveContent: Set<String> = ["AXCell", "AXStaticText", "AXTextField", "AXImage", "AXGroup"]
+
+    /// Selects `s` and nothing else in its list, the way a plain click does:
+    /// in a list that allows several (a picker that takes many files), adding
+    /// one to the selection would keep the others.
+    public static func selectOnly(_ s: Selectable) -> AXError {
+        let err: AXError
+        switch s {
+        case .item(let item, let list, _):
+            err = set(list, "AXSelectedChildren", [item] as CFArray)
+        case .row(let row):
+            let list = element(row, "AXParent")
+            if let list, isSettable(list, "AXSelectedRows"),
+               set(list, "AXSelectedRows", [row] as CFArray) == .success, bool(row, "AXSelected") == true {
+                return .success
+            }
+            let e = set(row, "AXSelected", kCFBooleanTrue)
+            if e == .success, let list {
+                for other in elements(list, "AXSelectedRows") where !CFEqual(other, row) {
+                    set(other, "AXSelected", kCFBooleanFalse)
+                }
+            }
+            err = e
+        }
+        // A file picker's list (drawn by another process) can report a
+        // failure although the file got selected: "unsupported" when nothing
+        // was selected before, or a timeout while it shows the file. Look
+        // before calling it a failure.
+        guard err != .success else { return err }
+        let deadline = Date().addingTimeInterval(3)
+        repeat {
+            if isSelected(s) { return .success }
+            usleep(100_000)
+        } while Date() < deadline
+        return err
+    }
+
+    /// Whether `s` is selected now. A picker's column redraws as it selects,
+    /// so an item is also found by the text clicked on, in it or its children.
+    private static func isSelected(_ s: Selectable) -> Bool {
+        switch s {
+        case .row(let row):
+            return bool(row, "AXSelected") == true
+        case .item(let item, let list, let name):
+            func says(_ el: AXUIElement) -> Bool { name != nil && self.name(of: el) == name }
+            return elements(list, "AXSelectedChildren").contains { CFEqual($0, item) || says($0) }
+        }
+    }
+
     public static func isSettable(_ el: AXUIElement, _ name: String) -> Bool {
         var settable: DarwinBoolean = false
         return AXUIElementIsAttributeSettable(el, name as CFString, &settable) == .success && settable.boolValue

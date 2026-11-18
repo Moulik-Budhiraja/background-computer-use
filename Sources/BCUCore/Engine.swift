@@ -1693,6 +1693,17 @@ public final class Engine {
                 let err = guarded(w, cause: "opening a context menu") { AX.perform(n.element, "AXShowMenu") }
                 if err == .success { return ToolResult(text: "Opened the context menu of element \(n.index). Call get_window_state to see it.") }
             }
+            // A row or item of a list in a sheet (a file picker) has no press
+            // action, and a click can't land while the sheet is up: select it
+            // through accessibility. Typing goes nowhere until the sheet is
+            // answered, so forget the field typing would have gone to.
+            if button == .left && count == 1, let item = AX.selectable(n.element) {
+                let err = guarded(w, cause: "selecting a row") { AX.selectOnly(item) }
+                if err == .success {
+                    focusedText[w.id] = nil
+                    return ToolResult(text: "Selected the row of element \(n.index) through accessibility.")
+                }
+            }
             let p = n.frame.center
             try keyed(w, cause: "clicking") { check in try Input.click(pid: w.pid, windowID: w.id, at: p, button: button, count: count, check: check) }
             return ToolResult(text: "Clicked element \(n.index) at its center.")
