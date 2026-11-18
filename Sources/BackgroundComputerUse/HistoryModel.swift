@@ -93,6 +93,8 @@ final class HistoryModel: ObservableObject {
             // On a run's newest frame: stay on it as the run grows, even
             // while another agent records newer frames at the same time.
             let following = self.atRunEnd ? self.currentRun?.id : nil
+            // Opened before anything was recorded: follow the first recording.
+            let wasEmpty = self.items.isEmpty
             let keep = self.current.map { (self.runs[$0.run].id, $0.frame.t) }
             let loaded = self.runs
             DispatchQueue.global(qos: .userInitiated).async {
@@ -105,6 +107,8 @@ final class HistoryModel: ObservableObject {
                         } else {
                             self.index = self.byTime.last ?? 0
                         }
+                    } else if wasEmpty {
+                        self.index = self.byTime.last ?? 0
                     }
                     self.onItemsChanged?()
                     self.onIndexChanged?(false)
