@@ -285,10 +285,13 @@ final class HistoryModel: ObservableObject {
                 guard let text = e.text, !text.isEmpty else { continue }
                 while at < last && items[at].frame.t < e.t { at += 1 }
                 let kind = kind(of: text, error: e.isError)
-                if let m = marks.last, m.item == at {
-                    marks[marks.count - 1].lines.append(tidy(text))
-                    marks[marks.count - 1].kinds.append(kind)
-                    marks[marks.count - 1].kind = max(m.kind, kind)
+                // The last mark's item only: holding the mark itself would
+                // copy its growing arrays on every append.
+                if marks.last?.item == at {
+                    let k = marks.count - 1
+                    marks[k].lines.append(tidy(text))
+                    marks[k].kinds.append(kind)
+                    marks[k].kind = max(marks[k].kind, kind)
                 } else {
                     marks.append(Mark(item: at, lines: [tidy(text)], kinds: [kind], kind: kind))
                 }
