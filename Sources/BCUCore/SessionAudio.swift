@@ -46,6 +46,8 @@ public final class SessionAudio {
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
+    /// The tap's part of the recorder's input, rebuilt each cycle.
+    private var tapList: UnsafeMutableAudioBufferListPointer?
     private var tapDescription: AnyObject?
     private var processes: [AudioObjectID] = []
     private var file: AVAudioFile?
@@ -237,9 +239,17 @@ public final class SessionAudio {
         try openFile(for: format)
 
         var proc: AudioDeviceIOProcID?
+        // The aggregate's input is its sub-device's input streams (the
+        // output device's, when it has any: an audio interface, BlackHole),
+        // then the tap's: read the tap's, the last ones.
+        let tapBuffers = format.isInterleaved ? 1 : Int(format.channelCount)
+        let tapList = AudioBufferList.allocate(maximumBuffers: tapBuffers)
+        self.tapList = tapList
         err = AudioDeviceCreateIOProcIDWithBlock(&proc, agg, ioQueue) { [weak self] _, input, _, _, _ in
-            guard let self,
-                  let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: input, deallocator: nil) else { return }
+            let all = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
+            guard let self, all.count >= tapBuffers else { return }
+            for i in 0..<tapBuffers { tapList[i] = all[all.count - tapBuffers + i] }
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: tapList.unsafePointer, deallocator: nil) else { return }
             self.write(buffer)
         }
         guard err == noErr, let proc else { throw ToolError("couldn't read the tap (\(err))") }
@@ -256,6 +266,9 @@ public final class SessionAudio {
             }
             AudioHardwareDestroyAggregateDevice(aggregateID)
         }
+        // After the IO proc is gone: it reads it.
+        tapList.map { free($0.unsafeMutablePointer) }
+        tapList = nil
         procID = nil
         aggregateID = AudioObjectID(kAudioObjectUnknown)
     }
