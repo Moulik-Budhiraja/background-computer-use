@@ -89,8 +89,9 @@ public final class RecordedRun {
         _chunks.removeAll { $0.file == c.file }
         _frames.removeAll { $0.t >= c.from && $0.t <= c.to }
         // What the agent did up to a dropped frame belonged to it: don't let
-        // it land on a later frame. The oldest chunks go first.
-        if !_frames.contains(where: { $0.t < c.from }) { _events.removeAll { $0.t <= c.to } }
+        // it land on a later frame. The oldest chunks go first. Pointer
+        // positions stay: a later frame draws the cursor where it last was.
+        if !_frames.contains(where: { $0.t < c.from }) { _events.removeAll { $0.point == nil && $0.t <= c.to } }
         lock.unlock()
         decodeLock.lock(); generators[c.file] = nil; decodeLock.unlock()
     }
@@ -191,10 +192,11 @@ public final class RecordedRun {
         run._frames.removeAll { f in
             !run._chunks.contains { f.t >= $0.from && f.t <= $0.to } && !staged.contains("\(Int64(f.t)).jpg")
         }
-        // Events up to a frame that's gone from the start (deleted by the
-        // size limit) belonged to it: don't let them land on a later frame.
+        // What the agent did up to a frame that's gone from the start
+        // (deleted by the size limit) belonged to it: don't let it land on a
+        // later frame. Pointer positions stay, for the cursor.
         if let first = run._frames.map(\.t).min(), let gone = listed.map(\.t).filter({ $0 < first }).max() {
-            run._events.removeAll { $0.t <= gone }
+            run._events.removeAll { $0.point == nil && $0.t <= gone }
         }
         run._frames.sort { $0.t < $1.t }
         return run

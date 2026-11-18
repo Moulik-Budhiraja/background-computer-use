@@ -252,6 +252,13 @@ enum HistorySelfTest {
         let piled = pruned.model.marks.map(\.lines.count).max() ?? 0
         prunedOK = prunedOK && piled <= 4
         print("most lines on one frame after the size limit: \(piled) -> \(piled <= 4 ? "ok" : "WRONG")")
+        // The cursor stays on the first frame left: its last position was earlier.
+        if let first = pruned.model.runItems.first?.lowerBound {
+            pruned.model.go(to: first, animated: false)
+            let cursor = pruned.model.pointer != nil
+            prunedOK = prunedOK && cursor
+            print("cursor on the first frame left: \(cursor ? "ok" : "WRONG, none")")
+        }
         RecordingTest.applyLimit(store, bytes: nil)
         // On the newest frame when a new recording starts: History goes on to it.
         pruned.model.goToNewest()
