@@ -57,6 +57,8 @@ final class SettingsModel: ObservableObject {
     let engine: Engine
     @Published var accessibility = false
     @Published var screenRecording = false
+    /// Screen Recording is switched on, but works only once the app restarts.
+    @Published var screenRecordingNeedsRestart = false
     @Published var launchAtLogin = false
     @Published var safeTyping = QuietRules.safeTyping
     @Published var copied: String?
@@ -84,6 +86,7 @@ final class SettingsModel: ObservableObject {
     func refresh() {
         accessibility = AX.isTrusted
         screenRecording = Capture.hasPermission
+        screenRecordingNeedsRestart = !screenRecording && OnboardingModel.screenRecordingSwitchedOn()
         launchAtLogin = LaunchAtLogin.isEnabled
         if safeTyping != QuietRules.safeTyping { safeTyping = QuietRules.safeTyping }
         // Adding up the recordings' size touches every file; every few seconds is plenty.
@@ -132,6 +135,26 @@ final class SettingsModel: ObservableObject {
     func requestScreenRecording() {
         if !CGRequestScreenCaptureAccess() {
             open("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+        }
+    }
+
+    func relaunch() { OnboardingModel.relaunchApp() }
+
+    /// Deletes every recording but the ones being made now.
+    func clearHistory() {
+        let alert = NSAlert()
+        alert.messageText = "Clear History?"
+        alert.informativeText = "This deletes every recording of what agents did on their screens. Recordings being made right now are kept."
+        alert.addButton(withTitle: "Clear History")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].hasDestructiveAction = true
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            AppRecordings.store.deleteAll()
+            DispatchQueue.main.async {
+                self.ticks = 0
+                self.refresh()
+            }
         }
     }
 
@@ -184,7 +207,17 @@ struct SettingsView: View {
                     RowDivider(inset: 46)
                     permissionRow("Screen Recording", granted: model.screenRecording, action: model.requestScreenRecording)
                 }
-                if !model.screenRecording {
+                if model.screenRecordingNeedsRestart {
+                    HStack {
+                        Text("Screen Recording is on, but works once the app reopens.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Quit & Reopen", action: model.relaunch)
+                            .controlSize(.small)
+                    }
+                    .padding(.horizontal, 4)
+                } else if !model.screenRecording {
                     Text("macOS asks you to reopen the app after you allow Screen Recording.")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
@@ -224,6 +257,17 @@ struct SettingsView: View {
                         .pickerStyle(.menu)
                         .labelsHidden()
                         .fixedSize()
+                    }
+                    .generalRow()
+                    RowDivider(inset: 14)
+                    HStack {
+                        Text("Recordings are kept up to a week, or less once they reach this size.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Clear History…", action: model.clearHistory)
+                            .controlSize(.small)
+                            .disabled(model.historyUsedBytes == 0)
                     }
                     .generalRow()
                 }

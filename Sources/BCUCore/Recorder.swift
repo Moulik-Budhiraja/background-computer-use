@@ -125,6 +125,12 @@ public final class RecordedRun {
         return nil
     }
 
+    /// Lets go of the video decoders kept for quick reads; the next read
+    /// makes them again.
+    public func releaseDecoders() {
+        decodeLock.lock(); generators.removeAll(); decodeLock.unlock()
+    }
+
     private func decode(_ c: RecordedChunk, at t: Double) -> CGImage? {
         decodeLock.lock(); defer { decodeLock.unlock() }
         let gen: AVAssetImageGenerator
@@ -383,6 +389,7 @@ public final class Recordings {
         lock.lock(); let liveIDs = Set(live.keys); lock.unlock()
         let dirs = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
         for d in dirs where !liveIDs.contains(d.lastPathComponent) { try? FileManager.default.removeItem(at: d) }
+        post()
     }
 }
 

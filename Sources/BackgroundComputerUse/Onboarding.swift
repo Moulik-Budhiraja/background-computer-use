@@ -48,6 +48,8 @@ final class OnboardingModel: ObservableObject {
 
     static let doneKey = "onboardingDone"
     static let stepKey = "onboardingStep"
+    /// Set by Quit & Reopen, read once by the next launch.
+    static let reopenedKey = "onboardingReopened"
 
     @Published var step: Step
     @Published var accessibility = false
@@ -55,6 +57,8 @@ final class OnboardingModel: ObservableObject {
     @Published var screenRecording = false
     /// The switch is on, but the app may need to restart before capture works.
     @Published var screenRecordingOn = false
+    /// This launch came from Quit & Reopen on the Screen Recording step.
+    @Published var reopened = false
     @Published var installed: Set<AgentKind> = []
     @Published var connected: Set<AgentKind> = []
     @Published var selected: Set<AgentKind> = []
@@ -81,6 +85,8 @@ final class OnboardingModel: ObservableObject {
     init(step: Step? = nil) {
         let saved = Step(rawValue: UserDefaults.standard.integer(forKey: Self.stepKey)) ?? .welcome
         self.step = step ?? saved
+        reopened = UserDefaults.standard.bool(forKey: Self.reopenedKey)
+        UserDefaults.standard.removeObject(forKey: Self.reopenedKey)
         refresh()
         selected = installed.subtracting(connected)
     }
@@ -90,6 +96,8 @@ final class OnboardingModel: ObservableObject {
     static func shouldShow() -> Bool {
         let defaults = UserDefaults.standard
         if defaults.bool(forKey: doneKey) { return false }
+        // Back from Quit & Reopen: carry on with the steps after Screen Recording.
+        if defaults.bool(forKey: reopenedKey) { return true }
         let bcu = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/bcu").path
         let ready = AX.isTrusted && Capture.hasPermission
             && AgentKind.allCases.contains { AgentSetup.isConnected($0, bcuPath: bcu) }
@@ -98,7 +106,7 @@ final class OnboardingModel: ObservableObject {
     }
 
     func refresh() {
-        let wasTrusted = accessibility
+        let wasTrusted = accessibility, wasRecording = screenRecording
         accessibility = AX.isTrusted
         screenRecording = Capture.hasPermission
         screenRecordingOn = screenRecording || Self.screenRecordingSwitchedOn()
@@ -116,7 +124,9 @@ final class OnboardingModel: ObservableObject {
                 if self?.step == .accessibility { self?.next() }
             }
         }
-        if step == .screenRecording, screenRecording { next() }
+        // Only as it turns on (or at launch): Back onto a step that's already
+        // on stays there.
+        if step == .screenRecording, screenRecording, !wasRecording { next() }
     }
 
     func startPolling() {
@@ -192,9 +202,16 @@ final class OnboardingModel: ObservableObject {
         open("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
     }
 
-    /// Quit and open again, coming back to the Connect step.
+    /// Quit and open again, back on the Screen Recording step: it moves on
+    /// once capture works, or says it's still off.
     func relaunch() {
-        go(.connect)
+        go(.screenRecording)
+        UserDefaults.standard.set(true, forKey: Self.reopenedKey)
+        Self.relaunchApp()
+    }
+
+    /// Quit and open the app again.
+    static func relaunchApp() {
         let script = "while kill -0 \(getpid()) 2>/dev/null; do sleep 0.1; done; /usr/bin/open \"$0\""
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -280,6 +297,11 @@ struct OnboardingView: View {
         model.step == .screenRecording && model.screenRecordingOn && !model.screenRecording
     }
 
+    /// Reopened, and capture still doesn't work.
+    private var stillOff: Bool {
+        model.step == .screenRecording && model.reopened && !model.screenRecording
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             Color.clear.frame(height: 44)
@@ -325,7 +347,9 @@ struct OnboardingView: View {
         switch model.step {
         case .welcome: return "Your agents get their own screen"
         case .accessibility: return "Let agents use your apps"
-        case .screenRecording: return needsRestart ? "Reopen the app" : "Let agents see their windows"
+        case .screenRecording:
+            if stillOff { return "Screen Recording is still off" }
+            return needsRestart ? "Reopen the app" : "Let agents see their windows"
         case .browser: return "Keep browser windows off your screen"
         case .connect: return "Connect your agents"
         case .done: return "You're ready"
@@ -337,7 +361,11 @@ struct OnboardingView: View {
         case .welcome: return "They do all their work in their own windows so they don't get in your way."
         case .accessibility: return "Turn on Background Computer Use in this list."
         case .screenRecording:
-            return needsRestart ? "macOS won't let it record until it restarts." : "Same thing, but in the Screen Recording list."
+            if stillOff {
+                return "Check that Background Computer Use is on in the Screen Recording list. If it is, turn it off and on again, then reopen."
+            }
+            if needsRestart { return "macOS won't let it record until it restarts." }
+            return "Same thing, but in the Screen Recording list. If macOS later asks about System Audio Recording, allow it too: it keeps sound from agents' apps off your speakers."
         case .browser: return "Allow it to control \(model.browser?.name ?? "your browser") so new windows open on the agent's screen."
         case .connect: return "Pick the agents you want to use this with."
         case .done: return "Ask an agent to use any app. You can watch it from the menu bar."
@@ -484,7 +512,7 @@ private struct StatusLine: View {
             }
             Text(on ? "On" : "Off")
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(on ? Color(hex: 0x1E8A42) : Theme.needsInk)
+                .foregroundStyle(on ? Theme.liveInk : Theme.needsInk)
         }
     }
 }

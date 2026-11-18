@@ -168,7 +168,7 @@ final class PopoverModel: ObservableObject {
     }
 }
 
-/// The ⋯ menu: settings, open at login, updates, display size and quit.
+/// The ⋯ menu: settings, setup, open at login, updates, display size and quit.
 final class MoreMenu: NSObject {
     private let openSettings: () -> Void
 
@@ -182,6 +182,9 @@ final class MoreMenu: NSObject {
         let settings = NSMenuItem(title: "Settings…", action: #selector(settingsAction), keyEquivalent: ",")
         settings.target = self
         menu.addItem(settings)
+        let setup = NSMenuItem(title: "Setup…", action: #selector(setupAction), keyEquivalent: "")
+        setup.target = self
+        menu.addItem(setup)
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = LaunchAtLogin.isEnabled ? .on : .off
@@ -216,6 +219,7 @@ final class MoreMenu: NSObject {
     }
 
     @objc private func settingsAction() { openSettings() }
+    @objc private func setupAction() { (NSApp.delegate as? AppDelegate)?.showOnboarding() }
     @objc private func toggleLogin() { LaunchAtLogin.set(!LaunchAtLogin.isEnabled) }
     @objc private func checkForUpdates() { Updater.shared?.checkForUpdates() }
     @objc private func installUpdate() { Updater.shared?.installNow() }
