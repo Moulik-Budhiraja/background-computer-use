@@ -1397,13 +1397,12 @@ public final class Engine {
         // Not while macOS is still to ask the user: with its prompt up,
         // starting and stopping the recorder each block for about two
         // minutes, and the user taking the app back would wait that long.
-        switch BCUAudioCapturePreflight() {
-        case 1:
-            throw ToolError("System Audio Recording is off for Background Computer Use (System Settings > Privacy & Security > Screen & System Audio Recording), so your sound can't be kept off the user's speakers. Don't play sound; if the task needs it, tell the user.")
-        case 2:
+        // (Its other answers aren't to be trusted: allowed in System Settings
+        // after a denial still reads as denied. A tap that doesn't take is
+        // caught below.)
+        if BCUAudioCapturePreflight() == 2 {
             BCUAudioCaptureRequest()
             throw ToolError("macOS is asking the user to allow System Audio Recording for Background Computer Use. Until they do, your sound can't be kept off their speakers: don't play sound yet, and call this again once they've answered.")
-        default: break
         }
         var mute: AXNode?
         if args.int("mute_element") != nil {
