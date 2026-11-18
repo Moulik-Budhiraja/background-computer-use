@@ -345,7 +345,7 @@ public final class Hub {
     private func routeAudio() {
         let engines = self.engines.filter { $0.display.isRunning }
         guard !engines.isEmpty else { return }
-        let onAgent = Engine.appsOnAgent()
+        let onAgent = Engine.appsOnAgent(checking: Set(engines.flatMap { $0.windows.windows.map(\.pid) }))
         for e in engines { e.audio.route { e.audioApps(onAgent: onAgent) } }
     }
 

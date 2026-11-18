@@ -1355,8 +1355,8 @@ public final class Engine {
     /// have windows in (`onAgent`, from `Engine.appsOnAgent`) and the ones
     /// it claimed. Any thread.
     func audioApps(onAgent: [pid_t: Bool]? = nil) -> [NSRunningApplication] {
-        let onAgent = onAgent ?? Self.appsOnAgent()
         let ws = windows.windows
+        let onAgent = onAgent ?? Self.appsOnAgent(checking: Set(ws.map(\.pid)))
         var pids = Set(ws.filter { !$0.withUser }.map(\.pid)).filter { onAgent[$0] == true }
         pids.formUnion(audioClaims.pids(open: Set(ws.map(\.id))))
         // The last claimed window closed: stop reading while nothing plays.
@@ -1365,13 +1365,22 @@ public final class Engine {
     }
 
     /// For each app with a window, whether every one of its windows (hidden
-    /// and minimized ones included) is on an agent display.
-    static func appsOnAgent() -> [pid_t: Bool] {
+    /// and minimized ones included) is on an agent display. For the apps in
+    /// `checking`, an off-screen window counts only if accessibility lists
+    /// it: minimized and hidden windows are listed, an app's own off-screen
+    /// helper windows aren't (Safari keeps a 500x500 one, which made Safari
+    /// never count as the agent's alone).
+    static func appsOnAgent(checking: Set<pid_t> = []) -> [pid_t: Bool] {
         let displays = AgentDisplay.running.map(\.bounds)
+        var listed: [pid_t: Set<CGWindowID>] = [:]
         var onAgent: [pid_t: Bool] = [:]
         for w in WindowList.all() where w.layer == 0 && w.bounds.width > 40 && w.bounds.height > 40 {
             let c = CGPoint(x: w.bounds.midX, y: w.bounds.midY)
             let mine = displays.contains { $0.contains(c) }
+            if !mine && !w.onScreen && checking.contains(w.pid) {
+                if listed[w.pid] == nil { listed[w.pid] = Set(AX.windows(w.pid).compactMap(AX.windowID)) }
+                if listed[w.pid]?.contains(w.id) == false { continue }
+            }
             onAgent[w.pid] = (onAgent[w.pid] ?? true) && mine
         }
         return onAgent
@@ -1382,7 +1391,7 @@ public final class Engine {
     private func captureAudio(_ args: Args) throws -> ToolResult {
         let (w, _) = try agentWindow(args)
         guard let app = NSRunningApplication(processIdentifier: w.pid) else { throw ToolError("\(w.appName) isn't running") }
-        if Self.appsOnAgent()[w.pid] == true && !w.withUser {
+        if Self.appsOnAgent(checking: [w.pid])[w.pid] == true && !w.withUser {
             audio.routeNow(audioApps())
             return ToolResult(text: "Only agents have windows in \(w.appName), so its sound already stays off the user's speakers and is recorded to \(audio.url.path). Play it now.")
         }
