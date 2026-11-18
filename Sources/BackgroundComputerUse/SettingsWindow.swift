@@ -29,6 +29,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         window.makeKeyAndOrderFront(nil)
     }
 
+    var isShown: Bool { window.isVisible }
+
     func windowWillClose(_ notification: Notification) {
         model.stopPolling()
     }
@@ -58,6 +60,8 @@ final class SettingsModel: ObservableObject {
     @Published var accessibility = false
     @Published var screenRecording = false
     @Published var launchAtLogin = false
+    @Published var launchAtLoginProblem: String?
+    @Published var hotKeysFailed: [String] = []
     @Published var safeTyping = QuietRules.safeTyping
     @Published var copied: String?
     @Published var historyLimitMB = AppRecordings.store.limitMB
@@ -85,6 +89,8 @@ final class SettingsModel: ObservableObject {
         accessibility = AX.isTrusted
         screenRecording = Capture.hasPermission
         launchAtLogin = LaunchAtLogin.isEnabled
+        if launchAtLoginProblem != LaunchAtLogin.problem { launchAtLoginProblem = LaunchAtLogin.problem }
+        if hotKeysFailed != HotKeys.failed { hotKeysFailed = HotKeys.failed }
         if safeTyping != QuietRules.safeTyping { safeTyping = QuietRules.safeTyping }
         // Adding up the recordings' size touches every file; every few seconds is plenty.
         if ticks % 5 == 0 {
@@ -273,6 +279,18 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                     .generalRow()
+                }
+                if let problem = model.launchAtLoginProblem {
+                    Text(problem)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.needsInk)
+                        .padding(.horizontal, 4)
+                }
+                if !model.hotKeysFailed.isEmpty {
+                    Text("\(model.hotKeysFailed.joined(separator: " and ")) didn't register: another app may be using \(model.hotKeysFailed.count == 1 ? "it" : "them"). Use the menu bar's buttons instead.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.needsInk)
+                        .padding(.horizontal, 4)
                 }
                 Text(model.safeTyping
                      ? "Safe typing: an agent working in the app you're typing in waits until you pause."

@@ -52,6 +52,8 @@ final class PopoverModel: ObservableObject {
     var openHistory: (() -> Void)?
     private var previewFPS = 8
     private var previewing = false
+    /// A preview was asked for; it starts once the display is up, if it wasn't yet.
+    private var wantsPreview = false
     private var pointerObserver: NSObjectProtocol?
 
     private lazy var stream = PreviewStream(engine: engine) { [weak self] image in
@@ -111,11 +113,13 @@ final class PopoverModel: ObservableObject {
         } else {
             lastGuardEvent = nil
         }
+        if wantsPreview && !previewing { startPreview(fps: previewFPS) }
     }
 
     func startPreview(fps: Int = 15) {
-        guard engine.display.isRunning, Capture.hasPermission else { return }
+        wantsPreview = true
         previewFPS = fps
+        guard engine.display.isRunning, Capture.hasPermission else { return }
         frame.displayBounds = engine.display.bounds
         frame.cursor.place(engine.lastPointer)
         previewing = true
@@ -123,6 +127,7 @@ final class PopoverModel: ObservableObject {
     }
 
     func stopPreview() {
+        wantsPreview = false
         previewing = false
         stream.stop()
     }
@@ -159,6 +164,15 @@ final class PopoverModel: ObservableObject {
         case .paused, .userInControl: return .paused
         case .idle: return permissionsMissing ? .needs : .idle
         }
+    }
+
+    /// The handed-off window is on the user's screen (the preview says so).
+    var showsHandoffMarker: Bool {
+        !permissionsMissing && handedOffApp != nil && handoffWithUser && !controlling
+    }
+
+    var showsPausedScrim: Bool {
+        !permissionsMissing && !showsHandoffMarker && paused && !controlling
     }
 
     /// Shown in place of the app list when the agent has no windows.
@@ -216,7 +230,11 @@ final class MoreMenu: NSObject {
     }
 
     @objc private func settingsAction() { openSettings() }
-    @objc private func toggleLogin() { LaunchAtLogin.set(!LaunchAtLogin.isEnabled) }
+    @objc private func toggleLogin() {
+        LaunchAtLogin.set(!LaunchAtLogin.isEnabled)
+        // Settings says what went wrong.
+        if LaunchAtLogin.problem != nil { openSettings() }
+    }
     @objc private func checkForUpdates() { Updater.shared?.checkForUpdates() }
     @objc private func installUpdate() { Updater.shared?.installNow() }
 }
@@ -349,22 +367,13 @@ struct HeaderBar: View {
                     model.engine.setPaused(!model.paused)
                 }
                 IconButton(symbol: "stop.fill", help: "Stop: close the agent's windows (⌃⌥⌘.)") {
-                    model.engine.stopAll()
+                    if StopConfirm.confirm([model.engine]) { model.engine.stopAll() }
                 }
                 .disabled(!model.hasWindows)
                 if model.controlling {
-                    Button { model.endControl() } label: {
-                        Text("Done")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 12)
-                            .frame(height: 22)
-                            .background(Capsule().fill(Color.accentColor))
-                            .contentShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .help("Give the display back to the agent")
-                    .padding(.horizontal, 3)
+                    done(help: "Give the display back to the agent") { model.endControl() }
+                } else if model.handoffWindow != nil {
+                    done(help: "Done: hand it back to the agent") { model.engine.handBack() }
                 } else if model.hasWindows, let takeOver = model.takeOver {
                     IconButton(symbol: "hand.raised.fill", help: "Take over: use the agent's windows yourself", action: takeOver)
                 }
@@ -377,6 +386,37 @@ struct HeaderBar: View {
             }
         }
         .frame(height: 28)
+    }
+
+    private func done(help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text("Done")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 12)
+                .frame(height: 22)
+                .background(Capsule().fill(Color.accentColor))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .padding(.horizontal, 3)
+    }
+}
+
+/// Stop closes the windows agents opened, whatever is in them, and answers
+/// Leave to a page that asks to stay. Ask first when there's one to lose.
+enum StopConfirm {
+    static func confirm(_ engines: [Engine]) -> Bool {
+        let opened = engines.flatMap { $0.windows.windows }.filter { $0.kind == .opened }.count
+        guard opened > 0 else { return true }
+        let alert = NSAlert()
+        alert.messageText = "Stop and close \(opened == 1 ? "the window" : "\(opened) windows") the agent opened?"
+        alert.informativeText = "Anything unsaved in \(opened == 1 ? "it" : "them") is lost, and a page that asks you to stay is closed anyway. Windows the agent borrowed go back where they were."
+        alert.addButton(withTitle: "Stop")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
     }
 }
 
@@ -401,12 +441,10 @@ struct PreviewPane: View {
             if let remote, model.hasWindows, !model.permissionsMissing {
                 RemoteSurface(model: model, remote: remote)
             }
-            if !model.permissionsMissing {
-                if let app = model.handedOffApp, model.handoffWithUser, !model.controlling {
-                    handoffMarker(app).allowsHitTesting(false)
-                } else if model.paused && !model.controlling {
-                    pausedScrim
-                }
+            if model.showsHandoffMarker, let app = model.handedOffApp {
+                handoffMarker(app).allowsHitTesting(false)
+            } else if model.showsPausedScrim {
+                pausedScrim
             }
             if model.askingControl {
                 controlPrompt
@@ -489,7 +527,7 @@ struct PreviewPane: View {
     private var pausedScrim: some View {
         ZStack {
             Color(hex: 0x0C0C0D, alpha: 0.74)
-            VStack(spacing: 10) {
+            Self.pausedLayout {
                 Button { model.engine.setPaused(false) } label: {
                     Circle().fill(.white).frame(width: 44, height: 44)
                         .overlay(Image(systemName: "play.fill").font(.system(size: 16)).foregroundStyle(Color(hex: 0x1D1D1F)).offset(x: 1.5))
@@ -497,8 +535,18 @@ struct PreviewPane: View {
                 }
                 .buttonStyle(.plain)
                 .help("Resume (⌃⌥⌘P)")
-                Text("Paused").font(.system(size: 12, weight: .medium)).foregroundStyle(.white.opacity(0.74))
+            } label: {
+                Text("Paused").foregroundStyle(.white.opacity(0.74))
             }
+        }
+    }
+
+    /// The play button over "Paused". A tile lays a click target out the
+    /// same way, so it lands on the button above the tile's own.
+    static func pausedLayout<B: View, L: View>(@ViewBuilder button: () -> B, @ViewBuilder label: () -> L) -> some View {
+        VStack(spacing: 10) {
+            button().frame(width: 44, height: 44)
+            label().font(.system(size: 12, weight: .medium))
         }
     }
 
@@ -533,6 +581,8 @@ final class MenuModel: ObservableObject {
     @Published var allPaused = false
     @Published var permissionsMissing = false
     @Published var screenRecordingMissing = false
+    /// A downloaded update waiting for the agents to go quiet.
+    @Published var updateVersion: String?
     private var previewing = false
     let moreMenu: MoreMenu
 
@@ -572,6 +622,7 @@ final class MenuModel: ObservableObject {
         screenRecordingMissing = !Capture.hasPermission
         permissionsMissing = !AX.isTrusted || screenRecordingMissing
         allPaused = hub.allPaused
+        if updateVersion != Updater.shared?.pendingVersion { updateVersion = Updater.shared?.pendingVersion }
         let status = hub.status
         switch status {
         case .working: tally = .live
@@ -625,6 +676,10 @@ struct PopoverView: View {
         VStack(spacing: 10) {
             MenuHeader(menu: menu)
                 .frame(width: contentWidth)
+            if let version = menu.updateVersion {
+                UpdateNotice(version: version)
+                    .frame(width: contentWidth)
+            }
             if menu.permissionsMissing {
                 Placeholder(kind: .setup(screenRecording: menu.screenRecordingMissing), openSettings: menu.openSettings)
                     .frame(width: 440, height: 275)
@@ -642,6 +697,26 @@ struct PopoverView: View {
         }
         .padding(10)
         .fixedSize()
+    }
+}
+
+/// An update is downloaded and waits until the agents are done.
+private struct UpdateNotice: View {
+    let version: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.down.circle").font(.system(size: 13)).foregroundStyle(.secondary)
+            Text("Update \(version) installs once your agents are done")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            Button("Restart Now") { Updater.shared?.installNow() }
+                .controlSize(.small)
+                .help("Install now. Agents' windows close, and agents reconnect on their next call.")
+        }
+        .padding(.horizontal, 4)
     }
 }
 
@@ -665,7 +740,7 @@ private struct MenuHeader: View {
                 }
                 .disabled(menu.sessions.isEmpty)
                 IconButton(symbol: "stop.fill", help: "Stop: close every agent's windows (⌃⌥⌘.)") {
-                    menu.hub.stopAll()
+                    if StopConfirm.confirm(menu.hub.shownEngines) { menu.hub.stopAll() }
                 }
                 .disabled(menu.sessions.isEmpty)
                 IconButton(symbol: "clock.arrow.circlepath", help: "History: look back at what agents did", action: menu.openHistory)
@@ -689,7 +764,7 @@ private struct SessionTile: View {
                 .frame(width: width, height: (width * 10 / 16).rounded())
                 .overlay(alignment: .bottomLeading) { label.padding(8) }
                 .overlay {
-                    if hovering {
+                    if hovering && !model.showsPausedScrim {
                         Image(systemName: "arrow.up.left.and.arrow.down.right")
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundStyle(.white)
@@ -707,6 +782,16 @@ private struct SessionTile: View {
                         ClickCatcher(help: "Expand \(model.engine.label)'s display",
                                      onHover: { hovering = $0 },
                                      action: { model.openViewer() })
+                    }
+                }
+                .overlay {
+                    // Above the tile's catcher, which would otherwise take the play button's click.
+                    if model.showsPausedScrim {
+                        PreviewPane.pausedLayout {
+                            ClickCatcher(help: "Resume (⌃⌥⌘P)", onHover: { _ in }, action: { model.engine.setPaused(false) })
+                        } label: {
+                            Text("Paused").hidden()
+                        }
                     }
                 }
             if model.handoffReason != nil {
@@ -769,6 +854,12 @@ final class ClickCatcherView: NSView {
         addTrackingArea(t)
         tracking = t
     }
+
+    // A plain NSView is invisible to VoiceOver: this one reads as a button.
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .button }
+    override func accessibilityLabel() -> String? { toolTip }
+    override func accessibilityPerformPress() -> Bool { action(); return true }
 
     override func mouseEntered(with event: NSEvent) { onHover(true) }
     override func mouseExited(with event: NSEvent) { onHover(false) }

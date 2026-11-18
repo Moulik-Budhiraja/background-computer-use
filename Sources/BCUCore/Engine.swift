@@ -110,6 +110,9 @@ public final class Engine {
     private var _userInControl = false
     private lazy var testRemote = RemoteControl(engine: self)
     private var _waitingReason: String?
+    /// What the user did from the menu bar (pressed Done on a handoff), for
+    /// the agent's next call: it may be waiting with no call running.
+    private var userNotes: [String] = []
     private var _busy: String?
     private var lastCallMs = 0.0
     private var lastLeftoverLogMs = -Double.infinity
@@ -321,6 +324,13 @@ public final class Engine {
         return _busy != nil || nowMs() - lastCallMs < 3000
     }
 
+    /// How long since a call last ran (`.infinity` before the first); 0 while one runs.
+    public var msSinceLastCall: Double {
+        stateLock.lock(); defer { stateLock.unlock() }
+        if _busy != nil { return 0 }
+        return lastCallMs == 0 ? .infinity : nowMs() - lastCallMs
+    }
+
     public var activity: [ActivityItem] {
         stateLock.lock(); defer { stateLock.unlock() }
         return _activity
@@ -366,14 +376,29 @@ public final class Engine {
         if was != value { log(value ? "You took over the agent display" : "You gave the agent display back") }
     }
 
-    /// The user is done: move handed-off windows back to the agent display and resume.
+    /// The user is done: move handed-off windows back to the agent display,
+    /// and tell the agent on its next call. A pause the user set stays.
     public func handBack() {
         queue.async {
+            var done: [String] = []
             for w in self.windows.windows where w.handedOff {
-                try? self.windows.takeBack(w.id)
+                guard (try? self.windows.takeBack(w.id)) != nil else { continue }
+                done.append("window \(w.id) (\(w.appName))")
             }
-            self.setPaused(false)
+            guard !done.isEmpty else { return }
+            self.stateLock.lock()
+            self.userNotes.append("The user pressed Done on \(done.joined(separator: " and ")): it's back on your display, so there's no need to call take_back.")
+            self.stateLock.unlock()
+            self.log("You handed \(done.joined(separator: ", ")) back")
         }
+    }
+
+    /// Notes from the user since the last call, once.
+    private func takeUserNotes() -> String? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard !userNotes.isEmpty else { return nil }
+        defer { userNotes = [] }
+        return "\n[user] " + userNotes.joined(separator: " ")
     }
 
     /// The window the agent handed to the user, if any.
@@ -443,6 +468,7 @@ public final class Engine {
                     focusGuard.record("\(tool): \(focusNote)")
                     result.text += "\n[focus guard] \(focusNote)"
                 }
+                if let note = takeUserNotes() { result.text += note }
                 if tool != "status" && tool != "guard_report" {
                     log("\(tool) (\(Int(nowMs() - startMs)) ms): \(result.text.split(separator: "\n").first.map(String.init) ?? "")")
                 }
@@ -453,6 +479,7 @@ public final class Engine {
                     focusGuard.record("\(tool): \(focusNote)")
                     text += "\n[focus guard] \(focusNote)"
                 }
+                if let note = takeUserNotes() { text += note }
                 log("\(tool) failed after \(Int(nowMs() - startMs)) ms: \(error)", error: true)
                 return .error(text)
             }
