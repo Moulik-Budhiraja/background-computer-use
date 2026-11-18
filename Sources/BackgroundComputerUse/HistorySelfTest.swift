@@ -363,6 +363,18 @@ enum HistorySelfTest {
                     let survivedPrune = track.pruneEdgeAnchorForTest()
                     keptEdge = keptEdge && survivedPrune
                     print("at the live edge, its anchor frame pruned: \(survivedPrune ? "still at the edge" : "WRONG, let go of the edge")")
+                    // Dragging at the live edge, both record in one reload, then the drag ends.
+                    _ = track.dragForTest(from: nil, by: 10_000)
+                    quiet.add(fake(size, app: "Photos", title: "All", body: "drag", field: nil, step: 4), t: wallMs(), app: "Photos", bundleID: "com.apple.Photos")
+                    var framesM3: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+                    let now3 = wallMs()
+                    for i in 0..<3 { framesM3.append((fake(size, app: "Music", title: "Queue", body: "d\(i)", field: nil, step: i), now3 + 10 + Double(i) * 10, "Music", "com.apple.Music")) }
+                    RecordingTest.record(into: store, session: "dddd2222-aaaa", label: "Agent", size: size, frames: framesM3, events: [])
+                    spin(1.5)
+                    track.endDragForTest()
+                    let draggedEdge = track.heldForTest.edge && vm2.currentRun?.session == "bbbb0000-eeee"
+                    keptEdge = keptEdge && draggedEdge
+                    print("dragging at the live edge through a reload: \(draggedEdge ? "still at the edge" : "WRONG, let go of the edge")")
                     quiet.finish(packing: 2.0)
                     var framesN: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
                     let after = wallMs()

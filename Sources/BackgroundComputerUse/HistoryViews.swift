@@ -253,7 +253,10 @@ final class HistoryTrackView: NSView {
         if h.edge, let shown = key(m.index), shown.run == h.frame.run {
             if let newest = m.byTime.last, newest != m.index, let at = key(newest) {
                 held = (shown, at, true)
-                if !scrolling, dragStart == nil { scrollX = lastContentX }
+                // Onto the new edge, mid-gesture too: the gesture goes on from there.
+                let shift = lastContentX - scrollX
+                scrollX = lastContentX
+                if let d = dragStart { dragStart = (d.x, d.scrollX + shift) }
             } else {
                 held = nil
             }
