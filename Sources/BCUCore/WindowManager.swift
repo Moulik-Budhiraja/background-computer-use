@@ -666,20 +666,47 @@ public final class WindowManager {
         return best?.item
     }
 
-    /// Whether a menu item opens a new window, best first: 0 "New Window",
-    /// 1 one that names a window ("New Finder Window", "New Viewer Window"),
-    /// 2 a document app's plain "New" (cmd+N); nil for anything else. Not
-    /// any cmd+N item: in many apps it makes something inside the window that
-    /// has key, often the user's ("New Chat", "New Message" in Messages,
-    /// "New Note", "New Event").
+    /// Whether a menu item opens a new window, best first: 0 "New Window"
+    /// (or, in another language, an item naming a window with cmd+N: "Neues
+    /// Fenster", "Nouvelle fenêtre"), 1 one that names a window ("New Finder
+    /// Window", "New Viewer Window", or in another language with N as its
+    /// key), 2 a document app's plain "New" (cmd+N, in the languages macOS
+    /// ships in); nil for anything else. Not any cmd+N item: in many apps it
+    /// makes something inside the window that has key, often the user's
+    /// ("New Chat", "New Message" in Messages, "New Note", "New Event").
     static func newWindowRank(title: String, key: String, modifiers: Int) -> Int? {
         let lower = title.lowercased().trimmingCharacters(in: .whitespaces)
-        if lower.isEmpty || lower.contains("private") || lower.contains("incognito") { return nil }
+        if lower.isEmpty || privateWords.contains(where: lower.contains) { return nil }
+        let cmdN = key.uppercased() == "N"
         if lower == "new window" { return 0 }
+        let namesWindow = windowWords.contains(where: lower.contains)
+        if namesWindow && cmdN && modifiers == 0 { return 0 }
         if lower.hasSuffix(" window") && (lower.hasPrefix("new ") || lower.hasPrefix("open ")) { return 1 }
-        if key.uppercased() == "N" && modifiers == 0 && (lower == "new" || lower == "new document") { return 2 }
+        if namesWindow && cmdN { return 1 }
+        if cmdN && modifiers == 0 && documentNew.contains(lower) { return 2 }
         return nil
     }
+
+    /// "Window" in the languages macOS ships in.
+    private static let windowWords = [
+        "window", "fenster", "fenêtre", "ventana", "finestra", "janela", "venster", "fönster", "vindue", "vindu",
+        "ikkuna", "okno", "okna", "окно", "вікно", "ablak", "fereastră", "prozor", "pencere", "παράθυρο", "חלון",
+        "نافذة", "หน้าต่าง", "cửa sổ", "jendela", "tetingkap", "विंडो", "ウインドウ", "ウィンドウ", "窗口", "視窗", "윈도우",
+    ]
+    /// Private and incognito windows, which aren't the agent's to open.
+    private static let privateWords = [
+        "private", "incognito", "privé", "privat", "privad", "privat", "priva", "inkognito", "incógnito",
+        "приват", "инкогнито", "プライベート", "シークレット", "无痕", "隐私", "隱私", "私密", "시크릿", "gizli",
+    ]
+    /// A document app's "New" and "New Document" in those languages.
+    private static let documentNew: Set<String> = [
+        "new", "new document", "neu", "neues dokument", "nouveau", "nouveau document", "nuevo", "nuevo documento",
+        "nuovo", "nuovo documento", "novo", "novo documento", "nieuw", "nieuw document", "ny", "nytt dokument",
+        "nyt dokument", "uusi", "uusi dokumentti", "nowy", "nowy dokument", "nový", "nový dokument", "новый",
+        "новый документ", "новий", "новий документ", "új", "új dokumentum", "nou", "document nou", "novi", "yeni",
+        "yeni belge", "νέο", "νέο έγγραφο", "חדש", "جديد", "ใหม่", "mới", "baru", "dokumen baru", "新規", "新規書類",
+        "新建", "新建文稿", "新增", "新增文件", "새로 만들기", "신규",
+    ]
 
     /// Move a window onto the agent display, keeping its size where it fits.
     @discardableResult
