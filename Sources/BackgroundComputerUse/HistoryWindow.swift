@@ -21,7 +21,8 @@ final class HistoryWindowController {
     init() {
         trackView.model = model
         frameView.onScroll = { [weak self] e in self?.trackView.scrollWheel(with: e) }
-        model.onItemsChanged = { [weak self] in self?.trackView.needsDisplay = true }
+        model.onItemsChanged = { [weak self] in self?.trackView.itemsChanged() }
+        model.onRecenter = { [weak self] animated in self?.trackView.recenter(animated: animated) }
         model.onIndexChanged = { [weak self] animated in
             self?.trackView.follow(animated: animated)
             self?.showCurrent()
@@ -49,7 +50,7 @@ final class HistoryWindowController {
 
     /// Opens on the newest frame, or `session`'s newest.
     func show(session: String? = nil) {
-        if panel != nil { model.load(session: session); return }
+        if panel != nil { open(session: session); return }
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main ?? NSScreen.screens[0]
 
@@ -100,6 +101,13 @@ final class HistoryWindowController {
             guard let self, let panel = self.panel, e.window === panel else { return e }
             return self.handleKey(e) ? nil : e
         }
+        open(session: session)
+    }
+
+    /// Loads at the newest frame (of `session`), letting go of any playhead a
+    /// scrub held from before: opening is a jump, not a reload.
+    func open(session: String? = nil) {
+        trackView.releaseHold()
         model.load(session: session)
     }
 
@@ -107,9 +115,9 @@ final class HistoryWindowController {
         let mods = e.modifierFlags.intersection([.command, .option, .shift, .control])
         switch Int(e.keyCode) {
         case 123: // ←
-            if mods == .command { model.go(to: 0) } else if mods == .option { model.previousSegment() } else { model.step(-1) }
+            if mods == .command { model.goToOldest() } else if mods == .option { model.previousSegment() } else { model.step(-1) }
         case 124: // →
-            if mods == .command { model.go(to: model.items.count - 1) } else if mods == .option { model.nextSegment() } else { model.step(1) }
+            if mods == .command { model.goToNewest() } else if mods == .option { model.nextSegment() } else { model.step(1) }
         case 53: // Esc
             close()
         case 24 where mods.contains(.command), 69 where mods.contains(.command): // ⌘= ⌘+
@@ -183,8 +191,9 @@ struct HistoryView: View {
             .clipShape(RoundedRectangle(cornerRadius: 10))
             .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5))
             .onHover { hovering = $0 }
+            // A lane more for each agent that recorded at the same time.
             HistoryTrackRep(view: trackView)
-                .frame(height: Self.trackHeight)
+                .frame(height: Self.trackHeight + CGFloat(model.lanes - 1) * HistoryTrackView.laneHeight)
         }
         .padding(Self.padding)
         .background(RoundedRectangle(cornerRadius: 16).fill(Theme.hud))
@@ -232,7 +241,7 @@ struct HistoryView: View {
                     .disabled(!controller.canZoomOut)
                 IconButton(symbol: "plus.magnifyingglass", help: "Zoom in the timeline (⌘+)") { controller.zoomTrack(1) }
                     .disabled(!controller.canZoomIn)
-                IconButton(symbol: "forward.end.fill", help: "Latest (⌘→)") { model.go(to: model.items.count - 1) }
+                IconButton(symbol: "forward.end.fill", help: "Latest (⌘→)") { model.goToNewest() }
                     .disabled(model.atEnd)
                 Rectangle().fill(Theme.hairline).frame(width: 1, height: 14).padding(.leading, 2).padding(.trailing, 4)
                 IconButton(symbol: "xmark", help: "Close (Esc)") { controller.close() }

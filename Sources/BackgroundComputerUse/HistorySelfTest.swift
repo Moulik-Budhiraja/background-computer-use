@@ -83,6 +83,17 @@ enum HistorySelfTest {
         }
         RecordingTest.record(into: store, session: "11111111-aaaa", label: "Claude Code", size: size, frames: framesA, events: eventsA)
 
+        // Another agent in Mail at the same time, starting 40 s into the first.
+        var framesC: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+        var eventsC: [(t: Double, text: String?, point: CGPoint?, click: Bool)] = []
+        t = now - 3_600_000 + 40_350
+        for i in 0..<100 {
+            framesC.append((fake(size, app: "Mail", title: "Inbox", body: String("Re: Thursday's review, moved to 3 pm".prefix(i / 2)), field: nil, step: i), t, "Mail", "com.apple.mail"))
+            if i % 8 == 0 { eventsC.append((t - 120, "click (60 ms): Clicked \"Reply\"", CGPoint(x: 500, y: 200), true)) }
+            t += 1100 + Double(i % 5)
+        }
+        RecordingTest.record(into: store, session: "33333333-cccc", label: "Claude Code", size: size, frames: framesC, events: eventsC)
+
         var framesB: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
         var eventsB: [(t: Double, text: String?, point: CGPoint?, click: Bool)] = []
         t = now - 600_000
@@ -96,7 +107,7 @@ enum HistorySelfTest {
         // Read every frame back, and check it's that frame's picture: closer
         // to its own source than to the frames either side of it.
         var sources: [Int64: CGImage] = [:]
-        for f in framesA + framesB { sources[Int64(f.t)] = f.image }
+        for f in framesA + framesB + framesC { sources[Int64(f.t)] = f.image }
         let runs = store.all()
         var total = 0, ok = 0, wrong = 0, worst = 0.0, sum = 0.0
         for r in runs {
@@ -133,6 +144,34 @@ enum HistorySelfTest {
         controller.model.go(to: 200, animated: false)
         spin(1.0)
         snapshot(host, to: out.appendingPathComponent("history-zoomed-out.png"))
+        var clockOK = clockOrder(controller.model, "recorded")
+        // Scrubbing the Mail run where the other run's frames sit between its
+        // own: the playhead moves on instead of snapping back.
+        let m = controller.model
+        if let from = m.items.indices.first(where: { i in
+            m.items[i].frame.app == "Mail" && i + 1 < m.items.count && m.items[i + 1].run == m.items[i].run && m.slot[i + 1] - m.slot[i] >= 3
+        }) {
+            let ok = controller.trackViewForTest.scrubForwardForTest(from: from, steps: 12)
+            clockOK = clockOK && ok
+            print("scrub forward past a sparse run's frames: \(ok ? "ok" : "WRONG")")
+            let back = controller.trackViewForTest.recenterForTest(from: from)
+            clockOK = clockOK && back
+            print("jump to the frame shown after a held scrub: \(back ? "ok" : "WRONG")")
+            let gap = controller.trackViewForTest.stepIntoGapForTest()
+            clockOK = clockOK && gap
+            print("a step into the gap before a run: \(gap ? "settled onto its first frame" : "WRONG, held")")
+        } else {
+            clockOK = false
+            print("scrub forward: no sparse frame to start from -> WRONG")
+        }
+
+        // Hold the playhead past a Mail frame before the size limit below
+        // closes up the clock: it has to stay on the timeline.
+        var heldBefore: Double?
+        if let mail = m.items.indices.last(where: { m.items[$0].frame.app == "Mail" && $0 + 1 < m.items.count && m.items[$0 + 1].run == m.items[$0].run && m.slot[$0 + 1] - m.slot[$0] >= 3 }),
+           controller.trackViewForTest.holdForTest(from: mail) {
+            heldBefore = controller.trackViewForTest.heldForTest.time
+        }
 
         // Retention: a run that ended 8 days ago goes; recent ones stay.
         let old = store.directory.appendingPathComponent("20200101-000000-old")
@@ -156,8 +195,233 @@ enum HistorySelfTest {
         let leftFrames = left.reduce(0) { $0 + $1.frames.count }
         let limitOK = after <= before / 2 && newestKept?.0 == newest?.0 && newestKept?.1 == newest?.1 && decodedAfter == leftFrames && leftFrames < total
         print("size limit: \(before / 1024) KB -> \(after / 1024) KB (limit \(before / 2048) KB), \(leftFrames) frames left from \(firstLeft), all decode: \(decodedAfter == leftFrames), newest run whole: \(newestKept?.1 == newest?.1) -> \(limitOK ? "ok" : "WRONG")")
+        // The limit took the first run's oldest frames, so it now starts
+        // after the Mail run that started later: lanes and gaps still follow
+        // the clock.
+        let (pruned, prunedHost) = offscreenViewer()
+        pruned.model.load()
+        spin(1.5)
+        pruned.zoomTrack(-2)
+        spin(0.5)
+        snapshot(prunedHost, to: out.appendingPathComponent("history-after-limit.png"))
+        var prunedOK = clockOrder(pruned.model, "after the size limit")
+        spin(1.0)
+        let heldAfter = controller.trackViewForTest.heldForTest
+        let sane = heldBefore != nil && heldAfter.held && heldAfter.time == heldBefore
+        prunedOK = prunedOK && sane
+        print("held playhead after the size limit: \(sane ? "same time" : "WRONG, held \(heldAfter.held), time \(heldAfter.time) was \(heldBefore ?? -1)")")
         RecordingTest.applyLimit(store, bytes: nil)
-        exit(ok == total && total > 0 && wrong == 0 && limitOK ? 0 : 1)
+        // On the newest frame when a new recording starts: History goes on to it.
+        pruned.model.goToNewest()
+        spin(0.3)
+        var framesD: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+        t = wallMs() - 5_000
+        for i in 0..<4 {
+            framesD.append((fake(size, app: "Calendar", title: "Today", body: "", field: nil, step: i), t, "Calendar", "com.apple.iCal"))
+            t += 1000
+        }
+        RecordingTest.record(into: store, session: "44444444-dddd", label: "Agent", size: size, frames: framesD, events: [])
+        spin(2.0)
+        let followedNew = pruned.model.currentRun?.session == "44444444-dddd" && pruned.model.atEnd
+        print("a new recording after the newest frame: \(followedNew ? "followed" : "WRONG, stayed on \(pruned.model.currentRun?.session ?? "-")")")
+        prunedOK = prunedOK && followedNew
+        // An agent whose screen didn't change records one frame, but its
+        // recording goes on: another agent recording then gets its own lane.
+        let quiet = wallMs() - 4_000
+        RecordingTest.record(into: store, session: "55555555-eeee", label: "Agent", size: size,
+                             frames: [(fake(size, app: "Calendar", title: "Week", body: "", field: nil, step: 0), quiet, "Calendar", "com.apple.iCal")],
+                             events: [], end: quiet + 3_500)
+        var framesF: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+        for i in 0..<3 { framesF.append((fake(size, app: "Notes", title: "List", body: String(i), field: nil, step: i), quiet + 1_000 + Double(i) * 500, "Notes", "com.apple.Notes")) }
+        RecordingTest.record(into: store, session: "66666666-ffff", label: "Agent", size: size, frames: framesF, events: [])
+        spin(2.0)
+        let pm = pruned.model
+        let laneE = pm.runs.indices.first { pm.runs[$0].session == "55555555-eeee" }.map { pm.laneOf[$0] }
+        let laneF = pm.runs.indices.first { pm.runs[$0].session == "66666666-ffff" }.map { pm.laneOf[$0] }
+        let ownLane = laneE != nil && laneF != nil && laneE != laneF
+        print("a quiet agent still recording keeps its lane: \(ownLane ? "ok" : "WRONG, lanes \(String(describing: laneE)) \(String(describing: laneF))")")
+        prunedOK = prunedOK && ownLane
+        // A live agent whose screen hasn't changed: hold the playhead at a
+        // time it was showing that frame, and its next frame doesn't pull
+        // History away. Then it stops, and a run that starts right after
+        // shares its lane: capture stopped before the packing finished.
+        let base = wallMs() - 120_000
+        var liveOK = false
+        if let live = LiveRecordingTest(store: store, session: "77777777-aaaa", label: "Agent", size: size, start: base) {
+            live.add(fake(size, app: "Maps", title: "Map", body: "", field: nil, step: 0), t: base, app: "Maps", bundleID: "com.apple.Maps")
+            var framesG: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+            for i in 0..<20 { framesG.append((fake(size, app: "Books", title: "Library", body: String(i), field: nil, step: i), base + 2_000 + Double(i) * 1_000, "Books", "com.apple.iBooksX")) }
+            RecordingTest.record(into: store, session: "88888888-bbbb", label: "Agent", size: size, frames: framesG, events: [])
+            let (viewer, _) = offscreenViewer()
+            viewer.model.load()
+            spin(1.5)
+            let vm = viewer.model
+            if let a = vm.items.indices.first(where: { vm.runs[vm.items[$0].run].session == "77777777-aaaa" }),
+               viewer.trackViewForTest.holdForTest(from: a) {
+                live.add(fake(size, app: "Maps", title: "Map", body: "moved", field: nil, step: 1), t: wallMs(), app: "Maps", bundleID: "com.apple.Maps")
+                spin(1.5)
+                let stayed = vm.current.map { vm.runs[$0.run].session == "77777777-aaaa" && $0.frame.t == base.rounded() } == true
+                print("held on a live agent's unchanged frame, then it records: \(stayed ? "stayed" : "WRONG, moved")")
+                // Back at the live edge, held on the same unchanged frame while
+                // another agent records: its next frame is followed.
+                var framesJ: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+                let soon = wallMs()
+                for i in 0..<3 { framesJ.append((fake(size, app: "Books", title: "Shelf", body: String(i), field: nil, step: i), soon + 10 + Double(i) * 10, "Books", "com.apple.iBooksX")) }
+                RecordingTest.record(into: store, session: "aaaa0000-dddd", label: "Agent", size: size, frames: framesJ, events: [])
+                spin(1.5)
+                var edgeOK = false, reopened = false
+                let aLast = soon + 200
+                if let newestA = vm.items.indices.last(where: { vm.runs[vm.items[$0].run].session == "77777777-aaaa" }) {
+                    // Opening History again starts from the newest frame, not the hold.
+                    let heldNewest = viewer.trackViewForTest.holdForTest(from: newestA)
+                    viewer.open(session: "77777777-aaaa")
+                    spin(1.0)
+                    reopened = heldNewest && !viewer.trackViewForTest.heldForTest.held && !vm.holdingPast
+                        && vm.current.map { vm.runs[$0.run].session == "77777777-aaaa" } == true
+                    print("reopened while held: \(reopened ? "let go of the hold" : "WRONG, still held")")
+                }
+                if let newestA = vm.items.indices.last(where: { vm.runs[vm.items[$0].run].session == "77777777-aaaa" }),
+                   viewer.trackViewForTest.holdAtEdgeForTest(from: newestA) {
+                    live.add(fake(size, app: "Maps", title: "Map", body: "moved again", field: nil, step: 2), t: aLast, app: "Maps", bundleID: "com.apple.Maps")
+                    spin(1.5)
+                    edgeOK = vm.current.map { vm.runs[$0.run].session == "77777777-aaaa" && $0.frame.t == aLast.rounded() } == true
+                }
+                print("held at the live edge on a live agent, then it records: \(edgeOK ? "followed" : "WRONG, stayed")")
+                // It stops while its video is still packing, and another run
+                // starts right after: History goes on to it, and they share a lane.
+                live.finish(packing: 2.0)
+                let next = max(wallMs(), aLast) + 1
+                var framesH: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+                for i in 0..<3 { framesH.append((fake(size, app: "Maps", title: "Map", body: "next \(i)", field: nil, step: i), next + Double(i) * 30, "Maps", "com.apple.Maps")) }
+                RecordingTest.record(into: store, session: "99999999-cccc", label: "Agent", size: size, frames: framesH, events: [])
+                spin(1.2)
+                let movedOn = vm.currentRun?.session == "99999999-cccc"
+                print("the run stopped while packing, another started: \(movedOn ? "moved on to it" : "WRONG, stayed on \(vm.currentRun?.session ?? "-")")")
+                spin(2.5)
+                let lane = { (session: String) in vm.runs.indices.first { vm.runs[$0].session == session }.map { vm.laneOf[$0] } }
+                let shared = lane("77777777-aaaa") != nil && lane("77777777-aaaa") == lane("99999999-cccc")
+                print("a run that starts as another stops shares its lane: \(shared ? "ok" : "WRONG")")
+                liveOK = stayed && reopened && edgeOK && movedOn && shared
+            } else {
+                print("live agent: couldn't hold the playhead -> WRONG")
+            }
+        }
+        // Mid-gesture on a quiet live agent: a reload doesn't follow it from
+        // an earlier time, nor put back the last gesture's hold; held at the
+        // live edge, when it stops, History goes on to the newest frame.
+        var gestureOK = false
+        let base2 = wallMs()
+        if let quiet = LiveRecordingTest(store: store, session: "bbbb0000-eeee", label: "Agent", size: size, start: base2 - 30_000) {
+            quiet.add(fake(size, app: "Photos", title: "All", body: "", field: nil, step: 0), t: base2 - 30_000, app: "Photos", bundleID: "com.apple.Photos")
+            var framesK: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+            // Another agent records all along, so the quiet one's frame is
+            // well back from the live edge.
+            for i in 0..<25 { framesK.append((fake(size, app: "Music", title: "Library", body: String(i), field: nil, step: i), base2 - 29_000 + Double(i) * 1_000, "Music", "com.apple.Music")) }
+            RecordingTest.record(into: store, session: "cccc0000-ffff", label: "Agent", size: size, frames: framesK, events: [])
+            let (viewer2, _) = offscreenViewer()
+            viewer2.model.load()
+            spin(1.5)
+            let vm2 = viewer2.model, track = viewer2.trackViewForTest
+            let isQuiet = { (i: Int) in vm2.runs[vm2.items[i].run].session == "bbbb0000-eeee" }
+            if let first = vm2.items.indices.first(where: isQuiet) {
+                let shownT = vm2.items[first].frame.t
+                let step = track.spacingForTest
+                var dragOK = track.dragForTest(from: first, by: step * 3.6)
+                quiet.add(fake(size, app: "Photos", title: "All", body: "new", field: nil, step: 1), t: wallMs(), app: "Photos", bundleID: "com.apple.Photos")
+                spin(1.5)
+                dragOK = dragOK && vm2.current?.frame.t == shownT
+                track.endDragForTest()
+                dragOK = dragOK && vm2.current?.frame.t == shownT && track.heldForTest.held
+                print("a reload mid-drag on a quiet live agent: \(dragOK ? "kept the earlier frame" : "WRONG, followed it")")
+                // Zooming keeps the hold: the quiet agent's next frame doesn't pull History back.
+                let heldTime = track.heldForTest.time
+                track.zoom(-1)
+                quiet.add(fake(size, app: "Photos", title: "All", body: "zoomed", field: nil, step: 5), t: wallMs(), app: "Photos", bundleID: "com.apple.Photos")
+                spin(1.5)
+                let zoomKept = track.heldForTest.held && track.heldForTest.time == heldTime && vm2.current?.frame.t == shownT
+                track.zoom(1)
+                print("zooming while held back on a quiet live agent: \(zoomKept ? "kept the hold" : "WRONG, let go")")
+                dragOK = dragOK && zoomKept
+                // A second gesture moves on; a reload doesn't put back the first's hold.
+                let settled = track.holdForTest(from: first)
+                _ = track.dragForTest(from: nil, by: step * 2.3)
+                let x = track.playheadXForTest, midway = settled && track.heldForTest.held && !track.heldForTest.edge
+                quiet.add(fake(size, app: "Photos", title: "All", body: "newer", field: nil, step: 2), t: wallMs(), app: "Photos", bundleID: "com.apple.Photos")
+                spin(1.5)
+                let kept = midway && abs(track.playheadXForTest - x) < 0.5
+                track.endDragForTest()
+                print("a reload mid-gesture after a hold: \(kept ? "kept the playhead" : "WRONG, put back the old hold")")
+                // Held at the live edge on the quiet agent while another records; it stops.
+                var framesM: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+                let later = wallMs()
+                for i in 0..<3 { framesM.append((fake(size, app: "Music", title: "Queue", body: String(i), field: nil, step: i), later + 10 + Double(i) * 10, "Music", "com.apple.Music")) }
+                RecordingTest.record(into: store, session: "dddd0000-aaaa", label: "Agent", size: size, frames: framesM, events: [])
+                spin(1.5)
+                var handedOff = false
+                var keptEdge = false
+                if let newestQuiet = vm2.items.indices.last(where: isQuiet), track.holdAtEdgeForTest(from: newestQuiet) {
+                    // It records a frame, and the other agent newer ones, in one reload.
+                    quiet.add(fake(size, app: "Photos", title: "All", body: "edge", field: nil, step: 3), t: wallMs(), app: "Photos", bundleID: "com.apple.Photos")
+                    var framesM2: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+                    let then = wallMs()
+                    for i in 0..<3 { framesM2.append((fake(size, app: "Music", title: "Queue", body: "m\(i)", field: nil, step: i), then + 10 + Double(i) * 10, "Music", "com.apple.Music")) }
+                    RecordingTest.record(into: store, session: "dddd1111-aaaa", label: "Agent", size: size, frames: framesM2, events: [])
+                    spin(1.5)
+                    keptEdge = track.heldForTest.edge && vm2.currentRun?.session == "bbbb0000-eeee"
+                    print("at the live edge, the quiet agent and another record: \(keptEdge ? "still at the edge" : "WRONG, let go of the edge")")
+                    let survivedPrune = track.pruneEdgeAnchorForTest()
+                    keptEdge = keptEdge && survivedPrune
+                    print("at the live edge, its anchor frame pruned: \(survivedPrune ? "still at the edge" : "WRONG, let go of the edge")")
+                    // Dragging at the live edge, both record in one reload, then the drag ends.
+                    _ = track.dragForTest(from: nil, by: 10_000)
+                    quiet.add(fake(size, app: "Photos", title: "All", body: "drag", field: nil, step: 4), t: wallMs(), app: "Photos", bundleID: "com.apple.Photos")
+                    var framesM3: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+                    let now3 = wallMs()
+                    for i in 0..<3 { framesM3.append((fake(size, app: "Music", title: "Queue", body: "d\(i)", field: nil, step: i), now3 + 10 + Double(i) * 10, "Music", "com.apple.Music")) }
+                    RecordingTest.record(into: store, session: "dddd2222-aaaa", label: "Agent", size: size, frames: framesM3, events: [])
+                    spin(1.5)
+                    track.endDragForTest()
+                    let draggedEdge = track.heldForTest.edge && vm2.currentRun?.session == "bbbb0000-eeee"
+                    keptEdge = keptEdge && draggedEdge
+                    print("dragging at the live edge through a reload: \(draggedEdge ? "still at the edge" : "WRONG, let go of the edge")")
+                    // Dragging at the edge, the quiet agent's next frame is the newest of all.
+                    _ = track.dragForTest(from: nil, by: 10_000)
+                    let ownT = wallMs()
+                    quiet.add(fake(size, app: "Photos", title: "All", body: "own", field: nil, step: 6), t: ownT, app: "Photos", bundleID: "com.apple.Photos")
+                    spin(1.5)
+                    _ = track.dragForTest(from: nil, by: 1)
+                    track.endDragForTest()
+                    let onOwn = vm2.current?.frame.t == ownT.rounded() && !vm2.holdingPast
+                    keptEdge = keptEdge && onOwn
+                    print("dragging at the edge, the agent's own frame is newest: \(onOwn ? "on it" : "WRONG, fell back")")
+                    quiet.finish(packing: 2.0)
+                    var framesN: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+                    let after = wallMs()
+                    for i in 0..<3 { framesN.append((fake(size, app: "Music", title: "Queue", body: "n\(i)", field: nil, step: i), after + 10 + Double(i) * 10, "Music", "com.apple.Music")) }
+                    RecordingTest.record(into: store, session: "eeee0000-bbbb", label: "Agent", size: size, frames: framesN, events: [])
+                    spin(1.2)
+                    handedOff = vm2.currentRun?.session == "eeee0000-bbbb"
+                    spin(2.0)
+                }
+                print("held at the live edge, the agent stops: \(handedOff ? "went on to the newest" : "WRONG, stayed on \(vm2.currentRun?.session ?? "-")")")
+                gestureOK = dragOK && kept && keptEdge && handedOff
+            }
+        }
+        exit(ok == total && total > 0 && wrong == 0 && limitOK && clockOK && prunedOK && liveOK && gestureOK ? 0 : 1)
+    }
+
+    /// Frames further right are later (gaps only go forward in time), and
+    /// runs that share a lane never overlap.
+    private static func clockOrder(_ m: HistoryModel, _ when: String) -> Bool {
+        let forward = zip(m.byTime, m.byTime.dropFirst()).allSatisfy { m.stretch[$0] <= m.stretch[$1] }
+        func span(_ r: Int) -> ClosedRange<Double> { m.items[m.runItems[r].lowerBound].frame.t...m.items[m.runItems[r].upperBound].frame.t }
+        var overlapping = 0
+        for a in m.runItems.indices {
+            for b in m.runItems.indices where a < b && m.laneOf[a] == m.laneOf[b] && span(a).overlaps(span(b)) { overlapping += 1 }
+        }
+        let firsts = m.runItems.map { HistoryModel.time(m.items[$0.lowerBound].frame.t, seconds: true) }
+        print("clock \(when): runs starting \(firsts.joined(separator: ", ")), lanes \(m.laneOf), \(m.lanes) lanes, gaps forward: \(forward), runs overlapping in a lane: \(overlapping) -> \(forward && overlapping == 0 ? "ok" : "WRONG")")
+        return forward && overlapping == 0
     }
 
     /// Mean gray difference between two pictures, at 160×100.
