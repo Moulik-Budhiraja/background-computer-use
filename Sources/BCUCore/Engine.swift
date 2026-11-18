@@ -1401,7 +1401,7 @@ public final class Engine {
         // the claim), so don't take it for the user's.
         let renewing = audioClaims.has(w.id)
         if !renewing && !AudioClaims.claimed(w.pid) && SessionAudio.audible(app) ?? SessionAudio.isPlaying(app) {
-            throw ToolError("\(w.appName) is playing sound right now, probably the user's, so it can't be muted without muting theirs. If it's yours, silence it, then call this again. Otherwise wait until it stops.")
+            throw ToolError("\(w.appName) is making sound right now, probably the user's, so it can't be muted without muting theirs. If it's yours, pause it (a muted tab can still count), then call this again. Otherwise wait until it stops.")
         }
         let label = mute.flatMap { n in [AX.string(n.element, "AXTitle"), AX.string(n.element, "AXDescription")].compactMap { $0 }.first { !$0.isEmpty } }
         let muteName = mute.map { "element \($0.index)" + (label.map { " \"\($0)\"" } ?? "") } ?? ""

@@ -132,13 +132,17 @@ final class AudioClaims {
                 return "\(back), but \(c.muteName) in window \(c.window) couldn't be pressed (\(AX.errorName(err))): if your sound is still playing there, stop it now."
             }
             if loud.contains(c.pid) {
-                return "\(back). \(c.muteName.prefix(1).uppercased() + c.muteName.dropFirst()) in window \(c.window) was pressed, but \(c.appName) was still making sound after it: if yours is still playing, stop it now."
+                return "\(back). \(c.muteName.prefix(1).uppercased() + c.muteName.dropFirst()) in window \(c.window) was pressed, but \(c.appName) still seemed to make sound after it: make sure yours has stopped. \(Self.again)"
             }
-            return "\(back), and your sound there was silenced with \(c.muteName) in window \(c.window). To play sound in it again, call capture_audio again, then unmute."
+            return "\(back), and your sound there was silenced with \(c.muteName) in window \(c.window). \(Self.again)"
         }
         lock.lock(); notes.forEach { self.notes.append($0) }; lock.unlock()
         return notes
     }
+
+    /// How to play sound in the app again. Pausing first: a muted tab whose
+    /// media still plays counts as sound (Safari), and the claim is refused.
+    static let again = "To play sound in it again, pause yours, call capture_audio, then unmute and play."
 
     func clear() {
         lock.lock(); claims = [:]; lock.unlock()
