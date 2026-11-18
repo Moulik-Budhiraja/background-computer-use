@@ -58,8 +58,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if OnboardingModel.shouldShow() {
             showOnboarding()
-        } else if !AX.isTrusted || !Capture.hasPermission {
-            showSettings()
+        } else {
+            if !AX.isTrusted || !Capture.hasPermission { showSettings() }
+            // If the app moved since setup, agents' entries point at a bcu that's gone.
+            let bundle = Bundle.main.bundleURL
+            if !AgentSetup.isTemporaryLocation(bundle) {
+                let bcu = bundle.appendingPathComponent("Contents/MacOS/bcu").path
+                DispatchQueue.global(qos: .utility).async { AgentSetup.repairMovedServers(bcuPath: bcu) }
+            }
         }
         // The event tap needs Accessibility; install it as soon as it's granted.
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] timer in

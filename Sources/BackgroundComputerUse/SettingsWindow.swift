@@ -3,6 +3,7 @@ import SwiftUI
 import ServiceManagement
 import ApplicationServices
 import BCUCore
+import BCUShared
 
 final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let window: NSWindow
@@ -73,13 +74,9 @@ final class SettingsModel: ObservableObject {
         Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/bcu").path
     }
 
-    var claudeCommand: String {
-        "claude mcp add --scope user background-computer-use -- \"\(bcuPath)\" mcp"
-    }
+    var claudeCommand: String { AgentSetup.manualSetup(.claude, bcuPath: bcuPath) }
 
-    var codexConfig: String {
-        "[mcp_servers.background-computer-use]\ncommand = \"\(bcuPath)\"\nargs = [\"mcp\"]"
-    }
+    var codexConfig: String { AgentSetup.manualSetup(.codex, bcuPath: bcuPath) }
 
     func refresh() {
         accessibility = AX.isTrusted
