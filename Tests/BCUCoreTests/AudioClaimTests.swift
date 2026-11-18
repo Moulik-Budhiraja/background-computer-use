@@ -8,12 +8,13 @@ final class AudioClaimTests: XCTestCase {
         AudioClaims.Claim(window: window, pid: pid, appName: "App\(pid)", mute: mute, muteName: mute == nil ? "" : "element 1")
     }
 
-    /// What `userInput` releases for this input, or nil if nothing.
-    private func released(by input: FocusGuard.UserInput, in claims: AudioClaims) -> [AudioClaims.Claim]? {
+    /// What `userInput` releases for this input, or nil if nothing within
+    /// `wait` seconds (short when nothing is expected).
+    private func released(by input: FocusGuard.UserInput, in claims: AudioClaims, wait: Double = 5) -> [AudioClaims.Claim]? {
         let done = DispatchSemaphore(value: 0)
         var got: [AudioClaims.Claim]?
         claims.userInput(input) { hit, _ in got = hit; done.signal() }
-        return done.wait(timeout: .now() + 0.3) == .success ? got : nil
+        return done.wait(timeout: .now() + wait) == .success ? got : nil
     }
 
     /// A key in the app ends its claims only.
@@ -28,7 +29,7 @@ final class AudioClaimTests: XCTestCase {
     func testKeyElsewhereKeepsClaims() {
         let c = AudioClaims()
         c.add(claim(1, pid: 100))
-        XCTAssertNil(released(by: .key(front: 300), in: c))
+        XCTAssertNil(released(by: .key(front: 300), in: c, wait: 0.3))
         XCTAssertEqual(c.pids(open: [1]), [100])
     }
 
@@ -42,7 +43,7 @@ final class AudioClaimTests: XCTestCase {
 
     /// With no claims, input does nothing (and costs nothing on the tap).
     func testNoClaimsNoRelease() {
-        XCTAssertNil(released(by: .mediaKey, in: AudioClaims()))
+        XCTAssertNil(released(by: .mediaKey, in: AudioClaims(), wait: 0.3))
     }
 
     /// A claim on a window that's gone is dropped.
@@ -65,13 +66,28 @@ final class AudioClaimTests: XCTestCase {
     /// The agent hears about it on its next call, once.
     func testNotesSayWhatHappened() {
         let c = AudioClaims()
-        let noElement = c.silence([claim(1, pid: 100)], why: "started using")
+        let quiet: (pid_t) -> Bool = { _ in false }
+        let noElement = c.silence([claim(1, pid: 100)], why: "started using", playing: quiet)
         XCTAssertTrue(noElement[0].contains("stop it now"), noElement[0])
         // An element that can't be pressed (no such process).
-        let dead = c.silence([claim(2, pid: 100, mute: AXUIElementCreateApplication(999_999))], why: "started using")
+        let dead = c.silence([claim(2, pid: 100, mute: AXUIElementCreateApplication(999_999))], why: "started using", playing: quiet)
         XCTAssertTrue(dead[0].contains("couldn't be pressed"), dead[0])
         XCTAssertEqual(c.takeNotes().count, 2)
         XCTAssertTrue(c.takeNotes().isEmpty)
+    }
+
+    /// Silencing waits for the app to go quiet, but not for long: the
+    /// user's own sound may have started too.
+    func testSilenceWaitsBrieflyForQuiet() {
+        let c = AudioClaims()
+        var calls = 0
+        let start = nowMs()
+        _ = c.silence([claim(1, pid: 100)], why: "started using", settleMs: 200) { _ in calls += 1; return calls < 4 }
+        XCTAssertLessThan(nowMs() - start, 150)          // quiet after a few polls
+        let loudStart = nowMs()
+        _ = c.silence([claim(2, pid: 100)], why: "started using", settleMs: 200) { _ in true }
+        XCTAssertGreaterThanOrEqual(nowMs() - loudStart, 200)
+        XCTAssertLessThan(nowMs() - loudStart, 400)
     }
 
     /// Play, next, previous, fast-forward and rewind going down count;

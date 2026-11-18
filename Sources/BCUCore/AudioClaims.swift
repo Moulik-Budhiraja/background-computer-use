@@ -94,24 +94,35 @@ final class AudioClaims {
     }
 
     /// Silence each claim's sound with its element (accessibility only, so
-    /// it doesn't touch the user's focus). Returns a note per claim.
-    func silence(_ hit: [Claim], why: String) -> [String] {
-        hit.map { c in
-            let n: String
-            guard let mute = c.mute else {
-                n = "The user \(why) \(c.appName), so it plays on their speakers again. You hadn't named an element to silence your sound with: if it's still playing in window \(c.window), stop it now."
-                lock.lock(); notes.append(n); lock.unlock()
-                return n
-            }
-            let err = AX.perform(mute, "AXPress")
-            if err == .success {
-                n = "The user \(why) \(c.appName), so your sound there was silenced with \(c.muteName) in window \(c.window), and \(c.appName) plays on their speakers again. To play sound in it again, call capture_audio again, then unmute."
-            } else {
-                n = "The user \(why) \(c.appName), so it plays on their speakers again, but \(c.muteName) in window \(c.window) couldn't be pressed (\(AX.errorName(err))): if your sound is still playing there, stop it now."
-            }
-            lock.lock(); notes.append(n); lock.unlock()
-            return n
+    /// it doesn't touch the user's focus), then wait up to `settleMs` for
+    /// the apps to go quiet: a press can succeed and do nothing (the page
+    /// changed under the element), and the app is still muted meanwhile.
+    /// Returns a note per claim, also kept for the agent's next call.
+    func silence(_ hit: [Claim], why: String, settleMs: Double = 250,
+                 playing: (pid_t) -> Bool = { pid in NSRunningApplication(processIdentifier: pid).map(SessionAudio.isPlaying) ?? false }) -> [String] {
+        let pressed = hit.map { c in c.mute.map { AX.perform($0, "AXPress") } }
+        let pids = Set(hit.map(\.pid))
+        let deadline = nowMs() + settleMs
+        var loud = pids.filter(playing)
+        while !loud.isEmpty && nowMs() < deadline {
+            usleep(20_000)
+            loud = loud.filter(playing)
         }
+        let notes = zip(hit, pressed).map { c, err -> String in
+            let back = "The user \(why) \(c.appName), so it plays on their speakers again"
+            guard let err else {
+                return "\(back). You hadn't named an element to silence your sound with: if it's still playing in window \(c.window), stop it now."
+            }
+            if err != .success {
+                return "\(back), but \(c.muteName) in window \(c.window) couldn't be pressed (\(AX.errorName(err))): if your sound is still playing there, stop it now."
+            }
+            if loud.contains(c.pid) {
+                return "\(back). \(c.muteName) in window \(c.window) was pressed, but \(c.appName) was still making sound after it: if yours is still playing, stop it now."
+            }
+            return "\(back), and your sound there was silenced with \(c.muteName) in window \(c.window). To play sound in it again, call capture_audio again, then unmute."
+        }
+        lock.lock(); notes.forEach { self.notes.append($0) }; lock.unlock()
+        return notes
     }
 
     func clear() {
