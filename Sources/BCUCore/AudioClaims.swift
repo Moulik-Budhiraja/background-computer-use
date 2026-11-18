@@ -64,7 +64,7 @@ final class AudioClaims {
             switch input {
             case .key(let front): pid = front
             case .click(let p):
-                guard let owner = FocusGuard.windowOwner(at: p) else { return }
+                guard let owner = Self.app(at: p) else { return }
                 pid = owner
             case .mediaKey: pid = nil
             }
@@ -75,6 +75,22 @@ final class AudioClaims {
             self.lock.unlock()
             if !hit.isEmpty { release(hit, pid == nil ? "pressed a media key, which can play sound in" : "started using") }
         }
+    }
+
+    /// The app a click at `p` (global, top-left origin) goes to. Asked of
+    /// accessibility, which skips windows clicks pass through: the window
+    /// list puts the Dock's and Notification Center's full-screen ones on
+    /// top of every app's.
+    static func app(at p: CGPoint) -> pid_t? {
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.25)
+        var element: AXUIElement?
+        var pid: pid_t = 0
+        if AXUIElementCopyElementAtPosition(system, Float(p.x), Float(p.y), &element) == .success,
+           let element, AXUIElementGetPid(element, &pid) == .success, pid > 0 {
+            return pid
+        }
+        return FocusGuard.windowOwner(at: p)
     }
 
     /// Silence each claim's sound with its element (accessibility only, so
