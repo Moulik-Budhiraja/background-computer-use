@@ -303,7 +303,64 @@ enum HistorySelfTest {
                 print("live agent: couldn't hold the playhead -> WRONG")
             }
         }
-        exit(ok == total && total > 0 && wrong == 0 && limitOK && clockOK && prunedOK && liveOK ? 0 : 1)
+        // Mid-gesture on a quiet live agent: a reload doesn't follow it from
+        // an earlier time, nor put back the last gesture's hold; held at the
+        // live edge, when it stops, History goes on to the newest frame.
+        var gestureOK = false
+        let base2 = wallMs()
+        if let quiet = LiveRecordingTest(store: store, session: "bbbb0000-eeee", label: "Agent", size: size, start: base2 - 30_000) {
+            quiet.add(fake(size, app: "Photos", title: "All", body: "", field: nil, step: 0), t: base2 - 30_000, app: "Photos", bundleID: "com.apple.Photos")
+            var framesK: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+            // Another agent records all along, so the quiet one's frame is
+            // well back from the live edge.
+            for i in 0..<25 { framesK.append((fake(size, app: "Music", title: "Library", body: String(i), field: nil, step: i), base2 - 29_000 + Double(i) * 1_000, "Music", "com.apple.Music")) }
+            RecordingTest.record(into: store, session: "cccc0000-ffff", label: "Agent", size: size, frames: framesK, events: [])
+            let (viewer2, _) = offscreenViewer()
+            viewer2.model.load()
+            spin(1.5)
+            let vm2 = viewer2.model, track = viewer2.trackViewForTest
+            let isQuiet = { (i: Int) in vm2.runs[vm2.items[i].run].session == "bbbb0000-eeee" }
+            if let first = vm2.items.indices.first(where: isQuiet) {
+                let shownT = vm2.items[first].frame.t
+                let step = track.spacingForTest
+                var dragOK = track.dragForTest(from: first, by: step * 3.6)
+                quiet.add(fake(size, app: "Photos", title: "All", body: "new", field: nil, step: 1), t: wallMs(), app: "Photos", bundleID: "com.apple.Photos")
+                spin(1.5)
+                dragOK = dragOK && vm2.current?.frame.t == shownT
+                track.endDragForTest()
+                dragOK = dragOK && vm2.current?.frame.t == shownT && track.heldForTest.held
+                print("a reload mid-drag on a quiet live agent: \(dragOK ? "kept the earlier frame" : "WRONG, followed it")")
+                // A second gesture moves on; a reload doesn't put back the first's hold.
+                let settled = track.holdForTest(from: first)
+                _ = track.dragForTest(from: nil, by: step * 2.3)
+                let x = track.playheadXForTest, midway = settled && track.heldForTest.held && !track.heldForTest.edge
+                quiet.add(fake(size, app: "Photos", title: "All", body: "newer", field: nil, step: 2), t: wallMs(), app: "Photos", bundleID: "com.apple.Photos")
+                spin(1.5)
+                let kept = midway && abs(track.playheadXForTest - x) < 0.5
+                track.endDragForTest()
+                print("a reload mid-gesture after a hold: \(kept ? "kept the playhead" : "WRONG, put back the old hold")")
+                // Held at the live edge on the quiet agent while another records; it stops.
+                var framesM: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+                let later = wallMs()
+                for i in 0..<3 { framesM.append((fake(size, app: "Music", title: "Queue", body: String(i), field: nil, step: i), later + 10 + Double(i) * 10, "Music", "com.apple.Music")) }
+                RecordingTest.record(into: store, session: "dddd0000-aaaa", label: "Agent", size: size, frames: framesM, events: [])
+                spin(1.5)
+                var handedOff = false
+                if let newestQuiet = vm2.items.indices.last(where: isQuiet), track.holdAtEdgeForTest(from: newestQuiet) {
+                    quiet.finish(packing: 2.0)
+                    var framesN: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+                    let after = wallMs()
+                    for i in 0..<3 { framesN.append((fake(size, app: "Music", title: "Queue", body: "n\(i)", field: nil, step: i), after + 10 + Double(i) * 10, "Music", "com.apple.Music")) }
+                    RecordingTest.record(into: store, session: "eeee0000-bbbb", label: "Agent", size: size, frames: framesN, events: [])
+                    spin(1.2)
+                    handedOff = vm2.currentRun?.session == "eeee0000-bbbb"
+                    spin(2.0)
+                }
+                print("held at the live edge, the agent stops: \(handedOff ? "went on to the newest" : "WRONG, stayed on \(vm2.currentRun?.session ?? "-")")")
+                gestureOK = dragOK && kept && handedOff
+            }
+        }
+        exit(ok == total && total > 0 && wrong == 0 && limitOK && clockOK && prunedOK && liveOK && gestureOK ? 0 : 1)
     }
 
     /// Frames further right are later (gaps only go forward in time), and

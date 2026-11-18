@@ -225,7 +225,10 @@ final class HistoryTrackView: NSView {
     /// which isn't looking back: History keeps following, and the playhead
     /// stays at the edge as it moves.
     private var held: (frame: FrameKey, at: FrameKey, edge: Bool)? {
-        didSet { model?.holdingPast = held.map { !$0.edge } ?? false }
+        didSet {
+            model?.holdingPast = held.map { !$0.edge } ?? false
+            model?.holdingEdge = held?.edge ?? false
+        }
     }
     private struct FrameKey: Equatable { let run: String; let t: Double }
 
@@ -247,6 +250,8 @@ final class HistoryTrackView: NSView {
             held = nil
             return
         }
+        // Mid-gesture the playhead is the user's: the next move updates the hold.
+        guard !scrolling, dragStart == nil else { return }
         scrollX = h.edge ? lastContentX : max(contentX(at), contentX(m.index))
     }
 
@@ -353,8 +358,32 @@ final class HistoryTrackView: NSView {
         return held != nil && m.index == i
     }
 
+    /// For the self-test: a drag, from item `i` (or on from where it is), by
+    /// `dx` points, still under way. True when the frame shown hasn't changed
+    /// from `i`.
+    func dragForTest(from i: Int?, by dx: CGFloat) -> Bool {
+        guard let m = model else { return false }
+        if let i { m.go(to: i, animated: false) }
+        let shown = m.index
+        if dragStart == nil { dragStart = (0, scrollX) }
+        dragged = true
+        scrollX += dx
+        moved()
+        return m.index == shown
+    }
+
+    /// For the self-test: the drag ends.
+    func endDragForTest() {
+        dragStart = nil
+        dragged = false
+        settle(animated: false)
+    }
+
+    var playheadXForTest: CGFloat { scrollX }
+    var spacingForTest: CGFloat { spacing }
+
     /// For the self-test: whether the playhead is held, and its time.
-    var heldForTest: (held: Bool, time: Double) { (held != nil, playheadTime) }
+    var heldForTest: (held: Bool, time: Double, edge: Bool) { (held != nil, playheadTime, held?.edge ?? false) }
 
     /// For the self-test: scrub a little past item `i` (it stays shown and
     /// the playhead is held), then jump to `i`. True when the playhead is
@@ -443,7 +472,21 @@ final class HistoryTrackView: NSView {
             m.scrubbed(to: i)
             holding = false
         }
+        // Kept up to date as the scrub goes, so a reload mid-gesture neither
+        // follows a live run from an earlier time nor puts back an old hold.
+        updateHold()
         needsDisplay = true
+    }
+
+    /// Held when the frame shown is further back than the playhead (an agent
+    /// whose screen didn't change for a while), else not.
+    private func updateHold() {
+        guard let m = model, m.items.indices.contains(m.index), abs(contentX(m.index) - scrollX) > spacing / 2,
+              let shown = key(m.index), let at = m.lastItem(atOrBefore: playheadTime).flatMap(key) else {
+            held = nil
+            return
+        }
+        held = (shown, at, key(m.byTime.last ?? -1) == at)
     }
 
     // MARK: Input
@@ -479,11 +522,8 @@ final class HistoryTrackView: NSView {
     /// forward would land back on that old frame.
     private func settle(animated: Bool = true) {
         scrolling = false
-        held = nil
-        guard let m = model, m.items.indices.contains(m.index), abs(contentX(m.index) - scrollX) <= spacing / 2 else {
-            if let m = model, let shown = key(m.index), let at = m.lastItem(atOrBefore: playheadTime).flatMap(key) {
-                held = (shown, at, key(m.byTime.last ?? -1) == at)
-            }
+        updateHold()
+        if held != nil {
             needsDisplay = true
             return
         }

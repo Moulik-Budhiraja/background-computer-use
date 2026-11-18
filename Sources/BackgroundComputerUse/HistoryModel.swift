@@ -56,6 +56,9 @@ final class HistoryModel: ObservableObject {
     /// The track holds the playhead past the frame shown, at an earlier time
     /// than the newest: the user is looking back, so don't follow.
     var holdingPast = false
+    /// The track holds the playhead at the newest frame of all, on a quiet
+    /// agent's older frame: the live edge.
+    var holdingEdge = false
     /// A jump to the frame already shown.
     var onRecenter: ((_ animated: Bool) -> Void)?
 
@@ -108,7 +111,9 @@ final class HistoryModel: ObservableObject {
             let following = self.atRunEnd && capturing && !self.holdingPast ? self.currentRun?.id : nil
             // On the newest frame of all (a run that has ended, or nothing
             // recorded yet): go on to whatever is newest, a new recording too.
-            let newest = (self.atEnd && !self.holdingPast) || self.items.isEmpty
+            // At the live edge (held on a quiet agent's frame) counts too: when
+            // that agent stops, go on to whatever is newest.
+            let newest = ((self.atEnd || self.holdingEdge) && !self.holdingPast) || self.items.isEmpty
             let keep = self.current.map { (self.runs[$0.run].id, $0.frame.t) }
             let loaded = self.runs
             DispatchQueue.global(qos: .userInitiated).async {
