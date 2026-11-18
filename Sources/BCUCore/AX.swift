@@ -95,17 +95,22 @@ public enum AX {
     }
 
     /// The row a click on `el` would select, when selecting it is all the
-    /// click would do: `el` is a row of a native list, table or outline (or
-    /// something in one of its cells) and accessibility can set the row's
-    /// selection. Selecting it that way needs no key focus, which matters in
-    /// a sheet: its window can't be made key from outside the app while it's
-    /// up. Nil in web content, where clicking a row usually does more than
+    /// click would do: `el` is a row of a native list, table or outline, or
+    /// passive content of one (a cell, its label or icon), and accessibility
+    /// can set the row's selection. Selecting it that way needs no key focus,
+    /// which matters in a sheet: its window can't be made key from outside the
+    /// app while it's up. Nil for a control in a row (a checkbox, a button, a
+    /// field the user can edit), which a click operates rather than selects,
+    /// and nil in web content, where clicking a row usually does more than
     /// select it (opens an email, follows a link).
     public static func selectableRow(_ el: AXUIElement) -> AXUIElement? {
         var row: AXUIElement? = el
-        // Up from a cell, or from a text field or image in a cell.
+        // Up from a cell, or from a label or image in a cell.
         for _ in 0..<3 {
-            guard let r = row, string(r, "AXRole") != "AXRow" else { break }
+            guard let r = row else { break }
+            let role = string(r, "AXRole") ?? ""
+            if role == "AXRow" { break }
+            guard passiveRowContent.contains(role), role != "AXTextField" || !isSettable(r, "AXValue") else { return nil }
             row = element(r, "AXParent")
         }
         guard let row, string(row, "AXRole") == "AXRow", isSettable(row, "AXSelected") else { return nil }
@@ -116,6 +121,27 @@ public enum AX {
             up = element(p, "AXParent")
         }
         return row
+    }
+
+    /// What a click on a row's content only selects the row through. A text
+    /// field counts only when it can't be edited (a file name in a list).
+    private static let passiveRowContent: Set<String> = ["AXCell", "AXStaticText", "AXTextField", "AXImage", "AXGroup"]
+
+    /// Selects `row` and nothing else in its list, the way a plain click does:
+    /// in a list that allows several (a picker that takes many files), setting
+    /// one row's selection would add to it instead.
+    public static func selectOnly(_ row: AXUIElement) -> AXError {
+        let list = element(row, "AXParent")
+        if let list, isSettable(list, "AXSelectedRows"),
+           set(list, "AXSelectedRows", [row] as CFArray) == .success, bool(row, "AXSelected") == true {
+            return .success
+        }
+        let err = set(row, "AXSelected", kCFBooleanTrue)
+        guard err == .success, let list else { return err }
+        for other in elements(list, "AXSelectedRows") where !CFEqual(other, row) {
+            set(other, "AXSelected", kCFBooleanFalse)
+        }
+        return .success
     }
 
     public static func isSettable(_ el: AXUIElement, _ name: String) -> Bool {

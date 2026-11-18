@@ -1697,7 +1697,7 @@ public final class Engine {
             // accessibility rather than click it, which needs key focus (and
             // can't get it in a sheet, such as a file picker).
             if button == .left && count == 1, let row = AX.selectableRow(n.element) {
-                let err = guarded(w, cause: "selecting a row") { AX.set(row, "AXSelected", kCFBooleanTrue) }
+                let err = guarded(w, cause: "selecting a row") { AX.selectOnly(row) }
                 if err == .success { return ToolResult(text: "Selected the row of element \(n.index) through accessibility.") }
             }
             let p = n.frame.center

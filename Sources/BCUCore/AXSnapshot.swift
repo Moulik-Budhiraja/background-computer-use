@@ -160,10 +160,13 @@ public enum AXSnapshot {
         // The window takes no input until the sheet is answered: list it first.
         let sheets = AX.children(window).filter { AX.string($0, "AXRole") == "AXSheet" }
         for sheet in sheets {
+            // A sheet can reach past a small window's edges.
+            bounds = AX.frame(sheet).map { $0.union(windowFrame) } ?? windowFrame
             entries.append(Entry(element: nil, indent: "", body: "Sheet over this window (the window behind it takes no input until it closes):", node: nil))
             walk(sheet, depth: 0, indent: 1)
             walkedApart.insert(sheet)
         }
+        bounds = windowFrame
         if !sheets.isEmpty {
             entries.append(Entry(element: nil, indent: "", body: "The window behind the sheet:", node: nil))
         }
