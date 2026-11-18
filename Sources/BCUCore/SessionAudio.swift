@@ -97,6 +97,69 @@ public final class SessionAudio {
         queue.sync { self.apply(apps) }
     }
 
+    /// Whether the app is making sound you could hear, by listening to it
+    /// (unmuted) for `ms`; nil if it can't be listened to (no permission).
+    /// `isPlaying` isn't enough to tell: WebKit keeps a muted tab's output
+    /// running, silent, for as long as its media plays.
+    public static func audible(_ app: NSRunningApplication, ms: Double = 200) -> Bool? {
+        guard #available(macOS 14.2, *) else { return nil }
+        let processes = audioProcesses(of: [app])
+        guard !processes.isEmpty else { return false }
+        guard processes.contains(where: running) else { return false }
+        let d = CATapDescription(stereoMixdownOfProcesses: processes)
+        d.name = "Background Computer Use check"
+        d.isPrivate = true
+        d.muteBehavior = .unmuted
+        var tap = AudioObjectID(kAudioObjectUnknown)
+        guard AudioHardwareCreateProcessTap(d, &tap) == noErr else { return nil }
+        defer { AudioHardwareDestroyProcessTap(tap) }
+        guard let output = defaultOutputUID() else { return nil }
+        let description: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "Background Computer Use check",
+            kAudioAggregateDeviceUIDKey: UUID().uuidString,
+            kAudioAggregateDeviceMainSubDeviceKey: output,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: output]],
+            kAudioAggregateDeviceTapListKey: [[kAudioSubTapDriftCompensationKey: true, kAudioSubTapUIDKey: d.uuid.uuidString]],
+        ]
+        var agg = AudioObjectID(kAudioObjectUnknown)
+        guard AudioHardwareCreateAggregateDevice(description as CFDictionary, &agg) == noErr else { return nil }
+        defer { AudioHardwareDestroyAggregateDevice(agg) }
+        var asbd = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        var formatAddr = address(kAudioTapPropertyFormat)
+        guard AudioObjectGetPropertyData(tap, &formatAddr, 0, nil, &size, &asbd) == noErr,
+              asbd.mFormatID == kAudioFormatLinearPCM, asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0 else { return nil }
+        // The tap's buffers come last (see `startRecorder`).
+        let tapBuffers = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0 ? Int(asbd.mChannelsPerFrame) : 1
+        let heard = OSAllocatedUnfairLock(initialState: false)
+        var proc: AudioDeviceIOProcID?
+        let ioQueue = DispatchQueue(label: "bcu.audio.check", qos: .userInteractive)
+        guard AudioDeviceCreateIOProcIDWithBlock(&proc, agg, ioQueue, { _, input, _, _, _ in
+            let all = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
+            guard all.count >= tapBuffers else { return }
+            for b in all.suffix(tapBuffers) {
+                guard let p = b.mData?.assumingMemoryBound(to: Float.self) else { continue }
+                for i in 0..<Int(b.mDataByteSize) / 4 where abs(p[i]) > 0.0005 { heard.withLock { $0 = true }; return }
+            }
+        }) == noErr, let proc else { return nil }
+        defer { AudioDeviceDestroyIOProcID(agg, proc) }
+        guard AudioDeviceStart(agg, proc) == noErr else { return nil }
+        let deadline = nowMs() + ms
+        while nowMs() < deadline && !heard.withLock({ $0 }) { usleep(10_000) }
+        AudioDeviceStop(agg, proc)
+        return heard.withLock { $0 }
+    }
+
+    private static func running(_ id: AudioObjectID) -> Bool {
+        var running: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var addr = address(kAudioProcessPropertyIsRunningOutput)
+        return AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &running) == noErr && running != 0
+    }
+
     /// Any of the app's audio processes (helpers included) is sending sound
     /// to an output right now.
     public static func isPlaying(_ app: NSRunningApplication) -> Bool {
