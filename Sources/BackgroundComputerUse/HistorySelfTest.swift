@@ -157,6 +157,9 @@ enum HistorySelfTest {
             let back = controller.trackViewForTest.recenterForTest(from: from)
             clockOK = clockOK && back
             print("jump to the frame shown after a held scrub: \(back ? "ok" : "WRONG")")
+            let gap = controller.trackViewForTest.stepIntoGapForTest()
+            clockOK = clockOK && gap
+            print("a step into the gap before a run: \(gap ? "settled onto its first frame" : "WRONG, held")")
         } else {
             clockOK = false
             print("scrub forward: no sparse frame to start from -> WRONG")

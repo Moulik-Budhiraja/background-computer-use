@@ -382,6 +382,18 @@ final class HistoryTrackView: NSView {
     var playheadXForTest: CGFloat { scrollX }
     var spacingForTest: CGFloat { spacing }
 
+    /// For the self-test: a step into the gap before a stretch of recording,
+    /// nearer its first frame. True when it settles onto that frame, not held.
+    func stepIntoGapForTest() -> Bool {
+        guard let m = model, let k = m.byTime.indices.dropLast().first(where: { m.stretch[m.byTime[$0 + 1]] != m.stretch[m.byTime[$0]] }) else { return false }
+        let j = m.byTime[k + 1]
+        m.go(to: m.byTime[k], animated: false)
+        scrollX = contentX(j) - spacing * 0.75
+        moved()
+        settle(animated: false)
+        return held == nil && m.index == j && abs(scrollX - contentX(j)) < 0.5
+    }
+
     /// For the self-test: whether the playhead is held, and its time.
     var heldForTest: (held: Bool, time: Double, edge: Bool) { (held != nil, playheadTime, held?.edge ?? false) }
 
@@ -479,9 +491,10 @@ final class HistoryTrackView: NSView {
     }
 
     /// Held when the frame shown is further back than the playhead (an agent
-    /// whose screen didn't change for a while), else not.
+    /// whose screen didn't change for a while), else not. A frame ahead of
+    /// it (the first of a run, after a gap) is settled onto instead.
     private func updateHold() {
-        guard let m = model, m.items.indices.contains(m.index), abs(contentX(m.index) - scrollX) > spacing / 2,
+        guard let m = model, m.items.indices.contains(m.index), scrollX - contentX(m.index) > spacing / 2,
               let shown = key(m.index), let at = m.lastItem(atOrBefore: playheadTime).flatMap(key) else {
             held = nil
             return
