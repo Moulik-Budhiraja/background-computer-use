@@ -140,12 +140,18 @@ final class AudioClaims {
         ["AXTitle", "AXDescription", "AXValue"].map { AX.attr(element, $0).map { "\($0)" } ?? "" }.joined(separator: "|")
     }
 
+    /// `outputRunning` says whether the app's audio output is running at
+    /// all: it stays running through a silent stretch of a video or call,
+    /// and stops when the media is paused (or, in Chromium, its tab muted).
     func silence(_ hit: [Claim], why: String, settleMs: Double = 600,
+                 outputRunning: (pid_t) -> Bool = { pid in NSRunningApplication(processIdentifier: pid).map(SessionAudio.isPlaying) ?? false },
                  playing: (pid_t) -> Bool = { pid in NSRunningApplication(processIdentifier: pid).map(SessionAudio.isPlaying) ?? false }) -> [String] {
-        // Nothing to silence when the app is already quiet, or when the named
-        // toggle reads otherwise than when it was named (the agent paused or
-        // muted since): pressing it then would play the agent's sound again.
-        let quietBefore = Set(hit.map(\.pid)).filter { !playing($0) }
+        // Nothing to silence when the app's output has stopped, or when the
+        // named toggle reads otherwise than when it was named (the agent
+        // paused or muted since): pressing it then would play the agent's
+        // sound again. Not when it's merely silent for a moment: a gap in a
+        // video isn't a pause, and its sound would come back after it.
+        let quietBefore = Set(hit.map(\.pid)).filter { !outputRunning($0) }
         let flipped = hit.map { c in
             quietBefore.contains(c.pid) || (c.mute.map { m in c.muteLook.map { $0 != Self.look(m) } ?? false } ?? false)
         }

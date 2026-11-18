@@ -77,18 +77,22 @@ final class AudioClaimTests: XCTestCase {
         let c = AudioClaims()
         let quiet: (pid_t) -> Bool = { _ in false }
         let loud: (pid_t) -> Bool = { _ in true }
-        let noElement = c.silence([claim(1, pid: 100)], why: "started using", settleMs: 50, playing: loud)
+        let noElement = c.silence([claim(1, pid: 100)], why: "started using", settleMs: 50, outputRunning: loud, playing: loud)
         XCTAssertTrue(noElement[0].contains("stop it now"), noElement[0])
         // An element that can't be pressed (no such process).
-        let dead = c.silence([claim(2, pid: 100, mute: AXUIElementCreateApplication(999_999))], why: "started using", settleMs: 50, playing: loud)
+        let dead = c.silence([claim(2, pid: 100, mute: AXUIElementCreateApplication(999_999))], why: "started using", settleMs: 50, outputRunning: loud, playing: loud)
         XCTAssertTrue(dead[0].contains("couldn't be pressed"), dead[0])
         // No element and already quiet.
-        let quietNoElement = c.silence([claim(4, pid: 100)], why: "started using", playing: quiet)
+        let quietNoElement = c.silence([claim(4, pid: 100)], why: "started using", outputRunning: quiet, playing: quiet)
         XCTAssertTrue(quietNoElement[0].contains("had already stopped. "), quietNoElement[0])
         // Already quiet: nothing is pressed (a toggle would play it again).
-        let stopped = c.silence([claim(3, pid: 100, mute: AXUIElementCreateApplication(999_999))], why: "started using", playing: quiet)
+        let stopped = c.silence([claim(3, pid: 100, mute: AXUIElementCreateApplication(999_999))], why: "started using", outputRunning: quiet, playing: quiet)
+        // Silent for a moment but its output still running (a gap in a
+        // video): the element is pressed.
+        let gap = c.silence([claim(5, pid: 100, mute: AXUIElementCreateApplication(999_999))], why: "started using", outputRunning: loud, playing: quiet)
+        XCTAssertTrue(gap[0].contains("couldn't be pressed"), gap[0])
         XCTAssertTrue(stopped[0].contains("already stopped"), stopped[0])
-        XCTAssertEqual(c.takeNotes().count, 4)
+        XCTAssertEqual(c.takeNotes().count, 5)
         XCTAssertTrue(c.takeNotes().isEmpty)
     }
 
@@ -98,10 +102,10 @@ final class AudioClaimTests: XCTestCase {
         let c = AudioClaims()
         var calls = 0
         let start = nowMs()
-        _ = c.silence([claim(1, pid: 100)], why: "started using", settleMs: 1000) { _ in calls += 1; return calls < 4 }
+        _ = c.silence([claim(1, pid: 100)], why: "started using", settleMs: 1000, outputRunning: { _ in true }) { _ in calls += 1; return calls < 4 }
         XCTAssertLessThan(nowMs() - start, 600)          // quiet after a few polls, well before the limit
         let loudStart = nowMs()
-        _ = c.silence([claim(2, pid: 100)], why: "started using", settleMs: 300) { _ in true }
+        _ = c.silence([claim(2, pid: 100)], why: "started using", settleMs: 300, outputRunning: { _ in true }) { _ in true }
         XCTAssertGreaterThanOrEqual(nowMs() - loudStart, 300)
         XCTAssertLessThan(nowMs() - loudStart, 1500)
     }

@@ -67,7 +67,12 @@ public final class FocusGuard {
         if type == .keyDown {
             // cmd+Tab goes to the app switcher, not the front app.
             if event.flags.contains(.maskCommand) && event.getIntegerValueField(.keyboardEventKeycode) == 48 { return }
-            input = .key(front: BCUFrontProcessPID())
+            // An agent's app that brought itself forward doesn't get the
+            // key: it's held and replayed into the user's app (see `handle`).
+            var front = BCUFrontProcessPID()
+            let user = userFront
+            if user != 0, front != user, agentCaused(front) { front = user }
+            input = .key(front: front)
         } else if Self.isMouseDown(type) {
             input = .click(at: event.location)
         } else if type == Self.systemDefined, Self.isMediaKeyDown(event) {
