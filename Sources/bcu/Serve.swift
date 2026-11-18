@@ -20,6 +20,7 @@ enum Serve {
         var owner = "Background Computer Use engine"
         var watchParent = true
         var ownEngine = false
+        var trusted: [String] = []
         var i = 0
         while i < args.count {
             switch args[i] {
@@ -31,6 +32,10 @@ enum Serve {
                 watchParent = false
             case "--own-engine":
                 ownEngine = true
+            case "--trust-client" where i + 1 < args.count:
+                // A client the signature check would refuse: a team ID, or the path
+                // of a program, app or folder (a host's development build, say).
+                trusted.append(args[i + 1]); i += 1
             default:
                 emit(["event": "error", "error": "unknown option \(args[i])"])
                 exit(64)
@@ -61,8 +66,10 @@ enum Serve {
         hub.start()
         let host = HostServer(hub: hub, ownerName: owner, version: BCUVersion.current)
         let server = SocketServer { tool, args in hub.call(tool: tool, args: args) }
+        server.policy = PeerInspector.ownPolicy(trusted: trusted)
         server.hostHandler = { op, req, connection in host.handle(op, req, connection) }
         server.sessionHandler = { [hub] session, on in hub.sessionAttached(session, on) }
+        host.scope = server.scope
         do {
             try server.start()
         } catch {

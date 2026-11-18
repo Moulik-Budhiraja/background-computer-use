@@ -36,7 +36,7 @@ writeFileSync(
 </dict></plist>`
 )
 const script = join(app, 'Contents/MacOS/standin')
-writeFileSync(script, `#!/bin/sh\nexec "${bcu}" serve --owner "Background Computer Use" --no-parent-watch --own-engine\n`)
+writeFileSync(script, `#!/bin/sh\nexec "${bcu}" serve --owner "Background Computer Use" --no-parent-watch --own-engine --trust-client "${process.execPath}"\n`)
 chmodSync(script, 0o755)
 
 function record(dir: string, fields: Record<string, unknown> = {}) {

@@ -1,0 +1,137 @@
+import XCTest
+@testable import BCUCore
+
+/// Who may connect to the engine's socket, and what each connection sees.
+final class PeerPolicyTests: XCTestCase {
+    private let ours = "AAAAAAAAAA"
+    private let theirs = "BBBBBBBBBB"
+    private let appHome = "/Applications/Background Computer Use.app"
+    private let hostApp = "/Applications/Host.app"
+
+    private func peer(_ path: String?, team: String? = nil, valid: Bool = true, cdhash: Data? = nil) -> PeerIdentity {
+        PeerIdentity(path: path, valid: valid, team: team, cdhash: cdhash)
+    }
+
+    private func signed(trusted: [String] = []) -> PeerPolicy {
+        PeerPolicy(team: ours, cdhash: Data([1]), home: appHome, trusted: trusted)
+    }
+
+    private func adHoc(trusted: [String] = []) -> PeerPolicy {
+        PeerPolicy(team: nil, cdhash: Data([1]), home: "/Users/me/bcu/build/Background Computer Use.app", trusted: trusted)
+    }
+
+    private let hostShipsBCU: (String, String) -> Bool = { app, team in app == "/Applications/Host.app" && team == "BBBBBBBBBB" }
+    private let noneShip: (String, String) -> Bool = { _, _ in false }
+
+    private func isDenied(_ d: PeerDecision) -> Bool {
+        if case .deny = d { return true }
+        return false
+    }
+
+    func testSameTeamIsOwner() {
+        let d = signed().decide(peer("\(appHome)/Contents/MacOS/bcu", team: ours), shipsBCU: noneShip)
+        XCTAssertEqual(d, .allow(.owner))
+    }
+
+    func testSameBinaryIsOwnerEvenAdHoc() {
+        let d = adHoc().decide(peer("/Users/me/bcu/.build/debug/bcu", cdhash: Data([1])), shipsBCU: noneShip)
+        XCTAssertEqual(d, .allow(.owner))
+    }
+
+    func testUnsignedOrUnreadablePeersAreRefused() {
+        XCTAssertTrue(isDenied(signed().decide(nil, shipsBCU: noneShip)))
+        XCTAssertTrue(isDenied(signed().decide(peer("/tmp/evil", valid: false), shipsBCU: noneShip)))
+        // A broken signature doesn't get in on a matching cdhash or team either.
+        XCTAssertTrue(isDenied(signed().decide(peer("/tmp/evil", team: ours, valid: false, cdhash: Data([1])), shipsBCU: noneShip)))
+    }
+
+    func testPlatformAndOtherSignedProgramsAreRefused() {
+        // Apple's own binaries have no team; another developer's that doesn't ship bcu.
+        XCTAssertTrue(isDenied(signed().decide(peer("/usr/bin/python3"), shipsBCU: noneShip)))
+        XCTAssertTrue(isDenied(signed().decide(peer("/opt/homebrew/Cellar/node/22/bin/node", team: "CCCCCCCCCC"), shipsBCU: noneShip)))
+    }
+
+    func testAnotherAppThatShipsBCUGetsItsOwnScope() {
+        let ui = peer("\(hostApp)/Contents/Frameworks/Host Helper.app", team: theirs)
+        XCTAssertEqual(signed().decide(ui, shipsBCU: hostShipsBCU), .allow(.app(team: theirs)))
+        let bcu = peer("\(hostApp)/Contents/Resources/bcu", team: theirs)
+        XCTAssertEqual(signed().decide(bcu, shipsBCU: hostShipsBCU), .allow(.app(team: theirs)))
+        // The same works for an ad hoc engine (a development build of the app).
+        XCTAssertEqual(adHoc().decide(ui, shipsBCU: hostShipsBCU), .allow(.app(team: theirs)))
+        // The bcu has to be signed by the same team as the peer.
+        let impostor = peer("\(hostApp)/Contents/MacOS/Host", team: "CCCCCCCCCC")
+        XCTAssertTrue(isDenied(signed().decide(impostor, shipsBCU: hostShipsBCU)))
+        // A program outside any app can't ship anything.
+        XCTAssertTrue(isDenied(signed().decide(peer("/usr/local/bin/tool", team: theirs), shipsBCU: { _, _ in true })))
+    }
+
+    func testAdHocEngineTrustsItsOwnApp() {
+        let p = adHoc()
+        XCTAssertEqual(p.decide(peer("\(p.home!)/Contents/MacOS/bcu"), shipsBCU: noneShip), .allow(.owner))
+        XCTAssertTrue(isDenied(p.decide(peer("\(p.home!) copy/Contents/MacOS/bcu"), shipsBCU: noneShip)))
+        XCTAssertTrue(isDenied(p.decide(peer("/tmp/evil"), shipsBCU: noneShip)))
+    }
+
+    func testSignedEngineDoesntTrustUnsignedCodeInItsApp() {
+        // With a team to go by, the path alone isn't enough.
+        XCTAssertTrue(isDenied(signed().decide(peer("\(appHome)/Contents/MacOS/dropped"), shipsBCU: noneShip)))
+    }
+
+    func testTrustClientByPathOrTeam() {
+        let node = "/opt/homebrew/Cellar/node/22/bin/node"
+        XCTAssertEqual(adHoc(trusted: [node]).decide(peer(node, team: "CCCCCCCCCC"), shipsBCU: noneShip), .allow(.owner))
+        XCTAssertEqual(signed(trusted: ["/Users/me/host/node_modules/electron/dist"])
+            .decide(peer("/Users/me/host/node_modules/electron/dist/Electron.app"), shipsBCU: noneShip), .allow(.owner))
+        XCTAssertEqual(signed(trusted: ["CCCCCCCCCC"]).decide(peer("/x/y", team: "CCCCCCCCCC"), shipsBCU: noneShip), .allow(.owner))
+        // A folder isn't a prefix of a sibling with a longer name.
+        XCTAssertTrue(isDenied(signed(trusted: ["/opt/node"]).decide(peer("/opt/node-evil/bin/node"), shipsBCU: noneShip)))
+    }
+
+    func testPaths() {
+        XCTAssertEqual(PeerPolicy.outermostApp("/Applications/A.app/Contents/Frameworks/B.app/Contents/MacOS/B"), "/Applications/A.app")
+        XCTAssertNil(PeerPolicy.outermostApp("/usr/bin/python3"))
+        XCTAssertTrue(PeerPolicy.path("/a/b/c", isInside: "/a/b/"))
+        XCTAssertTrue(PeerPolicy.path("/a/b", isInside: "/a/b"))
+        XCTAssertFalse(PeerPolicy.path("/a/bc", isInside: "/a/b"))
+        XCTAssertFalse(PeerPolicy.path("/a", isInside: ""))
+        XCTAssertTrue(PeerPolicy.isTeamID("ABCDE12345"))
+        XCTAssertFalse(PeerPolicy.isTeamID("abcde12345"))
+        XCTAssertFalse(PeerPolicy.isTeamID("X\" or true"))
+    }
+
+    // MARK: Scope
+
+    func testHostAppSeesOnlyItsOwnSessions() {
+        let scope = PeerScope()
+        let host = PeerTrust.app(team: theirs)
+        let other = PeerTrust.app(team: "CCCCCCCCCC")
+        XCTAssertNil(scope.admitCall(session: "claude-1", parent: nil, host: nil, .owner))
+        XCTAssertNil(scope.admitCall(session: "helper-1", parent: nil, host: "host", host))
+        XCTAssertTrue(scope.mayUse(session: "helper-1", host))
+        XCTAssertTrue(scope.mayUse(session: "helper-1", .owner))
+        XCTAssertFalse(scope.mayUse(session: "claude-1", host))
+        XCTAssertFalse(scope.mayUse(session: "helper-1", other))
+        // Sessions no one has called for yet are the engine's own.
+        XCTAssertFalse(scope.mayUse(session: "restored", host))
+        XCTAssertTrue(scope.mayUse(session: "restored", .owner))
+    }
+
+    func testCallsCantTakeAnotherAppsSessionOrHost() {
+        let scope = PeerScope()
+        let host = PeerTrust.app(team: theirs)
+        let other = PeerTrust.app(team: "CCCCCCCCCC")
+        XCTAssertNil(scope.admitCall(session: "helper-1", parent: nil, host: "host", host))
+        XCTAssertNotNil(scope.admitCall(session: "helper-1", parent: nil, host: nil, other))
+        XCTAssertNotNil(scope.admitCall(session: "x", parent: nil, host: "host", other))
+        XCTAssertNotNil(scope.admitCall(session: "x/sub", parent: "helper-1", host: nil, other))
+        XCTAssertNil(scope.admitCall(session: "helper-1/sub", parent: "helper-1", host: "host", host))
+        // The engine's own code may use them; it doesn't take them over.
+        XCTAssertNil(scope.admitCall(session: "helper-1", parent: nil, host: "host", .owner))
+        XCTAssertEqual(scope.owner(ofSession: "helper-1"), host)
+        XCTAssertFalse(scope.claimHost("host", other))
+        XCTAssertTrue(scope.claimHost("host", host))
+        XCTAssertTrue(scope.claimHost("host", .owner))
+        XCTAssertTrue(scope.claimHost("fresh", other))
+        XCTAssertFalse(scope.claimHost("fresh", host))
+    }
+}

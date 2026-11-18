@@ -18,6 +18,9 @@ public final class HostServer {
     private let version: String
     /// Another engine asked this one to step aside once its agents are done (`yield`).
     public var onYield: (() -> Void)?
+    /// Which app owns each session (`SocketServer.scope`): another
+    /// developer's app sees and drives only its own.
+    public var scope = PeerScope()
 
     private final class Client {
         let connection: SocketConnection
@@ -32,7 +35,16 @@ public final class HostServer {
         var remotes: [String: RemoteControl] = [:]
         init(_ connection: SocketConnection) { self.connection = connection }
 
-        func shows(_ e: Engine) -> Bool { all || (host != nil && e.host == host) }
+        func wants(_ e: Engine) -> Bool { all || (host != nil && e.host == host) }
+    }
+
+    /// The client asked for this session and may see it.
+    private func shows(_ c: Client, _ e: Engine) -> Bool {
+        c.wants(e) && scope.mayUse(session: e.sessionID, c.connection.trust)
+    }
+
+    private func claim(_ host: String, _ c: Client) throws {
+        guard scope.claimHost(host, c.connection.trust) else { throw ToolError("host \(host) belongs to another app") }
     }
 
     private final class Stream {
@@ -121,6 +133,7 @@ public final class HostServer {
 
         case "subscribe":
             let host = a.string("host")
+            if let host { try claim(host, c) }
             lock.lock()
             c.release?()
             c.release = nil
@@ -137,6 +150,7 @@ public final class HostServer {
             // A host chooses whether its own sessions are recorded, and where.
             // Until it does, they aren't.
             guard let host = a.string("host"), !host.isEmpty else { throw ToolError("recordings needs host: your host ID") }
+            try claim(host, c)
             guard let dir = a.string("directory") else {
                 hub.setRecordings(host: host, nil)
                 return ["ok": true, "recording": false]
@@ -172,19 +186,20 @@ public final class HostServer {
         case "sessions":
             let host = a.string("host")
             let all = a.bool("all") ?? (host == nil)
-            let list = hub.engines.filter { all || $0.host == host }.map(sessionJSON)
+            let list = hub.engines.filter { (all || $0.host == host) && scope.mayUse(session: $0.sessionID, c.connection.trust) }
+                .map(sessionJSON)
             return ["ok": true, "engine": engineInfo(), "sessions": list]
 
         case "pause":
-            try engine(a).setPaused(a.bool("paused") ?? true)
+            try engine(a, c).setPaused(a.bool("paused") ?? true)
             return ["ok": true]
 
         case "stop":
-            try engine(a).stopAll()
+            try engine(a, c).stopAll()
             return ["ok": true]
 
         case "take_over":
-            let e = try engine(a)
+            let e = try engine(a, c)
             if a.bool("on") ?? true {
                 guard e.display.isRunning else { throw ToolError("that session has no display yet") }
                 lock.lock()
@@ -205,18 +220,18 @@ public final class HostServer {
             return ["ok": true]
 
         case "hand_back":
-            try engine(a).handBack()
+            try engine(a, c).handBack()
             return ["ok": true]
 
         case "open_handoff":
-            let e = try engine(a)
+            let e = try engine(a, c)
             guard e.handoffWindow != nil else { throw ToolError("that session hasn't handed a window off") }
             let area = try rect(a.raw["area"]) ?? DispatchQueue.main.sync { Self.screenUnderPointer() }
             e.bringHandoffToUser(area: area)
             return ["ok": true]
 
         case "frames":
-            let e = try engine(a)
+            let e = try engine(a, c)
             lock.lock()
             nextStream += 1
             let s = Stream(id: nextStream, engine: e, maxWidth: a.int("max_width") ?? 1600, quality: a.double("quality") ?? 0.6)
@@ -248,7 +263,7 @@ public final class HostServer {
             return ["ok": true]
 
         case "input":
-            let e = try engine(a)
+            let e = try engine(a, c)
             lock.lock()
             let remote = c.remotes[e.sessionID]
             lock.unlock()
@@ -258,7 +273,7 @@ public final class HostServer {
             return ["ok": true]
 
         case "menu_pick":
-            let e = try engine(a)
+            let e = try engine(a, c)
             lock.lock()
             let remote = c.remotes[e.sessionID]
             lock.unlock()
@@ -276,9 +291,10 @@ public final class HostServer {
         }
     }
 
-    private func engine(_ a: Args) throws -> Engine {
+    private func engine(_ a: Args, _ c: Client) throws -> Engine {
         guard let id = a.string("session") else { throw ToolError("missing session") }
-        guard let e = hub.engine(id: id) else { throw ToolError("no session \(id)") }
+        // Another app's session looks the same as none.
+        guard let e = hub.engine(id: id), scope.mayUse(session: id, c.connection.trust) else { throw ToolError("no session \(id)") }
         return e
     }
 
@@ -457,9 +473,9 @@ public final class HostServer {
         let engines = hub.engines
         let info = engineInfo()
         var json: [String: JSONObject] = [:]
-        for e in engines where targets.contains(where: { $0.shows(e) }) { json[e.sessionID] = sessionJSON(e) }
+        for e in engines where targets.contains(where: { shows($0, e) }) { json[e.sessionID] = sessionJSON(e) }
         for c in targets {
-            let list = engines.filter(c.shows).compactMap { json[$0.sessionID] }
+            let list = engines.filter { shows(c, $0) }.compactMap { json[$0.sessionID] }
             let line = WireCodec.encodeLine(["event": "sessions", "engine": info, "sessions": list])
             lock.lock()
             let same = c.lastSessions == line
@@ -471,7 +487,7 @@ public final class HostServer {
 
     private func sendPointer(_ e: Engine, _ p: AgentPointer) {
         lock.lock()
-        let targets = clients.values.filter { $0.subscribed && $0.shows(e) }
+        let targets = clients.values.filter { $0.subscribed && shows($0, e) }
         lock.unlock()
         guard !targets.isEmpty else { return }
         var o: JSONObject = ["event": "pointer", "session": e.sessionID]

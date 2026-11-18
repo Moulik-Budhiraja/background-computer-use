@@ -7,6 +7,8 @@ import BCUShared
 public final class SocketConnection {
     let fd: Int32
     public let id: Int
+    /// What the peer may see and drive (`PeerPolicy`), set before its first line.
+    public internal(set) var trust: PeerTrust = .owner
     private let writer: DispatchQueue
     private let lock = NSLock()
     private var closed = false
@@ -77,6 +79,8 @@ public final class SocketConnection {
 }
 
 /// Line-delimited JSON over a unix socket (mode 0600). One thread per client.
+/// A client gets in only if its code signature passes `policy` (see
+/// `PeerCheck.swift`); otherwise it gets one `rejected` line and is closed.
 ///
 /// A line with `tool` is a tool call (see `Wire.swift`). A line with `op`
 /// is for host apps and goes to `hostHandler` (see `HostServer`).
@@ -88,6 +92,11 @@ public final class SocketServer {
     /// A connection began carrying a session's tool calls (true), or went
     /// away having carried them (false): how the engine learns an agent is gone.
     public var sessionHandler: ((String, Bool) -> Void)?
+    /// Who may connect. Read from this process's own signature at `start`
+    /// unless set before.
+    public var policy: PeerPolicy?
+    /// Which app owns each session; share it with `HostServer.scope`.
+    public let scope = PeerScope()
     private var listenFD: Int32 = -1
     private var nextID = 0
     private let idLock = NSLock()
@@ -98,6 +107,10 @@ public final class SocketServer {
     }
 
     public func start() throws {
+        if policy == nil { policy = PeerInspector.ownPolicy() }
+        if let p = policy {
+            Log.info("socket clients: team \(p.team ?? "none (ad hoc)"), home \(p.home ?? "-"), also trusted: \(p.trusted)")
+        }
         try FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
         unlink(path)
         listenFD = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -142,11 +155,28 @@ public final class SocketServer {
             idLock.lock(); nextID += 1; let id = nextID; idLock.unlock()
             let connection = SocketConnection(fd: client, id: id)
             let thread = Thread { [weak self] in
-                self?.serve(connection)
+                if let self, self.admit(connection) { self.serve(connection) }
                 connection.finish()
             }
             thread.name = "bcu.socket.client"
             thread.start()
+        }
+    }
+
+    /// Checks the peer's code signature. A refused client gets one line saying
+    /// why (in reply form, so a client waiting for a reply shows it) and is closed.
+    private func admit(_ connection: SocketConnection) -> Bool {
+        let peer = PeerInspector.identity(fd: connection.fd)
+        let decision = (policy ?? PeerInspector.ownPolicy()).decide(peer) { PeerInspector.shipsBCU(app: $0, team: $1) }
+        switch decision {
+        case .allow(let trust):
+            connection.trust = trust
+            return true
+        case .deny(let why):
+            Log.info("refused a socket client: \(why)")
+            connection.send(["event": "rejected", "ok": false,
+                             "error": "The computer use engine refused this connection: \(why). Only its own app and apps that ship bcu signed by their developer can connect (docs/embedding.md)."])
+            return false
         }
     }
 
@@ -176,7 +206,13 @@ public final class SocketServer {
                 }
                 let tool = request["tool"] as? String ?? ""
                 let args = request["args"] as? JSONObject ?? [:]
-                if let session = args["_session"] as? String, sessions.insert(session).inserted { sessionHandler?(session, true) }
+                let session = args["_session"] as? String
+                if let why = scope.admitCall(session: session ?? Hub.defaultSession, parent: args["_parent"] as? String,
+                                             host: args["_host"] as? String, connection.trust) {
+                    connection.send(ToolResult.error(why).wire(id: id))
+                    continue
+                }
+                if let session, sessions.insert(session).inserted { sessionHandler?(session, true) }
                 let result = handler(tool, args)
                 connection.send(result.wire(id: id))
             }

@@ -20,10 +20,12 @@ usage:
                                 --host so it shows the session in its own UI, and can
                                 name the session and its label
   bcu serve [--owner NAME] [--log-dir DIR] [--no-parent-watch] [--own-engine]
+            [--trust-client TEAM_ID|PATH]...
                                 run the engine without the menu bar app, for a host
                                 app (see docs/embedding.md); it stops when its parent does.
                                 If the app is installed and set up, starts it and uses
-                                its engine instead, unless --own-engine
+                                its engine instead, unless --own-engine. --trust-client
+                                lets in a client the code signature check would refuse
   bcu call <tool> ['{json}']    call one tool (images are saved to /tmp/bcu-*.png)
   bcu status                    show the app's status
   bcu tools                     list tool names

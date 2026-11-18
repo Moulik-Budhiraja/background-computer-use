@@ -18,7 +18,8 @@ const path = socketPath(home)
 let engine: EngineStart
 
 before(async () => {
-  engine = await startEngine({ bcu, owner: 'Test Host', logDir: join(home, 'logs'), env })
+  // node isn't signed by the engine's developer: let these tests' connections in.
+  engine = await startEngine({ bcu, owner: 'Test Host', logDir: join(home, 'logs'), trustClients: [process.execPath], env })
 })
 
 after(() => {

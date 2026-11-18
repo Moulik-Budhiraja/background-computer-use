@@ -52,7 +52,11 @@ public final class SocketClient {
             var offset = 0
             while offset < raw.count {
                 let n = write(fd, raw.baseAddress!.advanced(by: offset), raw.count - offset)
-                if n <= 0 { throw SocketError.message("write failed") }
+                if n <= 0 {
+                    // The engine may have refused this connection and said why.
+                    if let line = try? readLine(), let o = WireCodec.decode(line), o["ok"] as? Bool == false { throw SocketError.message(o["error"] as? String ?? "write failed") }
+                    throw SocketError.message("write failed")
+                }
                 offset += n
             }
         }
