@@ -1422,14 +1422,25 @@ public final class Engine {
             return ToolResult(text: mute == nil ? "\(w.appName) is still muted on the user's speakers." : "\(w.appName) is still muted on the user's speakers; when the user starts using it, \(muteName) is pressed to silence yours.")
         }
         audio.routeNow(audioApps())
+        var opening = ""
+        switch audio.state(of: app) {
+        case .muted: break
+        case .notOpenedYet:
+            opening = " (\(w.appName) hasn't opened its audio yet; it's muted the moment it does)"
+        case .failed(let why):
+            audioClaims.remove(w.id)
+            audio.keepRecording = !audioClaims.isIdle
+            audio.routeNow(audioApps())
+            throw ToolError("\(w.appName)'s sound can't be kept off the user's speakers: \(why). Don't play sound in it; if the task needs sound, tell the user.")
+        }
         if agentsOnly {
-            return ToolResult(text: "Only agents have windows in \(w.appName), so its sound stays off the user's speakers and is recorded to \(audio.url.path). Play it now.")
+            return ToolResult(text: "Only agents have windows in \(w.appName), so its sound stays off the user's speakers and is recorded to \(audio.url.path)\(opening). Play it now.")
         }
         log("Muted \(w.appName) on your speakers while the agent plays sound in it")
         let then = mute == nil
             ? "Once your window has a mute or pause button for it (a tab's mute button shows only once it plays), call this again with it as mute_element: when the user starts using \(w.appName), it plays on their speakers again, and that button is pressed to silence yours first."
             : "When the user starts using \(w.appName), \(muteName) is pressed to silence yours and the app plays on their speakers again; you're told on your next call."
-        return ToolResult(text: "\(w.appName)'s sound is muted on the user's speakers and recorded to \(audio.url.path). Play yours now. " + then)
+        return ToolResult(text: "\(w.appName)'s sound is muted on the user's speakers and recorded to \(audio.url.path)\(opening). Play yours now. " + then)
     }
 
     /// The user is using a claimed app: silence the agent's sound, then

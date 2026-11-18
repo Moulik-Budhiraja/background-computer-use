@@ -55,6 +55,11 @@ final class AudioClaims {
         lock.lock(); claims[claim.window] = claim; lock.unlock()
     }
 
+    /// Drop a claim that couldn't be honored.
+    func remove(_ window: CGWindowID) {
+        lock.lock(); claims[window] = nil; lock.unlock()
+    }
+
     func has(_ window: CGWindowID) -> Bool {
         lock.lock(); defer { lock.unlock() }; return claims[window] != nil
     }

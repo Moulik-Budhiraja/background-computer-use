@@ -75,6 +75,11 @@ public final class SessionAudio {
     private var fileFormat: AVAudioFormat?
     private var converter: AVAudioConverter?
     private var failedAt: Date?
+    /// Why the tap or the recorder last failed, for `state`.
+    private var lastError: String?
+    /// The apps last asked for, applied again when an app opens its audio.
+    private var wantedApps: [NSRunningApplication] = []
+    private var processListListener: AudioObjectPropertyListenerBlock?
     private var outputListeners: [AudioObjectID: AudioObjectPropertyListenerBlock] = [:]
 
     public init(name: String) {
@@ -177,9 +182,33 @@ public final class SessionAudio {
         }
     }
 
+    /// Whether an app's sound is kept off the speakers right now.
+    public enum State: Equatable {
+        /// Tapped, and the recorder is reading the tap (which is what mutes).
+        case muted
+        /// It hasn't opened its audio yet; it's muted the moment it does.
+        case notOpenedYet
+        case failed(String)
+    }
+
+    /// What routing did for this app (after `routeNow`).
+    public func state(of app: NSRunningApplication) -> State {
+        queue.sync {
+            let ids = Self.audioProcesses(of: [app])
+            if ids.isEmpty { return .notOpenedYet }
+            guard tapID != kAudioObjectUnknown, Set(ids).isSubset(of: processes) else {
+                return .failed(lastError ?? "its audio couldn't be tapped")
+            }
+            guard aggregateID != kAudioObjectUnknown else { return .failed(lastError ?? "its audio couldn't be read") }
+            return .muted
+        }
+    }
+
     /// Stop and delete the file.
     public func end() {
         queue.sync {
+            self.wantedApps = []
+            self.watchProcessList(false)
             self.teardownTap()
             self.file = nil
             self.converter = nil
@@ -205,6 +234,10 @@ public final class SessionAudio {
         let wanted = Self.audioProcesses(of: apps)
         let names = apps.compactMap(\.localizedName).sorted()
         let pids = Set(apps.map(\.processIdentifier))
+        wantedApps = apps
+        // An app gets its audio processes when it first opens its audio:
+        // tap them then, not at the next routing pass up to a second later.
+        watchProcessList(!apps.isEmpty)
         defer { updateRecorder() }
         if wanted.isEmpty {
             if tapID != kAudioObjectUnknown {
@@ -242,6 +275,7 @@ public final class SessionAudio {
         let err = AudioHardwareCreateProcessTap(d, &tap)
         guard err == noErr else {
             failedAt = Date()
+            lastError = "macOS refused to tap it (\(err)); System Audio Recording may not be allowed for Background Computer Use"
             Log.info("audio: couldn't tap app audio (\(err)); allow System Audio Recording for Background Computer Use")
             return
         }
@@ -251,7 +285,25 @@ public final class SessionAudio {
         routedApps = names
         routedPids = pids
         failedAt = nil
+        lastError = nil
         Log.info("audio: muted \(names.joined(separator: ", ")) on the speakers")
+    }
+
+    /// On `queue`.
+    private func watchProcessList(_ on: Bool) {
+        var addr = Self.address(kAudioHardwarePropertyProcessObjectList)
+        if on, processListListener == nil {
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                guard let self, !self.wantedApps.isEmpty else { return }
+                self.apply(self.wantedApps)
+            }
+            if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, queue, block) == noErr {
+                processListListener = block
+            }
+        } else if !on, let block = processListListener {
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, queue, block)
+            processListListener = nil
+        }
     }
 
     @available(macOS 14.2, *)
@@ -291,9 +343,11 @@ public final class SessionAudio {
         if want, aggregateID == kAudioObjectUnknown {
             do {
                 try startRecorder()
+                lastError = nil
                 Log.info("audio: recording \(routedApps.joined(separator: ", ")) to \(url.path)")
             } catch {
                 stopRecorder()
+                lastError = "\(error)"
                 Log.info("audio: \(error)")
             }
         } else if !want, aggregateID != kAudioObjectUnknown {
