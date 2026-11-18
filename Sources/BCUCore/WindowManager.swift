@@ -73,6 +73,15 @@ public final class WindowManager {
         return registeredAnywhere[id].map { $0.session != session } ?? false
     }
 
+    /// Windows a session opened or caught, whether or not it still has
+    /// them: the only ones cleanup may close (any other is the user's).
+    private static var agentMade: Set<CGWindowID> = []
+
+    static func wasAgentMade(_ id: CGWindowID) -> Bool {
+        sharedLock.lock(); defer { sharedLock.unlock() }
+        return agentMade.contains(id)
+    }
+
     /// Some session's window, as of right now.
     static func isRegistered(_ id: CGWindowID) -> Bool {
         sharedLock.lock(); defer { sharedLock.unlock() }
@@ -97,7 +106,10 @@ public final class WindowManager {
 
     func register(_ w: AgentWindow) {
         lock.lock(); registry[w.id] = w; registeredAt[w.id] = nowMs(); lock.unlock()
-        Self.sharedLock.lock(); Self.registeredAnywhere[w.id] = (sessionKey, w.pid); Self.sharedLock.unlock()
+        Self.sharedLock.lock()
+        Self.registeredAnywhere[w.id] = (sessionKey, w.pid)
+        if w.kind != .borrowed { Self.agentMade.insert(w.id) }
+        Self.sharedLock.unlock()
         persist()
     }
 
@@ -148,10 +160,21 @@ public final class WindowManager {
         let dir = BCUPaths.supportDirectory
         let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
             .filter { $0.hasPrefix("windows") && $0.hasSuffix(".json") }
-        return files.flatMap { recover(dir.appendingPathComponent($0)) }
+        // Before this run has a display of its own, every BCU display is
+        // one the last run left.
+        let agentDisplays = AgentDisplay.strayIDs.map { CGDisplayBounds($0) }
+        return files.flatMap { recover(dir.appendingPathComponent($0), agentDisplays: agentDisplays) }
     }
 
-    private static func recover(_ url: URL) -> [String] {
+    /// Whether recovery closes (or answers for) a window the last run had:
+    /// only one it opened or caught that's still on a display of its. Once
+    /// its display is gone the window is on the user's screen, where they
+    /// may be using it now.
+    static func recoveryCloses(kind: String?, bounds: CGRect, agentDisplays: [CGRect]) -> Bool {
+        kind != AgentWindow.Kind.borrowed.rawValue && agentDisplays.contains { $0.contains(CGPoint(x: bounds.midX, y: bounds.midY)) }
+    }
+
+    private static func recover(_ url: URL, agentDisplays: [CGRect]) -> [String] {
         defer { try? FileManager.default.removeItem(at: url) }
         guard let data = try? Data(contentsOf: url),
               let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
@@ -161,10 +184,14 @@ public final class WindowManager {
                   WindowList.info(id)?.pid == pid, let ax = AX.window(pid: pid, id: id) else { return nil }
             return (id, pid, ax)
         }
+        func closes(_ e: [String: Any], _ id: CGWindowID) -> Bool {
+            guard let bounds = WindowList.info(id)?.bounds else { return false }
+            return recoveryCloses(kind: e["kind"] as? String, bounds: bounds, agentDisplays: agentDisplays)
+        }
         // A dialog the last run caught that's still asking whether to leave
         // a page would keep that page's window open: answer it first.
         for e in entries where e["kind"] as? String == AgentWindow.Kind.caught.rawValue {
-            if let w = live(e), answerLeave(w.ax) { sleepMs(400); notes.append("answered Leave for \(e["app"] ?? "?")") }
+            if let w = live(e), closes(e, w.id), answerLeave(w.ax) { sleepMs(400); notes.append("answered Leave for \(e["app"] ?? "?")") }
         }
         // The dialogs each app already had up before anything here is closed:
         // those are the user's (a "Leave site?" on a page of their own), and
@@ -177,6 +204,8 @@ public final class WindowManager {
                 AX.setPosition(ax, CGPoint(x: f[0], y: f[1]))
                 AX.setSize(ax, CGSize(width: f[2], height: f[3]))
                 notes.append("returned \(e["app"] ?? "?") window \(id)")
+            } else if !closes(e, id) {
+                notes.append("left \(e["app"] ?? "?") window \(id) where it is: it's on your screen now")
             } else if let close = AX.element(ax, "AXCloseButton") {
                 if dialogsBefore[pid] == nil { dialogsBefore[pid] = Self.dialogIDs(pid) }
                 AX.perform(close, "AXPress")
@@ -468,6 +497,9 @@ public final class WindowManager {
         }
         defer { if assigned { _ = BCUProcessAssignToSpace(pid, 0) } }
         catcher.start()
+        // Also when asking for the window throws: a catcher left running
+        // moves the app's windows, the user's too, for good.
+        defer { catcher.stop() }
         var how = ""
         var caught: CGWindowID?
         var scriptFailed = scripted == nil
@@ -720,9 +752,15 @@ public final class WindowManager {
             return "returned window \(id) to where it was"
         case .opened, .caught:
             if keepOpen {
+                // Kept open for the user to see: on their screen, since
+                // nothing brings it off this display later (and a spare
+                // display with a window on it is never removed).
                 Self.keep(id)
+                lock.lock(); seenOnUser[id] = -1; spawnedAfter[id] = nil; lock.unlock()
                 unregister(id)
-                return "left window \(id) open"
+                if w.withUser { return "left window \(id) open on the user's screen" }
+                let moved = WindowList.info(id).map { Self.putOnUserScreen(ax, bounds: $0.bounds) } ?? false
+                return moved ? "left window \(id) open and moved it to the user's screen" : "left window \(id) open"
             }
             let before = Set(AX.windows(w.pid).compactMap { AX.windowID($0) })
             let onScreenBefore = Set(WindowList.of(pid: w.pid).map(\.id))
@@ -895,51 +933,100 @@ public final class WindowManager {
         }
     }
 
-    /// Windows an agent released with `keep_open`: nobody's any more, and
-    /// promised to stay open. They aren't leftovers: never closed or answered
-    /// for, and they don't hold a display back (when it goes, macOS moves
-    /// them to the user's screen).
+    /// Windows an agent released with `keep_open`, and others put on the
+    /// user's screen from an agent display: theirs now. Never closed or
+    /// answered for, and no session catches them again.
     private static let keptLock = NSLock()
     private static var keptOpen: Set<CGWindowID> = []
     static func keep(_ id: CGWindowID) { keptLock.lock(); keptOpen.insert(id); keptLock.unlock() }
-    static func leftovers(_ ids: [CGWindowID], kept: Set<CGWindowID>) -> [CGWindowID] { ids.filter { !kept.contains($0) } }
+    static func isKept(_ id: CGWindowID) -> Bool { keptLock.lock(); defer { keptLock.unlock() }; return keptOpen.contains(id) }
 
-    /// Close what's left on a display no agent is using any more: when the
-    /// display goes, macOS moves every window on it to the user's screen.
-    /// Returns how many wouldn't close. Not on the main thread.
+    /// What cleanup does with a window nobody has left on an agent display:
+    /// close one an agent opened or caught (and didn't keep open); put any
+    /// other on the user's screen. It may be theirs (a window an app opened
+    /// where its last one was, or every window macOS moved there when a
+    /// display was unplugged), and closing it could lose their work.
+    enum LeftoverFate: Equatable { case close, giveToUser }
+    static func leftoverFate(_ id: CGWindowID, agentMade: Bool, kept: Set<CGWindowID>) -> LeftoverFate {
+        agentMade && !kept.contains(id) ? .close : .giveToUser
+    }
+
+    /// Center a window on the user's main display, shrunk to fit (shrunk
+    /// first, so AppKit doesn't push it back to a screen it fits).
+    @discardableResult
+    static func putOnUserScreen(_ ax: AXUIElement, bounds: CGRect) -> Bool {
+        let main = CGDisplayBounds(CGMainDisplayID())
+        let w = min(bounds.width, main.width - 80), h = min(bounds.height, main.height - 120)
+        AX.setSize(ax, CGSize(width: w, height: h))
+        return AX.setPosition(ax, CGPoint(x: (main.midX - w / 2).rounded(), y: (main.midY - h / 2).rounded()))
+    }
+
+    /// Clean up what's left on a display no agent is using any more: when
+    /// the display goes, macOS moves every window on it to the user's
+    /// screen. Returns how many are still there. Not on the main thread.
     @discardableResult
     static func closeLeftovers(on bounds: CGRect) -> Int {
-        keptLock.lock(); let kept = keptOpen; keptLock.unlock()
-        func windows(on bounds: CGRect) -> [WindowInfo] {
-            let all = Self.windows(on: bounds)
-            let left = Set(leftovers(all.map(\.id), kept: kept))
-            return all.filter { left.contains($0.id) }
-        }
         // One sweep at a time: each can wait a second or two on an app.
         guard leftoverLock.try() else { return windows(on: bounds).count }
         defer { leftoverLock.unlock() }
+        keptLock.lock(); let kept = keptOpen; keptLock.unlock()
         // Not a window some session has: it's on this display for a moment
         // (macOS put it here, or it's being taken over), and its session
         // moves it to its own. It counts as left, so the display stays
         // until it's gone.
-        // Dialogs first: one that's asking about a window keeps it open.
         let found = windows(on: bounds).filter { !isRegistered($0.id) }
             .compactMap { info in AX.window(pid: info.pid, id: info.id).map { (info, $0) } }
-        for (_, ax) in found where answerLeave(ax) { sleepMs(400) }
-        for (info, ax) in found where WindowList.info(info.id) != nil {
+        let present = Set(found.map(\.0.id))
+        let toClose = found.filter { leftoverFate($0.0.id, agentMade: wasAgentMade($0.0.id), kept: kept) == .close }
+        for (info, ax) in found where !toClose.contains(where: { $0.0.id == info.id }) {
+            keep(info.id)
+            putOnUserScreen(ax, bounds: info.bounds)
+            // (Told once: one that won't move is tried again next time.)
+            guard !kept.contains(info.id) else { continue }
+            Log.info("moved \(info.owner) window \(info.id) from an agent display to the user's screen")
+            FocusGuard.shared?.record("moved a \(info.owner) window from an agent display to your screen")
+        }
+        // Dialogs first: one that's asking about a window keeps it open.
+        for (_, ax) in toClose where answerLeave(ax) { sleepMs(400) }
+        for (info, ax) in toClose where WindowList.info(info.id) != nil {
             if let close = AX.element(ax, "AXCloseButton") { AX.perform(close, "AXPress") } else { AX.perform(ax, "AXCancel") }
             let deadline = nowMs() + 1200
             while WindowList.info(info.id) != nil && nowMs() < deadline { sleepMs(50) }
         }
-        // A page that only now asks whether to leave: nobody is left to say no.
-        for info in windows(on: bounds) where !isRegistered(info.id) {
-            if let ax = AX.window(pid: info.pid, id: info.id), answerLeave(ax) { sleepMs(400) }
+        // A page that only now asks whether to leave, about a window closed
+        // here: nobody is left to say no.
+        if !toClose.isEmpty {
+            for info in windows(on: bounds) where !isRegistered(info.id) && !present.contains(info.id) {
+                if let ax = AX.window(pid: info.pid, id: info.id), answerLeave(ax) { sleepMs(400) }
+            }
         }
         let left = windows(on: bounds)
         if !left.isEmpty {
-            Log.info("leftover windows on an agent display wouldn't close: \(left.map { "\($0.owner) \($0.id) \"\($0.title.prefix(30))\"" }.joined(separator: ", "))")
+            Log.info("leftover windows on an agent display are still there: \(left.map { "\($0.owner) \($0.id) \"\($0.title.prefix(30))\"" }.joined(separator: ", "))")
         }
         return left.count
+    }
+
+    /// Windows on BCU displays a crashed copy left (see
+    /// `AgentDisplay.strayIDs`): the user can't see or reach them, and
+    /// nobody else will move them. Put them on the user's screen (once the
+    /// last run's own windows are closed, see `recoverFromPreviousRun`).
+    /// Done off the caller's thread.
+    static func rescue(fromStrays strays: [CGRect]) {
+        guard !strays.isEmpty else { return }
+        rescueQueue.async {
+            for bounds in strays {
+                for info in windows(on: bounds) where !isRegistered(info.id) && !isOpening(info.pid) {
+                    guard let ax = AX.window(pid: info.pid, id: info.id) else { continue }
+                    let first = !isKept(info.id)
+                    keep(info.id)
+                    putOnUserScreen(ax, bounds: info.bounds)
+                    guard first else { continue }
+                    Log.info("moved \(info.owner) window \(info.id) from a display a crashed copy left to the user's screen")
+                    FocusGuard.shared?.record("moved a \(info.owner) window from a leftover agent display to your screen")
+                }
+            }
+        }
     }
 
     /// The window stays on the agent display until the user asks for it
@@ -1083,7 +1170,7 @@ public final class WindowManager {
             // newer flag took an agent's new window for one the user opened,
             // and put it on their screen.
             lock.lock(); let mine = opening.contains(info.pid); lock.unlock()
-            if mine || Self.isOpening(info.pid) || Self.isRegistered(info.id) { continue }
+            if mine || Self.isOpening(info.pid) || Self.isRegistered(info.id) || Self.isKept(info.id) { continue }
             // Judge each new window for 1.5 s: the guard learns the user's front
             // app a moment after it changes.
             lock.lock()
@@ -1148,7 +1235,7 @@ public final class WindowManager {
             lock.lock()
             let midOpen = opening.contains(info.pid) || Self.isOpening(info.pid)
             lock.unlock()
-            guard !midOpen, !Self.isRegistered(info.id, byOtherThan: sessionKey),
+            guard !midOpen, !Self.isRegistered(info.id, byOtherThan: sessionKey), !Self.isKept(info.id),
                   display.touchesUser(info.bounds), !display.holds(info.bounds),
                   info.bounds.width > 40, info.bounds.height > 40 else { continue }
             // Only windows that appeared since this session began acting on
@@ -1252,6 +1339,7 @@ final class WindowCatcher {
         thread.start()
     }
 
+    /// Safe to call twice.
     func stop() {
         polling = false
         if let obs = observer {
@@ -1271,6 +1359,10 @@ final class WindowCatcher {
 
     private func catchWindow(id: CGWindowID, element: AXUIElement) {
         lock.lock()
+        // Only the one window asked for: another new window of the app
+        // while this one settles is the user's (or the app's own), not this.
+        if !Self.mayMove(id, caught: caughtID) { lock.unlock(); return }
+        if caughtID == nil { caughtID = id }
         // Apps can reset a new window's position just after creating it,
         // undoing the move, so a window still on the user's screen is moved
         // again, every 30 ms, up to 10 times.
@@ -1284,9 +1376,13 @@ final class WindowCatcher {
         if let target { manager?.moveToAgent(element, frame: target) }
         lock.lock()
         moved[id] = (count, nowMs())
-        if caughtID == nil { caughtID = id }
         if movedMs == nil { movedMs = nowMs() }
         lock.unlock()
+    }
+
+    /// Whether the catcher may move window `id`, having caught `caught`.
+    static func mayMove(_ id: CGWindowID, caught: CGWindowID?) -> Bool {
+        caught == nil || caught == id
     }
 
     /// Polls the window list every ~2 ms to measure exposure, and catches the
@@ -1298,6 +1394,7 @@ final class WindowCatcher {
             for info in WindowList.of(pid: pid, onScreenOnly: true) where info.layer == 0 && !before.contains(info.id)
                 && !WindowManager.isRegistered(info.id) {
                 lock.lock()
+                if !Self.mayMove(info.id, caught: caughtID) { lock.unlock(); continue }
                 let first = firstSeenMs == nil
                 if first { firstSeenMs = now }
                 lock.unlock()

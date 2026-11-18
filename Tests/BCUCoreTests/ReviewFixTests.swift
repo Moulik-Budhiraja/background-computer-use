@@ -38,8 +38,30 @@ final class ReviewFixTests: XCTestCase {
         XCTAssertNil(Hub.lookup("gone", in: byID, sessionID: { $0 }))
     }
 
-    func testAWindowReleasedWithKeepOpenIsNotALeftover() {
-        XCTAssertEqual(WindowManager.leftovers([1, 2, 3], kept: [2]), [1, 3])
-        XCTAssertEqual(WindowManager.leftovers([2], kept: [2]), [])
+    func testOnlyAnAgentsOwnLeftoverIsClosed() {
+        XCTAssertEqual(WindowManager.leftoverFate(1, agentMade: true, kept: []), .close)
+        // Kept open by its agent: the user's now.
+        XCTAssertEqual(WindowManager.leftoverFate(2, agentMade: true, kept: [2]), .giveToUser)
+        // Never an agent's (an app's own, or one macOS moved there): the user's.
+        XCTAssertEqual(WindowManager.leftoverFate(3, agentMade: false, kept: []), .giveToUser)
+    }
+
+    func testRecoveryClosesOnlyWhatsStillOnALeftoverDisplay() {
+        let stray = CGRect(x: 3000, y: 0, width: 1400, height: 900)
+        let there = CGRect(x: 3100, y: 100, width: 800, height: 600)
+        let onUsers = CGRect(x: 100, y: 100, width: 800, height: 600)
+        XCTAssertTrue(WindowManager.recoveryCloses(kind: "opened", bounds: there, agentDisplays: [stray]))
+        XCTAssertTrue(WindowManager.recoveryCloses(kind: "caught", bounds: there, agentDisplays: [stray]))
+        // Its display went with the crash: on the user's screen, maybe in use.
+        XCTAssertFalse(WindowManager.recoveryCloses(kind: "opened", bounds: onUsers, agentDisplays: [stray]))
+        XCTAssertFalse(WindowManager.recoveryCloses(kind: "opened", bounds: there, agentDisplays: []))
+        XCTAssertFalse(WindowManager.recoveryCloses(kind: "borrowed", bounds: there, agentDisplays: [stray]))
+    }
+
+    func testTheCatcherMovesOnlyTheWindowItCaught() {
+        XCTAssertTrue(WindowCatcher.mayMove(5, caught: nil))
+        XCTAssertTrue(WindowCatcher.mayMove(5, caught: 5))
+        // A second new window while the first settles: not the catcher's.
+        XCTAssertFalse(WindowCatcher.mayMove(6, caught: 5))
     }
 }

@@ -113,6 +113,9 @@ public final class Engine {
     private var _busy: String?
     private var lastCallMs = 0.0
     private var lastLeftoverLogMs = -Double.infinity
+    /// The agent went away and its windows weren't released because the
+    /// user was in control then: `Hub` asks again (`releaseAbandonedLater`).
+    private var _abandonPending = false
     /// How far this session has reported front-app changes (`FocusGuard.frontReport`).
     private var frontMark = 0
     /// Apps this call acted on that the session may have no window in (yet,
@@ -237,6 +240,8 @@ public final class Engine {
     /// `graceMs` unless it's `back` by then. A window the user took over
     /// stays with them.
     func agentLeft(graceMs: Double, back: @escaping () -> Bool) {
+        // A fresh grace: not cut short by an earlier departure's retry.
+        stateLock.lock(); _abandonPending = false; stateLock.unlock()
         tearDownIfIdle(idleMs: 0)
         DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(Int(graceMs))) {
             self.releaseAbandoned(back: back)
@@ -248,7 +253,12 @@ public final class Engine {
     func releaseAbandoned(back: @escaping () -> Bool) {
         guard !back() else { return }
         queue.async {
-            guard !back(), !self.userInControl else { return }
+            guard !back() else { return }
+            guard !self.userInControl else {
+                self.stateLock.lock(); self._abandonPending = true; self.stateLock.unlock()
+                return
+            }
+            self.stateLock.lock(); self._abandonPending = false; self.stateLock.unlock()
             let mine = self.windows.windows
             guard !mine.isEmpty else { self.tearDownIfIdle(idleMs: 0); return }
             var notes: [String] = []
@@ -264,6 +274,13 @@ public final class Engine {
             self.log("The agent went away without closing its windows: " + notes.joined(separator: "; "))
             self.tearDownIfIdle(idleMs: 0)
         }
+    }
+
+    /// `releaseAbandoned` again if it last gave up because the user was in
+    /// control, and they aren't any more. Any thread.
+    func releaseAbandonedLater(back: @escaping () -> Bool) {
+        stateLock.lock(); let pending = _abandonPending && !_userInControl; stateLock.unlock()
+        if pending { releaseAbandoned(back: back) }
     }
 
     /// Release windows (closing opened, returning borrowed) on the session's
