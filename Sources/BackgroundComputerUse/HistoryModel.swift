@@ -145,7 +145,7 @@ final class HistoryModel: ObservableObject {
         self.segmentOf = segmentOf
         self.acted = acted
         placeOnClock(runItems)
-        if let keep, let i = items.firstIndex(where: { runs[$0.run].id == keep.0 && $0.frame.t == keep.1 }) {
+        if let keep, let i = items.firstIndex(where: { self.runs[$0.run].id == keep.0 && $0.frame.t == keep.1 }) {
             index = i
         } else {
             index = min(index, max(0, items.count - 1))
