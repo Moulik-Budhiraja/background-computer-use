@@ -91,7 +91,7 @@
   },
   {
     "name": "get_window_state",
-    "description": "Accessibility tree of your window with numbered elements, plus a screenshot. An element keeps its number while it exists. After the first read of a window this lists only what changed since your last read (- removed, + added, ~ changed) unless you pass full=true; when most elements are new (another page) it lists everything and numbering restarts. Waits for the window to settle after an action.",
+    "description": "Accessibility tree of your window with numbered elements, plus a screenshot. An element keeps its number while it exists, even scrolled out of view. After the first read of a window this lists only what changed since your last read (- removed, + added, ~ changed) unless you pass full=true; when most elements are new (another page) it lists everything and numbering restarts. Waits for the window to settle after an action.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -133,7 +133,7 @@
   {
     "name": "click",
     "description": {
-      "macos": "Click an element (by number) or a point (x, y in window points). Element clicks use accessibility actions when the element supports them. A point click takes key focus in the app for a moment, so while the user is in that app it first waits for a pause in their input (see priority).",
+      "macos": "Click an element (by number) or a point (x, y in window points). A left click on an element that lists press, or a right click on one that lists showmenu, goes through accessibility. Any other click (a point, a double click, an element without that action) is a real click: it takes key focus in the app for a moment, so while the user is in that app it first waits for a pause in their input (see priority).",
       "windows": "Click an element (by number) or a point (x, y in window points). Element clicks use accessibility actions when the element supports them."
     },
     "inputSchema": {
@@ -154,7 +154,7 @@
         "priority": {
           "type": "string",
           "description": {
-            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s while they click or scroll; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
             "windows": "Ignored on Windows, where steps never wait for the user."
           }
         },
@@ -244,7 +244,7 @@
         "priority": {
           "type": "string",
           "description": {
-            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s while they click or scroll; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
             "windows": "Ignored on Windows, where steps never wait for the user."
           }
         },
@@ -289,7 +289,7 @@
         "priority": {
           "type": "string",
           "description": {
-            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s while they click or scroll; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
             "windows": "Ignored on Windows, where steps never wait for the user."
           }
         },
@@ -306,7 +306,7 @@
   },
   {
     "name": "scroll",
-    "description": "Scroll in your window at an element or point. Positive dy scrolls down.",
+    "description": "Scroll in your window at an element or point. Positive dy scrolls down. It takes no key focus, so it never waits for the user.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -355,7 +355,7 @@
         "priority": {
           "type": "string",
           "description": {
-            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s while they click or scroll; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
             "windows": "Ignored on Windows, where steps never wait for the user."
           }
         },
@@ -395,7 +395,7 @@
         "priority": {
           "type": "string",
           "description": {
-            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
+            "macos": "Omit to wait for a pause in the user's input when they're in the same app (up to 3 s while they click or scroll; for as long as they keep typing, and after 30 s of that the step fails with nothing done). \"now\" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and \"now\" skips that too.)",
             "windows": "Ignored on Windows, where steps never wait for the user."
           }
         },
@@ -477,7 +477,7 @@
   {
     "name": "batch",
     "description": {
-      "macos": "Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {\"tool\": \"click\", \"element\": 6}, {\"tool\": \"type_text\", \"text\": \"example.com\\n\"}, {\"tool\": \"wait\", \"ms\": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, wait. Element numbers refer to your last get_window_state. Steps that take key focus in an app the user is in wait for a pause in their input once, and back-to-back steps like that then run together.",
+      "macos": "Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {\"tool\": \"click\", \"element\": 6}, {\"tool\": \"type_text\", \"text\": \"example.com\\n\"}, {\"tool\": \"wait\", \"ms\": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, navigate, wait. Element numbers refer to your last get_window_state. Steps that take key focus in an app the user is in wait for a pause in their input once, and back-to-back steps like that then run together.",
       "windows": "Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {\"tool\": \"click\", \"element\": 6}, {\"tool\": \"type_text\", \"text\": \"example.com\\n\"}, {\"tool\": \"wait\", \"ms\": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, wait. Element numbers refer to your last get_window_state."
     },
     "inputSchema": {

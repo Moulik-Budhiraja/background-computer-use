@@ -10,6 +10,41 @@ import CoreServices
 public enum BrowserAutomation {
     public enum Permission { case allowed, denied, notAsked }
 
+    /// The URL to load for what an agent passed to navigate: as given when it
+    /// has a scheme, with https:// in front of a bare host ("example.com/a",
+    /// http:// for localhost and IP addresses), nil for anything else (words
+    /// to search for). The browser's scripting loads only full URLs: given
+    /// "example.com" it loads nothing.
+    public static func loadableURL(_ text: String) -> String? {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, !t.contains(where: \.isWhitespace) else { return nil }
+        if t.range(of: "^[A-Za-z][A-Za-z0-9+.-]*://", options: .regularExpression) != nil { return t }
+        let lower = t.lowercased()
+        for scheme in ["about:", "data:", "javascript:", "mailto:", "file:", "chrome:", "view-source:", "blob:"] where lower.hasPrefix(scheme) {
+            return t
+        }
+        let hostPort = String(lower.prefix { !"/?#".contains($0) })
+        var host = hostPort
+        if hostPort.hasPrefix("[") {
+            guard let close = hostPort.firstIndex(of: "]") else { return nil }
+            host = String(hostPort[...close])
+            let rest = hostPort[hostPort.index(after: close)...]
+            guard rest.isEmpty || (rest.hasPrefix(":") && rest.dropFirst().allSatisfy(\.isNumber) && rest.count > 1) else { return nil }
+            return "http://" + t
+        }
+        if let colon = hostPort.firstIndex(of: ":") {
+            host = String(hostPort[..<colon])
+            let port = hostPort[hostPort.index(after: colon)...]
+            guard !port.isEmpty, port.allSatisfy(\.isNumber) else { return nil }
+        }
+        let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.allSatisfy({ !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" } }) else { return nil }
+        if host == "localhost" || host.hasSuffix(".localhost") { return "http://" + t }
+        if labels.count == 4 && labels.allSatisfy({ $0.allSatisfy(\.isNumber) }) { return "http://" + t }
+        guard labels.count >= 2, labels.last!.contains(where: \.isLetter) else { return nil }
+        return "https://" + t
+    }
+
     /// A Chromium browser: "<Name> Framework.framework" and Chrome's scripting
     /// dictionary, with its scriptable window class.
     public static func isScriptableChromium(_ app: URL) -> Bool {

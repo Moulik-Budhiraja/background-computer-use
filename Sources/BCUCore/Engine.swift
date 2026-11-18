@@ -608,7 +608,7 @@ public final class Engine {
         case "admin_click_raw":
             let (w, ax) = try agentWindow(args)
             let p: CGPoint
-            if args.int("element") != nil { p = try node(args, window: w).frame.center } else { p = try globalPoint(args, window: ax) }
+            if args.int("element") != nil { p = try node(args, window: w).frame.center } else { p = try globalPoint(args, window: ax, of: w) }
             try Input.click(pid: w.pid, windowID: w.id, at: p)
             return ToolResult(text: "raw click posted")
         case "admin_flicker":
@@ -886,6 +886,12 @@ public final class Engine {
             throw ToolError("no element numbers for window \(window.id) yet: call get_window_state first")
         }
         guard let n = snap.nodes[index] else {
+            if snap.scrolledOut.contains(index) {
+                throw ToolError("element \(index) is scrolled out of view in window \(window.id): scroll to it, then call get_window_state")
+            }
+            if snap.unlisted.contains(index) {
+                throw ToolError("element \(index) is past max_elements in the last get_window_state for window \(window.id): read it again with a higher max_elements")
+            }
             throw ToolError("element \(index) isn't in the last get_window_state for window \(window.id)")
         }
         return n
@@ -1208,7 +1214,7 @@ public final class Engine {
     /// A step gave the user's typing `typingPatienceMs` to stop, in one wait
     /// or in several (it started over each time they started again).
     private static func typingError(appName: String, cause: String) -> ToolError {
-        ToolError("the user has been typing in \(appName) for the \(Int(QuietRules.typingPatienceMs / 1000)) s this step waited, and \(cause) would take the keyboard from their window for a moment (what they type would lag), so that wasn't done: their typing goes first. Steps that need no key focus still work meanwhile: set_value, type_text without Return or Tab, clicking an element, get_window_state. Otherwise wait a few seconds and retry.")
+        ToolError("the user has been typing in \(appName) for the \(Int(QuietRules.typingPatienceMs / 1000)) s this step waited, and \(cause) would take the keyboard from their window for a moment (what they type would lag), so that wasn't done: their typing goes first. Steps that need no key focus still work meanwhile: set_value, type_text without Return or Tab, a single click on an element that lists press, scroll, get_window_state. Otherwise wait a few seconds and retry.")
     }
 
     /// The user is typing, and steps wait for that (see `QuietWait.typing`
@@ -1304,10 +1310,23 @@ public final class Engine {
         return try body()
     }
 
-    private func globalPoint(_ args: Args, window ax: AXUIElement) throws -> CGPoint {
+    private func globalPoint(_ args: Args, window ax: AXUIElement, of w: AgentWindow) throws -> CGPoint {
         guard let x = args.double("x"), let y = args.double("y") else { throw ToolError("give an element or x and y") }
         guard let f = AX.frame(ax) else { throw ToolError("can't read the window frame") }
-        return CGPoint(x: f.minX + x, y: f.minY + y)
+        let p = CGPoint(x: f.minX + x, y: f.minY + y)
+        try requireInside(p, x: x, y: y, frame: f, window: ax, of: w)
+        return p
+    }
+
+    /// A point outside the window would land on whatever is next to it on
+    /// the display (another window, or nothing). A sheet or popup of the
+    /// window can reach past its edges, so a point on one of those is fine.
+    private func requireInside(_ p: CGPoint, x: Double, y: Double, frame f: CGRect, window ax: AXUIElement, of w: AgentWindow) throws {
+        if f.contains(p) { return }
+        let sheets = AX.children(ax).filter { AX.string($0, "AXRole") == "AXSheet" }
+        let over = (sheets + popupWindows(of: w, frame: f)).compactMap { AX.frame($0) }
+        if over.contains(where: { $0.contains(p) }) { return }
+        throw ToolError("(\(Int(x)), \(Int(y))) is outside window \(w.id), which is \(Int(f.width))x\(Int(f.height)) points. x and y are window points from its top-left corner, matching the screenshot's pixels.")
     }
 
     public static func defaultBrowser() -> (name: String, bundleID: String)? {
@@ -1436,7 +1455,7 @@ public final class Engine {
         if let app = args.string("app") {
             let target = try windows.resolveApp(app)
             if let running = target.running {
-                lines.append("\(target.name)'s other windows (the user's):")
+                lines.append("\(target.name)'s other windows:")
                 // Accessibility's window list holds only real windows (no menu-bar strips or panels' helpers).
                 let others = AX.windows(running.processIdentifier).compactMap { ax -> (CGWindowID, AXUIElement)? in
                     guard let id = AX.windowID(ax), windows.window(id) == nil else { return nil }
@@ -1444,9 +1463,15 @@ public final class Engine {
                 }
                 if others.isEmpty { lines.append("  (none)") }
                 for (id, ax) in others {
+                    // Another agent's window, or one on an agent's display:
+                    // not the user's, and its title is that agent's business.
+                    if WindowManager.isRegistered(id) || FocusGuard.onAgentDisplay(id) {
+                        lines.append("  \(id): another agent's window")
+                        continue
+                    }
                     let size = AX.size(ax) ?? .zero
                     let minimized = AX.bool(ax, "AXMinimized") == true
-                    lines.append("  \(id): \"\(AX.string(ax, "AXTitle") ?? "")\" \(Int(size.width))x\(Int(size.height))\(minimized ? " (minimized)" : "")")
+                    lines.append("  \(id): \"\(AX.string(ax, "AXTitle") ?? "")\" \(Int(size.width))x\(Int(size.height))\(minimized ? " (minimized)" : "") (the user's)")
                 }
             } else {
                 lines.append("\(target.name) isn't running.")
@@ -1552,7 +1577,7 @@ public final class Engine {
 
     // MARK: Batch
 
-    private static let batchable: Set<String> = ["click", "set_value", "perform_action", "type_text", "press_key",
+    static let batchable: Set<String> = ["click", "set_value", "perform_action", "type_text", "press_key",
                                                  "scroll", "drag", "press_menu_item", "navigate", "wait"]
 
     /// Steps that may take key focus in their app (see `keyed`).
@@ -1708,7 +1733,7 @@ public final class Engine {
             try keyed(w, cause: "clicking") { check in try Input.click(pid: w.pid, windowID: w.id, at: p, button: button, count: count, check: check) }
             return ToolResult(text: "Clicked element \(n.index) at its center.")
         }
-        let p = try globalPoint(args, window: ax)
+        let p = try globalPoint(args, window: ax, of: w)
         point(p, .click)
         try keyed(w, cause: "clicking") { check in try Input.click(pid: w.pid, windowID: w.id, at: p, button: button, count: count, check: check) }
         return ToolResult(text: "Clicked at (\(Int(args.double("x") ?? 0)), \(Int(args.double("y") ?? 0))).")
@@ -2006,7 +2031,7 @@ public final class Engine {
         if args.int("element") != nil {
             p = try node(args, window: w).frame.center
         } else if args.double("x") != nil {
-            p = try globalPoint(args, window: ax)
+            p = try globalPoint(args, window: ax, of: w)
         } else {
             guard let f = AX.frame(ax) else { throw ToolError("can't read the window frame") }
             p = f.center
@@ -2024,6 +2049,7 @@ public final class Engine {
               let fx = args.double("from_x"), let fy = args.double("from_y"),
               let tx = args.double("to_x"), let ty = args.double("to_y") else { throw ToolError("give from_x, from_y, to_x, to_y") }
         let from = CGPoint(x: f.minX + fx, y: f.minY + fy), to = CGPoint(x: f.minX + tx, y: f.minY + ty)
+        try requireInside(from, x: fx, y: fy, frame: f, window: ax, of: w)
         point(from, .drag(to: to))
         try keyed(w, cause: "dragging") { check in
             try check()
@@ -2038,7 +2064,10 @@ public final class Engine {
     /// end. With the user in the browser it waits like a keystroke would.
     private func navigate(_ args: Args) throws -> ToolResult {
         let (w, _) = try agentWindow(args)
-        guard let url = args.string("url")?.trimmingCharacters(in: .whitespaces), !url.isEmpty else { throw ToolError("give url") }
+        guard let given = args.string("url")?.trimmingCharacters(in: .whitespaces), !given.isEmpty else { throw ToolError("give url") }
+        guard let url = BrowserAutomation.loadableURL(given) else {
+            throw ToolError("\"\(given)\" isn't a URL. Give a full one, like https://example.com. navigate doesn't search: to search, load the search page's URL with the query in it.")
+        }
         guard let app = NSRunningApplication(processIdentifier: w.pid), let bundleURL = app.bundleURL, let bundleID = app.bundleIdentifier,
               BrowserAutomation.isScriptableChromium(bundleURL) else {
             throw ToolError("navigate works in Chromium browsers only. In \(w.appName), click the address bar, type_text the URL and \"\\n\".")
@@ -2194,9 +2223,12 @@ public final class Engine {
             item = next
         }
         guard let target = item else { throw ToolError("empty path") }
-        if AX.bool(target, "AXEnabled") == false { throw ToolError("\"\(path.last!)\" is disabled right now") }
         let err = try keyed(w, cause: "choosing \(path.joined(separator: " > "))") { check -> AXError in
             try check()
+            // Whether an item is enabled depends on the key window, so ask
+            // now that it's the agent's (before, it's the user's while
+            // they're in the app).
+            if AX.bool(target, "AXEnabled") == false { throw ToolError("\"\(path.last!)\" is disabled right now in window \(w.id)") }
             let e = AX.perform(target, "AXPress")
             sleepMs(200)
             return e
