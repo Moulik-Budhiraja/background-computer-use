@@ -64,6 +64,11 @@ public final class SessionAudio {
     /// The recorder's callback. Separate from `queue`, because stopping the
     /// device from `queue` waits for the callback to return.
     private let ioQueue = DispatchQueue(label: "bcu.audio.io", qos: .userInteractive)
+    /// Core Audio's property listeners. Not `queue`: removing a listener
+    /// waits for its blocks in flight, and one of those waiting on `queue`,
+    /// which is removing it, held both for minutes. Each only hands its work
+    /// on to `queue`.
+    private let listenerQueue = DispatchQueue(label: "bcu.audio.listeners")
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
@@ -294,14 +299,14 @@ public final class SessionAudio {
         var addr = Self.address(kAudioHardwarePropertyProcessObjectList)
         if on, processListListener == nil {
             let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-                guard let self, !self.wantedApps.isEmpty else { return }
-                self.apply(self.wantedApps)
+                guard let self else { return }
+                self.queue.async { if !self.wantedApps.isEmpty { self.apply(self.wantedApps) } }
             }
-            if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, queue, block) == noErr {
+            if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, listenerQueue, block) == noErr {
                 processListListener = block
             }
         } else if !on, let block = processListListener {
-            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, queue, block)
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, listenerQueue, block)
             processListListener = nil
         }
     }
@@ -317,13 +322,16 @@ public final class SessionAudio {
     private func setProcesses(_ ids: [AudioObjectID]) {
         for (id, block) in outputListeners where !ids.contains(id) {
             var addr = Self.address(kAudioProcessPropertyIsRunningOutput)
-            AudioObjectRemovePropertyListenerBlock(id, &addr, queue, block)
+            AudioObjectRemovePropertyListenerBlock(id, &addr, listenerQueue, block)
             outputListeners[id] = nil
         }
         for id in ids where outputListeners[id] == nil {
-            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.updateRecorder() }
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                guard let self else { return }
+                self.queue.async { self.updateRecorder() }
+            }
             var addr = Self.address(kAudioProcessPropertyIsRunningOutput)
-            if AudioObjectAddPropertyListenerBlock(id, &addr, queue, block) == noErr { outputListeners[id] = block }
+            if AudioObjectAddPropertyListenerBlock(id, &addr, listenerQueue, block) == noErr { outputListeners[id] = block }
         }
         processes = ids
     }
