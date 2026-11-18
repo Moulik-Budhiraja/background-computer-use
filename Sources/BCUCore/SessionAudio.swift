@@ -25,6 +25,20 @@ public final class SessionAudio {
     private var _routedApps: [String] = []
     private let stateLock = NSLock()
 
+    /// Read the tap even while nothing plays. A muted tap only mutes once a
+    /// device is reading it: started when the app starts playing, the first
+    /// ~0.7 s still reaches the speakers. Set while the agent has said it's
+    /// about to play (`AudioClaims`); off otherwise, since reading lights
+    /// the menu bar's recording indicator. Any thread.
+    public var keepRecording: Bool {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _keepRecording }
+        set {
+            stateLock.lock(); _keepRecording = newValue; stateLock.unlock()
+            queue.async { self.updateRecorder() }
+        }
+    }
+    private var _keepRecording = false
+
     private let queue = DispatchQueue(label: "bcu.audio")
     /// The recorder's callback. Separate from `queue`, because stopping the
     /// device from `queue` waits for the callback to return.
@@ -182,7 +196,7 @@ public final class SessionAudio {
 
     /// On `queue`.
     private func updateRecorder() {
-        let want = tapID != kAudioObjectUnknown && playing
+        let want = tapID != kAudioObjectUnknown && (playing || keepRecording)
         if want, aggregateID == kAudioObjectUnknown {
             do {
                 try startRecorder()
@@ -193,7 +207,7 @@ public final class SessionAudio {
             }
         } else if !want, aggregateID != kAudioObjectUnknown {
             stopRecorder()
-            Log.info("audio: recording paused, nothing playing")
+            Log.info("audio: recording paused")
         }
     }
 

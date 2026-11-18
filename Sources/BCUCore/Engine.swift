@@ -1359,6 +1359,8 @@ public final class Engine {
         let ws = windows.windows
         var pids = Set(ws.filter { !$0.withUser }.map(\.pid)).filter { onAgent[$0] == true }
         pids.formUnion(audioClaims.pids(open: Set(ws.map(\.id))))
+        // The last claimed window closed: stop reading while nothing plays.
+        if audioClaims.isEmpty && audio.keepRecording { audio.keepRecording = false }
         return pids.sorted().compactMap { NSRunningApplication(processIdentifier: $0) }
     }
 
@@ -1406,6 +1408,7 @@ public final class Engine {
         focusGuard.onUserInput(for: "audio-\(sessionID)") { [weak self] input in
             self?.audioClaims.userInput(input) { hit, why in self?.giveSoundBack(hit, why: why) }
         }
+        audio.keepRecording = true
         if renewing {
             return ToolResult(text: mute == nil ? "\(w.appName) is still muted on the user's speakers." : "\(w.appName) is still muted on the user's speakers; when the user starts using it, \(muteName) is pressed to silence yours.")
         }
@@ -1421,6 +1424,7 @@ public final class Engine {
     /// stop muting the app. Off the input tap's thread.
     private func giveSoundBack(_ hit: [AudioClaims.Claim], why: String) {
         _ = audioClaims.silence(hit, why: why)
+        audio.keepRecording = !audioClaims.isEmpty
         audio.routeNow(audioApps())
         if audioClaims.isEmpty { focusGuard.onUserInput(for: "audio-\(sessionID)", nil) }
         for name in Set(hit.map(\.appName)).sorted() { log("Gave \(name)'s sound back to you") }
@@ -1428,6 +1432,7 @@ public final class Engine {
 
     private func endAudioClaims() {
         audioClaims.clear()
+        audio.keepRecording = false
         focusGuard.onUserInput(for: "audio-\(sessionID)", nil)
     }
 
