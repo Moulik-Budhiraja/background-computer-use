@@ -100,7 +100,7 @@ public final class AgentDisplay {
         return running.map(\.liveBounds) + (spare + strayIDs).map { CGDisplayBounds($0) }
     }
 
-    private static var fencedCache: (atMs: Double, rects: [CGRect]) = (-1, [])
+    private static var fencedCache: (atMs: Double, rects: [CGRect], users: [CGRect]) = (-1, [], [])
 
     /// The fenced display a global point is on. The input tap asks on every
     /// mouse move, so the rects are worked out at most every 100 ms (and
@@ -108,13 +108,27 @@ public final class AgentDisplay {
     public static func fenced(at p: CGPoint) -> CGRect? {
         let now = nowMs()
         registryLock.lock()
-        if now - fencedCache.atMs < 100 { let r = fencedCache.rects; registryLock.unlock(); return r.first { $0.contains(p) } }
+        if now - fencedCache.atMs < 100 {
+            let c = fencedCache
+            registryLock.unlock()
+            return fenced(at: p, agents: c.rects, users: c.users)
+        }
         registryLock.unlock()
         let rects = fencedBounds
+        let users = userDisplayIDs().map { CGDisplayBounds($0) }
         registryLock.lock()
-        fencedCache = (now, rects)
+        fencedCache = (now, rects, users)
         registryLock.unlock()
-        return rects.first { $0.contains(p) }
+        return fenced(at: p, agents: rects, users: users)
+    }
+
+    /// The fenced display `p` is on, unless it's also on one of the user's
+    /// displays lying over that one (macOS wouldn't place it while the
+    /// screens slept): there the cursor, clicks and scrolls are on their
+    /// screen, where they belong.
+    static func fenced(at p: CGPoint, agents: [CGRect], users: [CGRect]) -> CGRect? {
+        guard let agent = agents.first(where: { $0.contains(p) }) else { return nil }
+        return users.contains { $0.contains(p) && $0.intersects(agent) } ? nil : agent
     }
 
     private static func onlineDisplayIDs() -> [CGDirectDisplayID] {
