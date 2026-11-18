@@ -68,7 +68,7 @@ public enum ToolCatalog {
     static let macOnly: [JSONObject] = [
         [
             "name": "capture_audio",
-            "description": "Call before you play sound (a video, music, a call) in an app the user also has windows in, such as their browser. Sound comes from the app as a whole, so it plays on the user's speakers otherwise. This mutes the app on their speakers and records it to a file for you, until the user clicks or types in that app or presses a media key: then mute_element is pressed to silence yours, the app plays on their speakers again, and your next call says so. Once your window shows a mute or pause button for your sound (a browser tab's mute button appears only once it plays), call this again with it as mute_element. Fails while the app is already playing sound. Apps only you have windows in are always muted and recorded.",
+            "description": "Call before you play sound (a video, music, a call) in any app. In an app the user also has windows in, such as their browser, sound comes from the app as a whole and plays on the user's speakers otherwise: this mutes the app on their speakers and records it to a file for you, until the user clicks or types in that app or presses a media key. Then mute_element is pressed to silence yours, the app plays on their speakers again, and your next call says so. Once your window shows a mute or pause button for your sound (a browser tab's mute button appears only once it plays), call this again with it as mute_element. Fails while the app is already making sound.",
             "inputSchema": [
                 "type": "object",
                 "properties": [

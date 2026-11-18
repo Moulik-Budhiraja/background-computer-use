@@ -1391,10 +1391,9 @@ public final class Engine {
     private func captureAudio(_ args: Args) throws -> ToolResult {
         let (w, _) = try agentWindow(args)
         guard let app = NSRunningApplication(processIdentifier: w.pid) else { throw ToolError("\(w.appName) isn't running") }
-        if Self.appsOnAgent(checking: [w.pid])[w.pid] == true && !w.withUser {
-            audio.routeNow(audioApps())
-            return ToolResult(text: "Only agents have windows in \(w.appName), so its sound already stays off the user's speakers and is recorded to \(audio.url.path). Play it now.")
-        }
+        // Only agents' windows: muted anyway, but only once the app starts
+        // playing, and the first ~0.7 s gets out. A claim reads the tap from now.
+        let agentsOnly = Self.appsOnAgent(checking: [w.pid])[w.pid] == true && !w.withUser
         var mute: AXNode?
         if args.int("mute_element") != nil {
             var muteArgs = args.raw
@@ -1409,7 +1408,7 @@ public final class Engine {
         // is muted, and its sound is an agent's (the user would have ended
         // the claim), so don't take it for the user's.
         let renewing = audioClaims.has(w.id)
-        if !renewing && !AudioClaims.claimed(w.pid) && SessionAudio.audible(app) ?? SessionAudio.isPlaying(app) {
+        if !renewing && !agentsOnly && !AudioClaims.claimed(w.pid) && SessionAudio.audible(app) ?? SessionAudio.isPlaying(app) {
             throw ToolError("\(w.appName) is making sound right now, probably the user's, so it can't be muted without muting theirs. If it's yours, pause it (a muted tab can still count), then call this again. Otherwise wait until it stops.")
         }
         let label = mute.flatMap { n in [AX.string(n.element, "AXTitle"), AX.string(n.element, "AXDescription")].compactMap { $0 }.first { !$0.isEmpty } }
@@ -1423,6 +1422,9 @@ public final class Engine {
             return ToolResult(text: mute == nil ? "\(w.appName) is still muted on the user's speakers." : "\(w.appName) is still muted on the user's speakers; when the user starts using it, \(muteName) is pressed to silence yours.")
         }
         audio.routeNow(audioApps())
+        if agentsOnly {
+            return ToolResult(text: "Only agents have windows in \(w.appName), so its sound stays off the user's speakers and is recorded to \(audio.url.path). Play it now.")
+        }
         log("Muted \(w.appName) on your speakers while the agent plays sound in it")
         let then = mute == nil
             ? "Once your window has a mute or pause button for it (a tab's mute button shows only once it plays), call this again with it as mute_element: when the user starts using \(w.appName), it plays on their speakers again, and that button is pressed to silence yours first."
