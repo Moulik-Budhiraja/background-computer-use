@@ -53,6 +53,9 @@ final class HistoryModel: ObservableObject {
     /// The track and the frame view follow the model through these.
     var onItemsChanged: (() -> Void)?
     var onIndexChanged: ((_ animated: Bool) -> Void)?
+    /// The track holds the playhead past the frame shown, at an earlier time
+    /// than the newest: the user is looking back, so don't follow.
+    var holdingPast = false
     /// A jump to the frame already shown.
     var onRecenter: ((_ animated: Bool) -> Void)?
 
@@ -98,10 +101,12 @@ final class HistoryModel: ObservableObject {
             self.reloadPending = false
             // On a run's newest frame: stay on it as the run grows, even
             // while another agent records newer frames at the same time.
-            let following = self.atRunEnd && self.currentRun?.isLive == true ? self.currentRun?.id : nil
+            // Not while the user holds the playhead at an earlier time (on a
+            // run's newest frame only because it hadn't changed since).
+            let following = self.atRunEnd && self.currentRun?.isLive == true && !self.holdingPast ? self.currentRun?.id : nil
             // On the newest frame of all (a run that has ended, or nothing
             // recorded yet): go on to whatever is newest, a new recording too.
-            let newest = self.atEnd || self.items.isEmpty
+            let newest = (self.atEnd && !self.holdingPast) || self.items.isEmpty
             let keep = self.current.map { (self.runs[$0.run].id, $0.frame.t) }
             let loaded = self.runs
             DispatchQueue.global(qos: .userInitiated).async {
@@ -181,7 +186,8 @@ final class HistoryModel: ObservableObject {
         let newest = items.map(\.frame.t).max() ?? 0
         let runEnds = runItems.indices.map { r -> Double in
             let last = items[runItems[r].upperBound].frame.t
-            return max(last, runs[r].isLive ? newest : runs[r].end)
+            if let stopped = runs[r].stoppedAt { return max(last, stopped) }
+            return runs[r].isLive ? max(last, newest) : last
         }
         for r in order {
             let range = runItems[r]

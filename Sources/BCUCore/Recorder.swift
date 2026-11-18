@@ -73,6 +73,10 @@ public final class RecordedRun {
     public var end: Double { lock.lock(); defer { lock.unlock() }; return _end ?? _frames.last?.t ?? start }
 
     func setLive(_ live: Bool) { lock.lock(); _live = live; if !live, _end == nil { _end = wallMs() }; lock.unlock() }
+    /// Capture stopped at `t` (its last frames may still be packing).
+    func stop(at t: Double) { lock.lock(); if _end == nil { _end = t }; lock.unlock() }
+    /// When capture stopped, once it has (a live run's packing can still be going).
+    public var stoppedAt: Double? { lock.lock(); defer { lock.unlock() }; return _end }
     /// Test support: when a made-up run's recording ended.
     func setEnd(_ t: Double) { lock.lock(); _end = t; lock.unlock(); writeMeta() }
     func append(_ f: RecordedFrame) { lock.lock(); _frames.append(f); lock.unlock() }
@@ -527,6 +531,8 @@ final class RunWriter {
 
     /// Packs what's left and marks the run finished. `done` runs after, on the compact queue.
     func finish(_ done: (() -> Void)? = nil) {
+        // Capture stops now, not when the packing below is done.
+        run.stop(at: wallMs())
         let rest = staged, run = self.run, store = self.store
         staged = []
         compactQueue.async {
@@ -781,6 +787,30 @@ public final class SessionRecorder {
             if changed >= (force ? 1 : 6) { return true }
         }
         return false
+    }
+}
+
+/// Test support: a run being recorded, frame by frame, through the real
+/// pipeline, with no display involved.
+public final class LiveRecordingTest {
+    private let writer: RunWriter
+    private let queue = DispatchQueue(label: "bcu.recorder.livetest")
+
+    public init?(store: Recordings, session: String, label: String, size: CGSize, start: Double) {
+        guard let w = RunWriter(store: store, id: SessionRecorder.runID(session: session, date: Date(timeIntervalSince1970: start / 1000)),
+                                session: session, label: label, start: start, size: size, compactQueue: queue) else { return nil }
+        writer = w
+    }
+
+    public func add(_ image: CGImage, t: Double, app: String, bundleID: String?) {
+        writer.add(image, t: t, app: app, bundleID: bundleID)
+    }
+
+    /// Stops capture now; `done` once its frames are packed. `packing`
+    /// stands for a long video to pack: the packing starts that much later.
+    public func finish(packing: TimeInterval = 0, _ done: @escaping () -> Void = {}) {
+        if packing > 0 { queue.async { usleep(useconds_t(packing * 1_000_000)) } }
+        writer.finish(done)
     }
 }
 

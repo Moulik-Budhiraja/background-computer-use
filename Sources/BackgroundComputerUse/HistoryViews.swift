@@ -221,7 +221,9 @@ final class HistoryTrackView: NSView {
     /// through reloads too. Kept as frames (run, time), since a reload can
     /// renumber items and the size limit can close up the clock: `frame`
     /// is the one shown, `at` the newest frame of all at the playhead.
-    private var held: (frame: FrameKey, at: FrameKey)?
+    private var held: (frame: FrameKey, at: FrameKey)? {
+        didSet { model?.holdingPast = held != nil }
+    }
     private struct FrameKey: Equatable { let run: String; let t: Double }
 
     private func key(_ i: Int) -> FrameKey? {

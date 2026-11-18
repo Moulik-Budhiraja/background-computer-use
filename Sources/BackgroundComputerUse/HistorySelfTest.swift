@@ -238,7 +238,42 @@ enum HistorySelfTest {
         let ownLane = laneE != nil && laneF != nil && laneE != laneF
         print("a quiet agent still recording keeps its lane: \(ownLane ? "ok" : "WRONG, lanes \(String(describing: laneE)) \(String(describing: laneF))")")
         prunedOK = prunedOK && ownLane
-        exit(ok == total && total > 0 && wrong == 0 && limitOK && clockOK && prunedOK ? 0 : 1)
+        // A live agent whose screen hasn't changed: hold the playhead at a
+        // time it was showing that frame, and its next frame doesn't pull
+        // History away. Then it stops, and a run that starts right after
+        // shares its lane: capture stopped before the packing finished.
+        let base = wallMs() - 120_000
+        var liveOK = false
+        if let live = LiveRecordingTest(store: store, session: "77777777-aaaa", label: "Agent", size: size, start: base) {
+            live.add(fake(size, app: "Maps", title: "Map", body: "", field: nil, step: 0), t: base, app: "Maps", bundleID: "com.apple.Maps")
+            var framesG: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+            for i in 0..<20 { framesG.append((fake(size, app: "Books", title: "Library", body: String(i), field: nil, step: i), base + 2_000 + Double(i) * 1_000, "Books", "com.apple.iBooksX")) }
+            RecordingTest.record(into: store, session: "88888888-bbbb", label: "Agent", size: size, frames: framesG, events: [])
+            let (viewer, _) = offscreenViewer()
+            viewer.model.load()
+            spin(1.5)
+            let vm = viewer.model
+            if let a = vm.items.indices.first(where: { vm.runs[vm.items[$0].run].session == "77777777-aaaa" }),
+               viewer.trackViewForTest.holdForTest(from: a) {
+                live.add(fake(size, app: "Maps", title: "Map", body: "moved", field: nil, step: 1), t: wallMs(), app: "Maps", bundleID: "com.apple.Maps")
+                spin(1.5)
+                let stayed = vm.current.map { vm.runs[$0.run].session == "77777777-aaaa" && $0.frame.t == base.rounded() } == true
+                print("held on a live agent's unchanged frame, then it records: \(stayed ? "stayed" : "WRONG, moved")")
+                live.finish(packing: 0.5)
+                let next = wallMs() + 1
+                var framesH: [(image: CGImage, t: Double, app: String, bundleID: String?)] = []
+                for i in 0..<3 { framesH.append((fake(size, app: "Maps", title: "Map", body: "next \(i)", field: nil, step: i), next + Double(i) * 300, "Maps", "com.apple.Maps")) }
+                RecordingTest.record(into: store, session: "99999999-cccc", label: "Agent", size: size, frames: framesH, events: [])
+                spin(2.0)
+                let lane = { (session: String) in vm.runs.indices.first { vm.runs[$0].session == session }.map { vm.laneOf[$0] } }
+                let shared = lane("77777777-aaaa") != nil && lane("77777777-aaaa") == lane("99999999-cccc")
+                print("a run that starts as another stops shares its lane: \(shared ? "ok" : "WRONG")")
+                liveOK = stayed && shared
+            } else {
+                print("live agent: couldn't hold the playhead -> WRONG")
+            }
+        }
+        exit(ok == total && total > 0 && wrong == 0 && limitOK && clockOK && prunedOK && liveOK ? 0 : 1)
     }
 
     /// Frames further right are later (gaps only go forward in time), and
