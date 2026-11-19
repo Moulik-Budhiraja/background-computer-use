@@ -102,6 +102,17 @@ uint64_t BCUCurrentSpaceForDisplay(CGDirectDisplayID display);
 /// Dock's "Assign To Desktop on Display N". Pass 0 to clear. Returns CGError.
 int BCUProcessAssignToSpace(pid_t pid, uint64_t sid);
 
+#pragma mark - Attention
+
+/// Whether the app has asked for the user's attention (its Dock icon is
+/// bouncing): LaunchServices' _kLSApplicationDesiresAttentionKey for it.
+/// 1 yes, 0 no, -1 unknown.
+int BCUAppWantsAttention(pid_t pid);
+
+/// Clear that request, which stops the bounce (and, with the Dock hidden,
+/// lets it hide again). Returns the LaunchServices status, 0 on success.
+int BCUClearAppAttention(pid_t pid);
+
 #pragma mark - Accessibility
 
 /// _AXUIElementGetWindow: the CGWindowID behind an AX window element.

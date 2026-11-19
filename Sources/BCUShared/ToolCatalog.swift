@@ -32,7 +32,7 @@ public enum ToolCatalog {
     can't wait (a dialog or toast about to close, a hover then a click, a code about to expire).
     Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's \
     elements in `get_window_state`; click their rows by number. A sheet over your window (a file picker, a save \
-    panel, an alert) is listed first: pick a file by clicking its row by number, then the panel's button. \
+    panel, an alert) is listed first. To pick or save a file by path, use `choose_file`. \
     In a browser, to go to a URL use \
     `navigate` (it sends no keys, so it doesn't wait for the user to pause unless they're in that same browser); in a browser it doesn't support, \
     click the address bar, then `type_text` the URL followed by "\\n".
@@ -66,6 +66,19 @@ public enum ToolCatalog {
 
     /// Tools the Windows app doesn't have.
     static let macOnly: [JSONObject] = [
+        [
+            "name": "choose_file",
+            "description": "Pick a file by path in the file picker or save panel open over your window (opened by an upload button, File > Open or Save), then press its Open or Save button. Works for any folder, including ones the picker's sidebar doesn't show. For a save panel, give the path to save to. Waits up to 3 s for the picker to open.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "window_id": ["type": "integer", "description": "Your window, the one the picker is over."],
+                    "path": ["type": "string", "description": "Absolute path of the file (~ allowed)."],
+                    "confirm": ["type": "boolean", "description": "Press Open or Save after selecting the file (default true). False only selects it."],
+                ],
+                "required": ["window_id", "path"],
+            ] as JSONObject,
+        ],
         [
             "name": "capture_audio",
             "description": "Call before you play sound (a video, music, a call) in any app. In an app the user also has windows in, such as their browser, sound comes from the app as a whole and plays on the user's speakers otherwise: this mutes the app on their speakers and records it to a file for you, until the user clicks or types in that app or presses a media key. Then mute_element is pressed to silence yours, the app plays on their speakers again, and your next call says so. Once your window shows a mute or pause button for your sound (a browser tab's mute button appears only once it plays), call this again with it as mute_element. Fails while the app is already making sound.",

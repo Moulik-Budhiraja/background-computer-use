@@ -257,3 +257,42 @@ int BCUPermittedFrontUpdate(uint64_t value, BOOL add) {
     uint32_t psn[2] = {(uint32_t)(value >> 32), (uint32_t)value};
     return fn(psn);
 }
+
+#pragma mark - Attention
+
+typedef CFTypeRef (*LSASNCreateWithPidFn)(CFAllocatorRef, pid_t);
+typedef CFTypeRef (*LSCopyInfoItemFn)(int, CFTypeRef, CFStringRef);
+typedef OSStatus (*LSSetInfoItemFn)(int, CFTypeRef, CFStringRef, CFTypeRef, CFDictionaryRef *);
+static const int kSessionDefault = -2;
+
+static CFStringRef AttentionKey(void) {
+    CFStringRef *key = dlsym(RTLD_DEFAULT, "_kLSApplicationDesiresAttentionKey");
+    return key ? *key : NULL;
+}
+
+int BCUAppWantsAttention(pid_t pid) {
+    LSASNCreateWithPidFn asnFor = dlsym(RTLD_DEFAULT, "_LSASNCreateWithPid");
+    LSCopyInfoItemFn copy = dlsym(RTLD_DEFAULT, "_LSCopyApplicationInformationItem");
+    CFStringRef key = AttentionKey();
+    if (!asnFor || !copy || !key) return -1;
+    CFTypeRef asn = asnFor(kCFAllocatorDefault, pid);
+    if (!asn) return -1;
+    CFTypeRef value = copy(kSessionDefault, asn, key);
+    CFRelease(asn);
+    if (!value) return 0;
+    int wants = CFGetTypeID(value) == CFBooleanGetTypeID() && CFBooleanGetValue(value) ? 1 : 0;
+    CFRelease(value);
+    return wants;
+}
+
+int BCUClearAppAttention(pid_t pid) {
+    LSASNCreateWithPidFn asnFor = dlsym(RTLD_DEFAULT, "_LSASNCreateWithPid");
+    LSSetInfoItemFn set = dlsym(RTLD_DEFAULT, "_LSSetApplicationInformationItem");
+    CFStringRef key = AttentionKey();
+    if (!asnFor || !set || !key) return -1;
+    CFTypeRef asn = asnFor(kCFAllocatorDefault, pid);
+    if (!asn) return -1;
+    OSStatus status = set(kSessionDefault, asn, key, kCFBooleanFalse, NULL);
+    CFRelease(asn);
+    return (int)status;
+}
