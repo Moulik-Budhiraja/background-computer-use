@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import BCUShared
 
@@ -52,7 +53,8 @@ public struct Args {
 
     public func int(_ key: String) -> Int? {
         if let v = raw[key] as? Int { return v }
-        if let v = raw[key] as? Double { return Int(v) }
+        // Int() traps on a Double out of its range (1e300, NaN).
+        if let v = raw[key] as? Double { return v.isFinite && abs(v) < 9e18 ? Int(v) : nil }
         if let v = raw[key] as? String { return Int(v) }
         return nil
     }
@@ -81,6 +83,21 @@ public struct Args {
     public func requireInt(_ key: String) throws -> Int {
         guard let v = int(key) else { throw ToolError("missing integer argument `\(key)`") }
         return v
+    }
+
+    /// A window ID, or nil when the argument is absent. Throws on one that
+    /// isn't a window ID at all (negative, past UInt32), which CGWindowID() would trap on.
+    public func windowID(_ key: String) throws -> CGWindowID? {
+        guard raw[key] != nil, !(raw[key] is NSNull) else { return nil }
+        guard let v = int(key), let id = CGWindowID(exactly: v) else {
+            throw ToolError("`\(key)` must be a window ID from list_windows or open_window, not \(raw[key]!)")
+        }
+        return id
+    }
+
+    public func requireWindowID(_ key: String) throws -> CGWindowID {
+        guard let id = try windowID(key) else { throw ToolError("missing integer argument `\(key)`") }
+        return id
     }
 
     public func requireString(_ key: String) throws -> String {

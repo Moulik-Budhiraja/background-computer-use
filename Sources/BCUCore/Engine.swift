@@ -486,6 +486,8 @@ public final class Engine {
         let outerPriority = priorityNow
         priorityNow = args.string("priority")?.lowercased() == "now"
         defer { priorityNow = outerPriority }
+        // Checked before the defers below, which use it on every tool.
+        let windowID = try args.windowID("window_id")
         // The patience for the user's typing is the whole call's (see `typingDeadline`).
         if runDepth == 0 { typingWaitedMs = 0 }
         runDepth += 1
@@ -494,11 +496,11 @@ public final class Engine {
             if runDepth == 0 { typingWaitedMs = 0 }
         }
         defer {
-            if Self.batchable.contains(tool), tool != "wait", let id = args.int("window_id") {
-                lastActionMs[CGWindowID(id)] = nowMs()
+            if Self.batchable.contains(tool), tool != "wait", let id = windowID {
+                lastActionMs[id] = nowMs()
             }
             // Still at work in that window: it keeps its app's key a while longer.
-            if let id = args.int("window_id") { focusGuard.touchParked(window: CGWindowID(id)) }
+            if let id = windowID { focusGuard.touchParked(window: id) }
         }
         // Opening or borrowing a window is what needs a display.
         if tool == "open_window" || tool == "borrow_window" { try ensureDisplay() }
@@ -536,19 +538,19 @@ public final class Engine {
         case "batch": return try batch(args)
         // Maintenance, not in the agent tool catalog.
         case "admin_close_window":
-            return ToolResult(text: windows.closeAny(CGWindowID(try args.requireInt("window_id"))) ? "closed" : "failed")
+            return ToolResult(text: windows.closeAny(try args.requireWindowID("window_id")) ? "closed" : "failed")
         case "admin_move_to_user":
             var frame: CGRect?
             if let x = args.double("x"), let y = args.double("y"), let w = args.double("w"), let h = args.double("h") { frame = CGRect(x: x, y: y, width: w, height: h) }
-            return ToolResult(text: windows.moveToUser(CGWindowID(try args.requireInt("window_id")), frame: frame) ? "moved" : "failed")
+            return ToolResult(text: windows.moveToUser(try args.requireWindowID("window_id"), frame: frame) ? "moved" : "failed")
         case "admin_type_hid":
             return TestHarness.shared.startTyping(try args.requireString("text"), intervalMs: args.double("interval_ms") ?? 35,
                                                   onlyPid: args.int("pid").map { pid_t($0) })
         case "admin_swap_test":
             // Experiment: which records, in what spacing, move key from one window to another.
             let pid = pid_t(try args.requireInt("pid"))
-            let from = CGWindowID(try args.requireInt("from"))
-            let to = CGWindowID(try args.requireInt("to"))
+            let from = try args.requireWindowID("from")
+            let to = try args.requireWindowID("to")
             let defocus = args.bool("defocus") ?? true
             let focus = args.bool("focus") ?? true
             let makeKey = args.bool("make_key") ?? true
@@ -566,7 +568,7 @@ public final class Engine {
             return ToolResult(text: "front=\(BCUFrontProcessPID()) keyWindow=\(AX.focusedWindowID(pid).map(String.init) ?? "none")")
         case "admin_activate":
             let pid = pid_t(try args.requireInt("pid"))
-            let wid = CGWindowID(args.int("window_id") ?? 0)
+            let wid = try args.windowID("window_id") ?? 0
             // Stands in for the user switching to it.
             focusGuard.noteUserSwitch()
             let r = BCUSetFrontProcess(pid, wid, 0x200)
@@ -596,7 +598,7 @@ public final class Engine {
         case "admin_records":
             // Experiment: post one focus record to a window of an app: "lose" or "gain", or the make-key pair.
             let pid = pid_t(try args.requireInt("pid"))
-            let wid = CGWindowID(try args.requireInt("window"))
+            let wid = try args.requireWindowID("window")
             let r: Int32
             switch args.string("kind") ?? "lose" {
             case "gain": r = BCUPostFocusRecord(pid, wid, true)
@@ -614,8 +616,8 @@ public final class Engine {
         case "admin_flicker":
             // Experiment: does moving key focus show up in the user's window?
             let pid = pid_t(try args.requireInt("pid"))
-            let user = CGWindowID(try args.requireInt("user_window"))
-            let agent = CGWindowID(try args.requireInt("agent_window"))
+            let user = try args.requireWindowID("user_window")
+            let agent = try args.requireWindowID("agent_window")
             let mode = args.string("mode") ?? "none"
             let settle = args.double("settle_ms") ?? 5
             let hold = args.double("hold_ms") ?? 0
@@ -662,7 +664,7 @@ public final class Engine {
         case "admin_film":
             // Test: film a user window (its pixels and the screen around it)
             // and the menu bar while running `steps` (like batch's actions).
-            let user = CGWindowID(try args.requireInt("user_window"))
+            let user = try args.requireWindowID("user_window")
             guard let info = WindowList.info(user) else { throw ToolError("no window \(user)") }
             let steps = (args.raw["steps"] as? [JSONObject]) ?? []
             var display: CGDirectDisplayID = 0
@@ -778,7 +780,7 @@ public final class Engine {
         case "admin_raise":
             // Test setup: bring a user window to the front of its app and the app to the front.
             let pid = pid_t(try args.requireInt("pid"))
-            let wid = CGWindowID(try args.requireInt("window_id"))
+            let wid = try args.requireWindowID("window_id")
             guard let win = AX.window(pid: pid, id: wid) else { throw ToolError("no window") }
             focusGuard.noteUserSwitch()
             _ = AX.perform(win, "AXRaise")
@@ -790,7 +792,7 @@ public final class Engine {
         case "admin_discard_window":
             // Test cleanup: close any app's window, answering "Delete" / "Don't Save" if it asks.
             let pid = pid_t(try args.requireInt("pid"))
-            let wid = CGWindowID(try args.requireInt("window_id"))
+            let wid = try args.requireWindowID("window_id")
             guard let win = AX.window(pid: pid, id: wid) else { throw ToolError("no window") }
             if let close = AX.element(win, "AXCloseButton") { _ = AX.perform(close, "AXPress") }
             sleepMs(400)
@@ -810,7 +812,7 @@ public final class Engine {
         case "admin_user_sim":
             let also = ((args.raw["also_pids"] as? [Any]) ?? []).compactMap { ($0 as? NSNumber).map { pid_t($0.intValue) } }
             return UserSim.shared.start((args.raw["script"] as? [JSONObject]) ?? [], pid: pid_t(try args.requireInt("pid")),
-                                         window: CGWindowID(args.int("window_id") ?? 0), title: args.string("title"), also: also)
+                                         window: try args.windowID("window_id") ?? 0, title: args.string("title"), also: also)
         case "admin_chaos":
             return Chaos.shared.start((args.raw["ops"] as? [JSONObject]) ?? [], guard: focusGuard)
         case "admin_chaos_status":
@@ -830,7 +832,7 @@ public final class Engine {
             return TestHarness.shared.typingStatus()
         case "admin_read_text":
             return try TestHarness.read(app: try args.requireString("app"), windows: windows,
-                                        windowID: args.int("window_id").map { CGWindowID($0) }, all: args.bool("all") ?? false,
+                                        windowID: try args.windowID("window_id"), all: args.bool("all") ?? false,
                                         set: args.string("set"))
         default: throw ToolError("unknown tool \(tool)")
         }
@@ -858,7 +860,7 @@ public final class Engine {
     }
 
     private func agentWindow(_ args: Args) throws -> (AgentWindow, AXUIElement) {
-        let id = CGWindowID(try args.requireInt("window_id"))
+        let id = try args.requireWindowID("window_id")
         guard let w = windows.window(id) else {
             throw ToolError("window \(id) isn't one of yours. Use open_window or borrow_window first, or list_windows.")
         }
@@ -1456,7 +1458,7 @@ public final class Engine {
     }
 
     private func borrowWindow(_ args: Args) throws -> ToolResult {
-        let id = CGWindowID(try args.requireInt("window_id"))
+        let id = try args.requireWindowID("window_id")
         guard let info = WindowList.info(id) else { throw ToolError("no window \(id)") }
         let front = BCUFrontProcessPID()
         if front == info.pid {
@@ -1467,7 +1469,7 @@ public final class Engine {
     }
 
     private func releaseWindow(_ args: Args) throws -> ToolResult {
-        let id = CGWindowID(try args.requireInt("window_id"))
+        let id = try args.requireWindowID("window_id")
         if windows.window(id) == nil && WindowList.info(id) == nil {
             snapshots[id] = nil
             focusedText[id] = nil
@@ -1579,6 +1581,7 @@ public final class Engine {
             guard Self.batchable.contains(tool) else {
                 throw ToolError("action \(i + 1): `\(tool)` can't be batched. Allowed: \(Self.batchable.sorted().joined(separator: ", ")). Read state with the batch's `state` option.")
             }
+            _ = try Args(step).windowID("window_id")
             if tool != "wait" && step["window_id"] == nil && defaultWindow == nil {
                 throw ToolError("action \(i + 1) needs a window_id (or set window_id on the batch)")
             }
@@ -1634,7 +1637,7 @@ public final class Engine {
         }
         closeCover()
         var images: [ToolImage] = []
-        if args.bool("state") ?? true, let wid = lastWindow, windows.window(CGWindowID(wid)) != nil {
+        if args.bool("state") ?? true, let wid = lastWindow, let id = CGWindowID(exactly: wid), windows.window(id) != nil {
             var stateArgs: JSONObject = ["window_id": wid, "screenshot": args.bool("screenshot") ?? false]
             if let full = args.bool("full") { stateArgs["full"] = full }
             if let m = args.int("max_elements") { stateArgs["max_elements"] = m }
@@ -2206,7 +2209,7 @@ public final class Engine {
     }
 
     private func handoff(_ args: Args) throws -> ToolResult {
-        let id = CGWindowID(try args.requireInt("window_id"))
+        let id = try args.requireWindowID("window_id")
         let reason = try args.requireString("reason")
         try windows.handoff(id, reason: reason)
         log("Handed off: \(reason)")
@@ -2214,7 +2217,7 @@ public final class Engine {
     }
 
     private func takeBack(_ args: Args) throws -> ToolResult {
-        let id = CGWindowID(try args.requireInt("window_id"))
+        let id = try args.requireWindowID("window_id")
         try windows.takeBack(id)
         return ToolResult(text: "Window \(id) is back on your display.")
     }

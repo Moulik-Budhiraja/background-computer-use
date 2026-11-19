@@ -31,6 +31,11 @@ final class MCPServer {
     private let subagents = SubagentLookup()
     /// The first Codex thread seen on this connection: the main agent's.
     private var mainThread: String?
+    /// Tool calls still waiting in a lane, and the ones of those the client
+    /// cancelled (`notifications/cancelled`), which then don't run.
+    private var queued: Set<String> = []
+    private var cancelled: Set<String> = []
+    private let queueLock = NSLock()
 
     static let appVersion = BCUVersion.current
 
@@ -42,8 +47,15 @@ final class MCPServer {
 
     func run() {
         while let line = readLine(strippingNewline: true) {
-            guard !line.isEmpty, let data = line.data(using: .utf8),
-                  let message = try? JSONSerialization.jsonObject(with: data) as? JSONObject else { continue }
+            guard !line.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+            guard let data = line.data(using: .utf8), let parsed = try? JSONSerialization.jsonObject(with: data) else {
+                replyError(NSNull(), code: -32700, message: "parse error: not JSON")
+                continue
+            }
+            guard let message = parsed as? JSONObject else {
+                replyError(NSNull(), code: -32600, message: "invalid request: expected a JSON-RPC object")
+                continue
+            }
             handle(message)
         }
     }
@@ -66,6 +78,10 @@ final class MCPServer {
 
     private func handle(_ message: JSONObject) {
         let method = message["method"] as? String ?? ""
+        if method == "notifications/cancelled", let id = (message["params"] as? JSONObject)?["requestId"] {
+            cancel(id)
+            return
+        }
         guard let id = message["id"] else { return }  // notifications need no reply
         let params = message["params"] as? JSONObject ?? [:]
         switch method {
@@ -88,18 +104,44 @@ final class MCPServer {
             let arguments = params["arguments"] as? JSONObject ?? [:]
             let caller = callerSession(params["_meta"] as? JSONObject ?? [:])
             // Maintenance and test tools are for `bcu call` on a debug run only.
-            if name.hasPrefix("admin_") {
+            // Only the tools this server lists: anything else is answered here,
+            // without starting or waiting for the app.
+            let known = (catalog?.tools ?? ToolCatalog.tools).compactMap { $0["name"] as? String }
+            if name.hasPrefix("admin_") || !known.contains(name) {
                 reply(id, result: ["content": [["type": "text", "text": "unknown tool \(name)"]], "isError": true])
                 return
             }
             let lane = lanes[caller] ?? Lane(caller)
             lanes[caller] = lane
+            let key = Self.requestKey(id)
+            queueLock.lock(); queued.insert(key); queueLock.unlock()
             lane.queue.async {
+                self.queueLock.lock()
+                self.queued.remove(key)
+                let skip = self.cancelled.remove(key) != nil
+                self.queueLock.unlock()
+                // A cancelled request gets no reply (MCP's cancellation rule).
+                if skip { return }
                 self.reply(id, result: self.callTool(name, arguments, session: caller, lane: lane))
             }
         default:
             replyError(id, code: -32601, message: "method not found: \(method)")
         }
+    }
+
+    /// A JSON-RPC id as a key: 5 and "5" are different requests.
+    private static func requestKey(_ id: Any) -> String {
+        if let s = id as? String { return "s:" + s }
+        return "n:\(id)"
+    }
+
+    /// Cancel a call that hasn't started. One already running carries on:
+    /// it's acting on a window, and stopping it halfway would be worse.
+    private func cancel(_ id: Any) {
+        let key = Self.requestKey(id)
+        queueLock.lock()
+        if queued.contains(key) { cancelled.insert(key) }
+        queueLock.unlock()
     }
 
     /// The session a call belongs to. Every agent gets its own (its own
@@ -120,8 +162,13 @@ final class MCPServer {
         var result: ToolResult
         do {
             result = try callWithReconnect(name, arguments, session: session, lane: lane)
+        } catch let error as ConnectError {
+            result = .error(error.description)
+        } catch SocketError.notSent {
+            result = .error("Couldn't send \(name) to \(ownerName); it didn't run. Try again.")
         } catch {
-            result = .error("\(error). Open \(ownerName) and grant its permissions.")
+            // It reached the app, so it may have run: don't send it again blind.
+            result = .error("Lost the connection to \(ownerName) during \(name) (\(error)); it may or may not have run. Check the window with get_window_state before repeating it.")
         }
         var content: [JSONObject] = [["type": "text", "text": result.text]]
         for image in result.images {
@@ -139,21 +186,26 @@ final class MCPServer {
     }
 
     private func callWithReconnect(_ name: String, _ arguments: JSONObject, session: String, lane: Lane) throws -> ToolResult {
+        var args = arguments
+        args["_session"] = session
+        if session != sessionID { args["_parent"] = sessionID }
+        if let clientName { args["_client"] = clientName }
+        if let host { args["_host"] = host }
+        if let label { args["_label"] = label }
+        // Sent again only if it never reached the app (its connection was
+        // stale): a click or type_text that did reach it mustn't run twice.
         for attempt in 0..<2 {
+            if let client = lane.client, !client.isOpen { lane.client = nil }
+            if lane.client == nil { lane.client = try connect() }
             do {
-                if lane.client == nil { lane.client = try connect() }
-                var args = arguments
-                args["_session"] = session
-                if session != sessionID { args["_parent"] = sessionID }
-                if let clientName { args["_client"] = clientName }
-                if let host { args["_host"] = host }
-                if let label { args["_label"] = label }
                 return try lane.client!.call(tool: name, args: args)
+            } catch SocketError.notSent where attempt == 0 {
+                lane.client = nil
             } catch {
                 lane.client = nil
-                if attempt == 1 { throw error }
+                throw error
             }
         }
-        throw SocketError.notRunning
+        throw SocketError.notSent
     }
 }

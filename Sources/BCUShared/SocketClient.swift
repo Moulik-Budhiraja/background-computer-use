@@ -36,6 +36,18 @@ public final class SocketClient {
 
     deinit { close(fd) }
 
+    /// False once the app has closed this connection (it quit or restarted).
+    /// Checked before a call, so a stale connection is replaced before the
+    /// request goes out rather than after, when it may already have run.
+    public var isOpen: Bool {
+        var p = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        guard poll(&p, 1, 0) >= 0 else { return false }
+        if p.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 { return false }
+        guard p.revents & Int16(POLLIN) != 0 else { return true }
+        var byte: UInt8 = 0
+        return recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) > 0
+    }
+
     public func call(tool: String, args: JSONObject) throws -> ToolResult {
         ToolResult(wire: try request(["tool": tool, "args": args]))
     }
@@ -52,7 +64,8 @@ public final class SocketClient {
             var offset = 0
             while offset < raw.count {
                 let n = write(fd, raw.baseAddress!.advanced(by: offset), raw.count - offset)
-                if n <= 0 { throw SocketError.message("write failed") }
+                // Without its newline the app can't have run any of it.
+                if n <= 0 { throw SocketError.notSent }
                 offset += n
             }
         }
@@ -80,11 +93,14 @@ public final class SocketClient {
 
 public enum SocketError: Error, CustomStringConvertible {
     case notRunning
+    /// The request never reached the app, so it's safe to send again.
+    case notSent
     case message(String)
 
     public var description: String {
         switch self {
         case .notRunning: return "Background Computer Use is not running"
+        case .notSent: return "couldn't send the request to the app"
         case .message(let m): return m
         }
     }
