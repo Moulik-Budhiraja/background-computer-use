@@ -226,6 +226,18 @@ public final class FrontGate {
     private static let maxRefusals = 3
     private var lastClearNoteMs = -Double.infinity
     private var stats = (applies: 0, lifts: 0, sinceMs: 0.0)
+    /// Lock held: running for the input tap, which mustn't wait on the
+    /// watchdog's record lock (see `fromTap`).
+    private var inTap = false
+    /// The tap's changes that had to wait, in the order the events came.
+    private let tapQueue = DispatchQueue(label: "bcu.front-gate.tap", qos: .userInteractive)
+    private let tapLock = NSLock()
+    private var tapPending = 0
+    /// How long the input tap waits for a pass to let go of the lock (one
+    /// changing the list holds it for a call per app) before letting the
+    /// event go on and opening the gate just after. Every event on the Mac
+    /// waits with it, and macOS turns off a tap that's slow.
+    private static let tapWaitS = 0.05
 
     /// The cmd+Tab switcher never keeps the gate open longer than this by itself.
     private static let switcherMaxMs = 30_000.0
@@ -398,10 +410,37 @@ public final class FrontGate {
     /// without bringing it forward). A click lets everyone through: it may be
     /// on that app's window.
     public func liftForKey(ms: Double) {
-        lock.lock()
-        keyLiftedUntilMs = max(keyLiftedUntilMs, nowMs() + ms)
-        openForUserLocked(keeping: lastStepping)
-        lock.unlock()
+        let now = nowMs()
+        fromTap {
+            self.keyLiftedUntilMs = max(self.keyLiftedUntilMs, now + ms)
+            self.openForUserLocked(keeping: self.lastStepping)
+        }
+    }
+
+    /// For the input tap: run `body` with the lock held, right away if the
+    /// lock comes within `tapWaitS`, else just after on `tapQueue`, so a
+    /// pass changing the list never holds up every event on the Mac.
+    /// After one has waited, the next go after it, in order.
+    private func fromTap(_ body: @escaping () -> Void) {
+        tapLock.lock(); let behind = tapPending > 0; tapLock.unlock()
+        if !behind && lock.lock(before: Date(timeIntervalSinceNow: Self.tapWaitS)) {
+            inTap = true
+            body()
+            inTap = false
+            lock.unlock()
+            return
+        }
+        laterOffTap(body)
+    }
+
+    /// Run `body` with the lock held on `tapQueue`, after the tap's earlier
+    /// changes: what the tap can't do without waiting.
+    private func laterOffTap(_ body: @escaping () -> Void) {
+        tapLock.lock(); tapPending += 1; tapLock.unlock()
+        tapQueue.async {
+            self.lock.lock(); body(); self.lock.unlock()
+            self.tapLock.lock(); self.tapPending -= 1; self.tapLock.unlock()
+        }
     }
 
     /// Lock held. Let every app through but `keeping`: LaunchServices' list
@@ -417,7 +456,7 @@ public final class FrontGate {
             if keep.isEmpty { clearLocked() } else { applyLocked(Targets(pids: keep), seed: appliedSeed) }
             return
         }
-        let recorded = Self.withRecordLock(wait: true) { () -> Bool in
+        let recorded = Self.withRecordLock(wait: !inTap) { () -> Bool in
             // The watchdog took the list down (after a stall): adding the
             // apps kept back to what's left would let only them through.
             // Leave it down; the next pass after this moment puts it back up.
@@ -432,6 +471,11 @@ public final class FrontGate {
                 if Self.system.updateWindowServerList(p, true) == 0 { onWindowServerList.insert(p) } else { allOn = false }
             }
             return allOn
+        }
+        if recorded == nil && inTap {
+            // The watchdog has the record lock: it's taking the list down.
+            laterOffTap { self.openForUserLocked(keeping: keeping) }
+            return
         }
         guard recorded == true else {
             // Can't let them through by adding (no record, or WindowServer
@@ -485,34 +529,35 @@ public final class FrontGate {
     /// cmd+Tab went down (open) or command came up (closed): the switch
     /// happens when command is released, however long the user holds it.
     public func switcher(open: Bool) {
-        lock.lock()
-        if open {
-            if !switcherOpen { switcherSinceMs = nowMs() }
-            switcherOpen = true
-            openForUserLocked()
-        } else if switcherOpen {
-            switcherOpen = false
-            // The app comes forward a moment after the key comes up.
-            liftedUntilMs = max(liftedUntilMs, nowMs() + 700)
+        let now = nowMs()
+        fromTap {
+            if open {
+                if !self.switcherOpen { self.switcherSinceMs = now }
+                self.switcherOpen = true
+                self.openForUserLocked()
+            } else if self.switcherOpen {
+                self.switcherOpen = false
+                // The app comes forward a moment after the key comes up.
+                self.liftedUntilMs = max(self.liftedUntilMs, now + 700)
+            }
         }
-        lock.unlock()
     }
 
     /// A mouse button went down, or came up: open for as long as it's held
     /// and `ms` after. What a drag is let go on can come forward (a file on
     /// a Dock icon, an item of a Dock menu), however long the drag took.
     public func pointer(down: Bool, ms: Double) {
-        lock.lock()
         let now = nowMs()
-        if down {
-            if !pointerDown { pointerSinceMs = now }
-            pointerDown = true
-            openForUserLocked()
-        } else {
-            pointerDown = false
+        fromTap {
+            if down {
+                if !self.pointerDown { self.pointerSinceMs = now }
+                self.pointerDown = true
+                self.openForUserLocked()
+            } else {
+                self.pointerDown = false
+            }
+            self.liftedUntilMs = max(self.liftedUntilMs, now + ms)
         }
-        liftedUntilMs = max(liftedUntilMs, now + ms)
-        lock.unlock()
     }
 
     public var isLifted: Bool {
@@ -781,9 +826,14 @@ public final class FrontGate {
     @discardableResult
     private func clearLocked() -> Bool {
         if useWindowServer {
-            let locked: Bool? = Self.withRecordLock(wait: true) { () -> Bool in
+            let locked: Bool? = Self.withRecordLock(wait: !inTap) { () -> Bool in
                 takeOffAllLocked()
                 return true
+            }
+            if locked == nil && inTap {
+                // The watchdog has the record lock (see `openForUserLocked`).
+                laterOffTap { self.clearLocked() }
+                return false
             }
             if locked == nil { takeOffAllLocked() }
             applied = nil

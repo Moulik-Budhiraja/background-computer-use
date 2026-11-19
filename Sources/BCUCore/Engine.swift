@@ -137,6 +137,10 @@ public final class Engine {
     /// How long `open_window` waits for a free display when all are taken.
     /// Under Codex's default 60 s tool timeout.
     static let displayWaitS: TimeInterval = 45
+    /// The still copy `open_window` puts over the user's window and menu
+    /// bar comes down once key is back on their window, and after this at
+    /// the most. Key is usually back within a few hundred ms.
+    static let freezeMaxS: TimeInterval = 1.5
     /// Another agent's window keeps its app's key for this long after that
     /// agent last touched it (`awaitAgentTurn`), but no one waits longer
     /// than `agentWaitMaxMs` for it.
@@ -160,7 +164,8 @@ public final class Engine {
     /// Create the session's display if it doesn't exist yet. Any thread.
     public func ensureDisplay() throws {
         guard !display.isRunning else { return }
-        func onMain(_ work: () -> Void) { if Thread.isMainThread { work() } else { DispatchQueue.main.sync(execute: work) } }
+        let quitting = ToolError("Background Computer Use is quitting. Try again once it's running.")
+        func onMain(_ work: @escaping () -> Void) throws { guard onMainUnlessQuitting(work) else { throw quitting } }
         let waitStart = nowMs()
         stateLock.lock(); let busy = _busy; stateLock.unlock()
         let got = display.reserve(timeout: Self.displayWaitS) {
@@ -180,14 +185,22 @@ public final class Engine {
         // A new display rearranges them all, and macOS then moves windows to
         // where they were the last time the displays were like this.
         let userWindows = AgentDisplay.noteUserWindows()
-        onMain { do { try self.display.start() } catch { failure = error } }
-        if let failure { throw failure }
+        // Every way out but success gives the display's place back (`stop`
+        // does, with or without a display): one kept would leave the next
+        // agent waiting for a display no one is using.
+        do {
+            try onMain { do { try self.display.start() } catch { failure = error } }
+            if let failure { throw failure }
+        } catch {
+            _ = onMainUnlessQuitting { self.display.stop(remove: true) }
+            throw error
+        }
         if !display.reused { AgentDisplay.restoreUserWindows(userWindows) }
         guard display.waitUntilOnline() else {
-            onMain { self.display.stop(remove: true) }
+            _ = onMainUnlessQuitting { self.display.stop(remove: true) }
             throw ToolError("virtual display never came online")
         }
-        onMain {
+        try onMain {
             self.display.finishStart()
             self.windows.startWatchdog()
         }
@@ -222,10 +235,11 @@ public final class Engine {
                 return
             }
             self.recorder.stop()
-            DispatchQueue.main.sync {
+            // Quitting removes the display itself.
+            guard onMainUnlessQuitting({
                 self.windows.stopWatchdog()
                 self.display.stop()
-            }
+            }) else { return }
             self.snapshots.removeAll()
             self.audio.end()
             self.log("Gave up the agent display: no windows for a while")
@@ -1386,6 +1400,9 @@ public final class Engine {
         // late: the window takes key as it shows (measured: their shadow
         // drawn as an inactive window's for up to 127 ms).
         let freeze = Locked<ScreenFreeze?>(nil)
+        // Whoever comes first takes the copies down: key is back on the
+        // user's window, the cap below, or the open is over.
+        func endFreeze() { freeze.with { f -> ScreenFreeze? in defer { f = nil }; return f }?.end() }
         let userPid = shared ? (try windows.resolveApp(app).running)?.processIdentifier : nil
         let beforeAsk: (() throws -> Void)? = userPid.map { pid in
             {
@@ -1400,14 +1417,18 @@ public final class Engine {
                 // on a busy Mac.
                 if self.userTyping && self.userIsIn(pid) { throw YieldToUser() }
                 freeze.value = ScreenFreeze.show(shots, chromeOnly: true)
+                // Never for long, whatever the app does: the user may be
+                // clicking where the copy of the menu bar shows other menus.
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + Self.freezeMaxS) { endFreeze() }
             }
         }
-        defer { freeze.value?.end() }
+        defer { endFreeze() }
         func open() throws -> WindowManager.OpenResult {
             while true {
                 do {
                     return try windows.open(app: app, placement: WindowManager.Placement(name: args.string("placement")), trigger: args.string("trigger"),
-                                            hold: hold, beforeAsk: beforeAsk)
+                                            hold: hold, beforeAsk: beforeAsk,
+                                            keyBack: { DispatchQueue.global(qos: .userInteractive).async { endFreeze() } })
                 } catch is YieldToUser {
                     Log.info("open: \(label) left opening a \(target.name) window for later: the user started typing there")
                     if nowMs() >= giveUpAt {

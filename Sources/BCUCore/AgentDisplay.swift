@@ -593,7 +593,7 @@ public final class AgentDisplay {
     }
 
     /// Where this display goes: at the bottom-right corner of the agent
-    /// display before it, or of the user's displays for the first.
+    /// display before it, or of the user's displays for the first (see `corner`).
     /// Stray displays sitting on the staircase are stepped over. nil when
     /// there's nowhere to put it (no user display at all).
     private func anchor() -> CGPoint? {
@@ -602,9 +602,8 @@ public final class AgentDisplay {
             let b = CGDisplayBounds(before.displayID)
             corner = CGPoint(x: b.maxX, y: b.maxY)
         } else {
-            let user = computeUserBounds()
-            guard !user.isNull, user.maxX.isFinite, user.maxY.isFinite else { return nil }
-            corner = CGPoint(x: user.maxX, y: user.maxY)
+            guard let c = Self.corner(of: userDisplayIDs().map { CGDisplayBounds($0) }) else { return nil }
+            corner = c
         }
         Self.registryLock.lock()
         let spare = Self.spares.map(\.id)
@@ -615,6 +614,17 @@ public final class AgentDisplay {
             strays.remove(at: i)
         }
         return corner
+    }
+
+    /// The bottom-right corner of the rightmost of `displays` (the lowest,
+    /// of those that end as far right). Not the corner of their bounding
+    /// box: where no display has that corner (the one on the right is the
+    /// shorter), a display put there touches none, and macOS moves it.
+    /// Right of every display, so it covers none.
+    static func corner(of displays: [CGRect]) -> CGPoint? {
+        let real = displays.filter { !$0.isEmpty && $0.maxX.isFinite && $0.maxY.isFinite }
+        guard let right = real.max(by: { ($0.maxX, $0.maxY) < ($1.maxX, $1.maxY) }) else { return nil }
+        return CGPoint(x: right.maxX, y: right.maxY)
     }
 
     private func computeUserBounds() -> CGRect {
@@ -715,6 +725,10 @@ public final class AgentDisplay {
 
     /// No user display to sit beside the last time this looked.
     private var unplaced = false
+    /// Where macOS put the display when it was asked for `wanted` and said
+    /// yes: it moves a display that touches no other one. Asking again
+    /// gets the same answer, and each ask rearranges every display.
+    private var adjusted: (wanted: CGPoint, got: CGPoint)?
     private var lastPlaceError: CGError = .success
 
     fileprivate func reconfigured() {
@@ -730,11 +744,20 @@ public final class AgentDisplay {
             bounds = b
             return
         }
-        if unplaced || user != userBounds || b.origin != wanted {
+        let accepted = adjusted.map { $0.wanted == wanted && $0.got == b.origin } ?? false
+        if unplaced || user != userBounds || (b.origin != wanted && !accepted) {
             let was = unplaced
             unplaced = false
             place()
-            if bounds.origin == wanted { Log.info("agent display \(slot + 1) re-placed at \(bounds.short)") } else if !was { unplaced = true }
+            if bounds.origin == wanted {
+                adjusted = nil
+                Log.info("agent display \(slot + 1) re-placed at \(bounds.short)")
+            } else if lastPlaceError == .success {
+                if adjusted.map({ $0.wanted != wanted || $0.got != bounds.origin }) ?? true {
+                    Log.info("agent display \(slot + 1) asked for \(Int(wanted.x)),\(Int(wanted.y)); macOS put it at \(bounds.short)")
+                }
+                adjusted = (wanted, bounds.origin)
+            } else if !was { unplaced = true }
         }
     }
 

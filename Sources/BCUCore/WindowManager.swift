@@ -304,13 +304,14 @@ public final class WindowManager {
     /// from when the new window could take key until key is back on theirs.
     /// `beforeAsk` runs once it's this session's turn to open a window,
     /// just before the app is asked for it (and before any input is held);
-    /// if it throws, nothing is opened.
+    /// if it throws, nothing is opened. `keyBack` runs once key is back on
+    /// the window that had it (or that was given up on).
     public func open(app query: String, placement: Placement = .auto, trigger: String? = nil, hold: InputHold? = nil,
-                     beforeAsk: (() throws -> Void)? = nil) throws -> OpenResult {
+                     beforeAsk: (() throws -> Void)? = nil, keyBack: (() -> Void)? = nil) throws -> OpenResult {
         let target = try resolveApp(query)
         if let running = target.running {
             return try openNewWindow(pid: running.processIdentifier, name: target.name, bundleID: target.bundleID, placement: placement, trigger: trigger,
-                                     hold: hold, beforeAsk: beforeAsk)
+                                     hold: hold, beforeAsk: beforeAsk, keyBack: keyBack)
         }
         guard let url = target.url else { throw ToolError("can't find \(target.name) on disk") }
         return try launch(url: url, name: target.name, bundleID: target.bundleID)
@@ -378,7 +379,7 @@ public final class WindowManager {
 
     /// Open a new window of a running app and put it on the agent display.
     private func openNewWindow(pid: pid_t, name: String, bundleID: String?, placement: Placement = .auto, trigger: String? = nil,
-                               hold: InputHold? = nil, beforeAsk: (() throws -> Void)? = nil) throws -> OpenResult {
+                               hold: InputHold? = nil, beforeAsk: (() throws -> Void)? = nil, keyBack: (() -> Void)? = nil) throws -> OpenResult {
         // Not while displays are still being added (see `awaitSettled`):
         // before this session's turn, and again once it has it.
         var settledMs = AgentDisplay.awaitSettled()
@@ -527,6 +528,7 @@ public final class WindowManager {
                 if AX.focusedWindowID(pid) == previousKey { break }
             }
         }
+        keyBack?()
         focusGuard.endSwap(pid)
         appLock.unlock()
         holdingInput = false
@@ -1238,15 +1240,16 @@ final class WindowCatcher {
 
     func start() {
         startMs = nowMs()
-        DispatchQueue.main.sync {
-            var obs: AXObserver?
-            guard AXObserverCreate(pid, catcherCallback, &obs) == .success, let obs else { return }
-            let refcon = Unmanaged.passUnretained(self).toOpaque()
-            AXObserverAddNotification(obs, AX.app(pid), kAXWindowCreatedNotification as CFString, refcon)
-            CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .commonModes)
-            observer = obs
-        }
         polling = true
+        // Not while BCU quits (see `onMainUnlessQuitting`): then polling alone catches the window.
+        onMainUnlessQuitting {
+            var obs: AXObserver?
+            guard AXObserverCreate(self.pid, catcherCallback, &obs) == .success, let obs else { return }
+            let refcon = Unmanaged.passUnretained(self).toOpaque()
+            AXObserverAddNotification(obs, AX.app(self.pid), kAXWindowCreatedNotification as CFString, refcon)
+            CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .commonModes)
+            self.observer = obs
+        }
         let thread = Thread { [weak self] in self?.poll() }
         thread.qualityOfService = .userInteractive
         thread.start()
@@ -1255,17 +1258,20 @@ final class WindowCatcher {
     func stop() {
         polling = false
         if let obs = observer {
-            DispatchQueue.main.sync {
-                AXObserverRemoveNotification(obs, AX.app(pid), kAXWindowCreatedNotification as CFString)
+            observer = nil
+            // Without waiting for the main thread, which may be waiting on
+            // this one (quitting). It holds the catcher until then, and
+            // `created` ignores the window from now on.
+            DispatchQueue.main.async {
+                AXObserverRemoveNotification(obs, AX.app(self.pid), kAXWindowCreatedNotification as CFString)
                 CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .commonModes)
             }
-            observer = nil
         }
     }
 
     /// AXObserver path: runs on the main thread right after the window is created.
     fileprivate func created(_ element: AXUIElement) {
-        guard let id = AX.windowID(element), !before.contains(id), !WindowManager.isRegistered(id) else { return }
+        guard polling, let id = AX.windowID(element), !before.contains(id), !WindowManager.isRegistered(id) else { return }
         catchWindow(id: id, element: element)
     }
 
