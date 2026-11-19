@@ -143,12 +143,10 @@ public enum Panel {
         return nil
     }
 
-    /// Whether the panel saves (it has a name field) rather than opens.
+    /// Whether the panel saves rather than opens: only a save panel has a
+    /// file name field. (Its labels are in the user's language.)
     static func isSavePanel(_ panel: AXUIElement) -> Bool {
-        let label = find(panel, limit: 400) { el, role in
-            role == "AXStaticText" && (AX.string(el, "AXValue") ?? "").lowercased().hasPrefix("save as")
-        }
-        return label != nil || AX.string(panel, "AXTitle")?.lowercased() == "save" || AX.string(panel, "AXDescription")?.lowercased() == "save"
+        nameField(panel) != nil
     }
 
     /// `path` with `~` expanded and `.` and `..` resolved.

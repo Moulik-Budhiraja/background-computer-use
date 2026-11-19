@@ -107,9 +107,11 @@ enum SecondLook {
 
     /// Whether `now` (the app's windows on the user's screens, id to title)
     /// shows something opened since `before` (every window on the user's
-    /// screens at the click).
-    static func opened(before: [CGWindowID: String], now: [CGWindowID: String]) -> Bool {
-        now.contains { id, title in before[id].map { $0 != title } ?? true }
+    /// screens, from a look taken before the click). With no such look,
+    /// nothing can be ruled out: count it as opened.
+    static func opened(before: [CGWindowID: String]?, now: [CGWindowID: String]) -> Bool {
+        guard let before else { return true }
+        return now.contains { id, title in before[id].map { $0 != title } ?? true }
     }
 }
 

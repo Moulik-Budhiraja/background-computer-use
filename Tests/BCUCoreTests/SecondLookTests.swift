@@ -81,6 +81,12 @@ final class SecondLookTests: XCTestCase {
         XCTAssertTrue(SecondLook.opened(before: before, now: [1: "A page they opened"]))
         XCTAssertTrue(SecondLook.opened(before: before, now: [1: "Home / X", 3: "New window"]))
     }
+
+    /// No look from before the click (agents had only just started): can't
+    /// tell what it opened, so nothing is put back.
+    func testWithNoLookFromBeforeTheClickItCountsAsOpened() {
+        XCTAssertTrue(SecondLook.opened(before: nil, now: [1: "Home / X"]))
+    }
 }
 
 /// Dock bounces from apps agents work in.

@@ -142,10 +142,13 @@ public final class FocusGuard {
     private var shownSpaces: [CGDirectDisplayID: UInt64] = [:]
     private var userFrontWindow: CGWindowID?
     private var lastUserMouseDownMs = 0.0
-    /// Where the user's last click landed: the app whose window it was on,
-    /// and every window on their screens then (id to title), for a second
-    /// look at an app that came forward just after it (`SecondLook`).
-    private var lastClick: (ms: Double, owner: pid_t?, windows: [CGWindowID: String]) = (0, nil, [:])
+    /// Where the user's last click landed (the app whose window it was on),
+    /// and the windows on their screens just before it (id to title), for a
+    /// second look at an app that came forward just after it (`SecondLook`).
+    private var lastClick: (ms: Double, owner: pid_t?, windows: [CGWindowID: String]?) = (0, nil, nil)
+    /// The windows on the user's screens, looked at every 250 ms while
+    /// agents work, so a click has a look from before anything it opened.
+    private var screenLook: [CGWindowID: String]?
     private let clickQueue = DispatchQueue(label: "bcu.guard.click", qos: .userInteractive)
     /// When an agent's step on each app last ended (see `Bounce`).
     private var lastActedMs: [pid_t: Double] = [:]
@@ -241,6 +244,7 @@ public final class FocusGuard {
         }
         installTap()
         Thread.detachNewThread { [weak self] in self?.watchAttention() }
+        Thread.detachNewThread { [weak self] in self?.watchUserScreen() }
         gate.targets = { [weak self] in self?.gateTargets() ?? FrontGate.Targets() }
         gate.tapWorking = { [weak self] in
             guard let self, let tap = self.tap, CGEvent.tapIsEnabled(tap: tap) else { return false }
@@ -546,7 +550,7 @@ public final class FocusGuard {
             let inputSince = self.lastUserMouseDownMs > arrivedMs || self.lastUserKeyMs > arrivedMs
             // The click's owner is worked out off the event tap, right after it.
             let owner = self.lastClick.ms == click.ms ? self.lastClick.owner : click.owner
-            let before = self.lastClick.ms == click.ms ? self.lastClick.windows : click.windows
+            let before = click.windows
             self.lock.unlock()
             let mine = Dictionary(uniqueKeysWithValues: WindowList.of(pid: pid, onScreenOnly: true)
                 .filter { $0.layer == 0 && !Self.onAgentDisplay($0.id) }.map { ($0.id, $0.title) })
@@ -1399,13 +1403,23 @@ public final class FocusGuard {
     /// few milliseconds, and the windows under the point don't change that fast.
     private func noteClick(at p: CGPoint) {
         let ms = nowMs()
-        lock.lock(); lastClick = (ms, nil, [:]); lock.unlock()
+        lock.lock(); lastClick = (ms, nil, screenLook); lock.unlock()
         clickQueue.async {
             let owner = Self.windowOwner(at: p)
-            let windows = Self.userScreenWindows()
             self.lock.lock()
-            if self.lastClick.ms == ms { self.lastClick = (ms, owner, windows) }
+            if self.lastClick.ms == ms { self.lastClick.owner = owner }
             self.lock.unlock()
+        }
+    }
+
+    /// Keeps `screenLook` while agents work (windows, or a step running or
+    /// settling); none otherwise.
+    private func watchUserScreen() {
+        while true {
+            let busy = !WindowManager.agentPids().isEmpty || !activeTaints.isEmpty
+            let look = busy ? Self.userScreenWindows() : nil
+            lock.lock(); screenLook = look; lock.unlock()
+            usleep(250_000)
         }
     }
 
