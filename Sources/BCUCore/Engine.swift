@@ -2303,6 +2303,12 @@ public final class Engine {
             goTo = path
         }
         point(remote.frame.center)
+        // The user can pause the agent or take over its display while this
+        // waits on the panel: check before every step.
+        func stillGoing() throws {
+            if paused { throw ToolError("paused by the user; nothing more was done in the file panel") }
+            if userInControl { throw ToolError("the user took over your display; nothing more was done in the file panel") }
+        }
         func press(_ key: String, _ mods: [String] = []) throws {
             try panelInput(w, cause: "pressing \((mods + [key]).joined(separator: "+")) in the file panel") {
                 try Input.pressKey(pid: remote.pid, key: key, modifiers: mods, windowID: remote.window, shortcutsToMenu: false)
@@ -2317,6 +2323,7 @@ public final class Engine {
         // take cmd+shift+G, but "/" typed into it empty opens Go to Folder;
         // so does "/" in an open panel's file list.
         func slash() throws {
+            try stillGoing()
             if saving, let name = Panel.nameField(panel.sheet) {
                 guarded(w, cause: "clearing the file name") {
                     AX.set(name, "AXFocused", kCFBooleanTrue)
@@ -2334,6 +2341,7 @@ public final class Engine {
         guard let field else {
             throw ToolError("Go to Folder didn't open in the file panel, so nothing was chosen. Read the window and pick the file by clicking its row, then the panel's button.")
         }
+        try stillGoing()
         let err = guarded(w, cause: "entering the path") { AX.set(field, "AXValue", goTo as CFString) }
         guard err == .success, waitUntil(500, { AX.string(field, "AXValue") == goTo }) else {
             try? press("escape")
@@ -2346,6 +2354,7 @@ public final class Engine {
         }
         if saving {
             guard let nameField = Panel.nameField(panel.sheet) else { throw ToolError("went to \(goTo), but found no file name field in the save panel") }
+            try stillGoing()
             let e = guarded(w, cause: "entering the file name") { AX.set(nameField, "AXValue", name as CFString) }
             guard e == .success, waitUntil(500, { AX.string(nameField, "AXValue") == name }) else {
                 throw ToolError("went to \(goTo), but couldn't enter the name \"\(name)\" (\(AX.errorName(e)))")
@@ -2365,6 +2374,7 @@ public final class Engine {
         if AX.bool(button, "AXEnabled") == false {
             throw ToolError("\(what), but \"\(title)\" is disabled: the panel may not accept this kind of file")
         }
+        try stillGoing()
         let e = guarded(w, cause: "pressing \(title)") { AX.perform(button, "AXPress") }
         guard e == .success else { throw ToolError("\(what), but pressing \"\(title)\" failed (\(AX.errorName(e)))") }
         let closed = waitUntil(3000) {
