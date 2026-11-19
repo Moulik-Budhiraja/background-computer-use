@@ -28,7 +28,7 @@ An element keeps its number for as long as it exists. After the first read, `get
 
 Popups that belong to your window (menus, dropdowns, address-bar suggestions) are listed after the window's own elements, with their own numbers.
 
-A sheet over your window, such as a file picker opened by an upload button, a save panel or an alert, is listed first, before the window behind it, which takes no input until the sheet closes. Click a file's row by number to select it, then click the panel's button (Upload, Open, Save). Selecting a row and pressing a button go through accessibility, so they work even though keys can't reach the panel. To go into a folder, select its row and press Open, or click it in the sidebar.
+A sheet over your window, such as a file picker opened by an upload button, a save panel or an alert, is listed first, before the window behind it, which takes no input until the sheet closes. To upload or save a file, call `choose_file` with its path: it goes to the file's folder (any folder, ~/Library too), selects it and presses Open or Save. You can also click a file's row by number and then the panel's button.
 
 Pass `screenshot=false` when the text is enough. Take the screenshot when layout matters, when the tree is thin (canvas apps, images, games) or when an action didn't do what you expected. Coordinates for `click` and `scroll` are window points, which match the screenshot's pixels.
 

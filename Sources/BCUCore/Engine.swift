@@ -536,6 +536,7 @@ public final class Engine {
         case "drag": return try drag(args)
         case "press_menu_item": return try pressMenuItem(args)
         case "navigate": return try navigate(args)
+        case "choose_file": return try chooseFile(args)
         case "handoff": return try handoff(args)
         case "take_back": return try takeBack(args)
         case "guard_report": return guardReport()
@@ -926,7 +927,7 @@ public final class Engine {
     /// `body` gets a check to call right before it posts anything: it throws
     /// unless the agent's window is still the app's key window and the user
     /// hasn't switched to the app since, so input never goes anywhere else.
-    private func keyed<T>(_ w: AgentWindow, cause: String, _ body: (_ check: () throws -> Void) throws -> T) throws -> T {
+    private func keyed<T>(_ w: AgentWindow, cause: String, _ body: (_ check: () throws -> Void, _ key: CGWindowID) throws -> T) throws -> T {
         let giveUpAt = typingDeadline
         while true {
             do {
@@ -960,7 +961,7 @@ public final class Engine {
     private struct YieldToUser: Error {}
 
     private func keyedOnce<T>(_ w: AgentWindow, cause: String, giveUpAtMs: Double,
-                              _ body: (_ check: () throws -> Void) throws -> T) throws -> T {
+                              _ body: (_ check: () throws -> Void, _ key: CGWindowID) throws -> T) throws -> T {
         if paused { throw ToolError("paused by the user") }
         if userInControl { throw ToolError("the user took over your display") }
         dropStaleCover(w)
@@ -1016,7 +1017,7 @@ public final class Engine {
         }
         // Key is this window's now, whoever had it parked before; other
         // agents wait while this step runs too.
-        focusGuard.park(w.pid, window: w.id, owner: sessionID)
+        focusGuard.park(w.pid, window: w.id, keyWindow: scope.keyWindow, owner: sessionID)
         let keyAt = nowMs()
         defer {
             let backFrom = nowMs()
@@ -1032,7 +1033,8 @@ public final class Engine {
         let wasFront = BCUFrontProcessPID() == w.pid
         let check = { [self] in
             let key = AX.focusedWindowID(w.pid)
-            if let key, key != w.id {
+            // Ours: the window, or the sheet over it (one the step opened, say).
+            if let key, key != w.id, key != scope.keyWindow, AX.sheetWindowID(pid: w.pid, window: w.id) != key {
                 throw ToolError("\(w.appName)'s key window changed to window \(key) (\(FocusGuard.onAgentDisplay(key) ? "another agent window" : "the user's")), so nothing more was sent")
             }
             if key == nil {
@@ -1042,7 +1044,7 @@ public final class Engine {
                 throw ToolError("the user switched to \(w.appName), so nothing more was sent")
             }
         }
-        let result = try body(check)
+        let result = try body(check, scope.keyWindow)
         // Let focus moves (Tab, a click) land before noting the focused field.
         sleepMs(30)
         rememberFocusedText(in: w)
@@ -1063,7 +1065,7 @@ public final class Engine {
             switch KeyScope.afterStep(popupOpen: popupOpen, userWindow: focusGuard.userWindow(of: w.pid)) {
             case .park:
                 if scope.keepKey() {
-                    focusGuard.park(w.pid, window: w.id, owner: sessionID)
+                    focusGuard.park(w.pid, window: w.id, keyWindow: scope.heldBy, owner: sessionID)
                     return
                 }
             case .handTo(let user):
@@ -1165,7 +1167,7 @@ public final class Engine {
     /// something there within `agentLeaseMs`.
     private func leaseHolder(_ pid: pid_t, window: CGWindowID?) -> FocusGuard.ParkedKey? {
         guard let p = focusGuard.parkedKey(pid), p.owner != sessionID, p.window != window,
-              nowMs() - p.lastUsedMs < Self.agentLeaseMs, AX.focusedWindowID(pid) == p.window else { return nil }
+              nowMs() - p.lastUsedMs < Self.agentLeaseMs, AX.focusedWindowID(pid) == p.keyWindow else { return nil }
         return p
     }
 
@@ -1309,6 +1311,41 @@ public final class Engine {
         windows.noteBefore(pid: w.pid)
         defer { focusGuard.endAction(pid: w.pid) }
         return try body()
+    }
+
+    /// The panel service window behind the sheet over `w`, when that sheet
+    /// is an open or save panel (see `Panel`).
+    private func remotePanel(_ w: AgentWindow) -> (sheet: AXUIElement, remote: Panel.Remote)? {
+        guard let ax = AX.window(pid: w.pid, id: w.id), let sheet = AX.sheet(of: ax), let sid = AX.windowID(sheet), sid != w.id,
+              let remote = Panel.remote(sheet: sid, appPid: w.pid) else { return nil }
+        return (sheet, remote)
+    }
+
+    /// A keys or pixel step in an open or save panel: posted to the panel's
+    /// own process, so the app's key window doesn't change and there's no
+    /// pause of the user's to wait for. The panel can still make its sheet
+    /// the app's key window as it opens one of its own (Go to Folder): if
+    /// the user is in the app, key goes back to their window.
+    private func panelInput<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) throws -> T {
+        if paused { throw ToolError("paused by the user") }
+        if userInControl { throw ToolError("the user took over your display") }
+        defer {
+            if userIsIn(w.pid) { focusGuard.reclaimWhenSafe(w.pid); focusGuard.scheduleReclaim(w.pid) }
+        }
+        return try guarded(w, cause: cause, body)
+    }
+
+    /// A pixel click at global `p`: into an open or save panel's process
+    /// when it's on one, else with the window made its app's key window.
+    private func pixelClick(_ w: AgentWindow, at p: CGPoint, button: Input.Button, count: Int) throws {
+        if let panel = remotePanel(w), panel.remote.frame.contains(p) {
+            let target = Panel.window(of: panel.remote, at: p)
+            try panelInput(w, cause: "clicking") {
+                try Input.click(pid: target.pid, windowID: target.window, at: p, button: button, count: count, origin: target.frame.origin)
+            }
+            return
+        }
+        try keyed(w, cause: "clicking") { check, key in try Input.click(pid: w.pid, windowID: Self.clickTarget(w.id, key: key, at: p), at: p, button: button, count: count, check: check) }
     }
 
     private func globalPoint(_ args: Args, window ax: AXUIElement) throws -> CGPoint {
@@ -1691,7 +1728,7 @@ public final class Engine {
     // MARK: Batch
 
     private static let batchable: Set<String> = ["click", "set_value", "perform_action", "type_text", "press_key",
-                                                 "scroll", "drag", "press_menu_item", "navigate", "wait"]
+                                                 "scroll", "drag", "press_menu_item", "navigate", "choose_file", "wait"]
 
     /// Steps that may take key focus in their app (see `keyed`).
     private static func mayTakeKey(_ tool: String, _ a: Args) -> Bool {
@@ -1842,14 +1879,20 @@ public final class Engine {
                     return ToolResult(text: "Selected the row of element \(n.index) through accessibility.")
                 }
             }
-            let p = n.frame.center
-            try keyed(w, cause: "clicking") { check in try Input.click(pid: w.pid, windowID: w.id, at: p, button: button, count: count, check: check) }
+            try pixelClick(w, at: n.frame.center, button: button, count: count)
             return ToolResult(text: "Clicked element \(n.index) at its center.")
         }
         let p = try globalPoint(args, window: ax)
         point(p, .click)
-        try keyed(w, cause: "clicking") { check in try Input.click(pid: w.pid, windowID: w.id, at: p, button: button, count: count, check: check) }
+        try pixelClick(w, at: p, button: button, count: count)
         return ToolResult(text: "Clicked at (\(Int(args.double("x") ?? 0)), \(Int(args.double("y") ?? 0))).")
+    }
+
+    /// The window a pixel click at `p` goes to: the sheet that has key
+    /// (`key`, when it isn't the window itself) if `p` is on it.
+    static func clickTarget(_ window: CGWindowID, key: CGWindowID, at p: CGPoint) -> CGWindowID {
+        guard key != window, let sheet = WindowList.info(key)?.bounds, sheet.contains(p) else { return window }
+        return key
     }
 
     private func setValue(_ args: Args) throws -> ToolResult {
@@ -1893,6 +1936,15 @@ public final class Engine {
         if args.int("element") != nil { target = try node(args, window: w) }
         if let n = target { point(n.frame.center) }
 
+        // An open or save panel takes keys in its own process, without the
+        // app's key window changing (see `Panel`), so it needs none of what
+        // follows.
+        if remotePanel(w) != nil {
+            if let n = target { guarded(w, cause: "focusing") { _ = AX.set(n.element, "AXFocused", kCFBooleanTrue) } }
+            try typeKeys(w, text)
+            return ToolResult(text: "Typed \(text.count) characters into the file panel with keystrokes.")
+        }
+
         // The user is in this app, so keystrokes would take key focus from
         // their window. Write the text through accessibility instead.
         if userIsIn(w.pid), AX.focusedWindowID(w.pid) != w.id {
@@ -1930,6 +1982,10 @@ public final class Engine {
     /// agent's window must still be key; if the user switched to the app
     /// partway, it stops rather than guess where the rest would go.
     private func typeKeys(_ w: AgentWindow, _ text: String) throws {
+        if let panel = remotePanel(w) {
+            try panelInput(w, cause: "typing") { _ = try Input.typeText(pid: panel.remote.pid, text, windowID: panel.remote.window) }
+            return
+        }
         let total = text.count
         let startedIn = userIsIn(w.pid)
         var typed = 0
@@ -1943,9 +1999,9 @@ public final class Engine {
             let piece = String(rest.prefix(Self.typeChunk))
             var sent = 0
             do {
-                try keyed(w, cause: "typing") { check in
+                try keyed(w, cause: "typing") { check, key in
                     let start = nowMs()
-                    let n = try Input.typeText(pid: w.pid, piece, windowID: w.id) { i in
+                    let n = try Input.typeText(pid: w.pid, piece, windowID: key) { i in
                         sent = i
                         // Keep each swap short: the user's input may be held meanwhile.
                         // And end it at once if they start typing into the app:
@@ -2131,9 +2187,15 @@ public final class Engine {
         let (w, _) = try agentWindow(args)
         let key = try args.requireString("key")
         let mods = args.strings("modifiers") ?? []
-        try keyed(w, cause: "pressing \((mods + [key]).joined(separator: "+"))") { check in
+        if let panel = remotePanel(w) {
+            try panelInput(w, cause: "pressing \((mods + [key]).joined(separator: "+"))") {
+                try Input.pressKey(pid: panel.remote.pid, key: key, modifiers: mods, windowID: panel.remote.window, shortcutsToMenu: false)
+            }
+            return ToolResult(text: "Pressed \((mods + [key]).joined(separator: "+")) in the file panel.")
+        }
+        try keyed(w, cause: "pressing \((mods + [key]).joined(separator: "+"))") { check, keyWindow in
             try check()
-            try Input.pressKey(pid: w.pid, key: key, modifiers: mods, windowID: w.id)
+            try Input.pressKey(pid: w.pid, key: key, modifiers: mods, windowID: keyWindow)
         }
         return ToolResult(text: "Pressed \((mods + [key]).joined(separator: "+")).")
     }
@@ -2152,7 +2214,12 @@ public final class Engine {
         let dx = args.int("dx") ?? 0, dy = args.int("dy") ?? 0
         guard dx != 0 || dy != 0 else { throw ToolError("give dx or dy") }
         point(p)
-        try guarded(w, cause: "scrolling") { try Input.scroll(pid: w.pid, windowID: w.id, at: p, dx: dx, dy: dy) }
+        if let panel = remotePanel(w), panel.remote.frame.contains(p) {
+            let target = Panel.window(of: panel.remote, at: p)
+            try panelInput(w, cause: "scrolling") { try Input.scroll(pid: target.pid, windowID: target.window, at: p, dx: dx, dy: dy, origin: target.frame.origin) }
+        } else {
+            try guarded(w, cause: "scrolling") { try Input.scroll(pid: w.pid, windowID: w.id, at: p, dx: dx, dy: dy) }
+        }
         return ToolResult(text: "Scrolled dx=\(dx) dy=\(dy).")
     }
 
@@ -2163,11 +2230,137 @@ public final class Engine {
               let tx = args.double("to_x"), let ty = args.double("to_y") else { throw ToolError("give from_x, from_y, to_x, to_y") }
         let from = CGPoint(x: f.minX + fx, y: f.minY + fy), to = CGPoint(x: f.minX + tx, y: f.minY + ty)
         point(from, .drag(to: to))
-        try keyed(w, cause: "dragging") { check in
+        if let panel = remotePanel(w), panel.remote.frame.contains(from) {
+            let target = Panel.window(of: panel.remote, at: from)
+            try panelInput(w, cause: "dragging") { try Input.drag(pid: target.pid, windowID: target.window, from: from, to: to, origin: target.frame.origin) }
+            return ToolResult(text: "Dragged from (\(Int(fx)),\(Int(fy))) to (\(Int(tx)),\(Int(ty))).")
+        }
+        try keyed(w, cause: "dragging") { check, key in
             try check()
-            try Input.drag(pid: w.pid, windowID: w.id, from: from, to: to)
+            try Input.drag(pid: w.pid, windowID: Self.clickTarget(w.id, key: key, at: from), from: from, to: to)
         }
         return ToolResult(text: "Dragged from (\(Int(fx)),\(Int(fy))) to (\(Int(tx)),\(Int(ty))).")
+    }
+
+    /// Poll `ok` every 50 ms for up to `ms`; whether it came true.
+    private func waitUntil(_ ms: Double, _ ok: () -> Bool) -> Bool {
+        let deadline = nowMs() + ms
+        while true {
+            if ok() { return true }
+            if nowMs() >= deadline { return false }
+            sleepMs(50)
+        }
+    }
+
+    /// Pick a file by path in the open or save panel over the window: Go to
+    /// Folder with the path, then the panel's button. Works for any folder,
+    /// including ones the panel's sidebar doesn't show (~/Library). Keys go
+    /// to the panel's own process (see `Panel`), so nothing waits for the user.
+    private func chooseFile(_ args: Args) throws -> ToolResult {
+        let (w, ax) = try agentWindow(args)
+        let path = Panel.resolve(try args.requireString("path"))
+        guard path.hasPrefix("/") else { throw ToolError("give an absolute path (or one starting with ~)") }
+        let confirm = args.bool("confirm") ?? true
+        // An upload button's picker takes a moment to open.
+        var found: (sheet: AXUIElement, remote: Panel.Remote)?
+        _ = waitUntil(3000) { found = remotePanel(w); return found != nil }
+        guard let panel = found else {
+            if AX.sheet(of: ax) != nil {
+                throw ToolError("the sheet over window \(w.id) isn't a file picker or save panel (an alert, say). Read it with get_window_state.")
+            }
+            throw ToolError("no file picker is open over window \(w.id). Open it first (click the page's upload button, or File > Open), then call choose_file.")
+        }
+        let remote = panel.remote
+        let saving = Panel.isSavePanel(panel.sheet)
+        let name = (path as NSString).lastPathComponent
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
+        let goTo: String
+        if saving {
+            if exists && isDir.boolValue { throw ToolError("\(path) is a folder: give the path of the file to save") }
+            goTo = (path as NSString).deletingLastPathComponent
+            var folder: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: goTo, isDirectory: &folder), folder.boolValue else {
+                throw ToolError("there's no folder \(goTo) to save into")
+            }
+        } else {
+            guard exists else { throw ToolError("there's no file or folder at \(path)") }
+            goTo = path
+        }
+        point(remote.frame.center)
+        func press(_ key: String, _ mods: [String] = []) throws {
+            try panelInput(w, cause: "pressing \((mods + [key]).joined(separator: "+")) in the file panel") {
+                try Input.pressKey(pid: remote.pid, key: key, modifiers: mods, windowID: remote.window, shortcutsToMenu: false)
+            }
+        }
+        func goToField() -> AXUIElement? {
+            Panel.innerSheet(panel.sheet).flatMap { inner in
+                Panel.find(inner) { el, role in (role == "AXTextField" || role == "AXComboBox") && AX.isSettable(el, "AXValue") }
+            }
+        }
+        // Go to Folder, with the path. A save panel's name field doesn't
+        // take cmd+shift+G, but "/" typed into it empty opens Go to Folder;
+        // so does "/" in an open panel's file list.
+        func slash() throws {
+            if saving, let name = Panel.nameField(panel.sheet) {
+                guarded(w, cause: "clearing the file name") {
+                    AX.set(name, "AXFocused", kCFBooleanTrue)
+                    AX.set(name, "AXValue", "" as CFString)
+                }
+            }
+            try panelInput(w, cause: "typing / in the file panel") { _ = try Input.typeText(pid: remote.pid, "/", windowID: remote.window) }
+        }
+        let openers: [() throws -> Void] = saving ? [slash, { try press("g", ["cmd", "shift"]) }] : [{ try press("g", ["cmd", "shift"]) }, slash]
+        var field: AXUIElement? = goToField()
+        for open in openers where field == nil {
+            try open()
+            _ = waitUntil(1500) { field = goToField(); return field != nil }
+        }
+        guard let field else {
+            throw ToolError("Go to Folder didn't open in the file panel, so nothing was chosen. Read the window and pick the file by clicking its row, then the panel's button.")
+        }
+        let err = guarded(w, cause: "entering the path") { AX.set(field, "AXValue", goTo as CFString) }
+        guard err == .success, waitUntil(500, { AX.string(field, "AXValue") == goTo }) else {
+            try? press("escape")
+            throw ToolError("couldn't enter the path in Go to Folder (\(AX.errorName(err))), so nothing was chosen")
+        }
+        try press("return")
+        guard waitUntil(3000, { Panel.innerSheet(panel.sheet) == nil }) else {
+            try? press("escape")
+            throw ToolError("the file panel didn't take \(goTo) (Go to Folder stayed open, so it may not be able to reach it); closed Go to Folder, nothing was chosen")
+        }
+        if saving {
+            guard let nameField = Panel.nameField(panel.sheet) else { throw ToolError("went to \(goTo), but found no file name field in the save panel") }
+            let e = guarded(w, cause: "entering the file name") { AX.set(nameField, "AXValue", name as CFString) }
+            guard e == .success, waitUntil(500, { AX.string(nameField, "AXValue") == name }) else {
+                throw ToolError("went to \(goTo), but couldn't enter the name \"\(name)\" (\(AX.errorName(e)))")
+            }
+        } else if !isDir.boolValue, !waitUntil(3000, { Panel.selectedNames(panel.sheet).contains(name) }) {
+            // (Go to Folder with a folder opens it, and a folder picker's
+            // button then chooses the folder it's in: nothing to select.)
+            let selected = Panel.selectedNames(panel.sheet)
+            throw ToolError("went to \(goTo), but the panel selected \(selected.isEmpty ? "nothing" : selected.map { "\"\($0)\"" }.joined(separator: ", ")) instead of \"\(name)\". Read the window and pick the row yourself.")
+        }
+        let what = saving ? "Entered \(path) in the save panel" : "Selected \(path) in the file picker"
+        guard let button = Panel.defaultButton(panel.sheet) else {
+            return ToolResult(text: "\(what), but found no button to finish with: read the window and press it.")
+        }
+        let title = AX.string(button, "AXTitle") ?? "the panel's button"
+        guard confirm else { return ToolResult(text: "\(what). Press \"\(title)\" to finish.") }
+        if AX.bool(button, "AXEnabled") == false {
+            throw ToolError("\(what), but \"\(title)\" is disabled: the panel may not accept this kind of file")
+        }
+        let e = guarded(w, cause: "pressing \(title)") { AX.perform(button, "AXPress") }
+        guard e == .success else { throw ToolError("\(what), but pressing \"\(title)\" failed (\(AX.errorName(e)))") }
+        let closed = waitUntil(3000) {
+            guard let now = AX.window(pid: w.pid, id: w.id).flatMap(AX.sheet(of:)) else { return true }
+            return !CFEqual(now, panel.sheet)
+        }
+        if !closed { return ToolResult(text: "\(what) and pressed \"\(title)\", but the panel is still open: read the window.") }
+        if AX.window(pid: w.pid, id: w.id).flatMap(AX.sheet(of:)) != nil {
+            return ToolResult(text: "\(what) and pressed \"\(title)\"; another sheet is open now (a question, say \"Replace?\"): read the window.")
+        }
+        return ToolResult(text: "\(saving ? "Saved as" : "Chose") \(path) and pressed \"\(title)\".")
     }
 
     /// Load a URL in one of the agent's Chromium windows by Apple event: no
@@ -2333,7 +2526,7 @@ public final class Engine {
         }
         guard let target = item else { throw ToolError("empty path") }
         if AX.bool(target, "AXEnabled") == false { throw ToolError("\"\(path.last!)\" is disabled right now") }
-        let err = try keyed(w, cause: "choosing \(path.joined(separator: " > "))") { check -> AXError in
+        let err = try keyed(w, cause: "choosing \(path.joined(separator: " > "))") { check, _ -> AXError in
             try check()
             let e = AX.perform(target, "AXPress")
             sleepMs(200)
