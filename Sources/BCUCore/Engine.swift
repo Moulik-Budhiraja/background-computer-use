@@ -1982,11 +1982,26 @@ public final class Engine {
     /// agent's window must still be key; if the user switched to the app
     /// partway, it stops rather than guess where the rest would go.
     private func typeKeys(_ w: AgentWindow, _ text: String) throws {
+        let total = text.count
         if let panel = remotePanel(w) {
-            try panelInput(w, cause: "typing") { _ = try Input.typeText(pid: panel.remote.pid, text, windowID: panel.remote.window) }
+            // Before each character: the user may pause the agent or take
+            // over its display partway through a long text.
+            var typed = 0
+            do {
+                try panelInput(w, cause: "typing") {
+                    _ = try Input.typeText(pid: panel.remote.pid, text, windowID: panel.remote.window) { i in
+                        typed = i
+                        if self.paused { throw ToolError("paused by the user") }
+                        if self.userInControl { throw ToolError("the user took over your display") }
+                        return true
+                    }
+                }
+            } catch {
+                let more = typed == 0 ? "Nothing was typed." : "Typed \(typed) of \(total) characters (\"\(text.prefix(typed).suffix(40))\"), nothing after that."
+                throw ToolError("stopped typing: \(error). \(more)")
+            }
             return
         }
-        let total = text.count
         let startedIn = userIsIn(w.pid)
         var typed = 0
         var rest = Substring(text)
