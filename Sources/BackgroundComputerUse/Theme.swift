@@ -28,6 +28,8 @@ extension Color {
 enum Theme {
     static let live = Color(hex: 0x2FB457)
     static let needs = Color(hex: 0xF09A0A)
+    /// Text in the live green, readable on light and dark grounds.
+    static let liveInk = Color(nsColor: .dynamic(light: 0x1E8A42, dark: 0x4CD472))
     static let needsInk = Color(nsColor: .dynamic(light: 0xC77700, dark: 0xF5A623))
     static let quiet = Color(hex: 0x8E8E93)
     /// Same gray the capture compositor paints behind the agent's windows.

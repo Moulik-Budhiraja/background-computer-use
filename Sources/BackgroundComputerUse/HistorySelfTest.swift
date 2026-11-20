@@ -456,7 +456,17 @@ enum HistorySelfTest {
                 gestureOK = dragOK && kept && keptEdge && handedOff
             }
         }
-        exit(ok == total && total > 0 && wrong == 0 && limitOK && clockOK && prunedOK && liveOK && gestureOK && hoverOK ? 0 : 1)
+        // The decoded-frame cache stays under its byte limit and empties on purge.
+        let frameBytes = Int(size.width) * 4 * Int(size.height)
+        let loader = FrameLoader(limitBytes: frameBytes * 3)
+        for i in 0..<5 {
+            loader.insertForTest(fake(size, app: "Notes", title: "Cache", body: "\(i)", field: nil, step: i), key: "cache/\(i)")
+        }
+        let capped = loader.cachedCount <= 3 && loader.cachedBytes <= loader.limitBytes && loader.cachedCount > 0
+        loader.purge()
+        let cacheOK = capped && loader.cachedCount == 0 && loader.cachedBytes == 0
+        print("decoded frames kept under the byte limit, dropped on close: \(cacheOK ? "yes" : "WRONG")")
+        exit(ok == total && total > 0 && wrong == 0 && limitOK && clockOK && prunedOK && liveOK && gestureOK && hoverOK && cacheOK ? 0 : 1)
     }
 
     /// Frames further right are later (gaps only go forward in time), and
