@@ -34,8 +34,10 @@ public struct ActivityItem {
 /// at a time on its own queue; input to apps is serialized across sessions.
 public final class Engine {
     public let sessionID: String
-    /// Shown in the menu bar, e.g. "Claude Code".
-    public let label: String
+    /// Shown in the menu bar, e.g. "Claude Code". A host can rename its session (`rename`).
+    public var label: String { labelLock.lock(); defer { labelLock.unlock() }; return _label }
+    private var _label: String
+    private let labelLock = NSLock()
     /// The host app that shows this session in its own UI (`bcu mcp --host`), if any.
     public let host: String?
     public let display: AgentDisplay
@@ -164,7 +166,7 @@ public final class Engine {
     public init(sessionID: String, label: String, focusGuard: FocusGuard, host: String? = nil,
                 width: Int = AgentDisplay.defaultWidth, height: Int = AgentDisplay.defaultHeight) {
         self.sessionID = sessionID
-        self.label = label
+        _label = label
         self.host = host
         self.focusGuard = focusGuard
         display = AgentDisplay(width: width, height: height)
@@ -386,6 +388,17 @@ public final class Engine {
         stateLock.unlock()
         Log.info((error ? "error: " : "") + text)
         recorder.note(text, error: error)
+        changed()
+    }
+
+    /// Goes by `label` from now on, here and in the run being recorded.
+    public func rename(_ label: String) {
+        labelLock.lock()
+        let same = label == _label
+        _label = label
+        labelLock.unlock()
+        guard !same else { return }
+        recorder.rename(label)
         changed()
     }
 
