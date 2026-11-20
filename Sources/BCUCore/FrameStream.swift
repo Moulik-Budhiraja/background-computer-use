@@ -48,10 +48,11 @@ public final class FrameStream {
             guard let self, self.engine.display.isRunning else { return }
             let skip = self.excluded, only = self.window
             let image: CGImage?
-            if only != 0 {
-                image = Capture.windowFrame(only)
-            } else {
-                image = skip != 0 ? Capture.display(self.engine.display, excluding: skip) : Capture.display(self.engine.display)
+            switch Self.target(window: only, excluded: skip, owns: { self.engine.windows.window($0) != nil }) {
+            case .nothing: image = nil
+            case .window(let id): image = Capture.windowFrame(id)
+            case .display(let excluding):
+                image = excluding != 0 ? Capture.display(self.engine.display, excluding: excluding) : Capture.display(self.engine.display)
             }
             guard let image else { return }
             // The whole display, as the history records it: while someone
@@ -61,6 +62,18 @@ public final class FrameStream {
         }
         t.resume()
         timer = t
+    }
+
+    /// What a frame shows.
+    enum Target: Equatable {
+        case nothing
+        case window(CGWindowID)
+        case display(excluding: CGWindowID)
+    }
+
+    /// The frame for a stream showing `window` (0: the whole display).
+    static func target(window: CGWindowID, excluded: CGWindowID, owns: (CGWindowID) -> Bool) -> Target {
+        window != 0 ? .window(window) : .display(excluding: excluded)
     }
 
     public func stop() {
