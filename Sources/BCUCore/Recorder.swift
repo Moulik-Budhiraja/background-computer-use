@@ -559,7 +559,10 @@ final class RunWriter {
             run.writeMeta()
             store.setLive(run, false)
             store.post()
-            if run.frames.isEmpty { try? FileManager.default.removeItem(at: run.dir) }
+            if run.frames.isEmpty {
+                try? FileManager.default.removeItem(at: run.dir)
+                Log.info("recordings: dropped \(run.id): no frames were recorded")
+            }
             done?()
         }
     }
@@ -638,7 +641,11 @@ public final class SessionRecorder {
     }
 
     private func begin() {
-        guard writer == nil, let store else { return }
+        guard writer == nil else { return }
+        guard let store else {
+            Log.info("recordings: session \(sessionID.prefix(8)) isn't recorded: its host hasn't asked for recordings")
+            return
+        }
         let size = display.bounds.size == .zero
             ? CGSize(width: display.width, height: display.height) : display.bounds.size
         guard let writer = RunWriter(store: store, id: Self.runID(session: sessionID, date: Date()), session: sessionID, label: label,

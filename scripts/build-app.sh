@@ -74,7 +74,7 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
   <key>NSHighResolutionCapable</key><true/>
   <key>NSHumanReadableCopyright</key><string>Background Computer Use</string>
   <key>NSAppleEventsUsageDescription</key><string>New browser windows open straight on the agent's display instead of flashing on your screen.</string>
-  <key>NSAudioCaptureUsageDescription</key><string>Sound from apps only the agent is using is kept off your speakers and saved to a file for the session.</string>
+  <key>NSAudioCaptureUsageDescription</key><string>Agents' sound is kept off your speakers and saved to a file for the session.</string>
   <key>SUFeedURL</key><string>$FEED_URL</string>
   <key>SUPublicEDKey</key><string>$SPARKLE_PUBLIC_KEY</string>
   <key>SUEnableAutomaticChecks</key><true/>
