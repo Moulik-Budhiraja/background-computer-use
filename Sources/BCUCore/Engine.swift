@@ -1920,9 +1920,11 @@ public final class Engine {
     }
 
     /// Whether writing AXFocused gave an element keyboard focus. Some
-    /// elements refuse the write but have focus anyway.
+    /// elements refuse the write but have focus anyway. A web page's static
+    /// text takes the write without an error, but AXFocused isn't settable
+    /// on it and keys stay with the field that has focus.
     static func focusTook(write: AXError, settable: Bool, focused: Bool?) -> Bool {
-        write == .success || focused == true
+        focused == true || (write == .success && settable)
     }
 
     /// Give `el` keyboard focus so keys go to it, or throw with nothing typed.
