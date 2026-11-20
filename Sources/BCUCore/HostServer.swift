@@ -16,6 +16,10 @@ public final class HostServer {
     private let hub: Hub
     private let ownerName: String
     private let version: String
+    /// The menu bar app shows host apps' sessions with its own controls
+    /// (`hello` says `shows_hosts`), so a host needn't put up a menu bar
+    /// icon of its own. A host's own `bcu serve` doesn't.
+    private let showsHosts: Bool
     /// Another engine asked this one to step aside once its agents are done (`yield`).
     public var onYield: (() -> Void)?
     /// Which app owns each session (`SocketServer.scope`): another
@@ -69,21 +73,28 @@ public final class HostServer {
     private let pushQueue = DispatchQueue(label: "bcu.host.push")
     private var observer: Int?
     private var pointerObserver: NSObjectProtocol?
+    private var stopObserver: NSObjectProtocol?
 
-    public init(hub: Hub, ownerName: String, version: String) {
+    public init(hub: Hub, ownerName: String, version: String, showsHosts: Bool = false) {
         self.hub = hub
         self.ownerName = ownerName
         self.version = version
+        self.showsHosts = showsHosts
         observer = hub.addObserver { [weak self] in self?.schedulePush() }
         pointerObserver = NotificationCenter.default.addObserver(forName: Engine.pointerNotification, object: nil, queue: nil) { [weak self] n in
             guard let self, let e = n.object as? Engine, let p = n.userInfo?["pointer"] as? AgentPointer else { return }
             self.sendPointer(e, p)
+        }
+        stopObserver = NotificationCenter.default.addObserver(forName: Engine.stoppedByUserNotification, object: nil, queue: nil) { [weak self] n in
+            guard let self, let e = n.object as? Engine else { return }
+            self.sendStopped(e)
         }
     }
 
     deinit {
         if let observer { hub.removeObserver(observer) }
         if let pointerObserver { NotificationCenter.default.removeObserver(pointerObserver) }
+        if let stopObserver { NotificationCenter.default.removeObserver(stopObserver) }
     }
 
     /// For `SocketServer.hostHandler`. Socket threads.
@@ -112,6 +123,7 @@ public final class HostServer {
         guard let c = clients.removeValue(forKey: id) else { lock.unlock(); return }
         let streams = Array(c.streams.values)
         let remotes = c.remotes
+        let controller = Self.controller(c)
         c.streams = [:]
         c.remotes = [:]
         lock.unlock()
@@ -119,7 +131,7 @@ public final class HostServer {
         for s in streams { s.frames.stop() }
         for (session, remote) in remotes {
             remote.end()
-            hub.engine(id: session)?.setUserInControl(false)
+            hub.engine(id: session)?.setUserInControl(false, by: controller)
         }
     }
 
@@ -142,7 +154,7 @@ public final class HostServer {
             c.subscribed = true
             c.lastSessions = nil
             lock.unlock()
-            if let host { c.release = hub.claim(host: host) }
+            if let host { c.release = hub.claim(host: host, pid: c.connection.peerPID) }
             schedulePush(now: true)
             return ["ok": true]
 
@@ -209,13 +221,13 @@ public final class HostServer {
                     let remote = makeRemote(e, c)
                     lock.lock(); c.remotes[e.sessionID] = remote; lock.unlock()
                 }
-                e.setUserInControl(true)
+                e.setUserInControl(true, by: Self.controller(c))
             } else {
                 lock.lock()
                 let remote = c.remotes.removeValue(forKey: e.sessionID)
                 lock.unlock()
                 remote?.end()
-                e.setUserInControl(false)
+                e.setUserInControl(false, by: Self.controller(c))
             }
             return ["ok": true]
 
@@ -267,7 +279,7 @@ public final class HostServer {
             lock.lock()
             let remote = c.remotes[e.sessionID]
             lock.unlock()
-            guard let remote, e.userInControl else { throw ToolError("take over the session first (take_over)") }
+            guard let remote, e.hasControl(Self.controller(c)) else { throw ToolError("take over the session first (take_over)") }
             let events = (a.raw["events"] as? [JSONObject]) ?? [a.raw["event"] as? JSONObject].compactMap { $0 }
             for ev in events { try HostInput.post(Args(ev), to: remote, display: e.display) }
             return ["ok": true]
@@ -290,6 +302,9 @@ public final class HostServer {
             throw ToolError("unknown op \(op)")
         }
     }
+
+    /// This client, as one of a session's controllers (`Engine.setUserInControl`).
+    private static func controller(_ c: Client) -> String { "host:\(c.connection.id)" }
 
     private func engine(_ a: Args, _ c: Client) throws -> Engine {
         guard let id = a.string("session") else { throw ToolError("missing session") }
@@ -390,8 +405,8 @@ public final class HostServer {
 
     // MARK: State
 
-    private func engineInfo() -> JSONObject {
-        [
+    func engineInfo() -> JSONObject {
+        var o: JSONObject = [
             "protocol": Self.protocolVersion,
             "version": version,
             "owner": ownerName,
@@ -400,6 +415,8 @@ public final class HostServer {
             "max_displays": AgentDisplay.maxDisplays,
             "display": ["width": AgentDisplay.defaultWidth, "height": AgentDisplay.defaultHeight],
         ]
+        if showsHosts { o["shows_hosts"] = true }
+        return o
     }
 
     static func local(_ p: CGPoint, _ e: Engine) -> CGPoint {
@@ -509,6 +526,16 @@ public final class HostServer {
         case .drag(let to): o["kind"] = "drag"; o["to"] = Self.pointJSON(to, e)
         }
         for c in targets { c.connection.send(o) }
+    }
+
+    /// The user stopped a session from the menu bar app: its windows are
+    /// released, and the clients showing it hear so (a host's own `stop`
+    /// isn't echoed back).
+    private func sendStopped(_ e: Engine) {
+        lock.lock()
+        let targets = clients.values.filter { $0.subscribed && shows($0, e) }
+        lock.unlock()
+        for c in targets { c.connection.send(["event": "stopped", "session": e.sessionID]) }
     }
 
     private func sendFrame(_ s: Stream, _ image: CGImage, _ connection: SocketConnection) {

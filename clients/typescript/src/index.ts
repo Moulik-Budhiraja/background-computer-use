@@ -17,7 +17,8 @@ import type {
   RecordingsInfo,
   Rect,
   Session,
-  SessionsEvent
+  SessionsEvent,
+  StoppedEvent
 } from './types.ts'
 
 export type * from './types.ts'
@@ -65,7 +66,8 @@ export type StartOptions = {
 // kind "running" and that engine is the one to use. If the Background
 // Computer Use app is installed and has its permissions, starts it (in the
 // background) and resolves with kind "running": its engine runs your agents
-// and its menu bar leaves them to you. Can take up to 25 s then.
+// and its menu bar shows them beside its own (`hello` says `shows_hosts`).
+// Can take up to 25 s then.
 export function startEngine(opts: StartOptions): Promise<EngineStart> {
   const args = ['serve', '--owner', opts.owner]
   if (opts.logDir) args.push('--log-dir', opts.logDir)
@@ -103,8 +105,9 @@ export function startEngine(opts: StartOptions): Promise<EngineStart> {
 
 export type McpOptions = {
   bcu: string
-  // Your app's ID. Sessions with it are yours to show; the Background
-  // Computer Use menu bar leaves them out while you're subscribed.
+  // Your app's ID. Sessions with it are yours to show. The Background
+  // Computer Use menu bar shows them too, with your app's icon, and leaves
+  // their handoff notifications to you while you're subscribed.
   host: string
   // Your own ID for the session (say, a helper's), so your UI can match it.
   session?: string
@@ -127,6 +130,7 @@ type Events = {
   cursor: [CursorEvent]
   menu: [MenuEvent]
   drag: [DragEvent]
+  stopped: [StoppedEvent]
   // The engine went away (it quit, or handed over to another one). Call
   // startEngine again and connect to the engine it reports.
   close: []

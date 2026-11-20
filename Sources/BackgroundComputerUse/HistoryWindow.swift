@@ -161,9 +161,15 @@ final class HistoryWindowController {
             ctx.duration = 0.15
             p.animator().alphaValue = 0
             d.animator().alphaValue = 0
-        }, completionHandler: {
+        }, completionHandler: { [weak self] in
             p.orderOut(nil)
             d.orderOut(nil)
+            // Decoded frames and video decoders are large: don't hold them
+            // while nothing shows them. Unless it opened again meanwhile.
+            guard let self, self.panel == nil else { return }
+            self.loader.purge()
+            self.frameView.clear()
+            self.model.unload()
         })
     }
 }
