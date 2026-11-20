@@ -232,16 +232,16 @@ public final class HostServer {
                 guard let s, connection.backlog < 2 else { return }
                 self.sendFrame(s, image, connection)
             }
-            s.frames.window = CGWindowID(a.int("window") ?? 0)
-            s.frames.excluded = CGWindowID(a.int("exclude") ?? 0)
+            s.frames.window = try a.windowID("window") ?? 0
+            s.frames.excluded = try a.windowID("exclude") ?? 0
             lock.lock(); c.streams[s.id] = s; lock.unlock()
             s.frames.start(fps: a.int("fps") ?? 15)
             return ["ok": true, "stream": s.id]
 
         case "frames_update":
             let s = try stream(a, c)
-            if let w = a.int("window") { s.frames.window = CGWindowID(w) }
-            if let x = a.int("exclude") { s.frames.excluded = CGWindowID(x) }
+            if let w = try a.windowID("window") { s.frames.window = w }
+            if let x = try a.windowID("exclude") { s.frames.excluded = x }
             if let m = a.int("max_width") { s.maxWidth = m }
             if let q = a.double("quality") { s.quality = q }
             if let fps = a.int("fps") { s.frames.start(fps: fps) }

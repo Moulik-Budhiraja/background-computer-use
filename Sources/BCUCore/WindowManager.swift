@@ -255,26 +255,46 @@ public final class WindowManager {
 
     public func resolveApp(_ query: String) throws -> AppTarget {
         let q = query.trimmingCharacters(in: .whitespaces)
-        let lower = q.lowercased().replacingOccurrences(of: ".app", with: "")
+        // A bundle id is matched as given ("com.example.app" ends in .app); a name without ".app".
+        let name = AppNameMatch.stripped(q)
         let running = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular && !$0.isTerminated }
-        if let app = running.first(where: { $0.bundleIdentifier?.lowercased() == lower })
-            ?? running.first(where: { $0.localizedName?.lowercased() == lower }) {
-            return AppTarget(name: app.localizedName ?? q, bundleID: app.bundleIdentifier, running: app, url: app.bundleURL)
+        func target(_ app: NSRunningApplication) -> AppTarget {
+            AppTarget(name: app.localizedName ?? q, bundleID: app.bundleIdentifier, running: app, url: app.bundleURL)
         }
-        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: q) {
-            return AppTarget(name: url.deletingPathExtension().lastPathComponent, bundleID: q, running: nil, url: url)
+        func target(_ url: URL) -> AppTarget {
+            AppTarget(name: url.deletingPathExtension().lastPathComponent, bundleID: Bundle(url: url)?.bundleIdentifier, running: nil, url: url)
         }
+        if let app = running.first(where: { AppNameMatch.sameBundleID($0.bundleIdentifier, q) })
+            ?? running.first(where: { $0.localizedName.map { AppNameMatch.rank(name, name: $0) == .exact } ?? false }) {
+            return target(app)
+        }
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: q) { return target(url) }
         let dirs = ["/Applications", "/System/Applications", "/System/Applications/Utilities",
                     "/Applications/Utilities", NSHomeDirectory() + "/Applications", "/System/Library/CoreServices"]
         for dir in dirs {
-            let url = URL(fileURLWithPath: dir).appendingPathComponent("\(q.replacingOccurrences(of: ".app", with: "")).app")
-            if FileManager.default.fileExists(atPath: url.path) {
-                let bundle = Bundle(url: url)
-                return AppTarget(name: url.deletingPathExtension().lastPathComponent, bundleID: bundle?.bundleIdentifier, running: nil, url: url)
+            let url = URL(fileURLWithPath: dir).appendingPathComponent("\(name).app")
+            if FileManager.default.fileExists(atPath: url.path) { return target(url) }
+        }
+        // No exact match: the running or installed app whose name matches
+        // best ("Chrome" is Google Chrome, "Code" isn't Xcode when Visual
+        // Studio Code is there), if just one does.
+        var candidates: [String: AppTarget] = [:]
+        for app in running { if let n = app.localizedName, candidates[n.lowercased()] == nil { candidates[n.lowercased()] = target(app) } }
+        let runningPaths = Set(running.compactMap { $0.bundleURL?.standardizedFileURL.path })
+        for dir in dirs {
+            for file in (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [] where file.hasSuffix(".app") {
+                let url = URL(fileURLWithPath: dir).appendingPathComponent(file)
+                let n = url.deletingPathExtension().lastPathComponent
+                guard candidates[n.lowercased()] == nil, !runningPaths.contains(url.standardizedFileURL.path) else { continue }
+                candidates[n.lowercased()] = target(url)
             }
         }
-        if let app = running.first(where: { ($0.localizedName ?? "").lowercased().contains(lower) }) {
-            return AppTarget(name: app.localizedName ?? q, bundleID: app.bundleIdentifier, running: app, url: app.bundleURL)
+        switch AppNameMatch.best(name, among: candidates.values.map(\.name)) {
+        case .one(let n):
+            if let t = candidates[n.lowercased()] { return t }
+        case .ambiguous(let names):
+            throw ToolError("\"\(q)\" could be \(names.map { "\"\($0)\"" }.joined(separator: ", ")). Give the app's full name or bundle id.")
+        case .none: break
         }
         throw ToolError("no app named \"\(q)\" is running or installed. Use list_apps to see running apps.")
     }
@@ -313,13 +333,14 @@ public final class WindowManager {
     /// from when the new window could take key until key is back on theirs.
     /// `beforeAsk` runs once it's this session's turn to open a window,
     /// just before the app is asked for it (and before any input is held);
-    /// if it throws, nothing is opened.
+    /// if it throws, nothing is opened. `keyBack` runs once key is back on
+    /// the window that had it (or that was given up on).
     public func open(app query: String, placement: Placement = .auto, trigger: String? = nil, hold: InputHold? = nil,
-                     beforeAsk: (() throws -> Void)? = nil) throws -> OpenResult {
+                     beforeAsk: (() throws -> Void)? = nil, keyBack: (() -> Void)? = nil) throws -> OpenResult {
         let target = try resolveApp(query)
         if let running = target.running {
             return try openNewWindow(pid: running.processIdentifier, name: target.name, bundleID: target.bundleID, placement: placement, trigger: trigger,
-                                     hold: hold, beforeAsk: beforeAsk)
+                                     hold: hold, beforeAsk: beforeAsk, keyBack: keyBack)
         }
         guard let url = target.url else { throw ToolError("can't find \(target.name) on disk") }
         return try launch(url: url, name: target.name, bundleID: target.bundleID)
@@ -349,45 +370,72 @@ public final class WindowManager {
             throw ToolError("could not launch \(name): \(launchError?.localizedDescription ?? "timed out")")
         }
         let pid = app.processIdentifier
-        // A fresh launch: every window it shows is the agent's.
-        lock.lock(); knownBefore[pid] = ([], nowMs()); lock.unlock()
         focusGuard.beginAction(pid: pid, cause: "launching \(name)")
         defer { focusGuard.endAction(pid: pid, graceMs: 2000) }
 
-        // Wait for the app to answer accessibility and show its first windows.
+        // Wait for the app to answer accessibility and show its first
+        // windows, then for it to finish showing them: an app restores
+        // several (Chrome's last session, TextEdit's unsaved documents) one
+        // after another.
         let deadline = nowMs() + 8000
         var axWindows: [AXUIElement] = []
-        while nowMs() < deadline {
-            axWindows = AX.windows(pid).filter { AX.windowID($0) != nil }
-            if !axWindows.isEmpty { break }
+        var lastChangeMs = nowMs()
+        var settleBy = deadline
+        while nowMs() < min(deadline, settleBy) {
+            let now = AX.windows(pid).filter { AX.windowID($0) != nil }
+            if Set(now.compactMap { AX.windowID($0) }) != Set(axWindows.compactMap { AX.windowID($0) }) {
+                axWindows = now
+                lastChangeMs = nowMs()
+                if settleBy == deadline && !now.isEmpty { settleBy = nowMs() + 3000 }
+            }
+            if !axWindows.isEmpty && nowMs() - lastChangeMs >= 700 { break }
             sleepMs(100)
         }
-        var notes = ["launched \(name) hidden"]
-        var first: AgentWindow?
+        // What the app shows at startup is the user's, as if they'd opened
+        // it: it stays on their screen and is never closed with the agent's
+        // windows. The agent gets a window of its own. One restored where an
+        // agent display is (or was) goes to the user's main display.
+        let main = CGDisplayBounds(CGMainDisplayID())
         for w in axWindows {
-            guard let id = AX.windowID(w) else { continue }
-            let size = AX.size(w) ?? CGSize(width: 1200, height: 800)
-            moveToAgent(w, size: size)
-            let aw = AgentWindow(id: id, pid: pid, appName: name, bundleID: bundleID, kind: .opened)
-            register(aw)
-            if first == nil { first = aw }
+            guard let f = AX.frame(w), AgentDisplay.containing(CGPoint(x: f.midX, y: f.midY)) != nil || !display.touchesUser(f) else { continue }
+            let size = f.size
+            AX.setSize(w, CGSize(width: min(size.width, main.width - 80), height: min(size.height, main.height - 100)))
+            AX.setPosition(w, CGPoint(x: main.minX + 40, y: main.minY + 60))
         }
         app.unhide()
-        sleepMs(250)
-        for w in axWindows { if let id = AX.windowID(w), let info = WindowList.info(id), !display.holds(info.bounds) { moveToAgent(w, size: info.bounds.size) } }
-        if let first {
-            let title = AX.window(pid: pid, id: first.id).flatMap { AX.string($0, "AXTitle") } ?? ""
-            notes.append("its startup window \"\(title)\" is on your display; if it's not the window you need, use press_menu_item or press_key in it")
-            return OpenResult(window: first, notes: notes)
+        var notes = ["launched \(name) hidden"]
+        if !axWindows.isEmpty { notes.append("the \(axWindows.count) window(s) it opened at startup are the user's and stay on their screen") }
+        do {
+            // (It notes the startup windows as there before, so they aren't caught as the agent's.)
+            let result = try openNewWindow(pid: pid, name: name, bundleID: bundleID)
+            return OpenResult(window: result.window, notes: notes + result.notes)
+        } catch {
+            // An app with one window (Calculator, System Settings): borrow
+            // it, so it goes back to the user rather than closing.
+            let front = BCUFrontProcessPID()
+            if axWindows.count == 1 && front == pid {
+                throw ToolError("\(name) didn't open a new window, and the user is using it now, so its window wasn't borrowed. Retry later.")
+            }
+            guard Self.mayBorrowStartupWindow(startupWindows: axWindows.count, pid: pid, front: front),
+                  let id = AX.windowID(axWindows[0]), WindowList.info(id) != nil else { throw error }
+            let aw = try borrow(id)
+            let title = AX.string(axWindows[0], "AXTitle") ?? ""
+            notes.append("\(name) didn't open a new window, so its startup window \"\(title)\" is borrowed: it goes back to the user when released")
+            return OpenResult(window: aw, notes: notes)
         }
-        // No startup window: open one the normal way.
-        let result = try openNewWindow(pid: pid, name: name, bundleID: bundleID)
-        return OpenResult(window: result.window, notes: notes + result.notes)
+    }
+
+    /// Whether a cold launch that got no new window borrows the app's
+    /// startup window instead: only an app's only one, and not while the
+    /// user is in the app (they may have gone to it while the open waited
+    /// its turn), as `borrow_window` asks.
+    static func mayBorrowStartupWindow(startupWindows: Int, pid: pid_t, front: pid_t) -> Bool {
+        startupWindows == 1 && front != pid
     }
 
     /// Open a new window of a running app and put it on the agent display.
     private func openNewWindow(pid: pid_t, name: String, bundleID: String?, placement: Placement = .auto, trigger: String? = nil,
-                               hold: InputHold? = nil, beforeAsk: (() throws -> Void)? = nil) throws -> OpenResult {
+                               hold: InputHold? = nil, beforeAsk: (() throws -> Void)? = nil, keyBack: (() -> Void)? = nil) throws -> OpenResult {
         // Not while displays are still being added (see `awaitSettled`):
         // before this session's turn, and again once it has it.
         var settledMs = AgentDisplay.awaitSettled()
@@ -549,6 +597,7 @@ public final class WindowManager {
                 if AX.focusedWindowID(pid) == previousKey { break }
             }
         }
+        keyBack?()
         focusGuard.endSwap(pid)
         appLock.unlock()
         holdingInput = false
@@ -1308,15 +1357,16 @@ final class WindowCatcher {
 
     func start() {
         startMs = nowMs()
-        DispatchQueue.main.sync {
-            var obs: AXObserver?
-            guard AXObserverCreate(pid, catcherCallback, &obs) == .success, let obs else { return }
-            let refcon = Unmanaged.passUnretained(self).toOpaque()
-            AXObserverAddNotification(obs, AX.app(pid), kAXWindowCreatedNotification as CFString, refcon)
-            CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .commonModes)
-            observer = obs
-        }
         polling = true
+        // Not while BCU quits (see `onMainUnlessQuitting`): then polling alone catches the window.
+        onMainUnlessQuitting {
+            var obs: AXObserver?
+            guard AXObserverCreate(self.pid, catcherCallback, &obs) == .success, let obs else { return }
+            let refcon = Unmanaged.passUnretained(self).toOpaque()
+            AXObserverAddNotification(obs, AX.app(self.pid), kAXWindowCreatedNotification as CFString, refcon)
+            CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .commonModes)
+            self.observer = obs
+        }
         let thread = Thread { [weak self] in self?.poll() }
         thread.qualityOfService = .userInteractive
         thread.start()
@@ -1325,17 +1375,20 @@ final class WindowCatcher {
     func stop() {
         polling = false
         if let obs = observer {
-            DispatchQueue.main.sync {
-                AXObserverRemoveNotification(obs, AX.app(pid), kAXWindowCreatedNotification as CFString)
+            observer = nil
+            // Without waiting for the main thread, which may be waiting on
+            // this one (quitting). It holds the catcher until then, and
+            // `created` ignores the window from now on.
+            DispatchQueue.main.async {
+                AXObserverRemoveNotification(obs, AX.app(self.pid), kAXWindowCreatedNotification as CFString)
                 CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .commonModes)
             }
-            observer = nil
         }
     }
 
     /// AXObserver path: runs on the main thread right after the window is created.
     fileprivate func created(_ element: AXUIElement) {
-        guard let id = AX.windowID(element), !before.contains(id), !WindowManager.isRegistered(id) else { return }
+        guard polling, let id = AX.windowID(element), !before.contains(id), !WindowManager.isRegistered(id) else { return }
         catchWindow(id: id, element: element)
     }
 
