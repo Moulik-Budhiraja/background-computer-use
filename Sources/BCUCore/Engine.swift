@@ -1363,8 +1363,9 @@ public final class Engine {
     }
 
     /// A window coordinate from the agent, for a message.
+    /// Int(v) traps past Int's range, and JSON allows any finite number.
     static func windowPoint(_ v: Double) -> String {
-        "\(Int(v))"
+        abs(v) < 1e15 ? "\(Int(v))" : "\(v)"
     }
 
     /// A point outside the window would land on whatever is next to it on
