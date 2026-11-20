@@ -167,8 +167,6 @@ public final class FocusGuard {
     /// agents work, so a click has a look from before anything it opened.
     private var screenLook: [CGWindowID: String]?
     private let clickQueue = DispatchQueue(label: "bcu.guard.click", qos: .userInteractive)
-    /// Accessibility's answer for a click, which a busy app can make slow.
-    private let axClickQueue = DispatchQueue(label: "bcu.guard.click.ax", qos: .userInteractive)
     /// When an agent's step on each app last ended (see `Bounce`).
     private var lastActedMs: [pid_t: Double] = [:]
     private var lastUserSwitchKeyMs = 0.0
@@ -1560,8 +1558,10 @@ public final class FocusGuard {
     private func noteClick(at p: CGPoint) {
         let ms = nowMs()
         lock.lock(); let look = screenLook; lastClick = Click(ms: ms, point: p, windows: look); lock.unlock()
-        // The window list first, on its own queue: a slow accessibility
-        // answer for one click mustn't hold up the next click's fallback.
+        // The window list first, on its own queue, and accessibility for
+        // each click on its own (at most 300 ms): a busy app's slow answer
+        // for one click mustn't hold up the next click's, say a click on the
+        // Dock, which answers in a few ms.
         clickQueue.async {
             let fallback = Self.listedTarget(at: p)
             self.lock.lock()
@@ -1578,8 +1578,8 @@ public final class FocusGuard {
                 self.lock.unlock()
                 return
             }
-            self.axClickQueue.async {
-                // A newer click came while this one waited: its answer is the one asked for.
+            DispatchQueue.global(qos: .userInteractive).async {
+                // A newer click came meanwhile: its answer is the one asked for.
                 self.lock.lock(); let current = self.lastClick.ms == ms; self.lock.unlock()
                 guard current else { return }
                 let (target, element) = Self.whatWasClicked(at: p, listed: fallback)
