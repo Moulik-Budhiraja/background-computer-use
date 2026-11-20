@@ -259,7 +259,7 @@ public enum KeyMap {
         let folded = key.lowercased().replacingOccurrences(of: "_", with: "").replacingOccurrences(of: "-", with: "").replacingOccurrences(of: " ", with: "")
         if key.count > 1, let c = named[folded] { return (c, false) }
         if key.count == 1, let ch = key.first {
-            if ch != " ", let hit = LayoutKeys.code(for: ch, command: command) { return hit }
+            if ch != " ", let hit = try LayoutKeys.code(for: ch, command: command) { return hit }
             if let c = chars[Character(ch.lowercased())] { return (c, ch.isUppercase) }
             if let base = shifted[ch], let c = chars[base] { return (c, true) }
             if ch == " " { return (49, false) }
@@ -371,13 +371,20 @@ enum LayoutKeys {
     private static let cache = Invalidated<Tables>()
     private static var observer: NSObjectProtocol?
 
-    static func code(for ch: Character, command: Bool) -> (CGKeyCode, Bool)? {
+    /// Runs `work` on the main thread and waits for it; false if it didn't
+    /// run (BCU is quitting).
+    static var runOnMain: (@escaping () -> Void) -> Bool = { work in DispatchQueue.main.sync(execute: work); return true }
+
+    /// Drops the tables, as a change of input source does.
+    static func forget() { cache.invalidate() }
+
+    static func code(for ch: Character, command: Bool) throws -> (CGKeyCode, Bool)? {
         let (cached, generation) = cache.read()
         var t = cached
         if t == nil {
             // Text Input Sources wants the main thread.
             var read: Tables?
-            if Thread.isMainThread { read = load() } else { DispatchQueue.main.sync { read = load() } }
+            if Thread.isMainThread { read = load() } else { _ = runOnMain { read = load() } }
             if let read { cache.publish(read, readAt: generation) }
             t = read
         }
