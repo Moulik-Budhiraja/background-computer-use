@@ -67,4 +67,18 @@ final class SubagentSessionTests: XCTestCase {
         XCTAssertEqual(RemoteControl.appLockWait(.leftMouseDown), RemoteControl.appLockWaitS)
         XCTAssertEqual(RemoteControl.appLockWait(.keyDown), RemoteControl.appLockWaitS)
     }
+
+    func testAConnectedParentStaysASubagentsUserWhenItsEngineIsForgotten() {
+        // The parent only works in its subagent's windows, so its own
+        // engine looks dormant, but it's still connected.
+        let usedBy = ["parent/agent-1": Set(["parent", "other"])]
+        let pruned = Hub.prunedUsers(usedBy, gone: ["parent", "other"], attached: ["parent": 1])
+        XCTAssertEqual(pruned["parent/agent-1"], ["parent"])
+    }
+
+    func testASubagentLeftWithNobodyGetsAFreshGrace() {
+        let times = Hub.departedTimes(["parent/agent-1": 1000, "x": 2000], left: ["parent/agent-1"], now: 9000)
+        XCTAssertEqual(times["parent/agent-1"], 9000)
+        XCTAssertEqual(times["x"], 2000)
+    }
 }
