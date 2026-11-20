@@ -71,9 +71,12 @@ public final class FrameStream {
         case display(excluding: CGWindowID)
     }
 
-    /// The frame for a stream showing `window` (0: the whole display).
+    /// The frame for a stream showing `window` (0: the whole display). A
+    /// window shows only while the session owns it: one it released (and
+    /// another app's agent may have borrowed since) gets no frames.
     static func target(window: CGWindowID, excluded: CGWindowID, owns: (CGWindowID) -> Bool) -> Target {
-        window != 0 ? .window(window) : .display(excluding: excluded)
+        if window == 0 { return .display(excluding: excluded) }
+        return owns(window) ? .window(window) : .nothing
     }
 
     public func stop() {
