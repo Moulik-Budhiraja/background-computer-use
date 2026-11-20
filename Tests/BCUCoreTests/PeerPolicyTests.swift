@@ -232,4 +232,17 @@ final class PeerPolicyTests: XCTestCase {
         XCTAssertEqual(PeerPolicy.trustedPath("/opt/node/bin/node", bundleExecutable: mainOf), "/opt/node/bin/node")
         XCTAssertEqual(PeerPolicy.trustedPath("/opt/node", bundleExecutable: mainOf), "/opt/node")
     }
+
+    /// A host running its own engine names its host ID from clients the
+    /// engine trusts as its own. Another app can't claim that ID after
+    /// (and so set where its sessions are recorded).
+    func testOwnersHostIDIsReservedToo() {
+        let scope = PeerScope()
+        let other = PeerTrust.app(team: "CCCCCCCCCC")
+        XCTAssertTrue(scope.claimHost("own-host", .owner))
+        XCTAssertFalse(scope.claimHost("own-host", other))
+        XCTAssertNil(scope.admitCall(session: "agent", parent: nil, host: "called-host", .owner))
+        XCTAssertFalse(scope.claimHost("called-host", other))
+        XCTAssertNotNil(scope.admitCall(session: "x", parent: nil, host: "called-host", other))
+    }
 }
