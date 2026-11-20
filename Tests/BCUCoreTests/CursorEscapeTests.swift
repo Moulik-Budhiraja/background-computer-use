@@ -43,4 +43,25 @@ final class CursorEscapeTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(q.x, small.midX - 1)
         XCTAssertGreaterThanOrEqual(q.y, small.midY - 1)
     }
+
+    // The user pushing their own mouse into the corner the agent display
+    // touches: it stops in the corner, as on any screen's edge.
+    func testTheUsersOwnMoveIntoTheCornerStaysInTheCorner() {
+        let q = FocusGuard.returnPoint(CGPoint(x: 1513, y: 983), agent: agent, users: [user], fenced: [agent], msSinceUserMove: 0)
+        XCTAssertEqual(q, CGPoint(x: user.maxX - 1, y: user.maxY - 1))
+    }
+
+    // The cursor watch can see the cursor over there a moment before the
+    // tap moves it back: a move the user just made is still theirs.
+    func testACursorFoundThereRightAfterAUserMoveStaysInTheCorner() {
+        let q = FocusGuard.returnPoint(CGPoint(x: 1520, y: 990), agent: agent, users: [user], fenced: [agent], msSinceUserMove: 5)
+        XCTAssertEqual(q, CGPoint(x: user.maxX - 1, y: user.maxY - 1))
+    }
+
+    // Put there by something else (a warp, the tap off) with the mouse still:
+    // it comes back inside the screen, where the user can see it.
+    func testACursorFoundThereWithoutAUserMoveComesBackInside() {
+        let q = FocusGuard.returnPoint(CGPoint(x: 1520, y: 990), agent: agent, users: [user], fenced: [agent], msSinceUserMove: 2000)
+        XCTAssertEqual(q, CGPoint(x: user.maxX - 1 - FocusGuard.escapeInset, y: user.maxY - 1 - FocusGuard.escapeInset))
+    }
 }
