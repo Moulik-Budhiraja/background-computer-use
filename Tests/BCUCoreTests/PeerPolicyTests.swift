@@ -163,4 +163,19 @@ final class PeerPolicyTests: XCTestCase {
         disk.sealedApps["/tmp/Fake.app"] = theirs
         XCTAssertTrue(HostCheck.vouches(app: "/tmp/Fake.app", peer: interpreter, disk: disk))
     }
+
+    /// The peer has to be the code that's in the signed app now: one that
+    /// was started from another file there doesn't count.
+    func testThePeerIsTheCodeInTheSignedApp() {
+        let disk = FakeDisk()
+        disk.sealedApps[hostApp] = theirs
+        disk.signed["\(hostApp)/Contents/Resources/bcu"] = theirs
+        disk.hashes["\(hostApp)/Contents/MacOS/Host"] = Data([1])
+        let host = PeerIdentity(path: "\(hostApp)/Contents/MacOS/Host", valid: true, team: theirs, cdhash: Data([1]))
+        XCTAssertTrue(HostCheck.vouches(app: hostApp, peer: host, disk: disk))
+        let swapped = PeerIdentity(path: "\(hostApp)/Contents/MacOS/Host", valid: true, team: theirs, cdhash: Data([2]))
+        XCTAssertFalse(HostCheck.vouches(app: hostApp, peer: swapped, disk: disk))
+        let outside = PeerIdentity(path: "/tmp/other", valid: true, team: theirs, cdhash: Data([1]))
+        XCTAssertFalse(HostCheck.vouches(app: hostApp, peer: outside, disk: disk))
+    }
 }
