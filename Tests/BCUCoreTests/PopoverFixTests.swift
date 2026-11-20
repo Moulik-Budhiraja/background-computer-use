@@ -54,3 +54,26 @@ final class StopAndMenuSurfaceTests: XCTestCase {
         XCTAssertEqual(MenuSurface.toClose(before: .panel, showing: []), [])
     }
 }
+
+/// Pure rules only, like the ones above.
+final class HandBackTests: XCTestCase {
+    /// Done after a long handoff: the agent gets its chance to resume first.
+    func testAnUpdateWaitsAfterTheUserHandsWindowsBack() {
+        let returned = UpdateGate.Session(msSinceLastCall: .infinity, hasWindows: true, handedOff: false, userInControl: false,
+                                          msSinceUserReturned: 1000)
+        XCTAssertFalse(UpdateGate.canInstall([returned], setupOpen: false))
+        let longAgo = UpdateGate.Session(msSinceLastCall: .infinity, hasWindows: true, handedOff: false, userInControl: false,
+                                         msSinceUserReturned: UpdateGate.quietMs)
+        XCTAssertTrue(UpdateGate.canInstall([longAgo], setupOpen: false))
+    }
+
+    /// Done while paused: the paused call still tells the agent.
+    func testARefusedCallCarriesTheUsersNotes() {
+        let note = "\n[user] The user pressed Done on window 7 (Safari)."
+        XCTAssertEqual(Engine.refusal(tool: "click", userInControl: false, paused: true, notes: { note })?.hasSuffix(note), true)
+        XCTAssertEqual(Engine.refusal(tool: "take_back", userInControl: true, paused: false, notes: { note })?.hasSuffix(note), true)
+        // A call that runs leaves the notes for its own result.
+        XCTAssertNil(Engine.refusal(tool: "click", userInControl: false, paused: false, notes: { XCTFail("taken"); return note }))
+        XCTAssertNil(Engine.refusal(tool: "screenshot", userInControl: false, paused: true, notes: { XCTFail("taken"); return note }))
+    }
+}
