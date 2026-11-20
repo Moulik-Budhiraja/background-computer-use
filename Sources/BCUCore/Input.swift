@@ -316,8 +316,8 @@ public enum KeyMap {
     /// `lookup` is `code(for:command:)`.
     public static func press(key: String, modifiers: [String],
                              lookup: (String, Bool) throws -> (CGKeyCode, Bool) = { try KeyMap.code(for: $0, command: $1) }) throws -> (CGKeyCode, CGEventFlags) {
-        let (code, implicitShift) = try lookup(key, false)
         var flags = try modifierFlags(modifiers)
+        let (code, implicitShift) = try lookup(key, flags.contains(.maskCommand))
         let letter = key.count == 1 && key.first!.isLetter
         if implicitShift && !(letter && !flags.isEmpty) { flags.insert(.maskShift) }
         return (code, flags)
