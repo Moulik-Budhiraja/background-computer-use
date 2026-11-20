@@ -229,6 +229,12 @@ export class EngineClient extends EventEmitter<Events> {
     return this.request('pause', { session, paused }).then(() => undefined)
   }
 
+  // Call the session `label` from now on, here and in the menu bar app, as
+  // when your name for it changes after its agent started.
+  rename(session: string, label: string): Promise<void> {
+    return this.request('rename', { session, label }).then(() => undefined)
+  }
+
   // Release every window the session has and clear what it's waiting on.
   stop(session: string): Promise<void> {
     return this.request('stop', { session }).then(() => undefined)
