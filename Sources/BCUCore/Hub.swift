@@ -344,6 +344,14 @@ public final class Hub {
             }
             if self.ticks % 5 == 0 {
                 for e in self.engines { e.tearDownIfIdle(idleMs: Self.idleTeardownMs) }
+                // Again for an agent that went away while the user was in
+                // control: nothing else would release its windows.
+                self.lock.lock()
+                let departed = self.departedAtMs.keys.compactMap { self.byID[$0] }
+                self.lock.unlock()
+                for e in departed {
+                    e.releaseAbandonedLater { [weak self, weak e] in e.flatMap { self?.isAttached($0) } ?? true }
+                }
                 self.forgetDormant()
             }
         }
