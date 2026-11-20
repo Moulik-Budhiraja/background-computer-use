@@ -860,6 +860,7 @@ public final class WindowManager {
                 AX.setSize(ax, f.size)
             }
             unregister(id)
+            Self.returnedToUser(id)
             return "returned window \(id) to where it was"
         case .opened, .caught:
             if keepOpen {
@@ -1054,6 +1055,8 @@ public final class WindowManager {
     /// A session has the window again (`register`): not kept any more, so
     /// its sweep looks after it.
     static func ownedAgain(_ id: CGWindowID) { keptLock.lock(); keptOpen.remove(id); keptLock.unlock() }
+    /// A borrowed window went back to the user (`release`).
+    static func returnedToUser(_ id: CGWindowID) {}
 
     /// What cleanup does with a window nobody has left on an agent display:
     /// close one an agent opened or caught (and didn't keep open); put any
