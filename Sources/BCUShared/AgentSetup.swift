@@ -159,18 +159,17 @@ public enum AgentSetup {
 
     /// Where `claude` is, and the PATH the user's shell sets up.
     static func findClaude() -> (path: String, shellPath: [String])? {
-        let fm = FileManager.default
         // An interactive login shell reads .zshrc (or .bashrc, or fish's
         // config), where nvm, volta, asdf and fnm put themselves on PATH.
         let marker = "__BCU_PATH__="
         let (_, output) = run(loginShell(), ["-ilc", "command -v claude; echo \"\(marker)$PATH\""], timeout: 10)
         let parsed = parseShellLookup(output, marker: marker)
-        if let path = parsed.claude.map(expandTilde), fm.isExecutableFile(atPath: path) {
+        if let path = parsed.claude.map(expandTilde), isProgram(path) {
             return (path, parsed.path)
         }
         for dir in parsed.path + claudeSearchDirs() {
             let path = dir + "/claude"
-            if fm.isExecutableFile(atPath: path) { return (path, parsed.path) }
+            if isProgram(path) { return (path, parsed.path) }
         }
         return nil
     }
@@ -223,6 +222,11 @@ public enum AgentSetup {
             }
         }
         return started ? word : nil
+    }
+
+    /// A file that can be run.
+    static func isProgram(_ path: String) -> Bool {
+        FileManager.default.isExecutableFile(atPath: path)
     }
 
     static func expandTilde(_ path: String) -> String {
