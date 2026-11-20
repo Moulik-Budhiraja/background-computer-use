@@ -90,4 +90,19 @@ final class ReviewFixTests: XCTestCase {
         WindowManager.ownedAgain(id)
         XCTAssertFalse(WindowManager.isKept(id))
     }
+
+    func testAWindowGoesToARealDisplayWhenAnAgentsIsMain() {
+        XCTAssertEqual(WindowManager.userScreen(main: 1, users: [1, 2]), 1)
+        // The user's displays asleep: macOS made an agent display main.
+        XCTAssertEqual(WindowManager.userScreen(main: 9, users: [2]), 2)
+        XCTAssertNil(WindowManager.userScreen(main: 9, users: []))
+    }
+
+    func testOnlyOneStrayRescueIsQueuedAtATime() {
+        XCTAssertTrue(WindowManager.takeStrayTurn())
+        XCTAssertFalse(WindowManager.takeStrayTurn())
+        WindowManager.endStrayTurn()
+        XCTAssertTrue(WindowManager.takeStrayTurn())
+        WindowManager.endStrayTurn()
+    }
 }
