@@ -426,6 +426,18 @@ final class ClaudeLookupTests: XCTestCase {
         XCTAssertEqual(r.path, ["/Users/me/Node Versions/v22/bin", "/usr/bin"])
     }
 
+    /// A profile can print a folder, which the lookup reads as a path.
+    func testAFolderIsntAProgram() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("bcu-claude-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        XCTAssertFalse(AgentSetup.isProgram(dir.path))
+        let file = dir.appendingPathComponent("claude")
+        try Data("#!/bin/sh\n".utf8).write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+        XCTAssertTrue(AgentSetup.isProgram(file.path))
+    }
+
     func testNotFound() {
         let r = AgentSetup.parseShellLookup("", marker: marker)
         XCTAssertNil(r.claude)
