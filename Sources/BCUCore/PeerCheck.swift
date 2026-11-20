@@ -257,13 +257,16 @@ public protocol CodeOnDisk {
 /// Whether another developer's app vouches for a process in it.
 public enum HostCheck {
     /// The app at `app` ships a `bcu` (see `PeerPolicy.bcuLocations`) signed
-    /// by the peer's team.
+    /// by the peer's team, and the app itself is signed by that team with
+    /// its seal intact. A file named bcu in a folder named .app proves
+    /// nothing: anyone can copy a signed program there.
     public static func vouches(app: String, peer: PeerIdentity, disk: CodeOnDisk) -> Bool {
         guard let team = peer.team else { return false }
         var candidates = PeerPolicy.bcuLocations.map { "\(app)/\($0)" }
         let resources = "\(app)/Contents/Resources"
         for sub in disk.subfolders(resources) { candidates.append("\(resources)/\(sub)/bcu") }
-        return candidates.contains { disk.isExecutable($0) && disk.isSigned($0, team: team) }
+        guard candidates.contains(where: { disk.isExecutable($0) && disk.isSigned($0, team: team) }) else { return false }
+        return disk.isSealedApp(app, team: team)
     }
 }
 
