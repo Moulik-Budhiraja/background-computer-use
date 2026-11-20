@@ -389,6 +389,13 @@ final class ClaudeLookupTests: XCTestCase {
         XCTAssertEqual(bash.claude, "~/.claude/local/claude")
     }
 
+    func testAliasWithAQuotedPath() {
+        let bash = AgentSetup.parseShellLookup("alias claude='\"/opt/Claude Code/claude\" --verbose'\n", marker: marker)
+        XCTAssertEqual(bash.claude, "/opt/Claude Code/claude")
+        let zsh = AgentSetup.parseShellLookup("claude='/opt/Claude\\ Code/claude'\n", marker: marker)
+        XCTAssertEqual(zsh.claude, "/opt/Claude Code/claude")
+    }
+
     func testFishSpaceSeparatedPath() {
         let r = AgentSetup.parseShellLookup("__BCU_PATH__=/a/bin /b/bin\n", marker: marker)
         XCTAssertNil(r.claude)
