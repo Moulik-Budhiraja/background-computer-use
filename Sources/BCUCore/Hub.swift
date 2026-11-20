@@ -113,15 +113,23 @@ public final class Hub {
         e.agentLeft(graceMs: Self.orphanGraceMs) { [weak self, weak e] in e.flatMap { self?.isAttached($0) } ?? true }
     }
 
-    /// When each session's agent went away, once `left` have nobody left.
+    /// When each session's agent went away, once `left` have nobody left:
+    /// now, for those, so they get the whole grace from here (one kept by a
+    /// relative may have lost its own connection long ago).
     static func departedTimes(_ departedAtMs: [String: Double], left: [String], now: Double) -> [String: Double] {
-        departedAtMs
+        var times = departedAtMs
+        for id in left { times[id] = now }
+        return times
     }
 
-    /// `usedBy` without the sessions `forgetDormant` dropped.
+    /// `usedBy` without the sessions `forgetDormant` dropped. A dropped
+    /// session that's still connected stays a user: one that only works in
+    /// a relative's windows looks dormant itself, and comes back under the
+    /// same id on its next call.
     static func prunedUsers(_ usedBy: [String: Set<String>], gone: [String], attached: [String: Int]) -> [String: Set<String>] {
+        let disconnected = Set(gone.filter { (attached[$0] ?? 0) == 0 })
         var kept = usedBy.filter { !gone.contains($0.key) }
-        for (owner, users) in kept { kept[owner] = users.subtracting(gone) }
+        for (owner, users) in kept { kept[owner] = users.subtracting(disconnected) }
         return kept
     }
 
