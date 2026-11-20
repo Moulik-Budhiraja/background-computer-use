@@ -107,7 +107,7 @@ public final class RecordedRun {
 
     // MARK: Reading frames
 
-    private let decodeLock = NSLock()
+    let decodeLock = NSLock()
     private var generators: [String: AVAssetImageGenerator] = [:]
 
     /// The picture of a frame: from its video once compacted, else its JPEG.

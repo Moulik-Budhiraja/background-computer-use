@@ -95,14 +95,13 @@ final class OnboardingModel: ObservableObject {
     /// permissions and a connected agent (an earlier install) never sees it.
     static func shouldShow() -> Bool {
         let defaults = UserDefaults.standard
-        if defaults.bool(forKey: doneKey) { return false }
-        // Back from Quit & Reopen: carry on with the steps after Screen Recording.
-        if defaults.bool(forKey: reopenedKey) { return true }
-        let bcu = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/bcu").path
-        let ready = AX.isTrusted && Capture.hasPermission
-            && AgentKind.allCases.contains { AgentSetup.isConnected($0, bcuPath: bcu) }
-        if ready { defaults.set(true, forKey: doneKey) }
-        return !ready
+        return SetupGate.shouldShow(done: defaults.bool(forKey: doneKey), reopened: defaults.bool(forKey: reopenedKey)) {
+            let bcu = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/bcu").path
+            let ready = AX.isTrusted && Capture.hasPermission
+                && AgentKind.allCases.contains { AgentSetup.isConnected($0, bcuPath: bcu) }
+            if ready { defaults.set(true, forKey: doneKey) }
+            return ready
+        }
     }
 
     func refresh() {
