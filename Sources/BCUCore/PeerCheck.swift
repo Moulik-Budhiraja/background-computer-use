@@ -311,6 +311,9 @@ public final class PeerScope {
         // that session, or hand its windows over if its agent went away.
         for s in windowOwners where !trust.mayUse(sessions[s] ?? .owner) { return "That window belongs to another app." }
         if sessions[session] == nil { sessions[session] = trust }
+        // A subagent's family is its parent's: claim the parent with it, or
+        // another app could claim it and reach the subagent through it.
+        if let parent, sessions[parent] == nil { sessions[parent] = trust }
         if let host, !host.isEmpty, hosts[host] == nil, trust != .owner { hosts[host] = trust }
         return nil
     }
