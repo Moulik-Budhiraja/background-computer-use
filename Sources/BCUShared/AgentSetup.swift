@@ -184,8 +184,11 @@ public enum AgentSetup {
         for raw in output.components(separatedBy: .newlines) {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if let r = line.range(of: marker) {
-                path = line[r.upperBound...].split(whereSeparator: { $0 == ":" || $0 == " " })
-                    .map(String.init).filter { $0.hasPrefix("/") }
+                // Colons split PATH, and a directory can have a space in it.
+                // Fish prints its PATH split by spaces instead.
+                let value = line[r.upperBound...]
+                let separator: Character = value.contains(":") ? ":" : " "
+                path = value.split(separator: separator).map(String.init).filter { $0.hasPrefix("/") }
             } else if line.hasPrefix("/") || line.hasPrefix("~/") {
                 claude = line
             } else if line.hasPrefix("alias claude=") || line.hasPrefix("claude=") {

@@ -114,6 +114,12 @@ enum CodexTOML {
                 edits.append((open + 1..<open + 1, " " + items.joined(separator: ", ") + (isEmpty ? " " : ",")))
             }
 
+            /// Written in a table above the server's, so new keys can go
+            /// next to it. Not one under it, like `[mcp_servers.<name>.env]`.
+            func aboveServer(_ a: Assignment) -> Bool {
+                a.table.count < server.count && Array(server.prefix(a.table.count)) == a.table
+            }
+
             let after = existingCommand ?? existingArgs
             if let a = after, !a.inline {
                 // Next to the key that's there, written the same way.
@@ -125,10 +131,10 @@ enum CodexTOML {
                 insertLines(lines([]), at: header.line.upperBound)
             } else if let t = doc.inlineTables.first(where: { $0.path == server }) {
                 insertEntries(entries([]), intoInlineAt: t.open, isEmpty: t.isEmpty)
-            } else if let a = live.last(where: { !$0.inline && $0.path.count > 2 && Array($0.path.prefix(2)) == server }) {
+            } else if let a = live.last(where: { !$0.inline && $0.path.count > 2 && Array($0.path.prefix(2)) == server && aboveServer($0) }) {
                 // Dotted keys like `background-computer-use.env.X = 1` in [mcp_servers].
                 insertLines(lines(Array(server.dropFirst(a.table.count))), at: a.statement.upperBound)
-            } else if let a = live.last(where: { $0.inline && $0.path.count > 2 && Array($0.path.prefix(2)) == server }) {
+            } else if let a = live.last(where: { $0.inline && $0.path.count > 2 && Array($0.path.prefix(2)) == server && aboveServer($0) }) {
                 let items = entries(Array(server.dropFirst(a.table.count)))
                 edits.append((a.statement.upperBound..<a.statement.upperBound, ", " + items.joined(separator: ", ")))
             } else if let t = doc.inlineTables.first(where: { $0.path == ["mcp_servers"] }) {
