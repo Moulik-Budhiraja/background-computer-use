@@ -121,8 +121,9 @@ public final class Hub {
 
     /// Whether a session's windows are up for another session to take over:
     /// not while it's `present`, a relative using them included.
+    /// Nor while a viewer is driving its display: its windows are in use.
     static func abandoned(_ id: String, attached: [String: Int], usedBy: [String: Set<String>], userInControl: Bool = false) -> Bool {
-        !present(id, attached: attached, usedBy: usedBy)
+        !userInControl && !present(id, attached: attached, usedBy: usedBy)
     }
 
     /// When each session's agent went away, once `left` have nobody left:

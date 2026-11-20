@@ -278,8 +278,11 @@ public final class Engine {
 
     /// What `releaseAbandoned` does with one of the agent's windows.
     enum AbandonedFate: Equatable { case leaveWithUser, keepForUser, release }
+    /// A window handed off and not yet opened by the user stays: it's the
+    /// user's task now, waiting in the menu bar, however long they take.
     static func abandonedFate(withUser: Bool, handedOff: Bool) -> AbandonedFate {
-        withUser ? .leaveWithUser : .release
+        if withUser { return .leaveWithUser }
+        return handedOff ? .keepForUser : .release
     }
 
     /// Whether a release asked for during departure `queuedFor` may still
