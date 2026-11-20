@@ -112,7 +112,11 @@ public final class Engine {
     private var batching = false
     private var _activity: [ActivityItem] = []
     private var _paused = false
-    private var _userInControl = false
+    /// Who has the user in control of the display: the menu bar app's
+    /// expanded view (`appController`) and each host client that took it
+    /// over. The user is in control until every one of them has ended.
+    private var controllers: Set<String> = []
+    private var _userInControl: Bool { !controllers.isEmpty }
     private lazy var testRemote = RemoteControl(engine: self)
     private var _waitingReason: String?
     /// What the user did from the menu bar (pressed Done on a handoff), for
@@ -403,18 +407,31 @@ public final class Engine {
         }
     }
 
-    /// The user is driving the agent display from the expanded view. The
-    /// agent's actions are refused until they give it back.
+    /// The user is driving the agent display, from the menu bar app's
+    /// expanded view or a host app. The agent's actions are refused until
+    /// every one of those gives it back.
     public var userInControl: Bool {
         stateLock.lock(); defer { stateLock.unlock() }
         return _userInControl
     }
 
-    public func setUserInControl(_ value: Bool) {
+    /// The menu bar app's expanded view, as a controller.
+    public static let appController = "app"
+
+    /// Whether `controller` has the user in control (and hasn't given it back).
+    public func hasControl(_ controller: String) -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return controllers.contains(controller)
+    }
+
+    /// `controller` takes the display over for the user, or gives it back.
+    /// The agent gets it back only when no controller holds it.
+    public func setUserInControl(_ on: Bool, by controller: String = Engine.appController) {
         stateLock.lock()
         let was = _userInControl
+        if on { controllers.insert(controller) } else { controllers.remove(controller) }
+        let value = _userInControl
         if Self.userReturns(paused: (_paused, _paused), inControl: (was, value)) { userReturnedMs = nowMs() }
-        _userInControl = value
         stateLock.unlock()
         windows.userArranging = value
         if was != value { log(value ? "You took over the agent display" : "You gave the agent display back") }

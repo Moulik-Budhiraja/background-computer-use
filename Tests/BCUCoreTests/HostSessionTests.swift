@@ -24,6 +24,29 @@ final class HostSessionTests: XCTestCase {
         XCTAssertNil(hub.hostPID("ping"))
     }
 
+    /// The menu bar app's viewer and a host app can both take a session
+    /// over: the agent gets it back only once both have given it back, and
+    /// each keeps its own hold (a host's input keeps working) meanwhile.
+    func testTakeOverLastsUntilEveryControllerEnds() {
+        let hub = Hub()
+        let e = hub.engine(for: "host-session", client: nil, label: "Pick Up O1 Media", host: "ping")
+        e.setUserInControl(true, by: "host:1")
+        e.setUserInControl(true)
+
+        e.setUserInControl(false)
+        XCTAssertTrue(e.userInControl)
+        XCTAssertTrue(e.hasControl("host:1"))
+        XCTAssertFalse(e.hasControl(Engine.appController))
+
+        e.setUserInControl(true)
+        e.setUserInControl(false, by: "host:1")
+        XCTAssertTrue(e.userInControl)
+        XCTAssertFalse(e.hasControl("host:1"))
+
+        e.setUserInControl(false)
+        XCTAssertFalse(e.userInControl)
+    }
+
     /// Only the menu bar app's engine says it shows host apps' sessions.
     func testHelloSaysWhetherHostsAreShown() {
         let hub = Hub()

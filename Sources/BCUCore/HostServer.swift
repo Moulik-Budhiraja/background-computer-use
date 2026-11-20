@@ -111,6 +111,7 @@ public final class HostServer {
         guard let c = clients.removeValue(forKey: id) else { lock.unlock(); return }
         let streams = Array(c.streams.values)
         let remotes = c.remotes
+        let controller = Self.controller(c)
         c.streams = [:]
         c.remotes = [:]
         lock.unlock()
@@ -118,7 +119,7 @@ public final class HostServer {
         for s in streams { s.frames.stop() }
         for (session, remote) in remotes {
             remote.end()
-            hub.engine(id: session)?.setUserInControl(false)
+            hub.engine(id: session)?.setUserInControl(false, by: controller)
         }
     }
 
@@ -205,13 +206,13 @@ public final class HostServer {
                     let remote = makeRemote(e, c)
                     lock.lock(); c.remotes[e.sessionID] = remote; lock.unlock()
                 }
-                e.setUserInControl(true)
+                e.setUserInControl(true, by: Self.controller(c))
             } else {
                 lock.lock()
                 let remote = c.remotes.removeValue(forKey: e.sessionID)
                 lock.unlock()
                 remote?.end()
-                e.setUserInControl(false)
+                e.setUserInControl(false, by: Self.controller(c))
             }
             return ["ok": true]
 
@@ -263,7 +264,7 @@ public final class HostServer {
             lock.lock()
             let remote = c.remotes[e.sessionID]
             lock.unlock()
-            guard let remote, e.userInControl else { throw ToolError("take over the session first (take_over)") }
+            guard let remote, e.hasControl(Self.controller(c)) else { throw ToolError("take over the session first (take_over)") }
             let events = (a.raw["events"] as? [JSONObject]) ?? [a.raw["event"] as? JSONObject].compactMap { $0 }
             for ev in events { try HostInput.post(Args(ev), to: remote, display: e.display) }
             return ["ok": true]
@@ -286,6 +287,9 @@ public final class HostServer {
             throw ToolError("unknown op \(op)")
         }
     }
+
+    /// This client, as one of a session's controllers (`Engine.setUserInControl`).
+    private static func controller(_ c: Client) -> String { "host:\(c.connection.id)" }
 
     private func engine(_ a: Args) throws -> Engine {
         guard let id = a.string("session") else { throw ToolError("missing session") }
