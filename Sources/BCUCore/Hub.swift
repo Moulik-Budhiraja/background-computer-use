@@ -115,7 +115,7 @@ public final class Hub {
 
     /// Whether a session's windows are up for another session to take over:
     /// not while it's `present`, a relative using them included.
-    static func abandoned(_ id: String, attached: [String: Int], usedBy: [String: Set<String>]) -> Bool {
+    static func abandoned(_ id: String, attached: [String: Int], usedBy: [String: Set<String>], userInControl: Bool = false) -> Bool {
         !present(id, attached: attached, usedBy: usedBy)
     }
 
@@ -290,7 +290,7 @@ public final class Hub {
     private func takeOver(_ window: CGWindowID, for caller: Engine, id callerID: String) -> Engine {
         lock.lock()
         let departed = byID.first { id, e in
-            id != Self.defaultSession && e !== caller && Self.abandoned(id, attached: attached, usedBy: usedBy) && e.host == caller.host
+            id != Self.defaultSession && e !== caller && Self.abandoned(id, attached: attached, usedBy: usedBy, userInControl: e.userInControl) && e.host == caller.host
                 && Self.kind(e.label) == Self.kind(caller.label) && e.windows.window(window) != nil
         }
         guard let (oldID, old) = departed else { lock.unlock(); return caller }
