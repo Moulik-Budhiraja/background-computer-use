@@ -299,8 +299,12 @@ public final class HostServer {
     }
 
     /// The window a frame stream shows (`window`), if the request names one.
+    /// One of the session's own windows, or 0 for its whole display: a
+    /// client let in for its app's sessions mustn't stream another's window.
     static func streamWindow(_ a: Args, owns: (CGWindowID) -> Bool) throws -> CGWindowID? {
-        a.int("window").map { CGWindowID($0) }
+        guard let n = a.int("window") else { return nil }
+        guard let id = CGWindowID(exactly: n), id == 0 || owns(id) else { throw ToolError("no window \(n) in that session") }
+        return id
     }
 
     private func stream(_ a: Args, _ c: Client) throws -> Stream {
