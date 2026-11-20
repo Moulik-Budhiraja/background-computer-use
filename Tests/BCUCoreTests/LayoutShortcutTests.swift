@@ -96,3 +96,22 @@ final class HostQuitBlockNonLatinTests: XCTestCase {
         XCTAssertFalse(HostInput.quitBlocked(command: true, keyCode: 0, key: "ф", quitCode: 12))
     }
 }
+
+/// Reading the layout tables needs the main thread, which is busy while
+/// BCU quits.
+final class LayoutRefillQuitTests: XCTestCase {
+    /// A key pressed as BCU quits waited on the main thread, which was
+    /// waiting on the tool: shutdown timed out before agent windows were
+    /// released. The lookup must fail instead.
+    func testARefillWhileQuittingFailsInsteadOfWaiting() {
+        let saved = LayoutKeys.runOnMain
+        defer { LayoutKeys.runOnMain = saved }
+        LayoutKeys.runOnMain = { _ in false }
+        LayoutKeys.forget()
+        var threw = false
+        DispatchQueue.global().sync {
+            do { _ = try LayoutKeys.code(for: "a", command: false) } catch { threw = true }
+        }
+        XCTAssertTrue(threw)
+    }
+}
