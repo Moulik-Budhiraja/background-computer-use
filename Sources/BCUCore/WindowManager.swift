@@ -4,7 +4,11 @@ import BCUShared
 import CPrivate
 
 public final class AgentWindow {
-    public enum Kind: String { case opened, borrowed, caught }
+    public enum Kind: String {
+        case opened, borrowed, caught
+        /// Stop closes this kind of window rather than putting it back.
+        public var closesOnStop: Bool { self == .opened }
+    }
     public let id: CGWindowID
     public let pid: pid_t
     public let appName: String

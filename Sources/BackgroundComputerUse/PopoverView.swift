@@ -408,7 +408,7 @@ struct HeaderBar: View {
 /// Leave to a page that asks to stay. Ask first when there's one to lose.
 enum StopConfirm {
     static func confirm(_ engines: [Engine]) -> Bool {
-        let opened = engines.flatMap { $0.windows.windows }.filter { $0.kind == .opened }.count
+        let opened = engines.flatMap { $0.windows.windows }.filter { $0.kind.closesOnStop }.count
         guard opened > 0 else { return true }
         let alert = NSAlert()
         alert.messageText = "Stop and close \(opened == 1 ? "the window" : "\(opened) windows") the agent opened?"

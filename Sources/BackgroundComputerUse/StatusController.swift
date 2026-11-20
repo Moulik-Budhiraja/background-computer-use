@@ -84,6 +84,7 @@ final class StatusController: NSObject, NSPopoverDelegate, NSWindowDelegate {
     /// small window when the icon can't be seen.
     func reveal() {
         if iconVisible {
+            closeOthers(before: .popover)
             if !popover.isShown { togglePopover() }
             return
         }
@@ -92,6 +93,7 @@ final class StatusController: NSObject, NSPopoverDelegate, NSWindowDelegate {
             fallback.makeKeyAndOrderFront(nil)
             return
         }
+        closeOthers(before: .panel)
         let panel = NSPanel(contentRect: .zero, styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
         panel.title = "Background Computer Use"
         panel.isReleasedWhenClosed = false
@@ -124,6 +126,7 @@ final class StatusController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         if popover.isShown {
             popover.performClose(nil)
         } else {
+            closeOthers(before: .popover)
             model.refresh()
             model.startPreviews()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -131,6 +134,18 @@ final class StatusController: NSObject, NSPopoverDelegate, NSWindowDelegate {
             // popover on outside clicks. Watch for them instead.
             clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
                 self?.close()
+            }
+        }
+    }
+
+    private func closeOthers(before next: MenuSurface) {
+        var showing: [MenuSurface] = []
+        if popover.isShown { showing.append(.popover) }
+        if fallback != nil { showing.append(.panel) }
+        for surface in MenuSurface.toClose(before: next, showing: showing) {
+            switch surface {
+            case .popover: popover.performClose(nil)
+            case .panel: fallback?.close()
             }
         }
     }
