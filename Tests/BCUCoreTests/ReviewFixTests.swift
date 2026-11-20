@@ -105,4 +105,19 @@ final class ReviewFixTests: XCTestCase {
         XCTAssertTrue(WindowManager.takeStrayTurn())
         WindowManager.endStrayTurn()
     }
+
+    func testAReleaseQueuedForAnEarlierDepartureDoesntRun() {
+        XCTAssertTrue(Engine.departureStillCurrent(3, latest: 3))
+        // The agent came back and left again: the new departure gets its grace.
+        XCTAssertFalse(Engine.departureStillCurrent(2, latest: 3))
+    }
+
+    func testAStrayRescueLeavesAWindowASessionHasSince() {
+        let id: CGWindowID = 0xFFFF_FE02
+        // A session borrowed it while the rescue waited on the app.
+        XCTAssertFalse(WindowManager.claimForRescue(id, registered: { _ in true }))
+        XCTAssertFalse(WindowManager.isKept(id))
+        XCTAssertTrue(WindowManager.claimForRescue(id, registered: { _ in false }))
+        XCTAssertTrue(WindowManager.isKept(id))
+    }
 }
