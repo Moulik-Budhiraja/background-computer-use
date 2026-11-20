@@ -3,7 +3,7 @@ import SwiftUI
 import BCUCore
 
 /// The menu bar icon and its popover.
-final class StatusController: NSObject, NSPopoverDelegate {
+final class StatusController: NSObject, NSPopoverDelegate, NSWindowDelegate {
     private enum Icon: Equatable { case idle, working, waiting, paused }
 
     private let hub: Hub
@@ -13,6 +13,8 @@ final class StatusController: NSObject, NSPopoverDelegate {
     private var icon: Icon?
     private var clickMonitor: Any?
     private var capsule: HandoffCapsule!
+    /// The popover's content in a small window, for when the icon can't be seen.
+    private var fallback: NSPanel?
     /// Handoffs already announced, by session and window.
     private var announced: Set<String> = []
     var onRefresh: (() -> Void)?
@@ -26,8 +28,14 @@ final class StatusController: NSObject, NSPopoverDelegate {
         super.init()
         openHandoff = { [weak self] in self?.openHandoff($0) }
         capsule = HandoffCapsule { [weak self] in
+            guard let self else { return nil }
             // The status item's window spans the menu bar's height.
-            self?.item.button?.window?.frame
+            if self.iconVisible, let f = self.item.button?.window?.frame { return f }
+            // Hidden: come out of the menu bar's top-right corner instead.
+            guard let screen = NSScreen.main ?? NSScreen.screens.first else { return nil }
+            let bar = screen.frame.maxY - screen.visibleFrame.maxY
+            let h = bar > 0 ? bar : 24
+            return NSRect(x: screen.frame.maxX - 40, y: screen.frame.maxY - h, width: 28, height: h)
         }
         item.button?.target = self
         item.button?.action = #selector(togglePopover)
@@ -44,7 +52,7 @@ final class StatusController: NSObject, NSPopoverDelegate {
 
 
     private func refresh() {
-        if popover.isShown { model.refresh() }
+        if popover.isShown || fallback != nil { model.refresh() }
         onRefresh?()
         announceHandoffs()
         let next: Icon
@@ -65,11 +73,60 @@ final class StatusController: NSObject, NSPopoverDelegate {
         item.button?.toolTip = model.statusText
     }
 
+    /// The icon is in the menu bar where the user can see it, not hidden
+    /// behind the notch or by a menu bar manager.
+    private var iconVisible: Bool {
+        guard item.isVisible, let window = item.button?.window, window.occlusionState.contains(.visible) else { return false }
+        return NSScreen.screens.contains { $0.frame.intersects(window.frame) }
+    }
+
+    /// The app was opened again: show the popover, or the same content in a
+    /// small window when the icon can't be seen.
+    func reveal() {
+        if iconVisible {
+            closeOthers(before: .popover)
+            if !popover.isShown { togglePopover() }
+            return
+        }
+        if let fallback {
+            NSApp.activate(ignoringOtherApps: true)
+            fallback.makeKeyAndOrderFront(nil)
+            return
+        }
+        closeOthers(before: .panel)
+        let panel = NSPanel(contentRect: .zero, styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
+        panel.title = "Background Computer Use"
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.delegate = self
+        let hosting = NSHostingController(rootView: PopoverView(menu: model))
+        hosting.sizingOptions = [.preferredContentSize]
+        panel.contentViewController = hosting
+        model.refresh()
+        model.startPreviews()
+        // Where the popover would have been: the top right of the main screen.
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            let size = panel.frame.size
+            let v = screen.visibleFrame
+            panel.setFrameOrigin(NSPoint(x: v.maxX - size.width - 12, y: v.maxY - size.height - 8))
+        }
+        fallback = panel
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard (notification.object as? NSPanel) === fallback else { return }
+        fallback = nil
+        if !popover.isShown { model.stopPreviews() }
+    }
+
     @objc private func togglePopover() {
         guard let button = item.button else { return }
         if popover.isShown {
             popover.performClose(nil)
         } else {
+            closeOthers(before: .popover)
             model.refresh()
             model.startPreviews()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -81,8 +138,21 @@ final class StatusController: NSObject, NSPopoverDelegate {
         }
     }
 
+    private func closeOthers(before next: MenuSurface) {
+        var showing: [MenuSurface] = []
+        if popover.isShown { showing.append(.popover) }
+        if fallback != nil { showing.append(.panel) }
+        for surface in MenuSurface.toClose(before: next, showing: showing) {
+            switch surface {
+            case .popover: popover.performClose(nil)
+            case .panel: fallback?.close()
+            }
+        }
+    }
+
     func close() {
         popover.performClose(nil)
+        fallback?.close()
     }
 
     /// A notification out of the menu bar icon for each new handoff; one
@@ -120,7 +190,7 @@ final class StatusController: NSObject, NSPopoverDelegate {
     }
 
     func popoverDidClose(_ notification: Notification) {
-        model.stopPreviews()
+        if fallback == nil { model.stopPreviews() }
         if let m = clickMonitor {
             NSEvent.removeMonitor(m)
             clickMonitor = nil
