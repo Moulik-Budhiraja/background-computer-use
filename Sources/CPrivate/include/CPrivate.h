@@ -52,6 +52,14 @@ int BCUPostMakeKeyRecords(pid_t pid, uint32_t windowID);
 /// The pid WindowServer considers frontmost (0 if unknown). Unlike
 /// NSWorkspace, this doesn't wait for our run loop to see the change.
 pid_t BCUFrontProcessPID(void);
+/// The app responsible for a process (a WebKit GPU process plays an app's
+/// sound under its own pid): `pid` itself for an app, or 0 if unknown.
+pid_t BCUResponsiblePID(pid_t pid);
+/// System Audio Recording for this app as TCC's preflight answers: 2 not
+/// asked yet (the one answer that holds up), -1 no preflight.
+int BCUAudioCapturePreflight(void);
+/// Ask for System Audio Recording (macOS shows its prompt); doesn't wait.
+void BCUAudioCaptureRequest(void);
 
 /// SLPSSetFrontProcessWithOptions. Used only to give the front back to the
 /// user's app after another app activated itself. 0x200 = user generated.
@@ -93,6 +101,17 @@ uint64_t BCUCurrentSpaceForDisplay(CGDirectDisplayID display);
 /// SLSProcessAssignToSpace: new windows of `pid` open on Space `sid`, like the
 /// Dock's "Assign To Desktop on Display N". Pass 0 to clear. Returns CGError.
 int BCUProcessAssignToSpace(pid_t pid, uint64_t sid);
+
+#pragma mark - Attention
+
+/// Whether the app has asked for the user's attention (its Dock icon is
+/// bouncing): LaunchServices' _kLSApplicationDesiresAttentionKey for it.
+/// 1 yes, 0 no, -1 unknown.
+int BCUAppWantsAttention(pid_t pid);
+
+/// Clear that request, which stops the bounce (and, with the Dock hidden,
+/// lets it hide again). Returns the LaunchServices status, 0 on success.
+int BCUClearAppAttention(pid_t pid);
 
 #pragma mark - Accessibility
 
