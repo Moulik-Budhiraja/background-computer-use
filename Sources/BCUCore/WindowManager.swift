@@ -88,7 +88,10 @@ public final class WindowManager {
     }
 
     /// Undo `claim`: the borrow it was for failed.
-    static func unclaim(_ id: CGWindowID, for session: String) {}
+    static func unclaim(_ id: CGWindowID, for session: String) {
+        sharedLock.lock(); defer { sharedLock.unlock() }
+        if registeredAnywhere[id]?.session == session { registeredAnywhere[id] = nil }
+    }
 
     /// Some session's window, as of right now.
     static func isRegistered(_ id: CGWindowID) -> Bool {
