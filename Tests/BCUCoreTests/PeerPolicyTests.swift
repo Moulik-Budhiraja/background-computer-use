@@ -277,4 +277,16 @@ final class PeerPolicyTests: XCTestCase {
         XCTAssertNil(scope.admitCall(session: Hub.defaultSession, parent: nil, host: nil, .owner))
         XCTAssertFalse(scope.mayUse(session: Hub.defaultSession, host))
     }
+
+    /// A drag started before the session gave its window back doesn't go on
+    /// moving it once it's left the display (and maybe been borrowed by
+    /// another app's agent).
+    func testDragStopsWhenItsWindowLeavesTheDisplay() {
+        func w(_ id: CGWindowID) -> WindowInfo {
+            WindowInfo(id: id, pid: 1, owner: "", title: "", bounds: .zero, layer: 0, onScreen: true, alpha: 1)
+        }
+        XCTAssertTrue(RemoteControl.pressStillHere(5, onDisplay: [w(6), w(5)]))
+        XCTAssertFalse(RemoteControl.pressStillHere(5, onDisplay: [w(6)]))
+        XCTAssertFalse(RemoteControl.pressStillHere(5, onDisplay: []))
+    }
 }
