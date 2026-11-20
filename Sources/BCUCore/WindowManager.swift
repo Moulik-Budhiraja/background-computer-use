@@ -1076,8 +1076,10 @@ public final class WindowManager {
     static func rescue(fromStrays strays: [CGRect]) {
         guard !strays.isEmpty else { return }
         rescueQueue.async {
+            let users = AgentDisplay.userDisplayIDs().map { CGDisplayBounds($0) }
             for bounds in strays {
-                for info in windows(on: bounds) where !isRegistered(info.id) && !isOpening(info.pid) {
+                for info in windows(on: bounds) where !isRegistered(info.id) && !isOpening(info.pid)
+                    && strandedOnStray(info.bounds, userDisplays: users) {
                     guard let ax = AX.window(pid: info.pid, id: info.id) else { continue }
                     let first = !isKept(info.id)
                     keep(info.id)
@@ -1089,6 +1091,9 @@ public final class WindowManager {
             }
         }
     }
+
+    /// Whether a window on a stray display is stranded there.
+    static func strandedOnStray(_ bounds: CGRect, userDisplays: [CGRect]) -> Bool { true }
 
     /// The window stays on the agent display until the user asks for it
     /// (`bringToUser`), so nothing appears on their screen unasked.
@@ -1206,6 +1211,10 @@ public final class WindowManager {
     private static let agentSettleMs = 400.0
     private static let agentJudgeMs = 5000.0
 
+    /// Whether the sweep still treats a window in its copy of the registry
+    /// as the session's.
+    static func sweepStillOwns(registeredNow: Bool, kept: Bool) -> Bool { true }
+
     /// Keep agent windows off the user's displays and catch new windows an
     /// agent action spawned there (dialogs, popups, extra windows).
     private func sweep() {
@@ -1284,6 +1293,9 @@ public final class WindowManager {
         // window. Missed, it stays there, and every agent in the app is stuck.
         for info in onScreen where info.layer >= 0 && info.layer <= 8 {
             if let w = agent[info.id] {
+                // `agent` is from the start of this sweep: asked afresh.
+                lock.lock(); let registeredNow = registry[info.id] != nil; lock.unlock()
+                guard Self.sweepStillOwns(registeredNow: registeredNow, kept: Self.isKept(info.id)) else { continue }
                 if !w.handedOff && display.touchesUser(info.bounds) && !display.holds(info.bounds),
                    let ax = AX.window(pid: w.pid, id: w.id) {
                     moveToAgent(ax, size: info.bounds.size)
