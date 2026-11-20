@@ -86,3 +86,13 @@ final class HostQuitBlockOtherKeysTests: XCTestCase {
         XCTAssertFalse(HostInput.quitBlocked(command: true, keyCode: 0, key: "a", quitCode: 0))
     }
 }
+
+/// A host on a non-Latin layout sends its own letter as the key's text.
+final class HostQuitBlockNonLatinTests: XCTestCase {
+    /// A Russian host's cmd+Q: code KeyQ, text "й". macOS matches the
+    /// shortcut by its key, so it's still Quit.
+    func testCommandQFromANonLatinLayoutIsBlocked() {
+        XCTAssertTrue(HostInput.quitBlocked(command: true, keyCode: 12, key: "й", quitCode: 12))
+        XCTAssertFalse(HostInput.quitBlocked(command: true, keyCode: 0, key: "ф", quitCode: 12))
+    }
+}
