@@ -64,3 +64,16 @@ final class HostQuitBlockTests: XCTestCase {
         XCTAssertFalse(HostInput.quitBlocked(command: false, keyCode: 0, key: "q", quitCode: 0))
     }
 }
+
+/// press_key's key and flags, by the user's layout.
+final class PressLayoutTests: XCTestCase {
+    /// On Dvorak - QWERTY ⌘, s is key 41 on its own and key 1 with cmd:
+    /// press_key cmd+s must send key 1 (Save), not Cmd+;.
+    func testPressLooksUpTheKeyWithCommand() throws {
+        let dvorakQwertyCmd: (String, Bool) throws -> (CGKeyCode, Bool) = { _, command in (command ? 1 : 41, false) }
+        let (code, flags) = try KeyMap.press(key: "s", modifiers: ["cmd"], lookup: dvorakQwertyCmd)
+        XCTAssertEqual(code, 1)
+        XCTAssertEqual(flags, .maskCommand)
+        XCTAssertEqual(try KeyMap.press(key: "s", modifiers: [], lookup: dvorakQwertyCmd).0, 41)
+    }
+}
