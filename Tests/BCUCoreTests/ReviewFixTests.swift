@@ -130,4 +130,18 @@ final class ReviewFixTests: XCTestCase {
         XCTAssertTrue(WindowManager.isKept(id))
         XCTAssertEqual(WindowManager.leftoverFate(id, agentMade: true, kept: [id]), .giveToUser)
     }
+
+    func testAWindowLeftWithTheUserWhenItsAgentGoesIsKept() {
+        let id: CGWindowID = 0xFFFF_FE04
+        WindowManager.keep(id)
+        WindowManager.ownedAgain(id)
+        WindowManager.leftWithUser(id)
+        XCTAssertTrue(WindowManager.isKept(id))
+    }
+
+    func testCleanupLeavesALeftoverASessionHasSince() {
+        XCTAssertTrue(WindowManager.leftoverStillUnowned(7, registered: { _ in false }))
+        // Borrowed while cleanup waited on the app.
+        XCTAssertFalse(WindowManager.leftoverStillUnowned(7, registered: { _ in true }))
+    }
 }
