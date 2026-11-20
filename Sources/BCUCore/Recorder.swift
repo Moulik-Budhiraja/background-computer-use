@@ -44,7 +44,8 @@ public final class RecordedRun {
     public let id: String
     public let dir: URL
     public let session: String
-    public let label: String
+    /// The session's label; it follows a rename while the run is live.
+    public var label: String { lock.lock(); defer { lock.unlock() }; return _label }
     public let start: Double
     /// The agent display's size in points.
     public let size: CGSize
@@ -55,12 +56,13 @@ public final class RecordedRun {
     private var _chunks: [RecordedChunk] = []
     private var _end: Double?
     private var _live = false
+    private var _label: String
 
     init(id: String, dir: URL, session: String, label: String, start: Double, size: CGSize) {
         self.id = id
         self.dir = dir
         self.session = session
-        self.label = label
+        _label = label
         self.start = start
         self.size = size
     }
@@ -79,6 +81,7 @@ public final class RecordedRun {
     public var stoppedAt: Double? { lock.lock(); defer { lock.unlock() }; return _end }
     /// Test support: when a made-up run's recording ended.
     func setEnd(_ t: Double) { lock.lock(); _end = t; lock.unlock(); writeMeta() }
+    func setLabel(_ label: String) { lock.lock(); _label = label; lock.unlock(); writeMeta() }
     func append(_ f: RecordedFrame) { lock.lock(); _frames.append(f); lock.unlock() }
     func append(_ e: RecordedEvent) { lock.lock(); _events.append(e); lock.unlock() }
     func append(_ c: RecordedChunk) { lock.lock(); _chunks.append(c); lock.unlock() }
@@ -163,7 +166,7 @@ public final class RecordedRun {
 
     func writeMeta() {
         lock.lock()
-        var meta: [String: Any] = ["v": 1, "session": session, "label": label, "start": start,
+        var meta: [String: Any] = ["v": 1, "session": session, "label": _label, "start": start,
                                    "w": size.width, "h": size.height]
         if let e = _end { meta["end"] = e }
         lock.unlock()
@@ -580,7 +583,7 @@ final class RunWriter {
 /// minute or so they're packed into a video.
 public final class SessionRecorder {
     private let sessionID: String
-    private let label: String
+    private var label: String
     private let display: AgentDisplay
     private let queue = DispatchQueue(label: "bcu.recorder", qos: .utility)
     private let compactQueue = DispatchQueue(label: "bcu.recorder.compact", qos: .background)
@@ -680,6 +683,14 @@ public final class SessionRecorder {
         self.writer = nil
         lastImage = nil
         writer.finish()
+    }
+
+    /// The session was renamed: the run under way and the ones after it go by the new name.
+    func rename(_ label: String) {
+        queue.async {
+            self.label = label
+            self.writer?.run.setLabel(label)
+        }
     }
 
     /// A line of the session's activity.
