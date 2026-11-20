@@ -178,4 +178,15 @@ final class PeerPolicyTests: XCTestCase {
         let outside = PeerIdentity(path: "/tmp/other", valid: true, team: theirs, cdhash: Data([1]))
         XCTAssertFalse(HostCheck.vouches(app: hostApp, peer: outside, disk: disk))
     }
+
+    // MARK: Windows and families
+
+    /// A frame stream shows the session's own windows only.
+    func testFrameStreamWindowMustBeTheSessions() {
+        let owns: (CGWindowID) -> Bool = { $0 == 42 }
+        XCTAssertEqual(try HostServer.streamWindow(Args(["window": 42]), owns: owns), 42)
+        XCTAssertEqual(try HostServer.streamWindow(Args(["window": 0]), owns: owns), 0)
+        XCTAssertNil(try HostServer.streamWindow(Args([:]), owns: owns))
+        XCTAssertThrowsError(try HostServer.streamWindow(Args(["window": 77]), owns: owns))
+    }
 }
