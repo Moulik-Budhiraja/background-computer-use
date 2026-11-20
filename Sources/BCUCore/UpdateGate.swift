@@ -13,12 +13,16 @@ public enum UpdateGate {
         public var hasWindows: Bool
         public var handedOff: Bool
         public var userInControl: Bool
+        /// Since the user last gave the agent its windows back (Done on a
+        /// handoff, or the end of a take-over); `.infinity` if never.
+        public var msSinceUserReturned: Double
 
-        public init(msSinceLastCall: Double, hasWindows: Bool, handedOff: Bool, userInControl: Bool) {
+        public init(msSinceLastCall: Double, hasWindows: Bool, handedOff: Bool, userInControl: Bool, msSinceUserReturned: Double = .infinity) {
             self.msSinceLastCall = msSinceLastCall
             self.hasWindows = hasWindows
             self.handedOff = handedOff
             self.userInControl = userInControl
+            self.msSinceUserReturned = msSinceUserReturned
         }
     }
 
@@ -39,6 +43,7 @@ extension UpdateGate.Session {
         self.init(msSinceLastCall: e.msSinceLastCall,
                   hasWindows: e.display.isRunning || !e.windows.windows.isEmpty,
                   handedOff: e.handoffWindow != nil,
-                  userInControl: e.userInControl)
+                  userInControl: e.userInControl,
+                  msSinceUserReturned: e.msSinceUserReturned)
     }
 }

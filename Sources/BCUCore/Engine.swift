@@ -117,6 +117,8 @@ public final class Engine {
     private var userNotes: [String] = []
     private var _busy: String?
     private var lastCallMs = 0.0
+    /// When the user last gave the agent its windows back (0: never).
+    private var userReturnedMs = 0.0
     private var lastLeftoverLogMs = -Double.infinity
     /// How far this session has reported front-app changes (`FocusGuard.frontReport`).
     private var frontMark = 0
@@ -335,6 +337,13 @@ public final class Engine {
         return lastCallMs == 0 ? .infinity : nowMs() - lastCallMs
     }
 
+    /// How long since the user last gave the agent its windows back
+    /// (`.infinity` if never).
+    public var msSinceUserReturned: Double {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return userReturnedMs == 0 ? .infinity : nowMs() - userReturnedMs
+    }
+
     public var activity: [ActivityItem] {
         stateLock.lock(); defer { stateLock.unlock() }
         return _activity
@@ -375,6 +384,7 @@ public final class Engine {
         stateLock.lock()
         let was = _userInControl
         _userInControl = value
+        if was, !value { userReturnedMs = nowMs() }
         stateLock.unlock()
         windows.userArranging = value
         if was != value { log(value ? "You took over the agent display" : "You gave the agent display back") }
@@ -391,10 +401,26 @@ public final class Engine {
             }
             guard !done.isEmpty else { return }
             self.stateLock.lock()
+            self.userReturnedMs = nowMs()
             self.userNotes.append("The user pressed Done on \(done.joined(separator: " and ")): it's back on your display, so there's no need to call take_back.")
             self.stateLock.unlock()
             self.log("You handed \(done.joined(separator: ", ")) back")
         }
+    }
+
+    static let readOnlyTools: Set<String> = ["status", "guard_report", "list_apps", "list_windows", "release_window", "screenshot", "get_window_state"]
+
+    /// Why a call is turned away before it runs, if it is. `notes` gives the
+    /// user's notes for the agent (taking them).
+    static func refusal(tool: String, userInControl: Bool, paused: Bool, notes: () -> String?) -> String? {
+        // Closing a window the user is working in would pull it out from under them.
+        if userInControl && (!readOnlyTools.contains(tool) || tool == "release_window") {
+            return "The user took over your display and is using your windows. Wait and retry later, or tell the user you're blocked."
+        }
+        if paused && !readOnlyTools.contains(tool) {
+            return "Paused by the user from the menu bar. Wait and retry later, or tell the user you're blocked."
+        }
+        return nil
     }
 
     /// Notes from the user since the last call, once.
@@ -444,13 +470,9 @@ public final class Engine {
                 changed()
                 recorder.captureSoon()
             }
-            let readOnly: Set<String> = ["status", "guard_report", "list_apps", "list_windows", "release_window", "screenshot", "get_window_state"]
-            // Closing a window the user is working in would pull it out from under them.
-            if userInControl && (!readOnly.contains(tool) || tool == "release_window") {
-                return .error("The user took over your display and is using your windows. Wait and retry later, or tell the user you're blocked.")
-            }
-            if paused && !readOnly.contains(tool) {
-                return .error("Paused by the user from the menu bar. Wait and retry later, or tell the user you're blocked.")
+            let readOnly = Self.readOnlyTools
+            if let refusal = Self.refusal(tool: tool, userInControl: userInControl, paused: paused, notes: takeUserNotes) {
+                return .error(refusal)
             }
             let monitored = !readOnly.contains(tool) || tool == "get_window_state"
             let startMs = nowMs()
