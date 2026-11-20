@@ -396,7 +396,10 @@ extension FrontGateWindowServerTests {
         let start = nowMs()
         gate.pointer(down: true, ms: 30)
         XCTAssertLessThan(nowMs() - start, 100)
-        XCTAssertTrue(gate.blocks(agent), "not let through while the watchdog has the lock")
+        // Read from the fake list, not `blocks`: the change waiting for the
+        // record lock holds the gate's lock, and `blocks` would wait on it
+        // while the record lock waits on this thread.
+        XCTAssertFalse(list.contains(psn(agent)), "not let through while the watchdog has the lock")
         release.signal()
         let deadline = nowMs() + 2000
         while gate.blocks(agent) && nowMs() < deadline { sleepMs(10) }
