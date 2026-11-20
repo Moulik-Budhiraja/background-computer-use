@@ -275,7 +275,9 @@ public enum AXSnapshot {
         let order = new.lines.keys.sorted()
         let added = order.filter { old.lines[$0] == nil }
         let changed = order.filter { old.lines[$0] != nil && old.lines[$0] != new.lines[$0] }
-        let removed = old.lines.keys.sorted().filter { new.lines[$0] == nil && !new.unlisted.contains($0) && !new.scrolledOut.contains($0) }
+        // Including numbers the last read kept without listing them.
+        let oldLines = old.lines.merging(old.hiddenLines) { listed, _ in listed }
+        let removed = oldLines.keys.sorted().filter { new.lines[$0] == nil && !new.unlisted.contains($0) && !new.scrolledOut.contains($0) }
         let pushedOut = old.lines.keys.filter { new.unlisted.contains($0) }.count
         let scrolledAway = old.lines.keys.filter { new.scrolledOut.contains($0) }.count
         let touched = added.count + changed.count + removed.count
@@ -286,7 +288,7 @@ public enum AXSnapshot {
         } else {
             out.append("Changes since your last get_window_state of this window. The other \(new.lines.count - added.count - changed.count) elements are unchanged and keep their numbers; pass full=true for the whole list.")
             let trim: (String) -> String = { $0.trimmingCharacters(in: .whitespaces) }
-            for i in removed { out.append("- " + trim(old.lines[i]!)) }
+            for i in removed { out.append("- " + trim(oldLines[i]!)) }
             for i in added { out.append("+ " + trim(new.lines[i]!)) }
             for i in changed { out.append("~ " + trim(new.lines[i]!)) }
         }
