@@ -32,3 +32,15 @@ final class LayoutShortcutTests: XCTestCase {
         XCTAssertEqual(cache.read().0, 1)
     }
 }
+
+/// The take-over's keys from a host, by DOM key when the code is unknown.
+final class HostKeyFallbackTests: XCTestCase {
+    /// On Dvorak - QWERTY ⌘, q is key 7 on its own and key 12 with cmd. A
+    /// host's cmd+q with no code must come out as key 12, which the
+    /// take-over blocks so it can't quit the user's app.
+    func testCommandQWithNoCodeIsLookedUpWithCommand() {
+        let dvorakQwertyCmd: (String, Bool) throws -> (CGKeyCode, Bool) = { _, command in (command ? 12 : 7, false) }
+        XCTAssertEqual(HostInput.keyCode(code: "", key: "q", command: true, lookup: dvorakQwertyCmd), 12)
+        XCTAssertEqual(HostInput.keyCode(code: "", key: "q", command: false, lookup: dvorakQwertyCmd), 7)
+    }
+}
