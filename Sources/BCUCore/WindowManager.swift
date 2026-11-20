@@ -402,12 +402,19 @@ public final class WindowManager {
         } catch {
             // An app with one window (Calculator, System Settings): borrow
             // it, so it goes back to the user rather than closing.
-            guard axWindows.count == 1, let id = AX.windowID(axWindows[0]), WindowList.info(id) != nil else { throw error }
+            guard Self.mayBorrowStartupWindow(startupWindows: axWindows.count, pid: pid, front: BCUFrontProcessPID()),
+                  let id = AX.windowID(axWindows[0]), WindowList.info(id) != nil else { throw error }
             let aw = try borrow(id)
             let title = AX.string(axWindows[0], "AXTitle") ?? ""
             notes.append("\(name) didn't open a new window, so its startup window \"\(title)\" is borrowed: it goes back to the user when released")
             return OpenResult(window: aw, notes: notes)
         }
+    }
+
+    /// Whether a cold launch that got no new window borrows the app's
+    /// startup window instead.
+    static func mayBorrowStartupWindow(startupWindows: Int, pid: pid_t, front: pid_t) -> Bool {
+        startupWindows == 1
     }
 
     /// Open a new window of a running app and put it on the agent display.
