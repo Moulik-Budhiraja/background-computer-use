@@ -60,7 +60,7 @@ final class HistoryModel: ObservableObject {
             case error
             static func < (a: Kind, b: Kind) -> Bool { a.rawValue < b.rawValue }
         }
-        let item: Int
+        var item: Int
         /// Oldest first, tidied.
         var lines: [String]
         /// Each line's kind, so the callout can show the one behind the color.
@@ -70,6 +70,10 @@ final class HistoryModel: ObservableObject {
     }
     /// By item, oldest first; at most one per item.
     private(set) var marks: [Mark] = []
+    /// Each run's marks from the last reload, by run id, with items counted
+    /// from the run's first: a live reload rebuilds only the runs that
+    /// gained events or frames.
+    private var runMarks: [String: (key: [Double], marks: [Mark])] = [:]
 
     @Published private(set) var loaded = false
     @Published private(set) var index = 0
@@ -169,8 +173,14 @@ final class HistoryModel: ObservableObject {
         self.runs = taken.map(\.0)
         var items: [Item] = [], segments: [Segment] = [], segmentOf: [Int] = [], acted: [Bool] = []
         var runItems: [ClosedRange<Int>] = []
+        var marks: [Mark] = [], runMarks: [String: (key: [Double], marks: [Mark])] = [:]
         for (r, (run, frames)) in taken.enumerated() {
-            let actions = run.events.filter { $0.text != nil }.map(\.t)
+            let events = run.events
+            let key = [Double(events.count), Double(frames.count), frames[0].t, frames[frames.count - 1].t]
+            let own = self.runMarks[run.id].flatMap { $0.key == key ? $0.marks : nil } ?? Self.marks(events, frames: frames)
+            runMarks[run.id] = (key, own)
+            marks += own.map { var m = $0; m.item += items.count; return m }
+            let actions = events.filter { $0.text != nil }.map(\.t)
             var a = 0
             var prevT = run.start
             for f in frames {
@@ -193,7 +203,8 @@ final class HistoryModel: ObservableObject {
         self.segmentOf = segmentOf
         self.acted = acted
         placeOnClock(runItems)
-        self.marks = Self.marks(self.runs, items: items)
+        self.marks = marks
+        self.runMarks = runMarks
         if let keep, let i = items.firstIndex(where: { self.runs[$0.run].id == keep.0 && $0.frame.t == keep.1 }) {
             index = i
         } else {
@@ -271,32 +282,27 @@ final class HistoryModel: ObservableObject {
         return byTime.indices.contains(s) ? byTime[s] : nil
     }
 
-    /// Each run's activity, put on the first frame at or after it (the frame
+    /// A run's activity, put on the first frame at or after it (the frame
     /// that shows what it did), or the run's last frame for what came after.
-    static func marks(_ runs: [RecordedRun], items: [Item]) -> [Mark] {
+    /// Items are the run's frame indices.
+    static func marks(_ events: [RecordedEvent], frames: [RecordedFrame]) -> [Mark] {
         var marks: [Mark] = []
-        var first = 0
-        while first < items.count {
-            let r = items[first].run
-            var last = first
-            while last + 1 < items.count && items[last + 1].run == r { last += 1 }
-            var at = first
-            for e in runs[r].events.sorted(by: { $0.t < $1.t }) {
-                guard let text = e.text, !text.isEmpty else { continue }
-                while at < last && items[at].frame.t < e.t { at += 1 }
-                let kind = kind(of: text, error: e.isError)
-                // The last mark's item only: holding the mark itself would
-                // copy its growing arrays on every append.
-                if marks.last?.item == at {
-                    let k = marks.count - 1
-                    marks[k].lines.append(tidy(text))
-                    marks[k].kinds.append(kind)
-                    marks[k].kind = max(marks[k].kind, kind)
-                } else {
-                    marks.append(Mark(item: at, lines: [tidy(text)], kinds: [kind], kind: kind))
-                }
+        let last = frames.count - 1
+        var at = 0
+        for e in events.sorted(by: { $0.t < $1.t }) {
+            guard let text = e.text, !text.isEmpty else { continue }
+            while at < last && frames[at].t < e.t { at += 1 }
+            let kind = kind(of: text, error: e.isError)
+            // The last mark's item only: holding the mark itself would
+            // copy its growing arrays on every append.
+            if marks.last?.item == at {
+                let k = marks.count - 1
+                marks[k].lines.append(tidy(text))
+                marks[k].kinds.append(kind)
+                marks[k].kind = max(marks[k].kind, kind)
+            } else {
+                marks.append(Mark(item: at, lines: [tidy(text)], kinds: [kind], kind: kind))
             }
-            first = last + 1
         }
         return marks
     }

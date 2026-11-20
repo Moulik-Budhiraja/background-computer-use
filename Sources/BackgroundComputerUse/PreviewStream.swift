@@ -10,8 +10,12 @@ final class PreviewStream {
     private let core: FrameStream
 
     init(engine: Engine, onFrame: @escaping (CGImage) -> Void) {
+        // While main is busy, newer frames replace the one waiting rather
+        // than queueing up behind it.
+        let box = Mailbox<CGImage>()
         core = FrameStream(engine: engine) { image in
-            DispatchQueue.main.async { onFrame(image) }
+            guard box.put(image) else { return }
+            DispatchQueue.main.async { if let latest = box.take() { onFrame(latest) } }
         }
     }
 
@@ -33,6 +37,8 @@ final class PreviewStream {
     }
 
     func stop() { core.stop() }
+
+    var isRunning: Bool { core.isRunning }
 }
 
 /// A layer that shows the latest frame, scaled to fit, plus the window the
