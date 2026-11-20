@@ -2089,10 +2089,19 @@ public final class FocusGuard {
         Self.returnPoint(p, agent: agent, users: AgentDisplay.userDisplayIDs().map { CGDisplayBounds($0) }, fenced: AgentDisplay.fencedBounds, msSinceUserMove: msSinceUserMove)
     }
 
+    /// A cursor found on the agent display this soon after the user moved
+    /// the mouse got there by that move (the watch can see it a moment
+    /// before the tap takes it back).
+    static let userMoveMs = 100.0
+
     /// Where a cursor found on the agent display `agent` at `p` goes back to,
-    /// `msSinceUserMove` after the user last moved the mouse.
+    /// `msSinceUserMove` after the user last moved the mouse. The user's own
+    /// move stops on the edge of their screen, as at any edge, so they can
+    /// reach the corner the agent display touches. Anything else put it
+    /// there (a warp, a posted event, the tap off): it comes back
+    /// `escapeInset` inside, where they can see it.
     static func returnPoint(_ p: CGPoint, agent: CGRect, users: [CGRect], fenced: [CGRect], msSinceUserMove: Double) -> CGPoint {
-        nearestUserPoint(p, agent: agent, users: users, fenced: fenced)
+        nearestUserPoint(p, agent: agent, users: users, fenced: fenced, inset: msSinceUserMove > userMoveMs)
     }
 
     /// How far inside the screen an escaped cursor goes back: on the edge's
