@@ -408,9 +408,12 @@ public final class Engine {
         tool == "status"
     }
 
-    /// Answers `tool` with `run` if it skips the session's queue; nil if it doesn't.
+    /// Answers `tool` with `run` if it skips the session's queue; nil if it
+    /// doesn't. `touch` marks the session as called first, so an agent that
+    /// only polls status isn't forgotten as dormant.
     static func answerOffQueue(_ tool: String, touch: () -> Void, run: () -> ToolResult) -> ToolResult? {
         guard answersOffQueue(tool) else { return nil }
+        touch()
         return run()
     }
 
