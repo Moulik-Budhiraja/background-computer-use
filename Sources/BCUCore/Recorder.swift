@@ -126,9 +126,13 @@ public final class RecordedRun {
     }
 
     /// Lets go of the video decoders kept for quick reads; the next read
-    /// makes them again.
+    /// makes them again. Returns at once: a decode in flight holds the lock
+    /// for as long as the video read takes, so the teardown waits for it on
+    /// another thread.
     public func releaseDecoders() {
-        decodeLock.lock(); generators.removeAll(); decodeLock.unlock()
+        DispatchQueue.global(qos: .utility).async { [self] in
+            decodeLock.lock(); generators.removeAll(); decodeLock.unlock()
+        }
     }
 
     private func decode(_ c: RecordedChunk, at t: Double) -> CGImage? {
