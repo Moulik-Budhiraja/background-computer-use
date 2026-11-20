@@ -64,4 +64,21 @@ final class ReviewFixTests: XCTestCase {
         // A second new window while the first settles: not the catcher's.
         XCTAssertFalse(WindowCatcher.mayMove(6, caught: 5))
     }
+
+    func testTheSweepLeavesAWindowReleasedSinceItsCopyOfTheRegistry() {
+        XCTAssertTrue(WindowManager.sweepStillOwns(registeredNow: true, kept: false))
+        // Released with keep_open while the sweep ran: on the user's screen now.
+        XCTAssertFalse(WindowManager.sweepStillOwns(registeredNow: false, kept: true))
+        // Released and closing.
+        XCTAssertFalse(WindowManager.sweepStillOwns(registeredNow: false, kept: false))
+    }
+
+    func testAStrayDisplaysWindowOnARealScreenIsLeftWhereItIs() {
+        let main = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let stranded = CGRect(x: 2000, y: 100, width: 800, height: 600)
+        XCTAssertTrue(WindowManager.strandedOnStray(stranded, userDisplays: [main]))
+        // A stray macOS left on top of the user's display: the window is visible.
+        let visible = CGRect(x: 300, y: 200, width: 800, height: 600)
+        XCTAssertFalse(WindowManager.strandedOnStray(visible, userDisplays: [main]))
+    }
 }
