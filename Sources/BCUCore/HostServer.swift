@@ -242,7 +242,7 @@ public final class HostServer {
                 self.sendFrame(s, image, connection)
             }
             s.frames.window = try Self.streamWindow(a, owns: { e.windows.window($0) != nil }) ?? 0
-            s.frames.excluded = CGWindowID(a.int("exclude") ?? 0)
+            s.frames.excluded = try a.windowID("exclude") ?? 0
             lock.lock(); c.streams[s.id] = s; lock.unlock()
             s.frames.start(fps: a.int("fps") ?? 15)
             return ["ok": true, "stream": s.id]
@@ -250,7 +250,7 @@ public final class HostServer {
         case "frames_update":
             let s = try stream(a, c)
             if let w = try Self.streamWindow(a, owns: { s.engine.windows.window($0) != nil }) { s.frames.window = w }
-            if let x = a.int("exclude") { s.frames.excluded = CGWindowID(x) }
+            if let x = try a.windowID("exclude") { s.frames.excluded = x }
             if let m = a.int("max_width") { s.maxWidth = m }
             if let q = a.double("quality") { s.quality = q }
             if let fps = a.int("fps") { s.frames.start(fps: fps) }

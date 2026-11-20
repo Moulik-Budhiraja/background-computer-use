@@ -111,8 +111,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         guard engineLock != nil else { return }
-        hub.shutdown()
+        // No new connections while the windows are being released.
         server?.stop()
+        hub.shutdown()
     }
 
     /// Expand one session's display. Only one expanded view shows at a time.

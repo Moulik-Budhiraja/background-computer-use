@@ -48,7 +48,7 @@ The MCP server's instructions tell the agent how to work: open a window of the a
 
 After the first read of a window, `get_window_state` lists only what changed, and an element keeps its number for as long as it exists. Right after an action it waits up to 5 s for the window to settle. `batch` runs a list of actions in one call (say, click the address bar, type a URL, press Return), stops at the first failure, and returns the changes at the end, so the agent makes fewer round trips to the model.
 
-For debugging: `bcu call <tool> '{json}'`, `bcu status`, `bcu tools`, `bcu docs`. The test tools (`admin_*`, which can type into and close any app's windows) answer only `bcu call`, and only when the app was started with `open --env BCU_ADMIN_TOOLS=1 "/Applications/Background Computer Use.app"`; they aren't listed and `bcu mcp` refuses them.
+For debugging: `bcu call <tool> '{json}'`, `bcu status`, `bcu tools`, `bcu docs`, `bcu --version`. The test tools (`admin_*`, which can type into and close any app's windows) answer only `bcu call`, and only when the app was started with `open --env BCU_ADMIN_TOOLS=1 "/Applications/Background Computer Use.app"`; they aren't listed and `bcu mcp` refuses them.
 
 ## Use it from another app
 
