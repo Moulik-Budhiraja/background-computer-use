@@ -402,15 +402,22 @@ public final class Engine {
 
     // MARK: Dispatch
 
-    /// Called from socket threads. Blocks until the tool finishes.
     /// Tools that only read state kept under locks, answered without
     /// waiting for the session's running call.
     static func answersOffQueue(_ tool: String) -> Bool {
         tool == "status"
     }
 
+    /// Answers `tool` with `run` if it skips the session's queue; nil if it doesn't.
+    static func answerOffQueue(_ tool: String, touch: () -> Void, run: () -> ToolResult) -> ToolResult? {
+        guard answersOffQueue(tool) else { return nil }
+        return run()
+    }
+
+    /// Called from socket threads. Blocks until the tool finishes.
     public func call(tool: String, args: JSONObject) -> ToolResult {
-        if Self.answersOffQueue(tool) { return status(Args(args)) }
+        let touch = { [self] in stateLock.lock(); lastCallMs = nowMs(); stateLock.unlock() }
+        if let result = Self.answerOffQueue(tool, touch: touch, run: { status(Args(args)) }) { return result }
         return queue.sync {
             stateLock.lock()
             lastCallMs = nowMs()
