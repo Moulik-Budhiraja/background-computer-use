@@ -326,7 +326,8 @@ enum LayoutKeys {
     private static var observer: NSObjectProtocol?
 
     static func code(for ch: Character, command: Bool) -> (CGKeyCode, Bool)? {
-        var (t, generation) = cache.read()
+        let (cached, generation) = cache.read()
+        var t = cached
         if t == nil {
             // Text Input Sources wants the main thread.
             var read: Tables?
@@ -384,6 +385,7 @@ final class Invalidated<Value> {
     /// Keep `v`, worked out after `read` returned `generation`.
     func publish(_ v: Value, readAt generation: Int) {
         lock.lock(); defer { lock.unlock() }
+        guard generation == self.generation else { return }
         value = v
     }
 }
