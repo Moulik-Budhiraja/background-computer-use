@@ -608,6 +608,6 @@ enum HostInput {
         if let c = codes[code] { return c }
         if code.hasPrefix("Key"), code.count == 4, let ch = code.last, let c = KeyMap.chars[Character(ch.lowercased())] { return c }
         if code.hasPrefix("Digit"), code.count == 6, let ch = code.last, let c = KeyMap.chars[ch] { return c }
-        return try? lookup(key, false).0
+        return try? lookup(key, command).0
     }
 }
