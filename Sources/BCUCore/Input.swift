@@ -322,17 +322,16 @@ public enum KeyMap {
 enum LayoutKeys {
     typealias Table = [Character: (CGKeyCode, Bool)]
     private struct Tables { var plain: [Table]; var command: [Table] }
-    private static let lock = NSLock()
-    private static var tables: Tables?
+    private static let cache = Invalidated<Tables>()
     private static var observer: NSObjectProtocol?
 
     static func code(for ch: Character, command: Bool) -> (CGKeyCode, Bool)? {
-        lock.lock(); var t = tables; lock.unlock()
+        var (t, generation) = cache.read()
         if t == nil {
             // Text Input Sources wants the main thread.
             var read: Tables?
             if Thread.isMainThread { read = load() } else { DispatchQueue.main.sync { read = load() } }
-            lock.lock(); tables = read; lock.unlock()
+            if let read { cache.publish(read, readAt: generation) }
             t = read
         }
         guard let t else { return nil }
@@ -345,7 +344,7 @@ enum LayoutKeys {
             observer = DistributedNotificationCenter.default().addObserver(
                 forName: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String), object: nil, queue: nil
             ) { _ in
-                lock.lock(); tables = nil; lock.unlock()
+                cache.invalidate()
             }
         }
         var layouts: [Data] = []
@@ -360,5 +359,31 @@ enum LayoutKeys {
     static func layoutData(_ source: TISInputSource) -> Data? {
         guard let p = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return nil }
         return Unmanaged<CFData>.fromOpaque(p).takeUnretainedValue() as Data
+    }
+}
+
+/// A value worked out once and dropped when what it was read from changes.
+/// Each drop starts a new generation, so a value read before it isn't kept.
+final class Invalidated<Value> {
+    private let lock = NSLock()
+    private var value: Value?
+    private var generation = 0
+
+    /// The value if there is one, and the generation to publish a new one at.
+    func read() -> (Value?, Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (value, generation)
+    }
+
+    func invalidate() {
+        lock.lock(); defer { lock.unlock() }
+        value = nil
+        generation += 1
+    }
+
+    /// Keep `v`, worked out after `read` returned `generation`.
+    func publish(_ v: Value, readAt generation: Int) {
+        lock.lock(); defer { lock.unlock() }
+        value = v
     }
 }
