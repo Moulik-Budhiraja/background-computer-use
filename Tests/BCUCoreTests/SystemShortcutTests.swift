@@ -28,3 +28,21 @@ final class SystemShortcutTests: XCTestCase {
         XCTAssertFalse(FocusGuard.systemShortcut(code: 53, flags: []))
     }
 }
+
+/// Only the whole system chord goes through: with another modifier it's
+/// the app's shortcut.
+final class SystemShortcutChordTests: XCTestCase {
+    func testAnAppsChordOnASystemKeyIsHeld() {
+        // Xcode's ctrl+cmd+left and right.
+        XCTAssertFalse(FocusGuard.systemShortcut(code: 123, flags: [.maskControl, .maskCommand, .maskNumericPad, .maskSecondaryFn]))
+        XCTAssertFalse(FocusGuard.systemShortcut(code: 124, flags: [.maskControl, .maskCommand, .maskNumericPad, .maskSecondaryFn]))
+        XCTAssertFalse(FocusGuard.systemShortcut(code: 49, flags: [.maskCommand, .maskShift]))
+        XCTAssertFalse(FocusGuard.systemShortcut(code: 160, flags: .maskCommand))
+    }
+
+    func testTheSystemChordsStillGoThrough() {
+        XCTAssertTrue(FocusGuard.systemShortcut(code: 48, flags: [.maskCommand, .maskShift]))
+        XCTAssertTrue(FocusGuard.systemShortcut(code: 49, flags: [.maskControl, .maskAlternate]))
+        XCTAssertTrue(FocusGuard.systemShortcut(code: 125, flags: [.maskControl, .maskNumericPad, .maskSecondaryFn]))
+    }
+}
