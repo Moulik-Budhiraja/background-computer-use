@@ -76,8 +76,15 @@ public final class SocketClient {
             while offset < raw.count {
                 let n = write(fd, raw.baseAddress!.advanced(by: offset), raw.count - offset)
                 if n < 0 && errno == EINTR { continue }
-                // Without its newline the app can't have run any of it.
-                if n <= 0 { throw SocketError.notSent }
+                if n <= 0 {
+                    // The engine may have refused this connection and said why.
+                    if let line = try? readLine(deadline: Date().addingTimeInterval(1), timeout: 1), let o = WireCodec.decode(line),
+                       o["ok"] as? Bool == false {
+                        throw SocketError.refused(o["error"] as? String ?? "the engine refused this connection")
+                    }
+                    // Without its newline the app can't have run any of it.
+                    throw SocketError.notSent
+                }
                 offset += n
             }
         }
@@ -86,6 +93,10 @@ public final class SocketClient {
             let response = try readLine(deadline: deadline, timeout: timeout)
             guard let reply = WireCodec.decode(response) else {
                 throw SocketError.message("bad response from app")
+            }
+            // The engine refused this connection (code signature check).
+            if reply["event"] as? String == "rejected" {
+                throw SocketError.refused(reply["error"] as? String ?? "the engine refused this connection")
             }
             // Ours, or the app's answer to a line it couldn't read (no id).
             // Anything else is a late reply to an earlier request.
@@ -155,12 +166,15 @@ public enum SocketError: Error, CustomStringConvertible {
     case notRunning
     /// The request never reached the app, so it's safe to send again.
     case notSent
+    /// The engine refused this connection (its code signature check), with why.
+    case refused(String)
     case message(String)
 
     public var description: String {
         switch self {
         case .notRunning: return "Background Computer Use is not running"
         case .notSent: return "couldn't send the request to the app"
+        case .refused(let why): return why
         case .message(let m): return m
         }
     }

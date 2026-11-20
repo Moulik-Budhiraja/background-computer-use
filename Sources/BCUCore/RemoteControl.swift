@@ -227,6 +227,7 @@ public final class RemoteControl {
                           menusBefore: Set(Self.menuWindows(w.pid).map(\.id)))
         case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             guard var p = press else { return }
+            guard Self.pressStillHere(p.window.id, onDisplay: windows()) else { return dropPress(p) }
             let unlock = lockApp(p.window.pid)
             defer { unlock() }
             if !p.dragging {
@@ -253,6 +254,7 @@ public final class RemoteControl {
             press = p
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
             guard let p = press else { return }
+            guard Self.pressStillHere(p.window.id, onDisplay: windows()) else { return dropPress(p) }
             let unlock = lockApp(p.window.pid)
             defer { unlock() }
             Log.info("remote: release button \(p.button) count \(p.clickCount) dragged \(p.dragging)")
@@ -294,6 +296,22 @@ public final class RemoteControl {
         default:
             break
         }
+    }
+
+    /// May a press keep acting on its window? `onDisplay`: the windows on
+    /// the agent display now.
+    /// Only while its window is still on the display: one the session gave
+    /// back (and another app's agent may have borrowed since) is left alone.
+    static func pressStillHere(_ window: CGWindowID, onDisplay: [WindowInfo]) -> Bool {
+        onDisplay.contains { $0.id == window }
+    }
+
+    /// Forget a press without acting on its window again.
+    private func dropPress(_ p: Press) {
+        Log.info("remote: dropped a press on window \(p.window.id), which left the agent display")
+        press = nil
+        cache.ms = 0
+        engine.focusGuard.endAction(pid: p.window.pid)
     }
 
     private func beginDrag(_ p: Press, _ kind: DragKind) {
@@ -621,7 +639,7 @@ public final class RemoteControl {
     public func key(_ event: CGEvent) {
         guard let e = event.copy() else { return }
         queue.async {
-            guard let w = self.keyTarget ?? self.frontWindow() else { return }
+            guard let w = Self.keyWindow(cached: self.keyTarget, onDisplay: self.windows()) else { return }
             let unlock = self.lockApp(w.pid)
             self.makeKey(w)
             // A shortcut like cmd+N can make the app bring itself forward; undo that.
@@ -686,6 +704,15 @@ public final class RemoteControl {
         // A window on the user's screen can reach the agent display's edge; never send it anything.
         guard engine.display.bounds.contains(point) else { return nil }
         return windows().first { $0.bounds.contains(point) }
+    }
+
+    /// Where a key goes: the window the user last clicked while it's still
+    /// on the agent display (`onDisplay`, front to back), else the front
+    /// window there. A window the session gave back may be another app's
+    /// agent's by now.
+    static func keyWindow(cached: WindowInfo?, onDisplay: [WindowInfo]) -> WindowInfo? {
+        if let cached, let current = onDisplay.first(where: { $0.id == cached.id }) { return current }
+        return onDisplay.first { $0.layer == 0 }
     }
 
     private func frontWindow() -> WindowInfo? {

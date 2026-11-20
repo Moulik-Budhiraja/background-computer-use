@@ -17,10 +17,11 @@ host app (Electron, say)
 - **Sessions belong to a host.** `bcu mcp --host <id>` tags its session. The menu bar app shows a host's sessions like its own, so a Mac has one menu bar icon for every agent: they count toward the icon's state, get a tile in the popover with the host app's icon beside their label, and its pause, stop and expanded view (take-over included) work on them. `hello` says `shows_hosts: true` when the menu bar app runs the engine, so the host can leave out a menu bar icon of its own; a host's own `bcu serve` doesn't say it. While the host is subscribed with that ID, the menu bar app leaves those sessions' handoff notifications to it, and when the user stops one from the menu bar app the host gets a `stopped` event. The menu bar app's history doesn't have them: see recordings, below.
 - **Recordings are the host's.** The engine can record each agent display, as the menu bar app's history does. A host's sessions are recorded only after it asks with `recordings`, into a folder it picks, and it keeps that folder's size and age in check the same way. The menu bar app records only its own sessions, into its own folder. Neither sees the other's.
 - **Permissions are the host's.** macOS attributes a child process's Accessibility, Screen Recording and audio capture to the app that launched it. The host asks for these permissions under its own name, and `hello` reports whether it has them.
+- **Only signed apps connect.** The engine checks the code signature of every process that connects to the socket (see [Who can connect](#who-can-connect)), so a script or another program can't use the permissions the user gave the engine's app. A host's own processes and its `bcu` pass as long as they're signed with its Developer ID and the `bcu` is in its bundle.
 
 ## Shipping it
 
-1. Build with `swift build -c release --arch arm64` and copy `.build/release/bcu` into the host's bundle (for electron-builder, `extraResources`; keep it out of `app.asar`). Sign it with the host's Developer ID and hardened runtime, like the rest of the host.
+1. Build with `swift build -c release --arch arm64` and copy `.build/release/bcu` into the host's bundle, at `Contents/Resources/bcu`, `Contents/Resources/<folder>/bcu`, `Contents/MacOS/bcu` or `Contents/Helpers/bcu` (for electron-builder, `extraResources`; keep it out of `app.asar`). Sign it with the host's Developer ID and hardened runtime, like the rest of the host. The engine lets the host's processes in because that `bcu` is there, signed by the same team as them.
 2. Add `NSAudioCaptureUsageDescription` to the host's Info.plist. The engine keeps sound from apps only agents use off the speakers with a Core Audio process tap.
 3. Ask the user for Accessibility (`systemPreferences.isTrustedAccessibilityClient(true)` in Electron) and Screen Recording.
 4. When the host launches, start the engine: `bcu serve --owner "<Host name>" [--log-dir <dir>]`. Its first line on stdout is either `{"event":"ready",…}` (this process is the engine) or `{"event":"running","owner":…}` (another engine runs it, maybe the app it just started, and this process exits). Starting the app can take up to 25 s. Either way, connect to `socket` from that line. When the connection closes, the engine went away (the user quit the app, say): run `bcu serve` again. An engine of the host's own stops when the host exits, and it releases its windows first. SIGTERM does the same.
@@ -67,7 +68,7 @@ await engine.handBack(session.id)      // the user is done; the agent resumes
 
 ## Protocol
 
-The engine reads and writes one JSON object per line on the socket (mode 0600, so only the user's processes can connect). Tool calls (`{"id","tool","args"}`) are what `bcu mcp` sends. A host sends `{"id": 1, "op": "<op>", …}` and gets a single reply with the same `id` and `"ok": true`, or `"ok": false` with `"error"`. Pushed events carry `"event"` and no `id`. Points are display-local, on the session's agent display, with a top-left origin, in points. Frames are at the display's pixel density, twice that. Every type is in [`clients/typescript/src/types.ts`](../clients/typescript/src/types.ts).
+The engine reads and writes one JSON object per line on the socket (mode 0600, so only the user's processes can connect, and only those [it lets in](#who-can-connect)). Tool calls (`{"id","tool","args"}`) are what `bcu mcp` sends. A host sends `{"id": 1, "op": "<op>", …}` and gets a single reply with the same `id` and `"ok": true`, or `"ok": false` with `"error"`. Pushed events carry `"event"` and no `id`. Points are display-local, on the session's agent display, with a top-left origin, in points. Frames are at the display's pixel density, twice that. Every type is in [`clients/typescript/src/types.ts`](../clients/typescript/src/types.ts).
 
 | op | params | reply / effect |
 |---|---|---|
@@ -90,9 +91,25 @@ The engine reads and writes one JSON object per line on the socket (mode 0600, s
 | `frames_stop` | `stream` | |
 | `yield` | | the engine stops once its agents are idle (the menu bar app sends this) |
 
-Events: `sessions`, `pointer`, `frame`, `stopped` (`{"event":"stopped","session":…}`: the user stopped that session from the menu bar app and its windows are released; a client's own `stop` isn't echoed), and while this client has a session taken over, `cursor` (the CSS cursor the app under the pointer would show), `menu` (an app menu the engine closed, to show and pick from) and `drag` (a window being moved or resized, which the real window follows about 100 ms later).
+Events: `rejected` (the first and only line to a client the engine [won't let in](#who-can-connect), with `ok: false` and `error` saying why; then it closes the connection), `sessions`, `pointer`, `frame`, `stopped` (`{"event":"stopped","session":…}`: the user stopped that session from the menu bar app and its windows are released; a client's own `stop` isn't echoed), and while this client has a session taken over, `cursor` (the CSS cursor the app under the pointer would show), `menu` (an app menu the engine closed, to show and pick from) and `drag` (a window being moved or resized, which the real window follows about 100 ms later).
 
 `HostServer.protocolVersion` goes up when a change would break an existing client.
+
+## Who can connect
+
+When a process connects, the engine reads its code signature through the socket's audit token (`PeerCheck.swift`) and lets it in if one of these holds:
+
+- It's signed by the same Developer ID team as the engine. That covers the menu bar app's own `bcu` (what Claude Code and Codex run), and, when the engine is a host's `bcu serve`, the host's own processes.
+- It's the same binary as the engine (the same code directory hash): a `bcu mcp` or `bcu call` next to its `bcu serve`.
+- The engine is an ad hoc build with no team (a development build), and the process is inside the engine's own app bundle, or its folder for a bare `bcu`.
+- It's signed by another team, the outermost app bundle it's in is signed by that same team with its seal intact, and that app ships a `bcu`, at one of the places in step 1 of [Shipping it](#shipping-it), signed by the same team. The process has to be the code in that bundle as it is on disk. This is how a host's UI and its agents' `bcu mcp` use the menu bar app's engine, and how the menu bar app asks a host's engine to `yield`.
+- `bcu serve --trust-client <team ID or path>` names it (`trustClients` in `startEngine`). A path can be a program, an app or a folder. An app's main executable (Electron's `process.execPath`) stands for its app. This is for development: an Electron host run with `electron .` is Electron's binary, signed by Electron's team, so its engine has to be started with `trustClients: [process.execPath]` (and `ownEngine: true`, since the menu bar app's engine doesn't take the option). The protocol tests do the same for `node`.
+
+A team only counts when a certificate issued by Apple vouches for it. Everything else, including Apple's own programs (`python3`, `nc`, `osascript`) and programs from other developers that don't ship `bcu`, gets one `rejected` line and the connection closes.
+
+A client let in under another team's app sees and drives only what its team started. `sessions` and `subscribe` list only those sessions, and the session ops (`pause`, `take_over`, `frames` and the rest) treat any other session as missing. A session belongs to the team whose client made its first tool call, and a host ID belongs to the first team that names it in `subscribe`, `recordings` or a tool call, the engine's own team included. Tool calls from another team for that session or host ID are refused, and so are calls that name a window of another team's session. A subagent's first call claims its parent session too. A tool call from another team has to name its session (`_session`, which `bcu mcp --session` sets): the default session that `bcu call` uses is the engine's own. A `frames` stream shows only windows of the session it's for. The engine's own team sees everything, as before.
+
+Hosts on Electron should turn off the `RunAsNode` and `EnableNodeCliInspectArguments` fuses (`@electron/fuses`), so nobody can run their own script as the host's signed binary. The same goes for any interpreter a host ships signed with its team.
 
 ## In process (Swift)
 

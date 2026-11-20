@@ -207,6 +207,9 @@ final class MCPServer {
             result = try callWithReconnect(name, arguments, session: session, lane: lane)
         } catch let error as ConnectError {
             result = .error(error.description)
+        } catch SocketError.refused(let why) {
+            // Never ran: the engine turned the connection away.
+            result = .error(why)
         } catch SocketError.notSent {
             result = .error("Couldn't send \(name) to \(ownerName); it didn't run. Try again.")
         } catch {

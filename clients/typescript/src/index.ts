@@ -53,6 +53,10 @@ export type StartOptions = {
   // installed. Then agents that use the app's own `bcu` (Claude Code,
   // Codex) run on your engine too, and nothing shows them.
   ownEngine?: boolean
+  // Clients the engine's code signature check would refuse: team IDs, or
+  // paths of programs, apps or folders (your development build, say). Your
+  // signed app and its `bcu` don't need this.
+  trustClients?: string[]
   env?: NodeJS.ProcessEnv
 }
 
@@ -68,6 +72,7 @@ export function startEngine(opts: StartOptions): Promise<EngineStart> {
   const args = ['serve', '--owner', opts.owner]
   if (opts.logDir) args.push('--log-dir', opts.logDir)
   if (opts.ownEngine) args.push('--own-engine')
+  for (const c of opts.trustClients ?? []) args.push('--trust-client', c)
   const child = spawn(opts.bcu, args, { stdio: ['ignore', 'pipe', 'ignore'], env: opts.env ?? process.env })
   return new Promise((resolve, reject) => {
     let buffer = ''
@@ -141,6 +146,8 @@ export class EngineClient extends EventEmitter<Events> {
   private nextId = 1
   private pending = new Map<number, Pending>()
   private closed = false
+  // Why the engine refused this connection, if it did.
+  private refusal?: string
   private streams = new Set<FrameStream>()
   private readonly socket: Socket
   readonly path: string
@@ -319,7 +326,9 @@ export class EngineClient extends EventEmitter<Events> {
       return
     }
     if (msg.event) {
-      if (msg.event === 'sessions') {
+      if (msg.event === 'rejected') {
+        this.refusal = msg.error
+      } else if (msg.event === 'sessions') {
         const e = msg as SessionsEvent
         this.emit('sessions', e.sessions, e.engine)
       } else {
@@ -341,7 +350,7 @@ export class EngineClient extends EventEmitter<Events> {
   private finish(): void {
     if (this.closed) return
     this.closed = true
-    for (const p of this.pending.values()) p.reject(new Error('the engine closed the connection'))
+    for (const p of this.pending.values()) p.reject(new Error(this.refusal ?? 'the engine closed the connection'))
     this.pending.clear()
     for (const s of this.streams) s.stop()
     this.emit('close')

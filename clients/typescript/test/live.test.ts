@@ -30,7 +30,7 @@ const running = (app: string) => {
 const calculatorWasRunning = running('Calculator')
 
 before(async () => {
-  if (live) engine = await startEngine({ bcu, owner: 'Live Test', logDir: join(home, 'logs'), env })
+  if (live) engine = await startEngine({ bcu, owner: 'Live Test', logDir: join(home, 'logs'), trustClients: [process.execPath], env })
 })
 
 after(async () => {

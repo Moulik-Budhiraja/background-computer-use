@@ -93,6 +93,13 @@ public final class Hub {
         byID[id] ?? byID.values.first { sessionID($0) == id }
     }
 
+    /// The sessions that have this window, by the id their connection uses
+    /// and the id they were made with.
+    public func sessions(owningWindow window: CGWindowID) -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        return byID.filter { $0.value.windows.window(window) != nil }.flatMap { [$0.key, $0.value.sessionID] }
+    }
+
     /// A connection began carrying this session's calls, or one that did
     /// went away (`SocketServer.sessionHandler`). When the last one goes the
     /// agent is gone: nobody is left to release its windows, and they'd hold
