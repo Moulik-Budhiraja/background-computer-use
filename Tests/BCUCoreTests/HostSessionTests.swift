@@ -24,6 +24,17 @@ final class HostSessionTests: XCTestCase {
         XCTAssertNil(hub.hostPID("ping"))
     }
 
+    /// A host renames its session once it knows a better name, such as its
+    /// task's title, and the menu bar shows the new one.
+    func testHostRenamesItsSession() {
+        let hub = Hub()
+        let e = hub.engine(for: "host-session", client: nil, label: "i want to get the google approval", host: "ping")
+        e.rename("Get Google Approval")
+        XCTAssertEqual(e.label, "Get Google Approval")
+        XCTAssertTrue(hub.engine(for: "host-session", client: nil, label: "old words", host: "ping") === e)
+        XCTAssertEqual(e.label, "Get Google Approval")
+    }
+
     /// The menu bar app's viewer and a host app can both take a session
     /// over: the agent gets it back only once both have given it back, and
     /// each keeps its own hold (a host's input keeps working) meanwhile.
