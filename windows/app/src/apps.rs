@@ -5,13 +5,19 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, HWND, RECT};
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile, STGM_READ};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, CoCreateInstance, CoTaskMemFree, IPersistFile, STGM_READ};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
 use windows::Win32::System::Threading::GetProcessId;
 use windows::Win32::UI::Shell::{
-    IShellLinkW, ITaskbarList, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW, ShellLink, TaskbarList,
+    AO_NOERRORUI, ApplicationActivationManager, BHID_EnumItems, FOLDERID_AppsFolder, IApplicationActivationManager, IEnumShellItems, IShellItem, IShellLinkW,
+    ITaskbarList, KF_FLAG_DEFAULT, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, SHGetKnownFolderItem, SIGDN_NORMALDISPLAY,
+    SIGDN_PARENTRELATIVEPARSING, ShellExecuteExW, ShellLink, TaskbarList,
 };
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GA_ROOTOWNER, GetAncestor, GetWindowPlacement, GetWindowRect, SPI_GETWORKAREA, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowPlacement, SetWindowPos, SystemParametersInfoW,
+    WINDOWPLACEMENT, WINDOWPLACEMENT_FLAGS,
+};
 use windows::core::{HSTRING, Interface, PCWSTR};
 
 use crate::{guard, monitor, offscreen, win};
@@ -25,6 +31,9 @@ pub struct App {
     /// The executable's full path, when known (for the browser checks).
     pub path: Option<String>,
     pub name: String,
+    /// A packaged (Store) app's AppUserModelID, launched through the shell's
+    /// activation manager, which says which process it started.
+    pub aumid: Option<String>,
 }
 
 fn exe_file(path: &str) -> String {
@@ -87,7 +96,7 @@ fn shortcut_target(lnk: &Path) -> Option<String> {
 }
 
 fn exe_app(path: &str, name: String) -> App {
-    App { launch: path.into(), exe: Some(exe_file(path)), path: Some(path.into()), name }
+    App { launch: path.into(), exe: Some(exe_file(path)), path: Some(path.into()), name, aumid: None }
 }
 
 /// Resolve "Helium", "Notepad", "notepad.exe" or a full path.
@@ -120,12 +129,61 @@ pub fn resolve(name: &str) -> Result<App, String> {
         // shortcut, which may carry arguments they need.
         return Ok(match shortcut_target(&lnk) {
             Some(path) if crate::browser::is_browser(&path) => exe_app(&path, display),
-            Some(path) => App { launch: lnk.to_string_lossy().into(), exe: Some(exe_file(&path)), path: Some(path), name: display },
-            None => App { launch: lnk.to_string_lossy().into(), exe: None, path: None, name: display },
+            Some(path) => App { launch: lnk.to_string_lossy().into(), exe: Some(exe_file(&path)), path: Some(path), name: display, aumid: None },
+            None => App { launch: lnk.to_string_lossy().into(), exe: None, path: None, name: display, aumid: None },
         });
     }
+    // A packaged app (Calculator) has no program the shell can start by name.
+    if !on_path(&format!("{wanted}.exe"))
+        && let Some((aumid, display)) = packaged_app(&wanted)
+    {
+        return Ok(App { launch: format!(r"shell:AppsFolder\{aumid}"), exe: None, path: None, name: display, aumid: Some(aumid) });
+    }
     // Let the shell try (PATH, system apps like notepad).
-    Ok(App { launch: name.into(), exe: Some(format!("{wanted}.exe")), path: None, name: name.into() })
+    Ok(App { launch: name.into(), exe: Some(format!("{wanted}.exe")), path: None, name: name.into(), aumid: None })
+}
+
+fn on_path(file: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(file).is_file()))
+}
+
+/// A packaged app by its Start menu name (lowercase): its AppUserModelID
+/// and display name, from shell:AppsFolder.
+fn packaged_app(wanted: &str) -> Option<(String, String)> {
+    unsafe {
+        let folder: IShellItem = SHGetKnownFolderItem(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None).ok()?;
+        let items: IEnumShellItems = folder.BindToHandler(None, &BHID_EnumItems).ok()?;
+        let name = |item: &IShellItem, kind| {
+            let p = item.GetDisplayName(kind).ok()?;
+            let s = p.to_string().ok();
+            CoTaskMemFree(Some(p.0 as *const _));
+            s
+        };
+        loop {
+            let mut batch = [None];
+            let mut fetched = 0u32;
+            if items.Next(&mut batch, Some(&mut fetched)).is_err() || fetched == 0 {
+                return None;
+            }
+            let Some(item) = batch[0].take() else { return None };
+            if name(&item, SIGDN_NORMALDISPLAY).is_some_and(|d| d.to_lowercase() == wanted)
+                // Packaged apps' ids are "PackageFamilyName!App"; others are paths.
+                && let Some(id) = name(&item, SIGDN_PARENTRELATIVEPARSING).filter(|id| id.contains('!'))
+            {
+                let display = name(&item, SIGDN_NORMALDISPLAY).unwrap_or_else(|| wanted.into());
+                return Some((id, display));
+            }
+        }
+    }
+}
+
+/// Start a packaged app. Returns the process it started (or the running one it activated).
+fn activate(aumid: &str) -> Result<u32, String> {
+    unsafe {
+        let manager: IApplicationActivationManager =
+            CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER).map_err(|e| format!("couldn't start {aumid}: {e}"))?;
+        manager.ActivateApplication(&HSTRING::from(aumid), &HSTRING::new(), AO_NOERRORUI).map_err(|e| format!("couldn't start {aumid}: {e}"))
+    }
 }
 
 /// Start `target`, with `args` if given. Returns the process it started, if
@@ -152,12 +210,23 @@ pub fn launch(target: &str, args: Option<&str>) -> Result<Option<u32>, String> {
     Ok((pid != 0).then_some(pid))
 }
 
-fn matches(app: &App, hwnd: HWND) -> bool {
+/// Whether `hwnd` is a window of `app`. With no program to compare (a
+/// packaged app, a shortcut to something that isn't an exe), only windows of
+/// the processes the launch started, and of their children, count; a UWP
+/// app's frame belongs to ApplicationFrameHost.exe and holds the app's window.
+fn matches(app: &App, hwnd: HWND, launched: &[u32]) -> bool {
+    let pid = win::pid_tid(hwnd).0;
     match (&app.path, &app.exe) {
         // Helium and Chrome are both chrome.exe: compare paths when known.
-        (Some(path), _) => win::exe_path(win::pid_tid(hwnd).0).is_some_and(|p| p.eq_ignore_ascii_case(path)),
-        (None, Some(exe)) => win::exe_name(win::pid_tid(hwnd).0).to_lowercase() == *exe,
-        (None, None) => true,
+        (Some(path), _) => win::exe_path(pid).is_some_and(|p| p.eq_ignore_ascii_case(path)),
+        (None, Some(exe)) => win::exe_name(pid).to_lowercase() == *exe,
+        (None, None) if launched.is_empty() => false,
+        (None, None) => {
+            let parents = win::parents();
+            win::descends_from(pid, launched, &parents)
+                || (win::exe_name(pid).eq_ignore_ascii_case("applicationframehost.exe")
+                    && win::child_pids(hwnd).iter().any(|c| win::descends_from(*c, launched, &parents)))
+        }
     }
 }
 
@@ -192,6 +261,87 @@ pub fn show_in_taskbar(hwnd: HWND) {
     }
 }
 
+/// The primary monitor's work area (without the taskbar).
+fn primary_work_area() -> RECT {
+    let mut r = RECT::default();
+    unsafe {
+        let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut r as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+    }
+    r
+}
+
+pub fn placement(hwnd: HWND) -> WINDOWPLACEMENT {
+    let mut wp = WINDOWPLACEMENT { length: size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+    unsafe {
+        let _ = GetWindowPlacement(hwnd, &mut wp);
+    }
+    wp
+}
+
+/// Move a window onto the middle of the user's main screen without
+/// activating it, with the dialogs and menus it has open (an unsaved-changes
+/// prompt, say), and give it its taskbar button back. A minimized window
+/// stays minimized and comes back there.
+pub fn to_user_screen(hwnd: HWND) {
+    let work = primary_work_area();
+    let mut wp = placement(hwnd);
+    let iconic = win::is_minimized(hwnd);
+    let before = win::frame(hwnd);
+    let size = if iconic || win::is_maximized(hwnd) { wp.rcNormalPosition } else { before };
+    let (w, h) = ((size.right - size.left).min(work.right - work.left), (size.bottom - size.top).min(work.bottom - work.top));
+    let x = work.left + (work.right - work.left - w) / 2;
+    let y = work.top + (work.bottom - work.top - h) / 2;
+    unsafe {
+        if iconic || win::is_maximized(hwnd) {
+            wp.flags = WINDOWPLACEMENT_FLAGS(0);
+            wp.showCmd = if iconic { SW_SHOWMINNOACTIVE.0 as u32 } else { SW_SHOWNOACTIVATE.0 as u32 };
+            wp.rcNormalPosition = RECT { left: x, top: y, right: x + w, bottom: y + h };
+            let _ = SetWindowPlacement(hwnd, &wp);
+        } else {
+            let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+    if !iconic {
+        let after = win::frame(hwnd);
+        let (dx, dy) = (after.left - before.left, after.top - before.top);
+        for owned in win::top_level_windows() {
+            if owned != hwnd && win::is_visible(owned) && unsafe { GetAncestor(owned, GA_ROOTOWNER) } == hwnd {
+                let mut r = RECT::default();
+                unsafe {
+                    let _ = GetWindowRect(owned, &mut r);
+                    let _ = SetWindowPos(owned, None, r.left + dx, r.top + dy, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
+                }
+            }
+        }
+    }
+    show_in_taskbar(hwnd);
+}
+
+/// Put a borrowed window back exactly as it was: where, and maximized or
+/// minimized. Only a maximized one can't be shown without activating it, so
+/// the focus guard hands the foreground back if it takes it.
+pub fn put_back(hwnd: HWND, home: &WINDOWPLACEMENT) {
+    let mut wp = *home;
+    wp.length = size_of::<WINDOWPLACEMENT>() as u32;
+    let maximized = home.showCmd == SW_SHOWMAXIMIZED.0 as u32;
+    wp.showCmd = match home.showCmd {
+        c if c == SW_SHOWMAXIMIZED.0 as u32 => c,
+        c if c == SW_SHOWMINIMIZED.0 as u32 || c == SW_MINIMIZE.0 as u32 || c == SW_SHOWMINNOACTIVE.0 as u32 => SW_SHOWMINNOACTIVE.0 as u32,
+        _ => SW_SHOWNOACTIVATE.0 as u32,
+    };
+    let pid = win::pid_tid(hwnd).0;
+    if maximized {
+        guard::begin_action(pid);
+    }
+    unsafe {
+        let _ = SetWindowPlacement(hwnd, &wp);
+    }
+    if maximized {
+        let _ = guard::end_action(pid);
+    }
+    show_in_taskbar(hwnd);
+}
+
 /// Open a new window of `app` on the agent monitor. Returns the window and
 /// notes on what happened.
 ///
@@ -207,7 +357,7 @@ pub fn open(app: &App, monitor: RECT, index: usize) -> Result<(HWND, Vec<String>
     // running in the background shows none, and opens the new window).
     let running: Vec<u32> = win::top_level_windows()
         .into_iter()
-        .filter(|h| app.exe.is_some() && matches(app, *h))
+        .filter(|h| app.exe.is_some() && matches(app, *h, &[]))
         .map(|h| win::pid_tid(h).0)
         .collect::<HashSet<_>>()
         .into_iter()
@@ -217,8 +367,19 @@ pub fn open(app: &App, monitor: RECT, index: usize) -> Result<(HWND, Vec<String>
     }
     let mut opening = offscreen::begin_open(&running, app.path.as_deref().or(app.exe.as_deref()), monitor, index);
     let result = (|| {
-        if let Some(pid) = launch(&app.launch, None)? {
+        let started = match &app.aumid {
+            Some(aumid) => Some(activate(aumid)?).filter(|p| *p != 0),
+            None => launch(&app.launch, None)?,
+        };
+        if let Some(pid) = started {
             opening.add_pid(pid);
+        }
+        let launched: Vec<u32> = started.into_iter().collect();
+        if app.exe.is_none() && launched.is_empty() {
+            return Err(format!(
+                "started {}, but couldn't tell which window is its new one. If it opened on the user's screen, use list_windows and borrow_window.",
+                app.name
+            ));
         }
         let deadline = t + Duration::from_secs(15);
         let mut found: Option<(HWND, Instant)> = None;
@@ -233,6 +394,20 @@ pub fn open(app: &App, monitor: RECT, index: usize) -> Result<(HWND, Vec<String>
                     place(hwnd, monitor, index);
                 }
                 if since.elapsed() > Duration::from_millis(500) {
+                    // An app running as administrator ignores this app's
+                    // moves and input (UIPI): say so rather than hand the agent a window it can't use.
+                    let pid = win::pid_tid(hwnd).0;
+                    if win::above_us(pid) || (!on_monitor(hwnd, &monitor) && !win::is_minimized(hwnd)) {
+                        guard::remove_agent_window(hwnd);
+                        if win::exists(hwnd) && win::is_visible(hwnd) {
+                            show_in_taskbar(hwnd);
+                        }
+                        return Err(format!(
+                            "{} opened a window, but it {}, so Windows doesn't let this app move it or send it input. It's on the user's screen.",
+                            app.name,
+                            if win::above_us(pid) { "runs as administrator" } else { "wouldn't move onto your monitor" }
+                        ));
+                    }
                     return Ok(hwnd);
                 }
             } else if Instant::now() > deadline {
@@ -242,7 +417,7 @@ pub fn open(app: &App, monitor: RECT, index: usize) -> Result<(HWND, Vec<String>
                 ));
             } else {
                 for hwnd in win::top_level_windows() {
-                    if known.contains(&(hwnd.0 as usize)) || !win::is_app_window(hwnd) || !matches(app, hwnd) {
+                    if known.contains(&(hwnd.0 as usize)) || !win::is_app_window(hwnd) || !matches(app, hwnd, &launched) {
                         continue;
                     }
                     guard::add_agent_window(hwnd, monitor, index);

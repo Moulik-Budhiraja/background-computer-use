@@ -391,6 +391,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 PostQuitMessage(0);
                 LRESULT(0)
             }
+            WM_QUERYENDSESSION => {
+                // Signing out or shutting down: give the agents' windows to
+                // the user before apps save where their windows are, or
+                // they'd reopen on the agent screen. Windows waits 5 s.
+                engine::surrender_for_end_of_session(Duration::from_secs(3));
+                LRESULT(1)
+            }
             WM_WTSSESSION_CHANGE => {
                 session_changed(wparam.0 as u32);
                 LRESULT(0)

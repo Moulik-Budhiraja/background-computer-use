@@ -86,6 +86,9 @@ impl Server {
     /// If the app restarted, the old pipe is dead: reconnect once and retry.
     fn call_with_reconnect(&mut self, name: &str, mut args: Map<String, Value>) -> Result<ToolResult, String> {
         args.insert("_session".into(), json!(self.session_id));
+        // The session lasts as long as this process's connection: when the
+        // agent goes, the app closes its windows and gives borrowed ones back.
+        args.insert("_live".into(), json!(true));
         if let Some(c) = &self.client_name {
             args.insert("_client".into(), json!(c));
         }

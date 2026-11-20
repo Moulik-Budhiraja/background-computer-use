@@ -61,6 +61,8 @@ fn main() {
     }
     offscreen::start();
     guard::start();
+    // Windows agents had when the app last died: back to the user.
+    offscreen::recover();
     gfx::startup();
     updater::start(tray::request_quit);
     println!("serving {}", pipe::pipe_name());
