@@ -506,10 +506,18 @@ public final class FrontGate {
     private static var clearedURL: URL { BCUPaths.supportDirectory.appendingPathComponent("front-gate.cleared") }
 
     /// Lock held. The watchdog took this engine's entries off (after a
-    /// stall), all of them (no record left) or some.
+    /// stall), all of them or some: it says so in a file of its own. A record
+    /// that's merely gone was deleted from outside (a cleanup app emptying
+    /// the folder), and the entries are still on.
     private var watchdogClearedLocked: Bool {
         FileManager.default.fileExists(atPath: Self.clearedURL.path)
-            || (!onWindowServerList.isEmpty && !FileManager.default.fileExists(atPath: markerURL.path))
+    }
+
+    /// Lock held. Entries on with no record: written again, or a crash would
+    /// leave them on with nothing to take them off, and every app launched
+    /// after that would be refused the front until the user logs out.
+    private var recordMissingLocked: Bool {
+        !onWindowServerList.isEmpty && !FileManager.default.fileExists(atPath: markerURL.path)
     }
 
     /// Lock and record lock held. Pick up what the watchdog took off: only
@@ -644,7 +652,14 @@ public final class FrontGate {
         }
         if useWindowServer {
             // The watchdog took this engine's entries off (after a stall).
-            if watchdogClearedLocked { _ = Self.withRecordLock(wait: true) { () -> Bool in noteWatchdogClearLocked() } }
+            // Or the record went from outside: put it back.
+            if watchdogClearedLocked || recordMissingLocked {
+                _ = Self.withRecordLock(wait: true) { () -> Bool in
+                    if noteWatchdogClearLocked() { return true }
+                    if recordMissingLocked { Self.writeRecord(onWindowServerList) }
+                    return false
+                }
+            }
             var held = want
             held.pids.remove(front)
             held.pids.remove(getpid())

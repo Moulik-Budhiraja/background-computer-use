@@ -42,6 +42,60 @@ public final class FocusGuard {
     private var pressHooks: [String: () -> Void] = [:]
     private let pressLock = NSLock()
 
+    /// What the user pressed, for `onUserInput`.
+    public enum UserInput {
+        /// A key (not a modifier alone), going to this app.
+        case key(front: pid_t)
+        /// A mouse button, at this point (global, top-left origin).
+        case click(at: CGPoint)
+        /// Play, next, previous, fast-forward or rewind on the keyboard:
+        /// it goes to whichever app last played, not to the front one.
+        case mediaKey
+    }
+    /// Like `onUserPress`, saying what was pressed and where. Called from
+    /// the input tap: `hook` must return at once. One per owner; nil removes it.
+    public func onUserInput(for owner: String, _ hook: ((UserInput) -> Void)?) {
+        pressLock.lock(); inputHooks[owner] = hook; pressLock.unlock()
+    }
+    private var inputHooks: [String: (UserInput) -> Void] = [:]
+
+    /// Tap thread.
+    private func userInput(_ type: CGEventType, _ event: CGEvent) {
+        pressLock.lock(); let hooks = Array(inputHooks.values); pressLock.unlock()
+        guard !hooks.isEmpty else { return }
+        let input: UserInput
+        if type == .keyDown {
+            // cmd+Tab goes to the app switcher, not the front app.
+            if event.flags.contains(.maskCommand) && event.getIntegerValueField(.keyboardEventKeycode) == 48 { return }
+            // An agent's app that brought itself forward doesn't get the
+            // key: it's held and replayed into the user's app (see `handle`).
+            var front = BCUFrontProcessPID()
+            let user = userFront
+            if user != 0, front != user, agentCaused(front) { front = user }
+            input = .key(front: front)
+        } else if Self.isMouseDown(type) {
+            input = .click(at: event.location)
+        } else if type == Self.systemDefined, Self.isMediaKeyDown(event) {
+            input = .mediaKey
+        } else {
+            return
+        }
+        for hook in hooks { hook(input) }
+    }
+
+    /// NX_SYSDEFINED: media, volume and brightness keys.
+    static let systemDefined = CGEventType(rawValue: 14)!
+
+    /// A media key going down (NX_SUBTYPE_AUX_CONTROL_BUTTONS): play (16),
+    /// next (17), previous (18), fast-forward (19), rewind (20). Volume and
+    /// brightness keys don't count.
+    static func isMediaKeyDown(_ event: CGEvent) -> Bool {
+        guard let e = NSEvent(cgEvent: event), e.subtype.rawValue == 8 else { return false }
+        let code = (e.data1 & 0xFFFF_0000) >> 16
+        let down = ((e.data1 & 0xFF00) >> 8) == 0xA
+        return down && (16...20).contains(code)
+    }
+
     private func userPressed() {
         pressLock.lock(); let hooks = Array(pressHooks.values); pressLock.unlock()
         for hook in hooks { hook() }
@@ -88,6 +142,16 @@ public final class FocusGuard {
     private var shownSpaces: [CGDirectDisplayID: UInt64] = [:]
     private var userFrontWindow: CGWindowID?
     private var lastUserMouseDownMs = 0.0
+    /// Where the user's last click landed (the app whose window it was on),
+    /// and the windows on their screens just before it (id to title), for a
+    /// second look at an app that came forward just after it (`SecondLook`).
+    private var lastClick: (ms: Double, owner: pid_t?, windows: [CGWindowID: String]?) = (0, nil, nil)
+    /// The windows on the user's screens, looked at every 250 ms while
+    /// agents work, so a click has a look from before anything it opened.
+    private var screenLook: [CGWindowID: String]?
+    private let clickQueue = DispatchQueue(label: "bcu.guard.click", qos: .userInteractive)
+    /// When an agent's step on each app last ended (see `Bounce`).
+    private var lastActedMs: [pid_t: Double] = [:]
     private var lastUserSwitchKeyMs = 0.0
     private var lastUserKeyMs = 0.0
     /// The user's last key that could open or switch to an app: Return or
@@ -179,6 +243,8 @@ public final class FocusGuard {
             self?.activated(app)
         }
         installTap()
+        Thread.detachNewThread { [weak self] in self?.watchAttention() }
+        Thread.detachNewThread { [weak self] in self?.watchUserScreen() }
         gate.targets = { [weak self] in self?.gateTargets() ?? FrontGate.Targets() }
         gate.tapWorking = { [weak self] in
             guard let self, let tap = self.tap, CGEvent.tapIsEnabled(tap: tap) else { return false }
@@ -224,7 +290,7 @@ public final class FocusGuard {
         guard tap == nil else { return }
         let types: [CGEventType] = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
                                     .leftMouseDown, .rightMouseDown, .otherMouseDown, .leftMouseUp, .rightMouseUp, .otherMouseUp, .scrollWheel, .tabletPointer,
-                                    .keyDown, .keyUp, .flagsChanged]
+                                    .keyDown, .keyUp, .flagsChanged, Self.systemDefined]
         let mask = types.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
         guard let port = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
                                            eventsOfInterest: mask, callback: guardTapCallback, userInfo: nil) else {
@@ -344,6 +410,7 @@ public final class FocusGuard {
 
     public func endAction(pid: pid_t, graceMs: Double = 700) {
         lock.lock()
+        lastActedMs[pid] = nowMs()
         if var t = taints[pid] {
             t.count = max(0, t.count - 1)
             // Another session's action in the same app is still running.
@@ -446,13 +513,63 @@ public final class FocusGuard {
     /// user's app back in front of it, unless the user clicked or pressed
     /// cmd+Tab and hasn't come to another app since.
     func agentCaused(_ pid: pid_t) -> Bool {
+        Attribution.agentCaused(facts(pid))
+    }
+
+    private func facts(_ pid: pid_t) -> Attribution.Facts {
         lock.lock(); defer { lock.unlock() }
-        return Attribution.agentCaused(Attribution.Facts(
+        return Attribution.Facts(
             nowMs: nowMs(),
             step: taints[pid].map { Attribution.Step(running: $0.count, settleUntilMs: $0.until, strict: $0.strict) },
             restoredAwayMs: restoredAwayMs[pid],
             lastMouseDownMs: lastUserMouseDownMs, lastSwitchKeyMs: lastUserSwitchKeyMs, lastOpenKeyMs: lastUserOpenKeyMs,
-            arrivedElsewhereMs: arrivals.last(where: { $0.pid != pid })?.ms ?? -.infinity))
+            arrivedElsewhereMs: arrivals.last(where: { $0.pid != pid })?.ms ?? -.infinity)
+    }
+
+    /// The user's windows on their screens: id to title.
+    private static func userScreenWindows() -> [CGWindowID: String] {
+        var out: [CGWindowID: String] = [:]
+        for w in WindowList.all(onScreenOnly: true) where w.layer == 0 && !onAgentDisplay(w.id) { out[w.id] = w.title }
+        return out
+    }
+
+    /// `pid` came forward during an agent's step on it, put down to a click
+    /// of the user's: look again in a moment, and if the click was in the
+    /// app they were in and opened nothing here, and they haven't touched
+    /// this app since, it was the agent's step after all: put their app
+    /// back. Better late than leaving them in the agent's app.
+    private func scheduleSecondLook(_ pid: pid_t) {
+        lock.lock()
+        let previous = (pid: userFrontPid, window: userFrontWindow)
+        let click = lastClick
+        lock.unlock()
+        guard previous.pid != 0, previous.pid != pid else { return }
+        let arrivedMs = nowMs()
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(Int(SecondLook.delayMs))) {
+            self.lock.lock()
+            let inputSince = self.lastUserMouseDownMs > arrivedMs || self.lastUserKeyMs > arrivedMs
+            // The click's owner is worked out off the event tap, right after it.
+            let owner = self.lastClick.ms == click.ms ? self.lastClick.owner : click.owner
+            let before = click.windows
+            self.lock.unlock()
+            let mine = Dictionary(uniqueKeysWithValues: WindowList.of(pid: pid, onScreenOnly: true)
+                .filter { $0.layer == 0 && !Self.onAgentDisplay($0.id) }.map { ($0.id, $0.title) })
+            let look = SecondLook.Facts(stillFront: BCUFrontProcessPID() == pid, clickInPrevious: owner == previous.pid,
+                                        inputSince: inputSince, openedForUser: SecondLook.opened(before: before, now: mine))
+            let name = { (p: pid_t) in NSRunningApplication(processIdentifier: p)?.localizedName ?? "pid \(p)" }
+            guard SecondLook.restore(look) else {
+                if look.stillFront {
+                    Log.info("guard: second look at \(name(pid)): left in front (click in \(owner.map(name) ?? "nothing known"), input since \(look.inputSince), opened for the user \(look.openedForUser))")
+                }
+                return
+            }
+            self.lock.lock()
+            self.userFrontPid = previous.pid
+            self.userFrontWindow = previous.window
+            self.lock.unlock()
+            self.record("second look: \(name(pid)) came forward during an agent's step just after a click in \(name(previous.pid)) that opened nothing in it; put \(name(previous.pid)) back in front")
+            self.restoreUserFront(from: pid, reason: "second look", immediate: true)
+        }
     }
 
     /// When the user last clicked or pressed a key that could open a window
@@ -528,6 +645,44 @@ public final class FocusGuard {
         }
     }
 
+    /// Cancel attention requests (a bouncing Dock icon) from apps agents are
+    /// working in, when they're the agents' doing (`Bounce.quiet`). Looks
+    /// every 100 ms while agents have windows, every 10 ms during and just
+    /// after a step.
+    private func watchAttention() {
+        var noted: Set<pid_t> = []
+        while true {
+            let pids = WindowManager.agentPids()
+            if pids.isEmpty {
+                noted.removeAll()
+                usleep(500_000)
+                continue
+            }
+            let front = BCUFrontProcessPID()
+            for pid in pids where BCUAppWantsAttention(pid) == 1 {
+                lock.lock()
+                let since = lastActedMs[pid].map { nowMs() - $0 }
+                let running = (taints[pid]?.count ?? 0) > 0
+                lock.unlock()
+                let userWindows = WindowList.of(pid: pid, onScreenOnly: true).filter { $0.layer == 0 && !Self.onAgentDisplay($0.id) }.count
+                guard Bounce.quiet(userInApp: front == pid, agentApp: true, sinceStepMs: running ? 0 : since, userWindows: userWindows) else { continue }
+                let status = BCUClearAppAttention(pid)
+                if !noted.contains(pid) {
+                    noted.insert(pid)
+                    let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"
+                    record("\(name) asked for attention (its Dock icon bounced) after an agent's step; \(status == 0 ? "cancelled it" : "COULD NOT cancel it (status \(status))")")
+                }
+            }
+            // Right after a step (when apps ask) look every 10 ms: the Dock
+            // starts coming up as soon as it hears of the request.
+            lock.lock()
+            let now = nowMs()
+            let hot = pids.contains { (taints[$0]?.count ?? 0) > 0 || now - (lastActedMs[$0] ?? -.infinity) < 3000 }
+            lock.unlock()
+            usleep(hot ? 10_000 : 100_000)
+        }
+    }
+
     /// The user can move between windows of the app they're in without the
     /// app changing, and a restore that raised the window they were in when
     /// they arrived would bring the wrong one forward. Ask every 300 ms
@@ -560,6 +715,7 @@ public final class FocusGuard {
         if agent {
             restoreUserFront(from: pid, reason: "self-activation", immediate: true)
         } else if pid != getpid() {
+            if SecondLook.wanted(facts(pid)) { scheduleSecondLook(pid) }
             arrived(pid)
         }
     }
@@ -585,10 +741,13 @@ public final class FocusGuard {
             let end = i + 1 < log.count ? log[i + 1].ms : now
             return "\(name(log[i].pid)) was frontmost for \(Int(end - log[i].ms)) ms"
         }
-        let front = BCUFrontProcessPID()
+        // WindowServer names no front process for a moment while apps
+        // switch (and while the screen is locked): go by the last one it named.
+        var front = BCUFrontProcessPID()
+        if front == 0 { front = log.last(where: { $0.pid != 0 })?.pid ?? 0 }
         let still = mine.last == log.count - 1 && front == log[log.count - 1].pid
         return "Front app changed: " + parts.joined(separator: "; ")
-            + (still ? ", and is STILL in front" : ", then the user's app (\(name(front))) was back in front")
+            + (still ? ", and is STILL in front" : front == 0 ? ", then it left the front" : ", then the user's app (\(name(front))) was back in front")
     }
 
     /// The user came to `pid`: they switched to it, it wasn't an agent's doing.
@@ -634,7 +793,7 @@ public final class FocusGuard {
         guard BCUFrontProcessPID() == pid, !isSwapping(pid) else { return }
         let moved = reclaimKey(pid)
         // No window of theirs to take key: at least not the agent's.
-        if let was, AX.focusedWindowID(pid) == was.window { _ = BCUPostFocusRecord(pid, was.window, false) }
+        if let was, AX.focusedWindowID(pid) == was.keyWindow { _ = BCUPostFocusRecord(pid, was.keyWindow, false) }
         if moved || was != nil {
             Log.info("guard: the user came to pid \(pid), where an agent's window had key; sorted out in \(Int(nowMs() - t0)) ms")
         }
@@ -757,6 +916,8 @@ public final class FocusGuard {
 
     public struct ParkedKey {
         public let window: CGWindowID
+        /// The window that has key: `window`, or the sheet over it.
+        public var keyWindow: CGWindowID
         /// The agent session whose window it is.
         public let owner: String
         /// When that agent last did anything in the window.
@@ -769,9 +930,9 @@ public final class FocusGuard {
     /// typed), so the agent's next step would find it reset. The user always
     /// comes first: keys they type into the app are held from the moment
     /// they switch to it until key is on their window (`activated`).
-    public func park(_ pid: pid_t, window: CGWindowID, owner: String) {
+    public func park(_ pid: pid_t, window: CGWindowID, keyWindow: CGWindowID? = nil, owner: String) {
         lock.lock()
-        parked[pid] = ParkedKey(window: window, owner: owner, lastUsedMs: nowMs())
+        parked[pid] = ParkedKey(window: window, keyWindow: keyWindow ?? window, owner: owner, lastUsedMs: nowMs())
         lock.unlock()
     }
 
@@ -809,9 +970,9 @@ public final class FocusGuard {
             if BCUFrontProcessPID() == pid {
                 reclaimKey(pid)
                 // No window of theirs to take key: at least not the agent's.
-                if AX.focusedWindowID(pid) == p.window { _ = BCUPostFocusRecord(pid, p.window, false) }
-            } else if AX.focusedWindowID(pid) == p.window {
-                _ = BCUPostFocusRecord(pid, p.window, false)
+                if AX.focusedWindowID(pid) == p.keyWindow { _ = BCUPostFocusRecord(pid, p.keyWindow, false) }
+            } else if AX.focusedWindowID(pid) == p.keyWindow {
+                _ = BCUPostFocusRecord(pid, p.keyWindow, false)
             }
         }
         Log.info("guard: gave up key on agent window \(p.window) in pid \(pid): \(reason)")
@@ -1072,6 +1233,7 @@ public final class FocusGuard {
         }
         activity.note(type, event)
         if type == .keyDown || Self.isMouseDown(type) { userPressed() }
+        userInput(type, event)
         switch type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .tabletPointer:
             let p = event.location
@@ -1093,6 +1255,7 @@ public final class FocusGuard {
             // link that opens in the browser): the gate opens before it goes on.
             openGate(for: type, event)
             lock.lock(); lastUserMouseDownMs = nowMs(); let holdAll = !holdTokens.isEmpty || draining; let anySwap = !swapping.isEmpty; lock.unlock()
+            noteClick(at: event.location)
             if AgentDisplay.fenced(at: event.location) != nil {
                 Log.info("guard: dropped a click on an agent display at \(Int(event.location.x)),\(Int(event.location.y))")
                 return nil
@@ -1236,6 +1399,30 @@ public final class FocusGuard {
 
     /// The app whose window is on top at a global point (not this app's
     /// click-through covers).
+    /// Note where a click landed, off the event tap: the window list takes a
+    /// few milliseconds, and the windows under the point don't change that fast.
+    private func noteClick(at p: CGPoint) {
+        let ms = nowMs()
+        lock.lock(); lastClick = (ms, nil, screenLook); lock.unlock()
+        clickQueue.async {
+            let owner = Self.windowOwner(at: p)
+            self.lock.lock()
+            if self.lastClick.ms == ms { self.lastClick.owner = owner }
+            self.lock.unlock()
+        }
+    }
+
+    /// Keeps `screenLook` while agents work (windows, or a step running or
+    /// settling); none otherwise.
+    private func watchUserScreen() {
+        while true {
+            let busy = !WindowManager.agentPids().isEmpty || !activeTaints.isEmpty
+            let look = busy ? Self.userScreenWindows() : nil
+            lock.lock(); screenLook = look; lock.unlock()
+            usleep(250_000)
+        }
+    }
+
     static func windowOwner(at p: CGPoint) -> pid_t? {
         let me = getpid()
         return WindowList.all(onScreenOnly: true).first { w in
@@ -1480,23 +1667,40 @@ public final class FocusGuard {
     }
 
     private func nearestUserPoint(_ p: CGPoint, agent: CGRect) -> CGPoint {
+        Self.nearestUserPoint(p, agent: agent, users: AgentDisplay.userDisplayIDs().map { CGDisplayBounds($0) }, fenced: AgentDisplay.fencedBounds)
+    }
+
+    /// How far inside the screen an escaped cursor goes back: on the edge's
+    /// last pixel the arrow is drawn past it (all of it, in the corner the
+    /// agent display touches), and the user can't find it.
+    static let escapeInset: CGFloat = 32
+
+    /// Where to put a cursor found at `p`, on the agent display `agent` (or
+    /// off every display, with `.null`): on the nearest of the user's
+    /// displays `users`, `escapeInset` inside each edge it crossed, at a
+    /// point no fenced display covers.
+    static func nearestUserPoint(_ p: CGPoint, agent: CGRect, users: [CGRect], fenced agents: [CGRect]) -> CGPoint {
         var best = p
         var bestDistance = CGFloat.infinity
-        let agents = AgentDisplay.fencedBounds
-        for id in AgentDisplay.userDisplayIDs() {
-            let r = CGDisplayBounds(id)
+        for r in users {
             // Skip any display that overlaps the agent's (mirroring, mid-rearrangement).
             let overlap = r.intersection(agent)
             if !overlap.isNull && overlap.width > 0 && overlap.height > 0 { continue }
             let q = CGPoint(x: min(max(p.x, r.minX), r.maxX - 1), y: min(max(p.y, r.minY), r.maxY - 1))
             let d = hypot(q.x - p.x, q.y - p.y)
             if agent.contains(q) || agents.contains(where: { $0.contains(q) }) { continue }
-            if d < bestDistance { bestDistance = d; best = q }
+            if d < bestDistance {
+                bestDistance = d
+                let dx = min(escapeInset, (r.width - 1) / 2), dy = min(escapeInset, (r.height - 1) / 2)
+                var inside = q
+                if p.x < r.minX { inside.x += dx } else if p.x > r.maxX - 1 { inside.x -= dx }
+                if p.y < r.minY { inside.y += dy } else if p.y > r.maxY - 1 { inside.y -= dy }
+                best = agent.contains(inside) || agents.contains(where: { $0.contains(inside) }) ? q : inside
+            }
         }
         if bestDistance == .infinity {
             // Not the main display: with the user's asleep, that can be an agent's.
-            guard let id = AgentDisplay.userDisplayIDs().first else { return p }
-            let r = CGDisplayBounds(id)
+            guard let r = users.first else { return p }
             return CGPoint(x: r.midX, y: r.midY)
         }
         return best

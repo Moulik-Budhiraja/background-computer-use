@@ -1,4 +1,5 @@
 import XCTest
+import BCUShared
 @testable import BCUCore
 
 /// The gate on a macOS whose LaunchServices refuses the permitted-front list
@@ -349,6 +350,29 @@ final class FrontGateWindowServerTests: XCTestCase {
         FrontGate.clearLeftoversForTests()
         XCTAssertEqual(list, [])
         XCTAssertTrue(calls >= left.count)
+    }
+
+    /// The record deleted from outside while the gate runs (a cleanup app
+    /// emptying the folder): the entries are still on WindowServer's list,
+    /// which counts adds. The gate keeps them, puts the record back, and
+    /// takes each off once when it stops.
+    func testARecordDeletedFromOutsideDoesntLoseTheEntries() {
+        var counts: [UInt64: Int] = [:]
+        FrontGate.system.updateWindowServerList = { p, add in
+            counts[p, default: 0] += add ? 1 : -1
+            if counts[p] == 0 { counts[p] = nil }
+            return 0
+        }
+        let record = BCUPaths.supportDirectory.appendingPathComponent("front-gate.on")
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        XCTAssertEqual(counts, [psn(user): 1, psn(other): 1])
+        try? FileManager.default.removeItem(at: record)
+        for _ in 0..<3 { _ = gate.passForTests() }
+        XCTAssertEqual(counts, [psn(user): 1, psn(other): 1])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.path))
+        gate.stop()
+        XCTAssertEqual(counts, [:])
     }
 }
 
