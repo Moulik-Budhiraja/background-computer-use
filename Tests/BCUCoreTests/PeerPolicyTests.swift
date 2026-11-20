@@ -289,4 +289,16 @@ final class PeerPolicyTests: XCTestCase {
         XCTAssertFalse(RemoteControl.pressStillHere(5, onDisplay: [w(6)]))
         XCTAssertFalse(RemoteControl.pressStillHere(5, onDisplay: []))
     }
+
+    /// A window ID past UInt32 (2^32 + a real ID) is refused before routing:
+    /// the hub would truncate it to the real window, past the owner check.
+    func testWindowIDsThatArentWindowIDsAreRefused() {
+        XCTAssertEqual(SocketServer.windowIDs(in: ["window_id": 42]), [42])
+        XCTAssertEqual(SocketServer.windowIDs(in: [:]), [])
+        XCTAssertEqual(SocketServer.windowIDs(in: ["actions": [["window_id": 7], ["tool": "wait"]]]), [7])
+        XCTAssertNil(SocketServer.windowIDs(in: ["window_id": 4_294_967_296 + 42]))
+        XCTAssertNil(SocketServer.windowIDs(in: ["window_id": -1]))
+        XCTAssertNil(SocketServer.windowIDs(in: ["window_id": "x"]))
+        XCTAssertNil(SocketServer.windowIDs(in: ["window_id": 5, "actions": [["window_id": 4_294_967_296 + 42]]]))
+    }
 }
