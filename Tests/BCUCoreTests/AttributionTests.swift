@@ -6,9 +6,9 @@ final class AttributionTests: XCTestCase {
     private let now = 10_000.0
 
     private func facts(step: Attribution.Step?, restoredAway: Double? = nil, mouseDown: Double = -1e9, switchKey: Double = -1e9,
-                       openKey: Double = -1e9, arrivedElsewhere: Double = -1e9) -> Attribution.Facts {
+                       openKey: Double = -1e9, arrivedElsewhere: Double = -1e9, clickOnApp: Bool = true) -> Attribution.Facts {
         Attribution.Facts(nowMs: now, step: step, restoredAwayMs: restoredAway, lastMouseDownMs: mouseDown, lastSwitchKeyMs: switchKey,
-                          lastOpenKeyMs: openKey, arrivedElsewhereMs: arrivedElsewhere)
+                          lastOpenKeyMs: openKey, arrivedElsewhereMs: arrivedElsewhere, clickOnApp: clickOnApp)
     }
 
     private var running: Attribution.Step { Attribution.Step(running: 1, settleUntilMs: .infinity, strict: false) }
@@ -48,6 +48,63 @@ final class AttributionTests: XCTestCase {
     /// the user is using shortcuts in their own app.
     func testAShortcutDoesntExplainTheAgentsAppComingForwardLate() {
         XCTAssertTrue(Attribution.agentCaused(facts(step: settling(left: 50), openKey: now - 120)))
+    }
+
+    // MARK: Only a click on the app explains it
+
+    /// The user clicked in their editor 205 ms before the browser came
+    /// forward during an agent's open_window. The click was in the editor,
+    /// so it says nothing about the browser: it goes back.
+    func testAClickInTheUsersOwnAppDoesntExplainTheAgentsAppComingForward() {
+        XCTAssertTrue(Attribution.agentCaused(facts(step: running, mouseDown: now - 205, clickOnApp: false)))
+    }
+
+    /// A click in the app that started the agent, 236 ms before its page
+    /// load brought the browser forward.
+    func testAClickInTheAppThatStartedTheAgentDoesntExplainIt() {
+        XCTAssertTrue(Attribution.agentCaused(facts(step: running, mouseDown: now - 236, clickOnApp: false)))
+    }
+
+    /// The same just after the guard had put their app back once.
+    func testAClickElsewhereDoesntExplainTheAppComingForwardAgain() {
+        XCTAssertTrue(Attribution.agentCaused(facts(step: nil, restoredAway: now - 300, mouseDown: now - 150, clickOnApp: false)))
+    }
+
+    /// cmd+Tab is still a switch they asked for, wherever they last clicked.
+    func testCmdTabIsTheirsWhereverTheyLastClicked() {
+        XCTAssertFalse(Attribution.agentCaused(facts(step: running, mouseDown: now - 200, switchKey: now - 50, clickOnApp: false)))
+    }
+
+    func testWhereAClickLandedSaysWhichAppItExplains() {
+        XCTAssertTrue(ClickTarget.app(42).explains(42))
+        XCTAssertFalse(ClickTarget.app(7).explains(42))
+        XCTAssertFalse(ClickTarget.app(nil).explains(42))
+        XCTAssertTrue(ClickTarget.dock(42).explains(42))
+        XCTAssertFalse(ClickTarget.dock(7).explains(42))
+        XCTAssertFalse(ClickTarget.dock(0).explains(42))
+        // A Dock icon accessibility couldn't name may have been the app's.
+        XCTAssertTrue(ClickTarget.dock(nil).explains(42))
+        // Not known yet: the old rule.
+        XCTAssertTrue(ClickTarget.pending.explains(42))
+    }
+
+    /// On macOS 26 and later the Dock has a window over the whole screen
+    /// that clicks pass through. With accessibility too slow, the window
+    /// list put a click in TextEdit down to the Dock, which explains any
+    /// app: the browser stayed in front.
+    func testTheWindowListLooksPastTheDocksWindowOverTheScreen() {
+        XCTAssertEqual(ClickTarget.listed([(pid: 5, dock: true), (pid: 42, dock: false)]), .app(42))
+        XCTAssertEqual(ClickTarget.listed([(pid: 42, dock: false)]), .app(42))
+        XCTAssertEqual(ClickTarget.listed([(pid: 5, dock: true)]), .dock(nil))
+        XCTAssertEqual(ClickTarget.listed([]), .app(nil))
+    }
+
+    func testWhatWasClickedIsALinkWhenAnythingAroundItIsOne() {
+        XCTAssertEqual(ClickElement.classify(roles: ["AXStaticText", "AXLink", "AXGroup"], url: false), .link)
+        XCTAssertEqual(ClickElement.classify(roles: ["AXStaticText", "AXGroup"], url: true), .link)
+        XCTAssertEqual(ClickElement.classify(roles: ["AXButton", "AXGroup"], url: false), .other("AXButton"))
+        XCTAssertEqual(ClickElement.classify(roles: ["AXGroup", "AXWindow"], url: false), .unknown)
+        XCTAssertEqual(ClickElement.classify(roles: [], url: false), .unknown)
     }
 
     // MARK: What was right before stays right

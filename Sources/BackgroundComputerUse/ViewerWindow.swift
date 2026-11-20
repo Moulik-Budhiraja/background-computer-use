@@ -33,10 +33,14 @@ final class ViewerWindowController {
         close = { [weak self] in self?.close() }
         model.remote = remote
         model.takeOver = { [weak model] in model?.beginControl() }
-        model.openHistory = { [weak self] in
-            guard let self else { return }
-            self.close()
-            openHistory(self.engine)
+        // A host app keeps its own sessions' recordings, so this app's
+        // history has none of them.
+        if engine.host == nil {
+            model.openHistory = { [weak self] in
+                guard let self else { return }
+                self.close()
+                openHistory(self.engine)
+            }
         }
         model.onControlChange = { [weak self] on in self?.controlChanged(on) }
         model.onDragPoint = { [weak self] p in self?.dragMoved(to: p) }

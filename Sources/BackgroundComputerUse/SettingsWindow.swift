@@ -60,6 +60,8 @@ final class SettingsModel: ObservableObject {
     let engine: Engine
     @Published var accessibility = false
     @Published var screenRecording = false
+    /// Screen Recording is switched on, but works only once the app restarts.
+    @Published var screenRecordingNeedsRestart = false
     @Published var launchAtLogin = false
     @Published var launchAtLoginProblem: String?
     @Published var hotKeysFailed: [String] = []
@@ -85,6 +87,7 @@ final class SettingsModel: ObservableObject {
     func refresh() {
         accessibility = AX.isTrusted
         screenRecording = Capture.hasPermission
+        screenRecordingNeedsRestart = !screenRecording && OnboardingModel.screenRecordingSwitchedOn()
         launchAtLogin = LaunchAtLogin.isEnabled
         if launchAtLoginProblem != LaunchAtLogin.problem { launchAtLoginProblem = LaunchAtLogin.problem }
         if hotKeysFailed != HotKeys.failed { hotKeysFailed = HotKeys.failed }
@@ -138,6 +141,26 @@ final class SettingsModel: ObservableObject {
         }
     }
 
+    func relaunch() { OnboardingModel.relaunchApp() }
+
+    /// Deletes every recording but the ones being made now.
+    func clearHistory() {
+        let alert = NSAlert()
+        alert.messageText = "Clear History?"
+        alert.informativeText = "Deletes every recording."
+        alert.addButton(withTitle: "Clear History")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].hasDestructiveAction = true
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            AppRecordings.store.deleteAll()
+            DispatchQueue.main.async {
+                self.ticks = 0
+                self.refresh()
+            }
+        }
+    }
+
     func setLaunchAtLogin(_ on: Bool) {
         LaunchAtLogin.set(on)
         refresh()
@@ -187,7 +210,17 @@ struct SettingsView: View {
                     RowDivider(inset: 46)
                     permissionRow("Screen Recording", granted: model.screenRecording, action: model.requestScreenRecording)
                 }
-                if !model.screenRecording {
+                if model.screenRecordingNeedsRestart {
+                    HStack {
+                        Text("Reopen to finish turning it on.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Quit & Reopen", action: model.relaunch)
+                            .controlSize(.small)
+                    }
+                    .padding(.horizontal, 4)
+                } else if !model.screenRecording {
                     Text("macOS asks you to reopen the app after you allow Screen Recording.")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
@@ -227,6 +260,14 @@ struct SettingsView: View {
                         .pickerStyle(.menu)
                         .labelsHidden()
                         .fixedSize()
+                    }
+                    .generalRow()
+                    RowDivider(inset: 14)
+                    HStack {
+                        Spacer()
+                        Button("Clear History…", action: model.clearHistory)
+                            .controlSize(.small)
+                            .disabled(model.historyUsedBytes == 0)
                     }
                     .generalRow()
                 }
