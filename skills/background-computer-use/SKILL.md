@@ -11,7 +11,7 @@ Use these tools when the task needs the user's logged-in session or an app with 
 
 ## Starting
 
-1. Call `status` once. It gives your display size, the user's default browser and any windows you still have open. Other agents may be working at the same time, each on its own display; you only see and control your own windows. Sound from apps that only you are using doesn't play on the user's speakers. While one plays, `status` gives the file it is recorded to, if the task needs what it says. Use that browser for anything on the web, because it holds the user's logins. Don't switch to another browser when that one gives you trouble: the others aren't signed in. On Windows, if `status` says you have no screen to work on, tell the user the reason it gives; you can't open windows until they fix it.
+1. Call `status` once. It gives your display size, the user's default browser and any windows you still have open. Other agents may be working at the same time, each on its own display; you only see and control your own windows. On a Mac, call `capture_audio` before you play sound in any app: it keeps your sound off the user's speakers, including in an app they also have windows in, such as their browser, and while it does, `status` gives the file it is recorded to, if the task needs what it says. Use that browser for anything on the web, because it holds the user's logins. Don't switch to another browser when that one gives you trouble: the others aren't signed in. On Windows, if `status` says you have no screen to work on, tell the user the reason it gives; you can't open windows until they fix it.
 2. Call `open_window` with the app name. It opens a new window on your display and returns its `window_id`. For a browser the window opens in the user's own profile, signed in to everything the user is. Open only apps and sites the task is allowed to use. Use `list_windows` and `borrow_window` only for apps that have a single window, such as System Settings. `release_window` puts a borrowed window back where it was.
 
 ## Reading a window
@@ -28,7 +28,7 @@ An element keeps its number for as long as it exists, even while it's scrolled o
 
 Popups that belong to your window (menus, dropdowns, address-bar suggestions) are listed after the window's own elements, with their own numbers.
 
-A sheet over your window, such as a file picker opened by an upload button, a save panel or an alert, is listed first, before the window behind it, which takes no input until the sheet closes. Click a file's row by number to select it, then click the panel's button (Upload, Open, Save). Selecting a row and pressing a button go through accessibility, so they work even though keys can't reach the panel. To go into a folder, select its row and press Open, or click it in the sidebar.
+A sheet over your window, such as a file picker opened by an upload button, a save panel or an alert, is listed first, before the window behind it, which takes no input until the sheet closes. To upload or save a file, call `choose_file` with its path: it goes to the file's folder (any folder, ~/Library too), selects it and presses Open or Save. You can also click a file's row by number and then the panel's button.
 
 Pass `screenshot=false` when the text is enough. Take the screenshot when layout matters, when the tree is thin (canvas apps, images, games) or when an action didn't do what you expected. Coordinates for `click` and `scroll` are window points, which match the screenshot's pixels.
 

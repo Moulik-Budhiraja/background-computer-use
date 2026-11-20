@@ -96,7 +96,7 @@ public enum AXSnapshot {
         // plain text line (the popup heading).
         struct Entry { let element: AXUIElement?; let indent: String; let body: String; let node: (String, CGRect, [String], Bool)? }
         var entries: [Entry] = []
-        var overflow: [AXUIElement] = []
+        var overflow: [(element: AXUIElement, role: String, frame: CGRect)] = []
         var outOfView: [AXUIElement] = []
         var visited = 0
         var listed = 0
@@ -129,7 +129,7 @@ public enum AXSnapshot {
                     outOfView.append(el)
                 } else if listed >= maxElements {
                     truncated = true
-                    overflow.append(el)
+                    overflow.append((el, raw.role, f))
                 } else {
                     listed += 1
                     let actions = AX.actions(el)
@@ -191,7 +191,7 @@ public enum AXSnapshot {
         let renumber = previous.map { prev in
             Self.renumbers(listed: elements.count, listedKnown: elements.filter { prev.indexByElement[$0] != nil }.count,
                            known: prev.indexByElement.count,
-                           stillThere: (elements + overflow + outOfView).filter { prev.indexByElement[$0] != nil }.count)
+                           stillThere: (elements + overflow.map(\.element) + outOfView).filter { prev.indexByElement[$0] != nil }.count)
         } ?? true
         var next = renumber ? 1 : previous!.nextIndex
         var used = Set<Int>()
@@ -218,17 +218,25 @@ public enum AXSnapshot {
 
         // Elements pushed past max_elements or scrolled out of view keep
         // their numbers for when they're listed again, and aren't reported
-        // as removed.
+        // as removed. The agent was told those past max_elements keep their
+        // numbers, so they can be acted on by them.
         var unlisted = Set<Int>()
         var scrolledOut = Set<Int>()
         if !renumber, let prev = previous {
-            for (els, into) in [(overflow, 0), (outOfView, 1)] {
-                for el in els {
-                    if let old = prev.indexByElement[el], !used.contains(old) {
-                        used.insert(old)
-                        indexByElement[el] = old
-                        if into == 0 { unlisted.insert(old) } else { scrolledOut.insert(old) }
-                    }
+            for o in overflow {
+                if let old = prev.indexByElement[o.element], !used.contains(old) {
+                    used.insert(old)
+                    indexByElement[o.element] = old
+                    unlisted.insert(old)
+                    nodes[old] = AXNode(index: old, element: o.element, role: o.role, frame: o.frame,
+                                        actions: AX.actions(o.element), valueSettable: AX.isSettable(o.element, "AXValue"))
+                }
+            }
+            for el in outOfView {
+                if let old = prev.indexByElement[el], !used.contains(old) {
+                    used.insert(old)
+                    indexByElement[el] = old
+                    scrolledOut.insert(old)
                 }
             }
         }
