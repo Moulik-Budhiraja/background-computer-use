@@ -202,6 +202,7 @@ public final class RemoteControl {
                           menusBefore: Set(Self.menuWindows(w.pid).map(\.id)))
         case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             guard var p = press else { return }
+            guard Self.pressStillHere(p.window.id, onDisplay: windows()) else { return dropPress(p) }
             if !p.dragging {
                 guard hypot(point.x - p.point.x, point.y - p.point.y) >= Self.dragThreshold else { return }
                 p.dragging = true
@@ -226,6 +227,7 @@ public final class RemoteControl {
             press = p
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
             guard let p = press else { return }
+            guard Self.pressStillHere(p.window.id, onDisplay: windows()) else { return dropPress(p) }
             Log.info("remote: release button \(p.button) count \(p.clickCount) dragged \(p.dragging)")
             if !p.dragging {
                 if p.button == 0, p.window.layer > 0, pressMenuItem(at: p.point, pid: p.window.pid) {
@@ -262,6 +264,20 @@ public final class RemoteControl {
         default:
             break
         }
+    }
+
+    /// May a press keep acting on its window? `onDisplay`: the windows on
+    /// the agent display now.
+    static func pressStillHere(_ window: CGWindowID, onDisplay: [WindowInfo]) -> Bool {
+        true
+    }
+
+    /// Forget a press without acting on its window again.
+    private func dropPress(_ p: Press) {
+        Log.info("remote: dropped a press on window \(p.window.id), which left the agent display")
+        press = nil
+        cache.ms = 0
+        engine.focusGuard.endAction(pid: p.window.pid)
     }
 
     private func beginDrag(_ p: Press, _ kind: DragKind) {
