@@ -118,6 +118,9 @@ public final class Engine {
     /// The agent went away and its windows weren't released because the
     /// user was in control then: `Hub` asks again (`releaseAbandonedLater`).
     private var _abandonPending = false
+    /// Counts the agent's departures (`agentLeft`), so a release queued for
+    /// one doesn't run after the next.
+    private var _departure = 0
     /// How far this session has reported front-app changes (`FocusGuard.frontReport`).
     private var frontMark = 0
     /// Apps this call acted on that the session may have no window in (yet,
@@ -244,19 +247,26 @@ public final class Engine {
     /// stays with them.
     func agentLeft(graceMs: Double, back: @escaping () -> Bool) {
         // A fresh grace: not cut short by an earlier departure's retry.
-        stateLock.lock(); _abandonPending = false; stateLock.unlock()
+        stateLock.lock(); _abandonPending = false; _departure += 1; let departure = _departure; stateLock.unlock()
         tearDownIfIdle(idleMs: 0)
         DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(Int(graceMs))) {
-            self.releaseAbandoned(back: back)
+            self.releaseAbandoned(back: back, departure: departure)
         }
     }
 
+    /// Whether a release asked for during departure `queuedFor` may still
+    /// run, the agent's latest departure being `latest`.
+    static func departureStillCurrent(_ queuedFor: Int, latest: Int) -> Bool { true }
+
     /// Close what an agent that went away left open, and give up its
     /// display, unless it's `back`. Any thread; safe to call twice.
-    func releaseAbandoned(back: @escaping () -> Bool) {
+    func releaseAbandoned(back: @escaping () -> Bool, departure: Int? = nil) {
         guard !back() else { return }
+        stateLock.lock(); let queuedFor = departure ?? _departure; stateLock.unlock()
         queue.async {
             guard !back() else { return }
+            self.stateLock.lock(); let latest = self._departure; self.stateLock.unlock()
+            guard Self.departureStillCurrent(queuedFor, latest: latest) else { return }
             guard !self.userInControl else {
                 self.stateLock.lock(); self._abandonPending = true; self.stateLock.unlock()
                 return

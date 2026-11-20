@@ -1108,7 +1108,7 @@ public final class WindowManager {
                     && strandedOnStray(info.bounds, userDisplays: users) {
                     guard let ax = AX.window(pid: info.pid, id: info.id) else { continue }
                     let first = !isKept(info.id)
-                    keep(info.id)
+                    guard claimForRescue(info.id, registered: isRegistered) else { continue }
                     putOnUserScreen(ax, bounds: info.bounds)
                     guard first else { continue }
                     Log.info("moved \(info.owner) window \(info.id) from a display a crashed copy left to the user's screen")
@@ -1116,6 +1116,13 @@ public final class WindowManager {
                 }
             }
         }
+    }
+
+    /// Mark a window on a stray display kept, for the user, before moving
+    /// it there. False: don't move it.
+    static func claimForRescue(_ id: CGWindowID, registered: (CGWindowID) -> Bool) -> Bool {
+        keep(id)
+        return true
     }
 
     /// Whether a window on a stray display is stranded there. A stray
