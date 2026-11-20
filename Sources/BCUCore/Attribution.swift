@@ -110,10 +110,12 @@ enum ClickTarget: Equatable {
 
     /// The window list's answer, for when accessibility is too slow: the
     /// apps whose windows are under the click, top first, and which of them
-    /// is the Dock.
+    /// is the Dock. On macOS 26 and later the Dock keeps a window over the
+    /// whole screen that clicks pass through, so the first window that isn't
+    /// the Dock's is where it went; only Dock windows there, the Dock.
     static func listed(_ owners: [(pid: pid_t, dock: Bool)]) -> ClickTarget {
-        guard let top = owners.first else { return .app(nil) }
-        return top.dock ? .dock(nil) : .app(top.pid)
+        if let app = owners.first(where: { !$0.dock }) { return .app(app.pid) }
+        return owners.isEmpty ? .app(nil) : .dock(nil)
     }
 }
 
