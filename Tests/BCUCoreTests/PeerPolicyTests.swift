@@ -245,4 +245,12 @@ final class PeerPolicyTests: XCTestCase {
         XCTAssertFalse(scope.claimHost("called-host", other))
         XCTAssertNotNil(scope.admitCall(session: "x", parent: nil, host: "called-host", other))
     }
+
+    /// A stream showing one window stops showing it once the window leaves
+    /// the session (released, then borrowed by another app's agent).
+    func testStreamStopsShowingAWindowThatLeftTheSession() {
+        XCTAssertEqual(FrameStream.target(window: 42, excluded: 0, owns: { $0 == 42 }), .window(42))
+        XCTAssertEqual(FrameStream.target(window: 42, excluded: 0, owns: { _ in false }), .nothing)
+        XCTAssertEqual(FrameStream.target(window: 0, excluded: 7, owns: { _ in false }), .display(excluding: 7))
+    }
 }
