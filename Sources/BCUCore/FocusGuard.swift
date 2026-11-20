@@ -1610,6 +1610,7 @@ public final class FocusGuard {
         var safeFor: pid_t = -1
         var retry = false
         var gaveUp: Set<pid_t> = []
+        var reclaims = ReclaimTries()
         while true {
             lock.lock()
             if held.isEmpty || holding || !holdTokens.isEmpty { draining = false; lock.unlock(); break }
@@ -1642,7 +1643,7 @@ public final class FocusGuard {
                     continue
                 }
                 if safeFor != front {
-                    if !keySafe(front) {
+                    if !keySafe(front) && reclaims.shouldTry(front) {
                         // Reclaim, but without waiting on a swap that may be stuck.
                         let appLock = Engine.inputLock(front)
                         if appLock.lock(before: Date().addingTimeInterval(0.05)) {
@@ -1697,6 +1698,18 @@ public final class FocusGuard {
         }
         if retry { scheduleDrain() }
         return n
+    }
+
+    /// The apps one `drain` has tried to give key back in. A try can take
+    /// most of a second (`reclaimKey`, `strand`), and a forced drain drops
+    /// the keys it can't send one by one.
+    struct ReclaimTries {
+        private var tried: Set<pid_t> = []
+        /// Whether to try giving key back in `pid` before its next held key.
+        mutating func shouldTry(_ pid: pid_t) -> Bool {
+            tried.insert(pid)
+            return true
+        }
     }
 
     /// Lock held. False if this key event was captured already (by `path`).
