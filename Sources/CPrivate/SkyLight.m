@@ -122,6 +122,30 @@ int BCUPostMakeKeyRecords(pid_t pid, uint32_t windowID) {
     return status;
 }
 
+extern int responsibility_get_pid_responsible_for_pid(pid_t pid) __attribute__((weak_import));
+
+pid_t BCUResponsiblePID(pid_t pid) {
+    if (!responsibility_get_pid_responsible_for_pid) return 0;
+    int r = responsibility_get_pid_responsible_for_pid(pid);
+    return r > 0 ? r : 0;
+}
+
+static void *TCCSym(const char *name) {
+    static void *tcc;
+    if (!tcc) tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/TCC", RTLD_LAZY);
+    return tcc ? dlsym(tcc, name) : NULL;
+}
+
+int BCUAudioCapturePreflight(void) {
+    int (*preflight)(CFStringRef, CFDictionaryRef) = TCCSym("TCCAccessPreflight");
+    return preflight ? preflight(CFSTR("kTCCServiceAudioCapture"), NULL) : -1;
+}
+
+void BCUAudioCaptureRequest(void) {
+    void (*request)(CFStringRef, CFDictionaryRef, void (^)(Boolean)) = TCCSym("TCCAccessRequest");
+    if (request) request(CFSTR("kTCCServiceAudioCapture"), NULL, ^(Boolean granted) { (void)granted; });
+}
+
 pid_t BCUFrontProcessPID(void) {
     GetFrontProcessFn front = (GetFrontProcessFn)Sym("_SLPSGetFrontProcess");
     GetProcessPIDFn toPid = (GetProcessPIDFn)Sym("GetProcessPID");
@@ -232,4 +256,43 @@ int BCUPermittedFrontUpdate(uint64_t value, BOOL add) {
     if (!fn || value == 0) return -1;
     uint32_t psn[2] = {(uint32_t)(value >> 32), (uint32_t)value};
     return fn(psn);
+}
+
+#pragma mark - Attention
+
+typedef CFTypeRef (*LSASNCreateWithPidFn)(CFAllocatorRef, pid_t);
+typedef CFTypeRef (*LSCopyInfoItemFn)(int, CFTypeRef, CFStringRef);
+typedef OSStatus (*LSSetInfoItemFn)(int, CFTypeRef, CFStringRef, CFTypeRef, CFDictionaryRef *);
+static const int kSessionDefault = -2;
+
+static CFStringRef AttentionKey(void) {
+    CFStringRef *key = dlsym(RTLD_DEFAULT, "_kLSApplicationDesiresAttentionKey");
+    return key ? *key : NULL;
+}
+
+int BCUAppWantsAttention(pid_t pid) {
+    LSASNCreateWithPidFn asnFor = dlsym(RTLD_DEFAULT, "_LSASNCreateWithPid");
+    LSCopyInfoItemFn copy = dlsym(RTLD_DEFAULT, "_LSCopyApplicationInformationItem");
+    CFStringRef key = AttentionKey();
+    if (!asnFor || !copy || !key) return -1;
+    CFTypeRef asn = asnFor(kCFAllocatorDefault, pid);
+    if (!asn) return -1;
+    CFTypeRef value = copy(kSessionDefault, asn, key);
+    CFRelease(asn);
+    if (!value) return 0;
+    int wants = CFGetTypeID(value) == CFBooleanGetTypeID() && CFBooleanGetValue(value) ? 1 : 0;
+    CFRelease(value);
+    return wants;
+}
+
+int BCUClearAppAttention(pid_t pid) {
+    LSASNCreateWithPidFn asnFor = dlsym(RTLD_DEFAULT, "_LSASNCreateWithPid");
+    LSSetInfoItemFn set = dlsym(RTLD_DEFAULT, "_LSSetApplicationInformationItem");
+    CFStringRef key = AttentionKey();
+    if (!asnFor || !set || !key) return -1;
+    CFTypeRef asn = asnFor(kCFAllocatorDefault, pid);
+    if (!asn) return -1;
+    OSStatus status = set(kSessionDefault, asn, key, kCFBooleanFalse, NULL);
+    CFRelease(asn);
+    return (int)status;
 }

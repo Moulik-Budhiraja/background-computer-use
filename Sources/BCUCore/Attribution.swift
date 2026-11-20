@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 /// Who made an app the front app: an agent's step, or the user.
 ///
@@ -62,6 +63,74 @@ enum Attribution {
         func unanswered(_ ms: Double) -> Bool { f.nowMs - ms < switchMs && ms > f.arrivedElsewhereMs }
         let click = f.step?.strict != true && unanswered(f.lastMouseDownMs)
         return !(click || unanswered(f.lastSwitchKeyMs))
+    }
+}
+
+/// A second look at an app an agent's step was acting on, which came
+/// forward and was put down to the user only because they had just clicked.
+///
+/// A click explains a front change when it lands on the app (its window,
+/// its Dock icon) or opens something in it (a link). It doesn't when it
+/// landed in the app the user was already in and the agent's app opened
+/// nothing of theirs: say they clicked a button in their app that started
+/// the agent, whose step then brought the browser forward. Left alone, the
+/// user had to switch back themselves.
+enum SecondLook {
+    /// How long after the app came forward to look again.
+    static let delayMs = 900.0
+
+    /// Whether to look again: the app came forward while a step on it was
+    /// running or settling, and only a click (not cmd+Tab) made it the user's.
+    static func wanted(_ f: Attribution.Facts) -> Bool {
+        guard let step = f.step, step.running > 0 || step.settleUntilMs >= f.nowMs, !step.strict else { return false }
+        if Attribution.agentCaused(f) { return false }
+        func unanswered(_ ms: Double) -> Bool { f.nowMs - ms < Attribution.switchMs && ms > f.arrivedElsewhereMs }
+        return unanswered(f.lastMouseDownMs) && !unanswered(f.lastSwitchKeyMs)
+    }
+
+    struct Facts {
+        /// The app is still in front.
+        var stillFront: Bool
+        /// The click landed on a window of the app the user was in before.
+        var clickInPrevious: Bool
+        /// The user clicked or pressed a key since the app came forward.
+        var inputSince: Bool
+        /// A window of the app on the user's screens is new since the
+        /// click, or shows another title: the click opened something there.
+        var openedForUser: Bool
+    }
+
+    /// Whether the user's previous app goes back in front.
+    static func restore(_ f: Facts) -> Bool {
+        f.stillFront && f.clickInPrevious && !f.inputSince && !f.openedForUser
+    }
+
+    /// Whether `now` (the app's windows on the user's screens, id to title)
+    /// shows something opened since `before` (every window on the user's
+    /// screens, from a look taken before the click). With no such look,
+    /// nothing can be ruled out: count it as opened.
+    static func opened(before: [CGWindowID: String]?, now: [CGWindowID: String]) -> Bool {
+        guard let before else { return true }
+        return now.contains { id, title in before[id].map { $0 != title } ?? true }
+    }
+}
+
+/// An app asking for the user's attention bounces its Dock icon, and with
+/// the Dock hidden, brings the Dock up over the user's work until they go
+/// to the app. Apps do it for what happens in a window that isn't in front:
+/// a dialog or file picker opening, a download finishing. In a window an
+/// agent is working in that's never for the user.
+enum Bounce {
+    /// How long after an agent's step in the app an attention request is
+    /// still put down to it.
+    static let afterStepMs = 20_000.0
+
+    /// Whether to cancel an attention request: an app agents have windows
+    /// in, that the user isn't in, and either an agent acted on it lately
+    /// or it has no window on the user's screens (nothing there for them to see).
+    static func quiet(userInApp: Bool, agentApp: Bool, sinceStepMs: Double?, userWindows: Int) -> Bool {
+        guard agentApp, !userInApp else { return false }
+        return userWindows == 0 || (sinceStepMs.map { $0 < afterStepMs } ?? false)
     }
 }
 
