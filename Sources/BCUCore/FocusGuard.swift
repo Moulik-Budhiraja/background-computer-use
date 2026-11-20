@@ -1670,9 +1670,15 @@ public final class FocusGuard {
         Self.nearestUserPoint(p, agent: agent, users: AgentDisplay.userDisplayIDs().map { CGDisplayBounds($0) }, fenced: AgentDisplay.fencedBounds)
     }
 
+    /// How far inside the screen an escaped cursor goes back: on the edge's
+    /// last pixel the arrow is drawn past it (all of it, in the corner the
+    /// agent display touches), and the user can't find it.
+    static let escapeInset: CGFloat = 32
+
     /// Where to put a cursor found at `p`, on the agent display `agent` (or
-    /// off every display, with `.null`): the nearest point on one of the
-    /// user's displays `users` that no fenced display covers.
+    /// off every display, with `.null`): on the nearest of the user's
+    /// displays `users`, `escapeInset` inside each edge it crossed, at a
+    /// point no fenced display covers.
     static func nearestUserPoint(_ p: CGPoint, agent: CGRect, users: [CGRect], fenced agents: [CGRect]) -> CGPoint {
         var best = p
         var bestDistance = CGFloat.infinity
@@ -1683,7 +1689,14 @@ public final class FocusGuard {
             let q = CGPoint(x: min(max(p.x, r.minX), r.maxX - 1), y: min(max(p.y, r.minY), r.maxY - 1))
             let d = hypot(q.x - p.x, q.y - p.y)
             if agent.contains(q) || agents.contains(where: { $0.contains(q) }) { continue }
-            if d < bestDistance { bestDistance = d; best = q }
+            if d < bestDistance {
+                bestDistance = d
+                let dx = min(escapeInset, (r.width - 1) / 2), dy = min(escapeInset, (r.height - 1) / 2)
+                var inside = q
+                if p.x < r.minX { inside.x += dx } else if p.x > r.maxX - 1 { inside.x -= dx }
+                if p.y < r.minY { inside.y += dy } else if p.y > r.maxY - 1 { inside.y -= dy }
+                best = agent.contains(inside) || agents.contains(where: { $0.contains(inside) }) ? q : inside
+            }
         }
         if bestDistance == .infinity {
             // Not the main display: with the user's asleep, that can be an agent's.
