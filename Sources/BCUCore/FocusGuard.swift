@@ -1705,7 +1705,18 @@ public final class FocusGuard {
     /// The `configurableShortcuts` that are on, by the user's
     /// `AppleSymbolicHotKeys` (nil: never changed, so all on as default).
     static func enabledShortcuts(_ hotKeys: [String: Any]?) -> Set<Chord> {
-        Set(configurableShortcuts.values)
+        var out = Set<Chord>()
+        for (id, chord) in configurableShortcuts {
+            guard let entry = hotKeys?[id] as? [String: Any] else { out.insert(chord); continue }
+            if let on = entry["enabled"] as? NSNumber, !on.boolValue { continue }
+            // parameters: the character (65535 for none), the key code, the modifiers.
+            if let value = entry["value"] as? [String: Any], let p = value["parameters"] as? [NSNumber], p.count >= 3 {
+                out.insert(Chord(code: p[1].int64Value, modifiers: p[2].uint64Value & chordModifiers.rawValue))
+            } else {
+                out.insert(chord)
+            }
+        }
+        return out
     }
 
     /// Read off the tap's thread (`watchUserWindow`): the tap only looks.
