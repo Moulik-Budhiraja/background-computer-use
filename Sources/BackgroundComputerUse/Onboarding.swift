@@ -60,6 +60,8 @@ final class OnboardingModel: ObservableObject {
     @Published var selected: Set<AgentKind> = []
     @Published var connecting = false
     @Published var connectError: String?
+    /// The agents that didn't connect, for the copy link.
+    @Published var failed: [AgentKind] = []
     @Published var copied = false
     @Published var openAtLogin = true
     /// The default browser, when it's a Chromium one whose new windows can
@@ -72,6 +74,8 @@ final class OnboardingModel: ObservableObject {
     private var timer: Timer?
 
     var bcuPath: String { Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/bcu").path }
+    /// Opened from the disk image or where it was downloaded; see AgentSetup.isTemporaryLocation.
+    let temporaryLocation = AgentSetup.isTemporaryLocation(Bundle.main.bundleURL)
     var skillSource: URL? {
         guard let url = Bundle.main.resourceURL?.appendingPathComponent("skills/\(AgentSetup.skillName)"),
               FileManager.default.fileExists(atPath: url.appendingPathComponent("SKILL.md").path) else { return nil }
@@ -210,11 +214,14 @@ final class OnboardingModel: ObservableObject {
     func connect() {
         let agents = AgentKind.allCases.filter { selected.contains($0) }
         guard !agents.isEmpty else { next(); return }
+        guard !temporaryLocation else { return }
         connecting = true
         connectError = nil
+        failed = []
         let bcu = bcuPath, skill = skillSource
         DispatchQueue.global(qos: .userInitiated).async {
             var errors: [String] = []
+            var failed: [AgentKind] = []
             for agent in agents {
                 do {
                     guard let skill else { throw SetupError("The skill is missing from the app.") }
@@ -222,6 +229,7 @@ final class OnboardingModel: ObservableObject {
                     try AgentSetup.addMCPServer(agent, bcuPath: bcu)
                 } catch {
                     errors.append("\(agent.displayName) didn't connect. \(error)")
+                    failed.append(agent)
                 }
             }
             DispatchQueue.main.async {
@@ -231,14 +239,19 @@ final class OnboardingModel: ObservableObject {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.next() }
                 } else {
                     self.connectError = errors.joined(separator: "\n")
+                    self.failed = failed
                 }
             }
         }
     }
 
+    /// After a failure, what sets up the failed agents by hand; otherwise the
+    /// bare command, for any other agent.
     func copyCommand() {
+        let text = failed.isEmpty ? "\"\(bcuPath)\" mcp"
+            : failed.map { AgentSetup.manualSetup($0, bcuPath: bcuPath) }.joined(separator: "\n\n")
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString("\"\(bcuPath)\" mcp", forType: .string)
+        NSPasteboard.general.setString(text, forType: .string)
         copied = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.copied = false }
     }
@@ -369,23 +382,37 @@ struct OnboardingView: View {
         case .browser:
             StatusLine(on: model.browserPermission == .allowed)
         case .connect:
-            if let error = model.connectError {
-                Text(error)
-                    .font(.system(size: 12))
-                    .foregroundStyle(Color(nsColor: .systemRed))
-                    .lineLimit(2)
-                    .textSelection(.enabled)
-            } else {
-                Button(action: model.copyCommand) {
-                    HStack(spacing: 4) {
-                        Text(model.copied ? "Copied" : "Other agent? Copy the MCP command")
-                        if !model.copied { Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold)) }
+            VStack(alignment: .leading, spacing: 6) {
+                if model.temporaryLocation {
+                    Text("Move \(BCUPaths.appName) to Applications and open it from there first. Agents can't use it where it is now.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color(nsColor: .systemRed))
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if let error = model.connectError {
+                    // The whole error, scrolling when it's long.
+                    ScrollView {
+                        Text(error)
+                            .font(.system(size: 12))
+                            .foregroundStyle(Color(nsColor: .systemRed))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Color.accentColor)
-                    .contentShape(Rectangle())
+                    .frame(maxHeight: 32)
                 }
-                .buttonStyle(.plain)
+                if !model.temporaryLocation {
+                    Button(action: model.copyCommand) {
+                        HStack(spacing: 4) {
+                            Text(model.copied ? "Copied"
+                                 : model.failed.isEmpty ? "Other agent? Copy the MCP command"
+                                 : "Copy the setup to do it yourself")
+                            if !model.copied { Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold)) }
+                        }
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         case .done:
             HStack(spacing: 10) {
@@ -426,7 +453,8 @@ struct OnboardingView: View {
             Button(primaryTitle, action: primaryAction)
                 .buttonStyle(PrimaryButtonStyle())
                 .keyboardShortcut(.defaultAction)
-                .disabled(model.connecting)
+                .disabled(model.connecting
+                          || (model.step == .connect && model.temporaryLocation && !model.selected.isEmpty))
         }
         .padding(.horizontal, 24)
         .frame(height: 64)
