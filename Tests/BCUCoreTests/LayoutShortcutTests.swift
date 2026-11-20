@@ -108,10 +108,15 @@ final class LayoutRefillQuitTests: XCTestCase {
         defer { LayoutKeys.runOnMain = saved }
         LayoutKeys.runOnMain = { _ in false }
         LayoutKeys.forget()
+        // A thread of its own: a sync onto a global queue runs on the caller's
+        // thread, which here is the main one, and that reads the tables directly.
         var threw = false
-        DispatchQueue.global().sync {
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
             do { _ = try LayoutKeys.code(for: "a", command: false) } catch { threw = true }
+            done.signal()
         }
+        done.wait()
         XCTAssertTrue(threw)
     }
 }
