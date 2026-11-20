@@ -43,6 +43,8 @@ public final class Engine {
     public let windows: WindowManager
     /// Sound from apps only this session uses goes here instead of the speakers.
     public let audio: SessionAudio
+    /// Apps the user also uses whose sound this session asked to have muted.
+    let audioClaims = AudioClaims()
     /// Keeps what the display showed, for the history viewer.
     let recorder: SessionRecorder
 
@@ -230,6 +232,7 @@ public final class Engine {
                 self.display.stop()
             }
             self.snapshots.removeAll()
+            self.endAudioClaims()
             self.audio.end()
             self.log("Gave up the agent display: no windows for a while")
         }
@@ -300,6 +303,7 @@ public final class Engine {
         recorder.stop()
         windows.stopWatchdog()
         display.stop(remove: true)
+        endAudioClaims()
         audio.end()
     }
 
@@ -456,6 +460,8 @@ public final class Engine {
                     result.text += "\n[other agents] " + agentWaitNotes.map(Self.sentence).joined(separator: " ") + " That's expected: the step ran, don't repeat it."
                     agentWaitNotes = []
                 }
+                let soundNotes = audioClaims.takeNotes()
+                if !soundNotes.isEmpty { result.text += "\n[sound] " + soundNotes.joined(separator: " ") }
                 if monitored, let focusNote = focusReport() {
                     focusGuard.record("\(tool): \(focusNote)")
                     result.text += "\n[focus guard] \(focusNote)"
@@ -547,9 +553,11 @@ public final class Engine {
         case "drag": return try drag(args)
         case "press_menu_item": return try pressMenuItem(args)
         case "navigate": return try navigate(args)
+        case "choose_file": return try chooseFile(args)
         case "handoff": return try handoff(args)
         case "take_back": return try takeBack(args)
         case "guard_report": return guardReport()
+        case "capture_audio": return try captureAudio(args)
         case "batch": return try batch(args)
         // Maintenance, not in the agent tool catalog.
         case "admin_close_window":
@@ -936,7 +944,7 @@ public final class Engine {
     /// `body` gets a check to call right before it posts anything: it throws
     /// unless the agent's window is still the app's key window and the user
     /// hasn't switched to the app since, so input never goes anywhere else.
-    private func keyed<T>(_ w: AgentWindow, cause: String, _ body: (_ check: () throws -> Void) throws -> T) throws -> T {
+    private func keyed<T>(_ w: AgentWindow, cause: String, _ body: (_ check: () throws -> Void, _ key: CGWindowID) throws -> T) throws -> T {
         let giveUpAt = typingDeadline
         while true {
             do {
@@ -970,7 +978,7 @@ public final class Engine {
     private struct YieldToUser: Error {}
 
     private func keyedOnce<T>(_ w: AgentWindow, cause: String, giveUpAtMs: Double,
-                              _ body: (_ check: () throws -> Void) throws -> T) throws -> T {
+                              _ body: (_ check: () throws -> Void, _ key: CGWindowID) throws -> T) throws -> T {
         if paused { throw ToolError("paused by the user") }
         if userInControl { throw ToolError("the user took over your display") }
         dropStaleCover(w)
@@ -1026,7 +1034,7 @@ public final class Engine {
         }
         // Key is this window's now, whoever had it parked before; other
         // agents wait while this step runs too.
-        focusGuard.park(w.pid, window: w.id, owner: sessionID)
+        focusGuard.park(w.pid, window: w.id, keyWindow: scope.keyWindow, owner: sessionID)
         let keyAt = nowMs()
         defer {
             let backFrom = nowMs()
@@ -1042,7 +1050,8 @@ public final class Engine {
         let wasFront = BCUFrontProcessPID() == w.pid
         let check = { [self] in
             let key = AX.focusedWindowID(w.pid)
-            if let key, key != w.id {
+            // Ours: the window, or the sheet over it (one the step opened, say).
+            if let key, key != w.id, key != scope.keyWindow, AX.sheetWindowID(pid: w.pid, window: w.id) != key {
                 throw ToolError("\(w.appName)'s key window changed to window \(key) (\(FocusGuard.onAgentDisplay(key) ? "another agent window" : "the user's")), so nothing more was sent")
             }
             if key == nil {
@@ -1052,7 +1061,7 @@ public final class Engine {
                 throw ToolError("the user switched to \(w.appName), so nothing more was sent")
             }
         }
-        let result = try body(check)
+        let result = try body(check, scope.keyWindow)
         // Let focus moves (Tab, a click) land before noting the focused field.
         sleepMs(30)
         rememberFocusedText(in: w)
@@ -1073,7 +1082,7 @@ public final class Engine {
             switch KeyScope.afterStep(popupOpen: popupOpen, userWindow: focusGuard.userWindow(of: w.pid)) {
             case .park:
                 if scope.keepKey() {
-                    focusGuard.park(w.pid, window: w.id, owner: sessionID)
+                    focusGuard.park(w.pid, window: w.id, keyWindow: scope.heldBy, owner: sessionID)
                     return
                 }
             case .handTo(let user):
@@ -1175,7 +1184,7 @@ public final class Engine {
     /// something there within `agentLeaseMs`.
     private func leaseHolder(_ pid: pid_t, window: CGWindowID?) -> FocusGuard.ParkedKey? {
         guard let p = focusGuard.parkedKey(pid), p.owner != sessionID, p.window != window,
-              nowMs() - p.lastUsedMs < Self.agentLeaseMs, AX.focusedWindowID(pid) == p.window else { return nil }
+              nowMs() - p.lastUsedMs < Self.agentLeaseMs, AX.focusedWindowID(pid) == p.keyWindow else { return nil }
         return p
     }
 
@@ -1321,6 +1330,41 @@ public final class Engine {
         return try body()
     }
 
+    /// The panel service window behind the sheet over `w`, when that sheet
+    /// is an open or save panel (see `Panel`).
+    private func remotePanel(_ w: AgentWindow) -> (sheet: AXUIElement, remote: Panel.Remote)? {
+        guard let ax = AX.window(pid: w.pid, id: w.id), let sheet = AX.sheet(of: ax), let sid = AX.windowID(sheet), sid != w.id,
+              let remote = Panel.remote(sheet: sid, appPid: w.pid) else { return nil }
+        return (sheet, remote)
+    }
+
+    /// A keys or pixel step in an open or save panel: posted to the panel's
+    /// own process, so the app's key window doesn't change and there's no
+    /// pause of the user's to wait for. The panel can still make its sheet
+    /// the app's key window as it opens one of its own (Go to Folder): if
+    /// the user is in the app, key goes back to their window.
+    private func panelInput<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) throws -> T {
+        if paused { throw ToolError("paused by the user") }
+        if userInControl { throw ToolError("the user took over your display") }
+        defer {
+            if userIsIn(w.pid) { focusGuard.reclaimWhenSafe(w.pid); focusGuard.scheduleReclaim(w.pid) }
+        }
+        return try guarded(w, cause: cause, body)
+    }
+
+    /// A pixel click at global `p`: into an open or save panel's process
+    /// when it's on one, else with the window made its app's key window.
+    private func pixelClick(_ w: AgentWindow, at p: CGPoint, button: Input.Button, count: Int) throws {
+        if let panel = remotePanel(w), panel.remote.frame.contains(p) {
+            let target = Panel.window(of: panel.remote, at: p)
+            try panelInput(w, cause: "clicking") {
+                try Input.click(pid: target.pid, windowID: target.window, at: p, button: button, count: count, origin: target.frame.origin)
+            }
+            return
+        }
+        try keyed(w, cause: "clicking") { check, key in try Input.click(pid: w.pid, windowID: Self.clickTarget(w.id, key: key, at: p), at: p, button: button, count: count, check: check) }
+    }
+
     private func globalPoint(_ args: Args, window ax: AXUIElement) throws -> CGPoint {
         guard let x = args.double("x"), let y = args.double("y") else { throw ToolError("give an element or x and y") }
         guard let f = AX.frame(ax) else { throw ToolError("can't read the window frame") }
@@ -1357,6 +1401,137 @@ public final class Engine {
             for w in ws { lines.append("  \(w.id): \(w.appName) [\(w.kind.rawValue)\(w.handedOff ? ", handed off" : "")] \"\(WindowList.info(w.id)?.title ?? "")\"") }
         }
         return ToolResult(text: lines.joined(separator: "\n"))
+    }
+
+    // MARK: Sound
+
+    /// The apps whose sound goes to this session's file: those only agents
+    /// have windows in (`onAgent`, from `Engine.appsOnAgent`) and the ones
+    /// it claimed. Any thread.
+    func audioApps(onAgent: [pid_t: Bool]? = nil) -> [NSRunningApplication] {
+        let ws = windows.windows
+        let onAgent = onAgent ?? Self.appsOnAgent(checking: Set(ws.map(\.pid)))
+        var pids = Set(ws.filter { !$0.withUser }.map(\.pid)).filter { onAgent[$0] == true }
+        pids.formUnion(audioClaims.pids(open: Set(ws.map(\.id))))
+        // The last claimed window closed: stop reading while nothing plays.
+        if audioClaims.isIdle && audio.keepRecording { audio.keepRecording = false }
+        return pids.sorted().compactMap { NSRunningApplication(processIdentifier: $0) }
+    }
+
+    /// For each app with a window, whether every one of its windows (hidden
+    /// and minimized ones included) is on an agent display. For the apps in
+    /// `checking`, an off-screen window counts only if accessibility lists
+    /// it: minimized and hidden windows are listed, an app's own off-screen
+    /// helper windows aren't (Safari keeps a 500x500 one, which made Safari
+    /// never count as the agent's alone).
+    static func appsOnAgent(checking: Set<pid_t> = []) -> [pid_t: Bool] {
+        let displays = AgentDisplay.running.map(\.bounds)
+        var listed: [pid_t: Set<CGWindowID>] = [:]
+        var onAgent: [pid_t: Bool] = [:]
+        for w in WindowList.all() where w.layer == 0 && w.bounds.width > 40 && w.bounds.height > 40 {
+            let c = CGPoint(x: w.bounds.midX, y: w.bounds.midY)
+            let mine = displays.contains { $0.contains(c) }
+            if !mine && !w.onScreen && checking.contains(w.pid) {
+                if listed[w.pid] == nil { listed[w.pid] = Set(AX.windows(w.pid).compactMap(AX.windowID)) }
+                if listed[w.pid]?.contains(w.id) == false { continue }
+            }
+            onAgent[w.pid] = (onAgent[w.pid] ?? true) && mine
+        }
+        return onAgent
+    }
+
+    /// Before the agent plays sound in an app the user also has windows in:
+    /// mute the app on the speakers and record it, until the user uses it.
+    private func captureAudio(_ args: Args) throws -> ToolResult {
+        let (w, _) = try agentWindow(args)
+        guard let app = NSRunningApplication(processIdentifier: w.pid) else { throw ToolError("\(w.appName) isn't running") }
+        guard #available(macOS 14.2, *) else {
+            throw ToolError("This Mac's macOS is older than 14.2, which can't keep one app's sound off the speakers. Don't play sound; if the task needs it, tell the user.")
+        }
+        // Only agents' windows: muted anyway, but only once the app starts
+        // playing, and the first ~0.7 s gets out. A claim reads the tap from now.
+        let agentsOnly = Self.appsOnAgent(checking: [w.pid])[w.pid] == true && !w.withUser
+        // Not while macOS is still to ask the user: with its prompt up,
+        // starting and stopping the recorder each block for about two
+        // minutes, and the user taking the app back would wait that long.
+        // (Its other answers aren't to be trusted: allowed in System Settings
+        // after a denial still reads as denied. A tap that doesn't take is
+        // caught below.)
+        if BCUAudioCapturePreflight() == 2 {
+            BCUAudioCaptureRequest()
+            throw ToolError("macOS is asking the user to allow System Audio Recording for Background Computer Use. Until they do, your sound can't be kept off their speakers: don't play sound yet, and call this again once they've answered.")
+        }
+        var mute: AXNode?
+        if args.int("mute_element") != nil {
+            var muteArgs = args.raw
+            muteArgs["element"] = muteArgs["mute_element"]
+            let n = try node(Args(muteArgs), window: w)
+            guard n.actions.contains("AXPress") else {
+                throw ToolError("element \(n.index) can't be pressed through accessibility (its actions: \(n.actions.joined(separator: ", "))). Name a mute or pause button.")
+            }
+            mute = n
+        }
+        // Already claimed (this window, or the app by any session): the app
+        // is muted, and its sound is an agent's (the user would have ended
+        // the claim), so don't take it for the user's.
+        let renewing = audioClaims.has(w.id)
+        if !renewing && !agentsOnly && !AudioClaims.claimed(w.pid) && SessionAudio.audible(app) ?? SessionAudio.isPlaying(app) {
+            throw ToolError("\(w.appName) is making sound right now, probably the user's, so it can't be muted without muting theirs. If it's yours, pause it (a muted tab can still count), then call this again. Otherwise wait until it stops.")
+        }
+        let label = mute.flatMap { n in [AX.string(n.element, "AXTitle"), AX.string(n.element, "AXDescription")].compactMap { $0 }.first { !$0.isEmpty } }
+        let muteName = mute.map { "element \($0.index)" + (label.map { " \"\($0)\"" } ?? "") } ?? ""
+        audioClaims.add(AudioClaims.Claim(window: w.id, pid: w.pid, appName: w.appName, mute: mute?.element, muteName: muteName,
+                                          muteLook: mute.map { AudioClaims.look($0.element) }))
+        focusGuard.onUserInput(for: "audio-\(sessionID)") { [weak self] input in
+            self?.audioClaims.userInput(input) { hit, why in self?.giveSoundBack(hit, why: why) }
+        }
+        audio.keepRecording = true
+        if renewing {
+            return ToolResult(text: mute == nil ? "\(w.appName) is still muted on the user's speakers." : "\(w.appName) is still muted on the user's speakers; when the user starts using it, \(muteName) is pressed to silence yours.")
+        }
+        audio.routeNow(audioApps())
+        var opening = ""
+        switch audio.state(of: app) {
+        case .muted: break
+        case .notOpenedYet:
+            opening = " (\(w.appName) hasn't opened its audio yet; it's muted the moment it does)"
+        case .failed(let why):
+            audioClaims.remove(w.id)
+            audio.keepRecording = !audioClaims.isIdle
+            audio.routeNow(audioApps())
+            throw ToolError("\(w.appName)'s sound can't be kept off the user's speakers: \(why). Don't play sound in it; if the task needs sound, tell the user.")
+        }
+        if agentsOnly {
+            return ToolResult(text: "Only agents have windows in \(w.appName), so its sound stays off the user's speakers and is recorded to \(audio.url.path)\(opening). Play it now.")
+        }
+        log("Muted \(w.appName) on your speakers while the agent plays sound in it")
+        let then = mute == nil
+            ? "Once your window has a mute or pause button for it (a tab's mute button shows only once it plays), call this again with it as mute_element: when the user starts using \(w.appName), it plays on their speakers again, and that button is pressed to silence yours first."
+            : "When the user starts using \(w.appName), \(muteName) is pressed to silence yours and the app plays on their speakers again; you're told on your next call."
+        return ToolResult(text: "\(w.appName)'s sound is muted on the user's speakers and recorded to \(audio.url.path)\(opening). Play yours now. " + then)
+    }
+
+    /// The user is using a claimed app: silence the agent's sound, then
+    /// stop muting the app. Off the input tap's thread.
+    private func giveSoundBack(_ hit: [AudioClaims.Claim], why: String) {
+        // Quiet once the tap has carried no sound for 60 ms. The tap mixes
+        // every app routed to this session, so with others in it (or no
+        // recorder reading it), once the app's own output has stopped.
+        let alone = audio.routedPids.subtracting(hit.map(\.pid)).isEmpty
+        _ = audioClaims.silence(hit, why: why) { [audio] pid in
+            (alone ? audio.soundWithin(ms: 60) : nil) ?? (NSRunningApplication(processIdentifier: pid).map(SessionAudio.isPlaying) ?? false)
+        }
+        audioClaims.finish(hit)
+        audio.keepRecording = !audioClaims.isIdle
+        audio.routeNow(audioApps())
+        if audioClaims.isEmpty { focusGuard.onUserInput(for: "audio-\(sessionID)", nil) }
+        for name in Set(hit.map(\.appName)).sorted() { log("Gave \(name)'s sound back to you") }
+    }
+
+    private func endAudioClaims() {
+        audioClaims.clear()
+        audio.keepRecording = false
+        focusGuard.onUserInput(for: "audio-\(sessionID)", nil)
     }
 
     private func listApps() -> ToolResult {
@@ -1570,7 +1745,7 @@ public final class Engine {
     // MARK: Batch
 
     private static let batchable: Set<String> = ["click", "set_value", "perform_action", "type_text", "press_key",
-                                                 "scroll", "drag", "press_menu_item", "navigate", "wait"]
+                                                 "scroll", "drag", "press_menu_item", "navigate", "choose_file", "wait"]
 
     /// Steps that may take key focus in their app (see `keyed`).
     private static func mayTakeKey(_ tool: String, _ a: Args) -> Bool {
@@ -1721,14 +1896,20 @@ public final class Engine {
                     return ToolResult(text: "Selected the row of element \(n.index) through accessibility.")
                 }
             }
-            let p = n.frame.center
-            try keyed(w, cause: "clicking") { check in try Input.click(pid: w.pid, windowID: w.id, at: p, button: button, count: count, check: check) }
+            try pixelClick(w, at: n.frame.center, button: button, count: count)
             return ToolResult(text: "Clicked element \(n.index) at its center.")
         }
         let p = try globalPoint(args, window: ax)
         point(p, .click)
-        try keyed(w, cause: "clicking") { check in try Input.click(pid: w.pid, windowID: w.id, at: p, button: button, count: count, check: check) }
+        try pixelClick(w, at: p, button: button, count: count)
         return ToolResult(text: "Clicked at (\(Int(args.double("x") ?? 0)), \(Int(args.double("y") ?? 0))).")
+    }
+
+    /// The window a pixel click at `p` goes to: the sheet that has key
+    /// (`key`, when it isn't the window itself) if `p` is on it.
+    static func clickTarget(_ window: CGWindowID, key: CGWindowID, at p: CGPoint) -> CGWindowID {
+        guard key != window, let sheet = WindowList.info(key)?.bounds, sheet.contains(p) else { return window }
+        return key
     }
 
     private func setValue(_ args: Args) throws -> ToolResult {
@@ -1772,6 +1953,15 @@ public final class Engine {
         if args.int("element") != nil { target = try node(args, window: w) }
         if let n = target { point(n.frame.center) }
 
+        // An open or save panel takes keys in its own process, without the
+        // app's key window changing (see `Panel`), so it needs none of what
+        // follows.
+        if remotePanel(w) != nil {
+            if let n = target { guarded(w, cause: "focusing") { _ = AX.set(n.element, "AXFocused", kCFBooleanTrue) } }
+            try typeKeys(w, text)
+            return ToolResult(text: "Typed \(text.count) characters into the file panel with keystrokes.")
+        }
+
         // The user is in this app, so keystrokes would take key focus from
         // their window. Write the text through accessibility instead.
         if userIsIn(w.pid), AX.focusedWindowID(w.pid) != w.id {
@@ -1810,6 +2000,25 @@ public final class Engine {
     /// partway, it stops rather than guess where the rest would go.
     private func typeKeys(_ w: AgentWindow, _ text: String) throws {
         let total = text.count
+        if let panel = remotePanel(w) {
+            // Before each character: the user may pause the agent or take
+            // over its display partway through a long text.
+            var typed = 0
+            do {
+                try panelInput(w, cause: "typing") {
+                    _ = try Input.typeText(pid: panel.remote.pid, text, windowID: panel.remote.window) { i in
+                        typed = i
+                        if self.paused { throw ToolError("paused by the user") }
+                        if self.userInControl { throw ToolError("the user took over your display") }
+                        return true
+                    }
+                }
+            } catch {
+                let more = typed == 0 ? "Nothing was typed." : "Typed \(typed) of \(total) characters (\"\(text.prefix(typed).suffix(40))\"), nothing after that."
+                throw ToolError("stopped typing: \(error). \(more)")
+            }
+            return
+        }
         let startedIn = userIsIn(w.pid)
         var typed = 0
         var rest = Substring(text)
@@ -1822,9 +2031,9 @@ public final class Engine {
             let piece = String(rest.prefix(Self.typeChunk))
             var sent = 0
             do {
-                try keyed(w, cause: "typing") { check in
+                try keyed(w, cause: "typing") { check, key in
                     let start = nowMs()
-                    let n = try Input.typeText(pid: w.pid, piece, windowID: w.id) { i in
+                    let n = try Input.typeText(pid: w.pid, piece, windowID: key) { i in
                         sent = i
                         // Keep each swap short: the user's input may be held meanwhile.
                         // And end it at once if they start typing into the app:
@@ -2010,9 +2219,15 @@ public final class Engine {
         let (w, _) = try agentWindow(args)
         let key = try args.requireString("key")
         let mods = args.strings("modifiers") ?? []
-        try keyed(w, cause: "pressing \((mods + [key]).joined(separator: "+"))") { check in
+        if let panel = remotePanel(w) {
+            try panelInput(w, cause: "pressing \((mods + [key]).joined(separator: "+"))") {
+                try Input.pressKey(pid: panel.remote.pid, key: key, modifiers: mods, windowID: panel.remote.window, shortcutsToMenu: false)
+            }
+            return ToolResult(text: "Pressed \((mods + [key]).joined(separator: "+")) in the file panel.")
+        }
+        try keyed(w, cause: "pressing \((mods + [key]).joined(separator: "+"))") { check, keyWindow in
             try check()
-            try Input.pressKey(pid: w.pid, key: key, modifiers: mods, windowID: w.id)
+            try Input.pressKey(pid: w.pid, key: key, modifiers: mods, windowID: keyWindow)
         }
         return ToolResult(text: "Pressed \((mods + [key]).joined(separator: "+")).")
     }
@@ -2031,7 +2246,12 @@ public final class Engine {
         let dx = args.int("dx") ?? 0, dy = args.int("dy") ?? 0
         guard dx != 0 || dy != 0 else { throw ToolError("give dx or dy") }
         point(p)
-        try guarded(w, cause: "scrolling") { try Input.scroll(pid: w.pid, windowID: w.id, at: p, dx: dx, dy: dy) }
+        if let panel = remotePanel(w), panel.remote.frame.contains(p) {
+            let target = Panel.window(of: panel.remote, at: p)
+            try panelInput(w, cause: "scrolling") { try Input.scroll(pid: target.pid, windowID: target.window, at: p, dx: dx, dy: dy, origin: target.frame.origin) }
+        } else {
+            try guarded(w, cause: "scrolling") { try Input.scroll(pid: w.pid, windowID: w.id, at: p, dx: dx, dy: dy) }
+        }
         return ToolResult(text: "Scrolled dx=\(dx) dy=\(dy).")
     }
 
@@ -2042,11 +2262,147 @@ public final class Engine {
               let tx = args.double("to_x"), let ty = args.double("to_y") else { throw ToolError("give from_x, from_y, to_x, to_y") }
         let from = CGPoint(x: f.minX + fx, y: f.minY + fy), to = CGPoint(x: f.minX + tx, y: f.minY + ty)
         point(from, .drag(to: to))
-        try keyed(w, cause: "dragging") { check in
+        if let panel = remotePanel(w), panel.remote.frame.contains(from) {
+            let target = Panel.window(of: panel.remote, at: from)
+            try panelInput(w, cause: "dragging") { try Input.drag(pid: target.pid, windowID: target.window, from: from, to: to, origin: target.frame.origin) }
+            return ToolResult(text: "Dragged from (\(Int(fx)),\(Int(fy))) to (\(Int(tx)),\(Int(ty))).")
+        }
+        try keyed(w, cause: "dragging") { check, key in
             try check()
-            try Input.drag(pid: w.pid, windowID: w.id, from: from, to: to)
+            try Input.drag(pid: w.pid, windowID: Self.clickTarget(w.id, key: key, at: from), from: from, to: to)
         }
         return ToolResult(text: "Dragged from (\(Int(fx)),\(Int(fy))) to (\(Int(tx)),\(Int(ty))).")
+    }
+
+    /// Poll `ok` every 50 ms for up to `ms`; whether it came true.
+    private func waitUntil(_ ms: Double, _ ok: () -> Bool) -> Bool {
+        let deadline = nowMs() + ms
+        while true {
+            if ok() { return true }
+            if nowMs() >= deadline { return false }
+            sleepMs(50)
+        }
+    }
+
+    /// Pick a file by path in the open or save panel over the window: Go to
+    /// Folder with the path, then the panel's button. Works for any folder,
+    /// including ones the panel's sidebar doesn't show (~/Library). Keys go
+    /// to the panel's own process (see `Panel`), so nothing waits for the user.
+    private func chooseFile(_ args: Args) throws -> ToolResult {
+        let (w, ax) = try agentWindow(args)
+        let path = Panel.resolve(try args.requireString("path"))
+        guard path.hasPrefix("/") else { throw ToolError("give an absolute path (or one starting with ~)") }
+        let confirm = args.bool("confirm") ?? true
+        // An upload button's picker takes a moment to open.
+        var found: (sheet: AXUIElement, remote: Panel.Remote)?
+        _ = waitUntil(3000) { found = remotePanel(w); return found != nil }
+        guard let panel = found else {
+            if AX.sheet(of: ax) != nil {
+                throw ToolError("the sheet over window \(w.id) isn't a file picker or save panel (an alert, say). Read it with get_window_state.")
+            }
+            throw ToolError("no file picker is open over window \(w.id). Open it first (click the page's upload button, or File > Open), then call choose_file.")
+        }
+        let remote = panel.remote
+        let saving = Panel.isSavePanel(panel.sheet)
+        let name = (path as NSString).lastPathComponent
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
+        let goTo: String
+        if saving {
+            if exists && isDir.boolValue { throw ToolError("\(path) is a folder: give the path of the file to save") }
+            goTo = (path as NSString).deletingLastPathComponent
+            var folder: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: goTo, isDirectory: &folder), folder.boolValue else {
+                throw ToolError("there's no folder \(goTo) to save into")
+            }
+        } else {
+            guard exists else { throw ToolError("there's no file or folder at \(path)") }
+            goTo = path
+        }
+        point(remote.frame.center)
+        // The user can pause the agent or take over its display while this
+        // waits on the panel: check before every step.
+        func stillGoing() throws {
+            if paused { throw ToolError("paused by the user; nothing more was done in the file panel") }
+            if userInControl { throw ToolError("the user took over your display; nothing more was done in the file panel") }
+        }
+        func press(_ key: String, _ mods: [String] = []) throws {
+            try panelInput(w, cause: "pressing \((mods + [key]).joined(separator: "+")) in the file panel") {
+                try Input.pressKey(pid: remote.pid, key: key, modifiers: mods, windowID: remote.window, shortcutsToMenu: false)
+            }
+        }
+        func goToField() -> AXUIElement? {
+            Panel.innerSheet(panel.sheet).flatMap { inner in
+                Panel.find(inner) { el, role in (role == "AXTextField" || role == "AXComboBox") && AX.isSettable(el, "AXValue") }
+            }
+        }
+        // Go to Folder, with the path. A save panel's name field doesn't
+        // take cmd+shift+G, but "/" typed into it empty opens Go to Folder;
+        // so does "/" in an open panel's file list.
+        func slash() throws {
+            try stillGoing()
+            if saving, let name = Panel.nameField(panel.sheet) {
+                guarded(w, cause: "clearing the file name") {
+                    AX.set(name, "AXFocused", kCFBooleanTrue)
+                    AX.set(name, "AXValue", "" as CFString)
+                }
+            }
+            try panelInput(w, cause: "typing / in the file panel") { _ = try Input.typeText(pid: remote.pid, "/", windowID: remote.window) }
+        }
+        let openers: [() throws -> Void] = saving ? [slash, { try press("g", ["cmd", "shift"]) }] : [{ try press("g", ["cmd", "shift"]) }, slash]
+        var field: AXUIElement? = goToField()
+        for open in openers where field == nil {
+            try open()
+            _ = waitUntil(1500) { field = goToField(); return field != nil }
+        }
+        guard let field else {
+            throw ToolError("Go to Folder didn't open in the file panel, so nothing was chosen. Read the window and pick the file by clicking its row, then the panel's button.")
+        }
+        try stillGoing()
+        let err = guarded(w, cause: "entering the path") { AX.set(field, "AXValue", goTo as CFString) }
+        guard err == .success, waitUntil(500, { AX.string(field, "AXValue") == goTo }) else {
+            try? press("escape")
+            throw ToolError("couldn't enter the path in Go to Folder (\(AX.errorName(err))), so nothing was chosen")
+        }
+        try press("return")
+        guard waitUntil(3000, { Panel.innerSheet(panel.sheet) == nil }) else {
+            try? press("escape")
+            throw ToolError("the file panel didn't take \(goTo) (Go to Folder stayed open, so it may not be able to reach it); closed Go to Folder, nothing was chosen")
+        }
+        if saving {
+            guard let nameField = Panel.nameField(panel.sheet) else { throw ToolError("went to \(goTo), but found no file name field in the save panel") }
+            try stillGoing()
+            let e = guarded(w, cause: "entering the file name") { AX.set(nameField, "AXValue", name as CFString) }
+            guard e == .success, waitUntil(500, { AX.string(nameField, "AXValue") == name }) else {
+                throw ToolError("went to \(goTo), but couldn't enter the name \"\(name)\" (\(AX.errorName(e)))")
+            }
+        } else if !isDir.boolValue, !waitUntil(3000, { Panel.selectedNames(panel.sheet).contains(name) }) {
+            // (Go to Folder with a folder opens it, and a folder picker's
+            // button then chooses the folder it's in: nothing to select.)
+            let selected = Panel.selectedNames(panel.sheet)
+            throw ToolError("went to \(goTo), but the panel selected \(selected.isEmpty ? "nothing" : selected.map { "\"\($0)\"" }.joined(separator: ", ")) instead of \"\(name)\". Read the window and pick the row yourself.")
+        }
+        let what = saving ? "Entered \(path) in the save panel" : "Selected \(path) in the file picker"
+        guard let button = Panel.defaultButton(panel.sheet) else {
+            return ToolResult(text: "\(what), but found no button to finish with: read the window and press it.")
+        }
+        let title = AX.string(button, "AXTitle") ?? "the panel's button"
+        guard confirm else { return ToolResult(text: "\(what). Press \"\(title)\" to finish.") }
+        if AX.bool(button, "AXEnabled") == false {
+            throw ToolError("\(what), but \"\(title)\" is disabled: the panel may not accept this kind of file")
+        }
+        try stillGoing()
+        let e = guarded(w, cause: "pressing \(title)") { AX.perform(button, "AXPress") }
+        guard e == .success else { throw ToolError("\(what), but pressing \"\(title)\" failed (\(AX.errorName(e)))") }
+        let closed = waitUntil(3000) {
+            guard let now = AX.window(pid: w.pid, id: w.id).flatMap(AX.sheet(of:)) else { return true }
+            return !CFEqual(now, panel.sheet)
+        }
+        if !closed { return ToolResult(text: "\(what) and pressed \"\(title)\", but the panel is still open: read the window.") }
+        if AX.window(pid: w.pid, id: w.id).flatMap(AX.sheet(of:)) != nil {
+            return ToolResult(text: "\(what) and pressed \"\(title)\"; another sheet is open now (a question, say \"Replace?\"): read the window.")
+        }
+        return ToolResult(text: "\(saving ? "Saved as" : "Chose") \(path) and pressed \"\(title)\".")
     }
 
     /// Load a URL in one of the agent's Chromium windows by Apple event: no
@@ -2212,7 +2568,7 @@ public final class Engine {
         }
         guard let target = item else { throw ToolError("empty path") }
         if AX.bool(target, "AXEnabled") == false { throw ToolError("\"\(path.last!)\" is disabled right now") }
-        let err = try keyed(w, cause: "choosing \(path.joined(separator: " > "))") { check -> AXError in
+        let err = try keyed(w, cause: "choosing \(path.joined(separator: " > "))") { check, _ -> AXError in
             try check()
             let e = AX.perform(target, "AXPress")
             sleepMs(200)

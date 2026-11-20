@@ -469,6 +469,11 @@ public final class WindowManager {
         // browsers) open it straight on the agent display, so no anchor is
         // needed and nothing ever reaches the user's screen.
         let scripted = trigger == nil || trigger == "script" ? Self.scriptableBrowser(pid: pid, bundleID: bundleID) : nil
+        // Without a New Window menu item there's nothing safe to press (see
+        // below): say so before holding the user's input.
+        if scripted == nil, trigger != "key", Self.newWindowMenuItem(pid: pid) == nil {
+            throw ToolError("\(name) has no menu item for a new window, so no window was opened. It may not support multiple windows: use list_windows with app=\"\(name)\" and borrow_window.")
+        }
         if scripted == nil { hold?.start() }
         var scope: KeyScope?
         if scripted == nil, placement.contains(.anchor), let anchor = anchorWindow(pid: pid) {
@@ -533,15 +538,23 @@ public final class WindowManager {
             }
         }
         if scriptFailed {
-            hold?.start()
+            // Only a menu item the app names: a bare cmd+N goes to the app's
+            // key window, which is often the user's, and in an app without
+            // such an item it does something else there (a new thread, a new
+            // note) while their input is held waiting for a window.
             if trigger != "key", let item = Self.newWindowMenuItem(pid: pid) {
+                hold?.start()
                 let err = AX.perform(item.element, "AXPress")
                 how = "menu \"\(item.title)\"" + (err == .success ? "" : " (\(AX.errorName(err)))")
-            } else {
+                caught = catcher.waitForWindow(timeoutMs: 5000)
+            } else if trigger == "key" {
+                hold?.start()
                 try Input.pressKey(pid: pid, key: "n", modifiers: ["cmd"])
                 how = "cmd+N"
+                caught = catcher.waitForWindow(timeoutMs: 5000)
+            } else {
+                how = "nothing: it has no menu item for a new window"
             }
-            caught = catcher.waitForWindow(timeoutMs: 5000)
         }
         // Give key back right away: while the new window is key, the user's
         // window in the same app is blurred.
@@ -655,29 +668,77 @@ public final class WindowManager {
         let title: String
     }
 
-    /// The app's "New Window" menu item, else its plain cmd+N item.
+    /// The app's menu item for a new window (see `newWindowRank`).
     static func newWindowMenuItem(pid: pid_t) -> MenuItemRef? {
         guard let bar = AX.element(AX.app(pid), "AXMenuBar") else { return nil }
-        var cmdN: MenuItemRef?
+        var best: (rank: Int, item: MenuItemRef)?
         for top in AX.children(bar) {
             for menu in AX.children(top) {
                 for item in AX.children(menu) {
                     let title = AX.string(item, "AXTitle") ?? ""
-                    let enabled = AX.bool(item, "AXEnabled") ?? true
-                    guard enabled, !title.isEmpty else { continue }
-                    let lower = title.lowercased()
-                    if lower == "new window" { return MenuItemRef(element: item, title: title) }
-                    let char = AX.string(item, "AXMenuItemCmdChar") ?? ""
-                    let mods = (AX.attr(item, "AXMenuItemCmdModifiers") as? NSNumber)?.intValue ?? -1
-                    if cmdN == nil && char.uppercased() == "N" && mods == 0
-                        && !lower.contains("private") && !lower.contains("incognito") {
-                        cmdN = MenuItemRef(element: item, title: title)
+                    guard AX.bool(item, "AXEnabled") ?? true,
+                          let rank = newWindowRank(title: title, key: AX.string(item, "AXMenuItemCmdChar") ?? "",
+                                                   modifiers: (AX.attr(item, "AXMenuItemCmdModifiers") as? NSNumber)?.intValue ?? -1)
+                    else { continue }
+                    // A submenu ("New Window" in Terminal: one per profile):
+                    // its cmd+N item, else its first one that names a window.
+                    var ref = MenuItemRef(element: item, title: title)
+                    let subitems = AX.children(item).flatMap { AX.children($0) }.filter { AX.bool($0, "AXEnabled") ?? true }
+                    if !subitems.isEmpty {
+                        let n = subitems.first { (AX.string($0, "AXMenuItemCmdChar") ?? "").uppercased() == "N" }
+                            ?? subitems.first { (AX.string($0, "AXTitle") ?? "").lowercased().contains("window") }
+                        guard let n else { continue }
+                        ref = MenuItemRef(element: n, title: "\(title) > \(AX.string(n, "AXTitle") ?? "")")
                     }
+                    if rank == 0 { return ref }
+                    if best == nil || rank < best!.rank { best = (rank, ref) }
                 }
             }
         }
-        return cmdN
+        return best?.item
     }
+
+    /// Whether a menu item opens a new window, best first: 0 "New Window"
+    /// (or, in another language, an item naming a window with cmd+N: "Neues
+    /// Fenster", "Nouvelle fenêtre"), 1 one that names a window ("New Finder
+    /// Window", "New Viewer Window", or in another language with N as its
+    /// key), 2 a document app's plain "New" (cmd+N, in the languages macOS
+    /// ships in); nil for anything else. Not any cmd+N item: in many apps it
+    /// makes something inside the window that has key, often the user's
+    /// ("New Chat", "New Message" in Messages, "New Note", "New Event").
+    static func newWindowRank(title: String, key: String, modifiers: Int) -> Int? {
+        let lower = title.lowercased().trimmingCharacters(in: .whitespaces)
+        if lower.isEmpty || privateWords.contains(where: lower.contains) { return nil }
+        let cmdN = key.uppercased() == "N"
+        if lower == "new window" { return 0 }
+        let namesWindow = windowWords.contains(where: lower.contains)
+        if namesWindow && cmdN && modifiers == 0 { return 0 }
+        if lower.hasSuffix(" window") && (lower.hasPrefix("new ") || lower.hasPrefix("open ")) { return 1 }
+        if namesWindow && cmdN { return 1 }
+        if cmdN && modifiers == 0 && documentNew.contains(lower) { return 2 }
+        return nil
+    }
+
+    /// "Window" in the languages macOS ships in.
+    private static let windowWords = [
+        "window", "fenster", "fenêtre", "ventana", "finestra", "janela", "venster", "fönster", "vindue", "vindu",
+        "ikkuna", "okno", "okna", "окно", "вікно", "ablak", "fereastră", "prozor", "pencere", "παράθυρο", "חלון",
+        "نافذة", "หน้าต่าง", "cửa sổ", "jendela", "tetingkap", "विंडो", "ウインドウ", "ウィンドウ", "窗口", "視窗", "윈도우",
+    ]
+    /// Private and incognito windows, which aren't the agent's to open.
+    private static let privateWords = [
+        "private", "incognito", "privé", "privat", "privad", "privat", "priva", "inkognito", "incógnito",
+        "приват", "инкогнито", "プライベート", "シークレット", "无痕", "隐私", "隱私", "私密", "시크릿", "gizli",
+    ]
+    /// A document app's "New" and "New Document" in those languages.
+    private static let documentNew: Set<String> = [
+        "new", "new document", "neu", "neues dokument", "nouveau", "nouveau document", "nuevo", "nuevo documento",
+        "nuovo", "nuovo documento", "novo", "novo documento", "nieuw", "nieuw document", "ny", "nytt dokument",
+        "nyt dokument", "uusi", "uusi dokumentti", "nowy", "nowy dokument", "nový", "nový dokument", "новый",
+        "новый документ", "новий", "новий документ", "új", "új dokumentum", "nou", "document nou", "novi", "yeni",
+        "yeni belge", "νέο", "νέο έγγραφο", "חדש", "جديد", "ใหม่", "mới", "baru", "dokumen baru", "新規", "新規書類",
+        "新建", "新建文稿", "新增", "新增文件", "새로 만들기", "신규",
+    ]
 
     /// Move a window onto the agent display, keeping its size where it fits.
     @discardableResult
