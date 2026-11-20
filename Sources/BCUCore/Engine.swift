@@ -116,6 +116,9 @@ public final class Engine {
     private var _busy: String?
     private var lastCallMs = 0.0
     private var lastLeftoverLogMs = -Double.infinity
+    /// Counts the agent's departures (`agentLeft`), so a release queued for
+    /// one doesn't run after the next.
+    private var _departure = 0
     /// How far this session has reported front-app changes (`FocusGuard.frontReport`).
     private var frontMark = 0
     /// Apps this call acted on that the session may have no window in (yet,
@@ -241,18 +244,26 @@ public final class Engine {
     /// `graceMs` unless it's `back` by then. A window the user took over
     /// stays with them.
     func agentLeft(graceMs: Double, back: @escaping () -> Bool) {
+        stateLock.lock(); _departure += 1; let departure = _departure; stateLock.unlock()
         tearDownIfIdle(idleMs: 0)
         DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(Int(graceMs))) {
-            self.releaseAbandoned(back: back)
+            self.releaseAbandoned(back: back, departure: departure)
         }
     }
 
+    /// Whether a release asked for during departure `queuedFor` may still
+    /// run, the agent's latest departure being `latest`.
+    static func departureStillCurrent(_ queuedFor: Int, latest: Int) -> Bool { true }
+
     /// Close what an agent that went away left open, and give up its
     /// display, unless it's `back`. Any thread; safe to call twice.
-    func releaseAbandoned(back: @escaping () -> Bool) {
+    func releaseAbandoned(back: @escaping () -> Bool, departure: Int? = nil) {
         guard !back() else { return }
+        stateLock.lock(); let queuedFor = departure ?? _departure; stateLock.unlock()
         queue.async {
             guard !back(), !self.userInControl else { return }
+            self.stateLock.lock(); let latest = self._departure; self.stateLock.unlock()
+            guard Self.departureStillCurrent(queuedFor, latest: latest) else { return }
             let mine = self.windows.windows
             guard !mine.isEmpty else { self.tearDownIfIdle(idleMs: 0); return }
             var notes: [String] = []

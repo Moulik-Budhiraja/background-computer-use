@@ -113,6 +113,11 @@ public final class Hub {
         e.agentLeft(graceMs: Self.orphanGraceMs) { [weak self, weak e] in e.flatMap { self?.isAttached($0) } ?? true }
     }
 
+    /// Whether a session's windows are up for another session to take over.
+    static func abandoned(_ id: String, attached: [String: Int], usedBy: [String: Set<String>]) -> Bool {
+        (attached[id] ?? 0) == 0
+    }
+
     /// When each session's agent went away, once `left` have nobody left:
     /// now, for those, so they get the whole grace from here (one kept by a
     /// relative may have lost its own connection long ago).
@@ -283,7 +288,7 @@ public final class Hub {
     private func takeOver(_ window: CGWindowID, for caller: Engine, id callerID: String) -> Engine {
         lock.lock()
         let departed = byID.first { id, e in
-            id != Self.defaultSession && e !== caller && (attached[id] ?? 0) == 0 && e.host == caller.host
+            id != Self.defaultSession && e !== caller && Self.abandoned(id, attached: attached, usedBy: usedBy) && e.host == caller.host
                 && Self.kind(e.label) == Self.kind(caller.label) && e.windows.window(window) != nil
         }
         guard let (oldID, old) = departed else { lock.unlock(); return caller }
