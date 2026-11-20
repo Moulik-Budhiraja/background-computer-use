@@ -223,7 +223,7 @@ final class HistoryTrackView: NSView {
     /// Content x of the playhead.
     private var scrollX: CGFloat = 0
     private var animation: Timer?
-    private var dragStart: (x: CGFloat, scrollX: CGFloat)?
+    private var dragStart: ScrubDrag?
     private var dragged = false
     private var scrolling = false
     /// The model is following a scrub: the track is already where it should be.
@@ -266,7 +266,7 @@ final class HistoryTrackView: NSView {
             // Onto the new edge, mid-gesture too: the gesture goes on from there.
             let shift = lastContentX - scrollX
             scrollX = lastContentX
-            if let d = dragStart { dragStart = (d.x, d.scrollX + shift) }
+            dragStart?.startScroll += shift
             if let newest = m.byTime.last, newest != m.index, let at = key(newest) {
                 held = (shown, at, true)
             } else {
@@ -400,7 +400,7 @@ final class HistoryTrackView: NSView {
         guard let m = model else { return false }
         if let i { m.go(to: i, animated: false) }
         let shown = m.index
-        if dragStart == nil { dragStart = (0, scrollX) }
+        if dragStart == nil { dragStart = ScrubDrag(pointerX: 0, windowX: 0, scroll: scrollX) }
         dragged = true
         scrollX += dx
         moved()
@@ -681,7 +681,7 @@ final class HistoryTrackView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         animation?.invalidate()
-        dragStart = (convert(event.locationInWindow, from: nil).x, scrollX)
+        dragStart = ScrubDrag(pointerX: convert(event.locationInWindow, from: nil).x, windowX: window?.frame.minX ?? 0, scroll: scrollX)
         dragged = false
     }
 
@@ -689,10 +689,10 @@ final class HistoryTrackView: NSView {
         // A drag sends no mouseMoved: keep the pointer for the hovered dot.
         pointer = event.locationInWindow
         guard let s = dragStart else { return }
-        let x = convert(event.locationInWindow, from: nil).x
-        if abs(x - s.x) > 3 { dragged = true }
+        let x = convert(event.locationInWindow, from: nil).x, windowX = window?.frame.minX ?? 0
+        if abs(s.distance(pointerX: x, windowX: windowX)) > 3 { dragged = true }
         guard dragged else { return }
-        scrollX = s.scrollX - (x - s.x)
+        scrollX = s.scroll(pointerX: x, windowX: windowX)
         moved()
     }
 

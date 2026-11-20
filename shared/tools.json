@@ -55,7 +55,10 @@
   },
   {
     "name": "borrow_window",
-    "description": "Move one of the user's existing windows onto your display. Use only for single-window apps whose accounts the user has allowed for this task; release_window puts it back exactly where it was.",
+    "description": {
+      "macos": "Move one of the user's existing windows onto your display. Use only for single-window apps whose accounts the user has allowed for this task; release_window puts it back exactly where it was. Fails, leaving the window with the user, if it can't be moved (full screen, say).",
+      "windows": "Move one of the user's existing windows onto your display. Use only for single-window apps whose accounts the user has allowed for this task; release_window puts it back exactly where it was."
+    },
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -71,7 +74,10 @@
   },
   {
     "name": "release_window",
-    "description": "Finish with a window: closes windows you opened, returns borrowed ones to the user.",
+    "description": {
+      "macos": "Finish with a window: closes windows you opened, returns borrowed ones to the user. Fails on a window handed off to the user until you call take_back.",
+      "windows": "Finish with a window: closes windows you opened, returns borrowed ones to the user."
+    },
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -133,7 +139,7 @@
   {
     "name": "click",
     "description": {
-      "macos": "Click an element (by number) or a point (x, y in window points). A left click on an element that lists press, or a right click on one that lists showmenu, goes through accessibility. Any other click (a point, a double click, an element without that action) is a real click: it takes key focus in the app for a moment, so while the user is in that app it first waits for a pause in their input (see priority).",
+      "macos": "Click an element (by number) or a point (x, y in window points). A left click on an element that lists press, or a right click on one that lists showmenu, goes through accessibility; if the element is gone or that action fails, nothing else is done. Any other click (a point, a double click, an element without that action) is a real click: it takes key focus in the app for a moment, so while the user is in that app it first waits for a pause in their input (see priority).",
       "windows": "Click an element (by number) or a point (x, y in window points). Element clicks use accessibility actions when the element supports them."
     },
     "inputSchema": {
@@ -233,7 +239,10 @@
   },
   {
     "name": "type_text",
-    "description": "Type text into your window. With `element`, that element is focused first. Uses accessibility insertion when it works, otherwise keystrokes.",
+    "description": {
+      "macos": "Type text into your window. With `element`, that element is focused first, and if it can't be, nothing is typed. Uses accessibility insertion when it works, otherwise keystrokes.",
+      "windows": "Type text into your window. With `element`, that element is focused first. Uses accessibility insertion when it works, otherwise keystrokes."
+    },
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -266,7 +275,7 @@
   {
     "name": "press_key",
     "description": {
-      "macos": "Press a key or shortcut in your window, e.g. key \"return\", or key \"l\" with modifiers [\"cmd\"]. While the user is in the same app it first waits for a pause in their input (see priority).",
+      "macos": "Press a key or shortcut in your window, e.g. key \"return\", or key \"l\" with modifiers [\"cmd\"]. With modifiers a letter's case doesn't matter: add \"shift\" for Shift. While the user is in the same app it first waits for a pause in their input (see priority).",
       "windows": "Press a key or shortcut in your window, e.g. key \"return\", or key \"l\" with modifiers [\"ctrl\"]."
     },
     "inputSchema": {
@@ -282,7 +291,7 @@
             "type": "string"
           },
           "description": {
-            "macos": "Any of cmd, shift, option, ctrl, fn.",
+            "macos": "Any of cmd, shift, option, ctrl, fn. Any other name fails the step.",
             "windows": "Any of ctrl, shift, alt, win."
           }
         },
@@ -312,11 +321,17 @@
       "properties": {
         "dx": {
           "type": "integer",
-          "description": "Horizontal lines (positive = right)."
+          "description": {
+            "macos": "Horizontal wheel notches, about 3 lines each (positive = right). At most 100 per call.",
+            "windows": "Horizontal wheel notches, about 3 lines each (positive = right)."
+          }
         },
         "dy": {
           "type": "integer",
-          "description": "Vertical lines (positive = down)."
+          "description": {
+            "macos": "Vertical wheel notches, about 3 lines each (positive = down). At most 100 per call.",
+            "windows": "Vertical wheel notches, about 3 lines each (positive = down)."
+          }
         },
         "element": {
           "type": "integer",

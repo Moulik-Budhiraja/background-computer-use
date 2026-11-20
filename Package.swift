@@ -60,7 +60,7 @@ let package = Package(
         ),
         .testTarget(
             name: "BCUCoreTests",
-            dependencies: ["BCUCore"],
+            dependencies: ["BCUCore", "BCUShared"],
             path: "Tests/BCUCoreTests",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

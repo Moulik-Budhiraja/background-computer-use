@@ -112,8 +112,13 @@ public final class Engine {
     private var _userInControl = false
     private lazy var testRemote = RemoteControl(engine: self)
     private var _waitingReason: String?
+    /// What the user did from the menu bar (pressed Done on a handoff), for
+    /// the agent's next call: it may be waiting with no call running.
+    private var userNotes: [String] = []
     private var _busy: String?
     private var lastCallMs = 0.0
+    /// When the user last gave the agent its windows back (0: never).
+    private var userReturnedMs = 0.0
     private var lastLeftoverLogMs = -Double.infinity
     /// How far this session has reported front-app changes (`FocusGuard.frontReport`).
     private var frontMark = 0
@@ -139,6 +144,10 @@ public final class Engine {
     /// How long `open_window` waits for a free display when all are taken.
     /// Under Codex's default 60 s tool timeout.
     static let displayWaitS: TimeInterval = 45
+    /// The still copy `open_window` puts over the user's window and menu
+    /// bar comes down once key is back on their window, and after this at
+    /// the most. Key is usually back within a few hundred ms.
+    static let freezeMaxS: TimeInterval = 1.5
     /// Another agent's window keeps its app's key for this long after that
     /// agent last touched it (`awaitAgentTurn`), but no one waits longer
     /// than `agentWaitMaxMs` for it.
@@ -162,7 +171,8 @@ public final class Engine {
     /// Create the session's display if it doesn't exist yet. Any thread.
     public func ensureDisplay() throws {
         guard !display.isRunning else { return }
-        func onMain(_ work: () -> Void) { if Thread.isMainThread { work() } else { DispatchQueue.main.sync(execute: work) } }
+        let quitting = ToolError("Background Computer Use is quitting. Try again once it's running.")
+        func onMain(_ work: @escaping () -> Void) throws { guard onMainUnlessQuitting(work) else { throw quitting } }
         let waitStart = nowMs()
         stateLock.lock(); let busy = _busy; stateLock.unlock()
         let got = display.reserve(timeout: Self.displayWaitS) {
@@ -182,14 +192,22 @@ public final class Engine {
         // A new display rearranges them all, and macOS then moves windows to
         // where they were the last time the displays were like this.
         let userWindows = AgentDisplay.noteUserWindows()
-        onMain { do { try self.display.start() } catch { failure = error } }
-        if let failure { throw failure }
+        // Every way out but success gives the display's place back (`stop`
+        // does, with or without a display): one kept would leave the next
+        // agent waiting for a display no one is using.
+        do {
+            try onMain { do { try self.display.start() } catch { failure = error } }
+            if let failure { throw failure }
+        } catch {
+            _ = onMainUnlessQuitting { self.display.stop(remove: true) }
+            throw error
+        }
         if !display.reused { AgentDisplay.restoreUserWindows(userWindows) }
         guard display.waitUntilOnline() else {
-            onMain { self.display.stop(remove: true) }
+            _ = onMainUnlessQuitting { self.display.stop(remove: true) }
             throw ToolError("virtual display never came online")
         }
-        onMain {
+        try onMain {
             self.display.finishStart()
             self.windows.startWatchdog()
         }
@@ -224,10 +242,11 @@ public final class Engine {
                 return
             }
             self.recorder.stop()
-            DispatchQueue.main.sync {
+            // Quitting removes the display itself.
+            guard onMainUnlessQuitting({
                 self.windows.stopWatchdog()
                 self.display.stop()
-            }
+            }) else { return }
             self.snapshots.removeAll()
             self.endAudioClaims()
             self.audio.end()
@@ -298,8 +317,17 @@ public final class Engine {
     }
 
     public func setPaused(_ value: Bool) {
-        stateLock.lock(); _paused = value; stateLock.unlock()
+        stateLock.lock()
+        if Self.userReturns(paused: (_paused, value), inControl: (_userInControl, _userInControl)) { userReturnedMs = nowMs() }
+        _paused = value
+        stateLock.unlock()
         log(value ? "Paused by you" : "Resumed")
+    }
+
+    /// The user gave the agent its windows back, as a state goes from `was`
+    /// to `now`: the update gate counts it like a call.
+    static func userReturns(paused: (was: Bool, now: Bool), inControl: (was: Bool, now: Bool)) -> Bool {
+        (paused.was && !paused.now) || (inControl.was && !inControl.now)
     }
 
     public var status: EngineStatus {
@@ -323,6 +351,20 @@ public final class Engine {
     public var isActive: Bool {
         stateLock.lock(); defer { stateLock.unlock() }
         return _busy != nil || nowMs() - lastCallMs < 3000
+    }
+
+    /// How long since a call last ran (`.infinity` before the first); 0 while one runs.
+    public var msSinceLastCall: Double {
+        stateLock.lock(); defer { stateLock.unlock() }
+        if _busy != nil { return 0 }
+        return lastCallMs == 0 ? .infinity : nowMs() - lastCallMs
+    }
+
+    /// How long since the user last gave the agent its windows back
+    /// (`.infinity` if never).
+    public var msSinceUserReturned: Double {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return userReturnedMs == 0 ? .infinity : nowMs() - userReturnedMs
     }
 
     public var activity: [ActivityItem] {
@@ -364,20 +406,57 @@ public final class Engine {
     public func setUserInControl(_ value: Bool) {
         stateLock.lock()
         let was = _userInControl
+        if Self.userReturns(paused: (_paused, _paused), inControl: (was, value)) { userReturnedMs = nowMs() }
         _userInControl = value
         stateLock.unlock()
         windows.userArranging = value
         if was != value { log(value ? "You took over the agent display" : "You gave the agent display back") }
     }
 
-    /// The user is done: move handed-off windows back to the agent display and resume.
+    /// The user is done: move handed-off windows back to the agent display,
+    /// and tell the agent on its next call. A pause the user set stays.
     public func handBack() {
         queue.async {
-            for w in self.windows.windows where w.handedOff {
-                try? self.windows.takeBack(w.id)
+            var done: [String] = []
+            let handedOff = self.windows.windows.filter(\.handedOff)
+            guard !handedOff.isEmpty else { return }
+            // Before the move: `takeBack` stops the window counting as handed
+            // off before it's back, and an update mustn't install in between.
+            self.stateLock.lock(); self.userReturnedMs = nowMs(); self.stateLock.unlock()
+            for w in handedOff {
+                guard (try? self.windows.takeBack(w.id)) != nil else { continue }
+                done.append("window \(w.id) (\(w.appName))")
             }
-            self.setPaused(false)
+            guard !done.isEmpty else { return }
+            self.stateLock.lock()
+            self.userReturnedMs = nowMs()
+            self.userNotes.append("The user pressed Done on \(done.joined(separator: " and ")): it's back on your display, so there's no need to call take_back.")
+            self.stateLock.unlock()
+            self.log("You handed \(done.joined(separator: ", ")) back")
         }
+    }
+
+    static let readOnlyTools: Set<String> = ["status", "guard_report", "list_apps", "list_windows", "release_window", "screenshot", "get_window_state"]
+
+    /// Why a call is turned away before it runs, if it is. `notes` gives the
+    /// user's notes for the agent (taking them).
+    static func refusal(tool: String, userInControl: Bool, paused: Bool, notes: () -> String?) -> String? {
+        // Closing a window the user is working in would pull it out from under them.
+        if userInControl && (!readOnlyTools.contains(tool) || tool == "release_window") {
+            return "The user took over your display and is using your windows. Wait and retry later, or tell the user you're blocked." + (notes() ?? "")
+        }
+        if paused && !readOnlyTools.contains(tool) {
+            return "Paused by the user from the menu bar. Wait and retry later, or tell the user you're blocked." + (notes() ?? "")
+        }
+        return nil
+    }
+
+    /// Notes from the user since the last call, once.
+    private func takeUserNotes() -> String? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard !userNotes.isEmpty else { return nil }
+        defer { userNotes = [] }
+        return "\n[user] " + userNotes.joined(separator: " ")
     }
 
     /// The window the agent handed to the user, if any.
@@ -419,13 +498,9 @@ public final class Engine {
                 changed()
                 recorder.captureSoon()
             }
-            let readOnly: Set<String> = ["status", "guard_report", "list_apps", "list_windows", "release_window", "screenshot", "get_window_state"]
-            // Closing a window the user is working in would pull it out from under them.
-            if userInControl && (!readOnly.contains(tool) || tool == "release_window") {
-                return .error("The user took over your display and is using your windows. Wait and retry later, or tell the user you're blocked.")
-            }
-            if paused && !readOnly.contains(tool) {
-                return .error("Paused by the user from the menu bar. Wait and retry later, or tell the user you're blocked.")
+            let readOnly = Self.readOnlyTools
+            if let refusal = Self.refusal(tool: tool, userInControl: userInControl, paused: paused, notes: takeUserNotes) {
+                return .error(refusal)
             }
             let monitored = !readOnly.contains(tool) || tool == "get_window_state"
             let startMs = nowMs()
@@ -449,6 +524,7 @@ public final class Engine {
                     focusGuard.record("\(tool): \(focusNote)")
                     result.text += "\n[focus guard] \(focusNote)"
                 }
+                if let note = takeUserNotes() { result.text += note }
                 if tool != "status" && tool != "guard_report" {
                     log("\(tool) (\(Int(nowMs() - startMs)) ms): \(result.text.split(separator: "\n").first.map(String.init) ?? "")")
                 }
@@ -459,6 +535,7 @@ public final class Engine {
                     focusGuard.record("\(tool): \(focusNote)")
                     text += "\n[focus guard] \(focusNote)"
                 }
+                if let note = takeUserNotes() { text += note }
                 log("\(tool) failed after \(Int(nowMs() - startMs)) ms: \(error)", error: true)
                 return .error(text)
             }
@@ -492,6 +569,8 @@ public final class Engine {
         let outerPriority = priorityNow
         priorityNow = args.string("priority")?.lowercased() == "now"
         defer { priorityNow = outerPriority }
+        // Checked before the defers below, which use it on every tool.
+        let windowID = try args.windowID("window_id")
         // The patience for the user's typing is the whole call's (see `typingDeadline`).
         if runDepth == 0 { typingWaitedMs = 0 }
         runDepth += 1
@@ -500,11 +579,11 @@ public final class Engine {
             if runDepth == 0 { typingWaitedMs = 0 }
         }
         defer {
-            if Self.batchable.contains(tool), tool != "wait", let id = args.int("window_id") {
-                lastActionMs[CGWindowID(id)] = nowMs()
+            if Self.batchable.contains(tool), tool != "wait", let id = windowID {
+                lastActionMs[id] = nowMs()
             }
             // Still at work in that window: it keeps its app's key a while longer.
-            if let id = args.int("window_id") { focusGuard.touchParked(window: CGWindowID(id)) }
+            if let id = windowID { focusGuard.touchParked(window: id) }
         }
         // Opening or borrowing a window is what needs a display.
         if tool == "open_window" || tool == "borrow_window" { try ensureDisplay() }
@@ -544,19 +623,19 @@ public final class Engine {
         case "batch": return try batch(args)
         // Maintenance, not in the agent tool catalog.
         case "admin_close_window":
-            return ToolResult(text: windows.closeAny(CGWindowID(try args.requireInt("window_id"))) ? "closed" : "failed")
+            return ToolResult(text: windows.closeAny(try args.requireWindowID("window_id")) ? "closed" : "failed")
         case "admin_move_to_user":
             var frame: CGRect?
             if let x = args.double("x"), let y = args.double("y"), let w = args.double("w"), let h = args.double("h") { frame = CGRect(x: x, y: y, width: w, height: h) }
-            return ToolResult(text: windows.moveToUser(CGWindowID(try args.requireInt("window_id")), frame: frame) ? "moved" : "failed")
+            return ToolResult(text: windows.moveToUser(try args.requireWindowID("window_id"), frame: frame) ? "moved" : "failed")
         case "admin_type_hid":
             return TestHarness.shared.startTyping(try args.requireString("text"), intervalMs: args.double("interval_ms") ?? 35,
                                                   onlyPid: args.int("pid").map { pid_t($0) })
         case "admin_swap_test":
             // Experiment: which records, in what spacing, move key from one window to another.
             let pid = pid_t(try args.requireInt("pid"))
-            let from = CGWindowID(try args.requireInt("from"))
-            let to = CGWindowID(try args.requireInt("to"))
+            let from = try args.requireWindowID("from")
+            let to = try args.requireWindowID("to")
             let defocus = args.bool("defocus") ?? true
             let focus = args.bool("focus") ?? true
             let makeKey = args.bool("make_key") ?? true
@@ -574,7 +653,7 @@ public final class Engine {
             return ToolResult(text: "front=\(BCUFrontProcessPID()) keyWindow=\(AX.focusedWindowID(pid).map(String.init) ?? "none")")
         case "admin_activate":
             let pid = pid_t(try args.requireInt("pid"))
-            let wid = CGWindowID(args.int("window_id") ?? 0)
+            let wid = try args.windowID("window_id") ?? 0
             // Stands in for the user switching to it.
             focusGuard.noteUserSwitch()
             let r = BCUSetFrontProcess(pid, wid, 0x200)
@@ -604,7 +683,7 @@ public final class Engine {
         case "admin_records":
             // Experiment: post one focus record to a window of an app: "lose" or "gain", or the make-key pair.
             let pid = pid_t(try args.requireInt("pid"))
-            let wid = CGWindowID(try args.requireInt("window"))
+            let wid = try args.requireWindowID("window")
             let r: Int32
             switch args.string("kind") ?? "lose" {
             case "gain": r = BCUPostFocusRecord(pid, wid, true)
@@ -622,8 +701,8 @@ public final class Engine {
         case "admin_flicker":
             // Experiment: does moving key focus show up in the user's window?
             let pid = pid_t(try args.requireInt("pid"))
-            let user = CGWindowID(try args.requireInt("user_window"))
-            let agent = CGWindowID(try args.requireInt("agent_window"))
+            let user = try args.requireWindowID("user_window")
+            let agent = try args.requireWindowID("agent_window")
             let mode = args.string("mode") ?? "none"
             let settle = args.double("settle_ms") ?? 5
             let hold = args.double("hold_ms") ?? 0
@@ -670,7 +749,7 @@ public final class Engine {
         case "admin_film":
             // Test: film a user window (its pixels and the screen around it)
             // and the menu bar while running `steps` (like batch's actions).
-            let user = CGWindowID(try args.requireInt("user_window"))
+            let user = try args.requireWindowID("user_window")
             guard let info = WindowList.info(user) else { throw ToolError("no window \(user)") }
             let steps = (args.raw["steps"] as? [JSONObject]) ?? []
             var display: CGDirectDisplayID = 0
@@ -786,7 +865,7 @@ public final class Engine {
         case "admin_raise":
             // Test setup: bring a user window to the front of its app and the app to the front.
             let pid = pid_t(try args.requireInt("pid"))
-            let wid = CGWindowID(try args.requireInt("window_id"))
+            let wid = try args.requireWindowID("window_id")
             guard let win = AX.window(pid: pid, id: wid) else { throw ToolError("no window") }
             focusGuard.noteUserSwitch()
             _ = AX.perform(win, "AXRaise")
@@ -798,7 +877,7 @@ public final class Engine {
         case "admin_discard_window":
             // Test cleanup: close any app's window, answering "Delete" / "Don't Save" if it asks.
             let pid = pid_t(try args.requireInt("pid"))
-            let wid = CGWindowID(try args.requireInt("window_id"))
+            let wid = try args.requireWindowID("window_id")
             guard let win = AX.window(pid: pid, id: wid) else { throw ToolError("no window") }
             if let close = AX.element(win, "AXCloseButton") { _ = AX.perform(close, "AXPress") }
             sleepMs(400)
@@ -818,7 +897,7 @@ public final class Engine {
         case "admin_user_sim":
             let also = ((args.raw["also_pids"] as? [Any]) ?? []).compactMap { ($0 as? NSNumber).map { pid_t($0.intValue) } }
             return UserSim.shared.start((args.raw["script"] as? [JSONObject]) ?? [], pid: pid_t(try args.requireInt("pid")),
-                                         window: CGWindowID(args.int("window_id") ?? 0), title: args.string("title"), also: also)
+                                         window: try args.windowID("window_id") ?? 0, title: args.string("title"), also: also)
         case "admin_chaos":
             return Chaos.shared.start((args.raw["ops"] as? [JSONObject]) ?? [], guard: focusGuard)
         case "admin_chaos_status":
@@ -838,7 +917,7 @@ public final class Engine {
             return TestHarness.shared.typingStatus()
         case "admin_read_text":
             return try TestHarness.read(app: try args.requireString("app"), windows: windows,
-                                        windowID: args.int("window_id").map { CGWindowID($0) }, all: args.bool("all") ?? false,
+                                        windowID: try args.windowID("window_id"), all: args.bool("all") ?? false,
                                         set: args.string("set"))
         default: throw ToolError("unknown tool \(tool)")
         }
@@ -866,7 +945,7 @@ public final class Engine {
     }
 
     private func agentWindow(_ args: Args) throws -> (AgentWindow, AXUIElement) {
-        let id = CGWindowID(try args.requireInt("window_id"))
+        let id = try args.requireWindowID("window_id")
         guard let w = windows.window(id) else {
             throw ToolError("window \(id) isn't one of yours. Use open_window or borrow_window first, or list_windows.")
         }
@@ -1308,7 +1387,10 @@ public final class Engine {
         (s.prefix(1).uppercased() + s.dropFirst()) + "."
     }
 
-    private func guarded<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) rethrows -> T {
+    private func guarded<T>(_ w: AgentWindow, cause: String, _ body: () throws -> T) throws -> T {
+        // A batch runs its steps without going back through `call`.
+        if paused { throw ToolError("paused by the user") }
+        if userInControl { throw ToolError("the user took over your display") }
         let appLock = Self.inputLock(w.pid)
         appLock.lock()
         defer { appLock.unlock() }
@@ -1586,6 +1668,9 @@ public final class Engine {
         // late: the window takes key as it shows (measured: their shadow
         // drawn as an inactive window's for up to 127 ms).
         let freeze = Locked<ScreenFreeze?>(nil)
+        // Whoever comes first takes the copies down: key is back on the
+        // user's window, the cap below, or the open is over.
+        func endFreeze() { freeze.with { f -> ScreenFreeze? in defer { f = nil }; return f }?.end() }
         let userPid = shared ? (try windows.resolveApp(app).running)?.processIdentifier : nil
         let beforeAsk: (() throws -> Void)? = userPid.map { pid in
             {
@@ -1600,14 +1685,18 @@ public final class Engine {
                 // on a busy Mac.
                 if self.userTyping && self.userIsIn(pid) { throw YieldToUser() }
                 freeze.value = ScreenFreeze.show(shots, chromeOnly: true)
+                // Never for long, whatever the app does: the user may be
+                // clicking where the copy of the menu bar shows other menus.
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + Self.freezeMaxS) { endFreeze() }
             }
         }
-        defer { freeze.value?.end() }
+        defer { endFreeze() }
         func open() throws -> WindowManager.OpenResult {
             while true {
                 do {
                     return try windows.open(app: app, placement: WindowManager.Placement(name: args.string("placement")), trigger: args.string("trigger"),
-                                            hold: hold, beforeAsk: beforeAsk)
+                                            hold: hold, beforeAsk: beforeAsk,
+                                            keyBack: { DispatchQueue.global(qos: .userInteractive).async { endFreeze() } })
                 } catch is YieldToUser {
                     Log.info("open: \(label) left opening a \(target.name) window for later: the user started typing there")
                     if nowMs() >= giveUpAt {
@@ -1662,7 +1751,7 @@ public final class Engine {
     }
 
     private func borrowWindow(_ args: Args) throws -> ToolResult {
-        let id = CGWindowID(try args.requireInt("window_id"))
+        let id = try args.requireWindowID("window_id")
         guard let info = WindowList.info(id) else { throw ToolError("no window \(id)") }
         let front = BCUFrontProcessPID()
         if front == info.pid {
@@ -1673,13 +1762,18 @@ public final class Engine {
     }
 
     private func releaseWindow(_ args: Args) throws -> ToolResult {
-        let id = CGWindowID(try args.requireInt("window_id"))
+        let id = try args.requireWindowID("window_id")
         if windows.window(id) == nil && WindowList.info(id) == nil {
             snapshots[id] = nil
             focusedText[id] = nil
             return ToolResult(text: "window \(id) is already closed")
         }
-        if let w = windows.window(id) { touched.insert(w.pid) }
+        if let w = windows.window(id) {
+            if w.handedOff {
+                throw ToolError("window \(id) is handed off to the user, so it was left alone. Wait for them, call take_back, then release it.")
+            }
+            touched.insert(w.pid)
+        }
         let text = try windows.release(id, keepOpen: args.bool("keep_open") ?? false)
         snapshots[id] = nil
         focusedText[id] = nil
@@ -1766,7 +1860,7 @@ public final class Engine {
         switch tool {
         case "press_key", "drag", "press_menu_item": return true
         case "click": return a.int("element") == nil
-        case "type_text": return (a.string("text") ?? "").contains { $0 == "\n" || $0 == "\r" || $0 == "\t" }
+        case "type_text": return (a.string("text") ?? "").contains { Input.isReturn($0) || $0 == "\t" }
         default: return false
         }
     }
@@ -1785,6 +1879,7 @@ public final class Engine {
             guard Self.batchable.contains(tool) else {
                 throw ToolError("action \(i + 1): `\(tool)` can't be batched. Allowed: \(Self.batchable.sorted().joined(separator: ", ")). Read state with the batch's `state` option.")
             }
+            _ = try Args(step).windowID("window_id")
             if tool != "wait" && step["window_id"] == nil && defaultWindow == nil {
                 throw ToolError("action \(i + 1) needs a window_id (or set window_id on the batch)")
             }
@@ -1806,6 +1901,12 @@ public final class Engine {
             let tool = step["tool"] as! String
             let stepArgs = argsOf(i)
             if let wid = Args(stepArgs).int("window_id") { lastWindow = wid }
+            if paused || userInControl {
+                let why = paused ? "paused by the user" : "the user took over your display"
+                lines.append(i + 1 == steps.count ? "Stopped (\(why)); action \(i + 1) didn't run." : "Stopped (\(why)); actions \(i + 1)–\(steps.count) didn't run.")
+                failed = true
+                break
+            }
             defer {
                 // Keep the user's window covered only into a next step that
                 // takes key focus too.
@@ -1840,7 +1941,7 @@ public final class Engine {
         }
         closeCover()
         var images: [ToolImage] = []
-        if args.bool("state") ?? true, let wid = lastWindow, windows.window(CGWindowID(wid)) != nil {
+        if args.bool("state") ?? true, let wid = lastWindow, let id = CGWindowID(exactly: wid), windows.window(id) != nil {
             var stateArgs: JSONObject = ["window_id": wid, "screenshot": args.bool("screenshot") ?? false]
             if let full = args.bool("full") { stateArgs["full"] = full }
             if let m = args.int("max_elements") { stateArgs["max_elements"] = m }
@@ -1888,35 +1989,72 @@ public final class Engine {
         if args.int("element") != nil {
             let n = try node(args, window: w)
             point(n.frame.center, .click)
+            // A click at the element's place lands on whatever is there now,
+            // so it's only for an element that's still there and has no
+            // accessibility action for this click.
             if button == .left && count == 1 && n.actions.contains("AXPress") {
-                let err = guarded(w, cause: "pressing an element") { AX.perform(n.element, "AXPress") }
+                let err = try guarded(w, cause: "pressing an element") { AX.perform(n.element, "AXPress") }
                 if err == .success {
                     if Self.textRoles.contains(n.role) { focusedText[w.id] = TextFocus(element: n.element, range: nil, value: AX.string(n.element, "AXValue") ?? "") }
                     return ToolResult(text: "Pressed element \(n.index) (\(n.role)) through accessibility.")
                 }
+                if err != .actionUnsupported { throw Self.elementFailed(n, "pressing", err) }
             }
             if button == .right && n.actions.contains("AXShowMenu") {
-                let err = guarded(w, cause: "opening a context menu") { AX.perform(n.element, "AXShowMenu") }
+                let err = try guarded(w, cause: "opening a context menu") { AX.perform(n.element, "AXShowMenu") }
                 if err == .success { return ToolResult(text: "Opened the context menu of element \(n.index). Call get_window_state to see it.") }
+                if err != .actionUnsupported { throw Self.elementFailed(n, "opening the context menu of", err) }
             }
             // A row or item of a list in a sheet (a file picker) has no press
             // action, and a click can't land while the sheet is up: select it
             // through accessibility. Typing goes nowhere until the sheet is
             // answered, so forget the field typing would have gone to.
             if button == .left && count == 1, let item = AX.selectable(n.element) {
-                let err = guarded(w, cause: "selecting a row") { AX.selectOnly(item) }
+                let err = try guarded(w, cause: "selecting a row") { AX.selectOnly(item) }
                 if err == .success {
                     focusedText[w.id] = nil
                     return ToolResult(text: "Selected the row of element \(n.index) through accessibility.")
                 }
+                if err == .invalidUIElement { throw Self.elementFailed(n, "selecting", err) }
             }
-            try pixelClick(w, at: n.frame.center, button: button, count: count)
+            let live = AX.liveness(n.element)
+            guard live == .success else { throw Self.elementFailed(n, "reaching", live) }
+            try pixelClick(w, at: (AX.frame(n.element) ?? n.frame).center, button: button, count: count)
             return ToolResult(text: "Clicked element \(n.index) at its center.")
         }
         let p = try globalPoint(args, window: ax, of: w)
         point(p, .click)
         try pixelClick(w, at: p, button: button, count: count)
         return ToolResult(text: "Clicked at (\(Int(args.double("x") ?? 0)), \(Int(args.double("y") ?? 0))).")
+    }
+
+    /// An accessibility action on an element failed, and nothing else was
+    /// tried in its place.
+    private static func elementFailed(_ n: AXNode, _ doing: String, _ err: AXError) -> ToolError {
+        if err == .invalidUIElement {
+            return ToolError("element \(n.index) no longer exists, so nothing was done. Call get_window_state for the current elements.")
+        }
+        return ToolError("\(doing) element \(n.index) through accessibility failed (\(AX.errorName(err))), and nothing else was tried: a click at its place could hit something else. It may have worked anyway: call get_window_state to check before retrying.")
+    }
+
+    /// Whether writing AXFocused gave an element keyboard focus. Some
+    /// elements refuse the write but have focus anyway. A web page's static
+    /// text takes the write without an error, but AXFocused isn't settable
+    /// on it and keys stay with the field that has focus.
+    static func focusTook(write: AXError, settable: Bool, focused: Bool?) -> Bool {
+        focused == true || (write == .success && settable)
+    }
+
+    /// Give `el` keyboard focus so keys go to it, or throw with nothing typed.
+    private func focusForKeys(_ w: AgentWindow, _ el: AXUIElement, index: Int?, alreadyTyped: Int = 0) throws {
+        let err = try guarded(w, cause: "focusing") { AX.set(el, "AXFocused", kCFBooleanTrue) }
+        guard !Self.focusTook(write: err, settable: AX.isSettable(el, "AXFocused"), focused: AX.bool(el, "AXFocused")) else { sleepMs(50); return }
+        let which = index.map { "element \($0)" } ?? "the field"
+        let done = alreadyTyped == 0 ? "nothing was typed" : "only the \(alreadyTyped) characters before it went in (through accessibility)"
+        if err == .invalidUIElement {
+            throw ToolError("\(which) no longer exists, so \(done). Call get_window_state for the current elements.")
+        }
+        throw ToolError("couldn't focus \(which) (\(AX.errorName(err))), so \(done): keystrokes would go to whatever has focus. Click it first, then type_text without element.")
     }
 
     /// The window a pixel click at `p` goes to: the sheet that has key
@@ -1931,7 +2069,7 @@ public final class Engine {
         let n = try node(args, window: w)
         let value = try args.requireString("value")
         point(n.frame.center)
-        let err = guarded(w, cause: "setting a value") { AX.set(n.element, "AXValue", value as CFString) }
+        let err = try guarded(w, cause: "setting a value") { AX.set(n.element, "AXValue", value as CFString) }
         guard err == .success else {
             throw ToolError("couldn't set element \(n.index)'s value (\(AX.errorName(err))). Try type_text with element=\(n.index).")
         }
@@ -1953,7 +2091,7 @@ public final class Engine {
             action = "AX" + action.prefix(1).uppercased() + action.dropFirst()
         }
         point(n.frame.center, .click)
-        let err = guarded(w, cause: "performing \(action)") { AX.perform(n.element, action) }
+        let err = try guarded(w, cause: "performing \(action)") { AX.perform(n.element, action) }
         guard err == .success else {
             throw ToolError("\(action) on element \(n.index) failed: \(AX.errorName(err)). Its actions: \(n.actions.joined(separator: ", "))")
         }
@@ -1971,7 +2109,7 @@ public final class Engine {
         // app's key window changing (see `Panel`), so it needs none of what
         // follows.
         if remotePanel(w) != nil {
-            if let n = target { guarded(w, cause: "focusing") { _ = AX.set(n.element, "AXFocused", kCFBooleanTrue) } }
+            if let n = target { try focusForKeys(w, n.element, index: n.index) }
             try typeKeys(w, text)
             return ToolResult(text: "Typed \(text.count) characters into the file panel with keystrokes.")
         }
@@ -1983,9 +2121,9 @@ public final class Engine {
         }
 
         // Accessibility insertion first: no keyboard focus involved.
-        if let n = target, !text.contains("\n"), !text.contains("\t"), AX.isSettable(n.element, "AXSelectedText") {
+        if let n = target, !text.contains(where: { Input.isReturn($0) || $0 == "\t" }), AX.isSettable(n.element, "AXSelectedText") {
             let before = AX.string(n.element, "AXValue") ?? ""
-            let err = guarded(w, cause: "typing") { () -> AXError in
+            let err = try guarded(w, cause: "typing") { () -> AXError in
                 AX.set(n.element, "AXFocused", kCFBooleanTrue)
                 return AX.set(n.element, "AXSelectedText", text as CFString)
             }
@@ -2000,10 +2138,7 @@ public final class Engine {
                 }
             }
         }
-        if let n = target {
-            guarded(w, cause: "focusing") { _ = AX.set(n.element, "AXFocused", kCFBooleanTrue) }
-            sleepMs(50)
-        }
+        if let n = target { try focusForKeys(w, n.element, index: n.index) }
         try typeKeys(w, text)
         return ToolResult(text: "Typed \(text.count) characters with keystrokes.")
     }
@@ -2079,7 +2214,7 @@ public final class Engine {
         var parts: [String] = []
         var run = ""
         for ch in text {
-            if ch == "\n" || ch == "\r" || ch == "\t" {
+            if Input.isReturn(ch) || ch == "\t" {
                 if !run.isEmpty { parts.append(run); run = "" }
                 parts.append(String(ch))
             } else {
@@ -2091,9 +2226,9 @@ public final class Engine {
         var focused = target == nil
         var changedTo: String?
         for part in parts {
-            let isKey = part == "\n" || part == "\r" || part == "\t"
+            let isKey = part.count == 1 && (Input.isReturn(part.first!) || part == "\t")
             if !isKey, let el = element {
-                switch guarded(w, cause: "typing", { axInsert(el, part, in: w) }) {
+                switch try guarded(w, cause: "typing", { axInsert(el, part, in: w) }) {
                 case .exact:
                     viaAX += part.count
                     changedTo = nil
@@ -2109,8 +2244,7 @@ public final class Engine {
             }
             // Keys go to the window's focused element: make that the target first.
             if !focused, let el = element {
-                guarded(w, cause: "focusing") { _ = AX.set(el, "AXFocused", kCFBooleanTrue) }
-                sleepMs(50)
+                try focusForKeys(w, el, index: target?.index, alreadyTyped: viaAX)
                 focused = true
             }
             try typeKeys(w, part)
@@ -2233,6 +2367,7 @@ public final class Engine {
         let (w, _) = try agentWindow(args)
         let key = try args.requireString("key")
         let mods = args.strings("modifiers") ?? []
+        _ = try KeyMap.press(key: key, modifiers: mods)
         if let panel = remotePanel(w) {
             try panelInput(w, cause: "pressing \((mods + [key]).joined(separator: "+"))") {
                 try Input.pressKey(pid: panel.remote.pid, key: key, modifiers: mods, windowID: panel.remote.window, shortcutsToMenu: false)
@@ -2266,6 +2401,9 @@ public final class Engine {
         } else {
             try guarded(w, cause: "scrolling") { try Input.scroll(pid: w.pid, windowID: w.id, at: p, dx: dx, dy: dy) }
         }
+        let cap = Input.maxScrollNotches
+        let sx = max(-cap, min(dx, cap)), sy = max(-cap, min(dy, cap))
+        if sx != dx || sy != dy { return ToolResult(text: "Scrolled dx=\(sx) dy=\(sy) (at most \(cap) each per call).") }
         return ToolResult(text: "Scrolled dx=\(dx) dy=\(dy).")
     }
 
@@ -2357,7 +2495,7 @@ public final class Engine {
         func slash() throws {
             try stillGoing()
             if saving, let name = Panel.nameField(panel.sheet) {
-                guarded(w, cause: "clearing the file name") {
+                try guarded(w, cause: "clearing the file name") {
                     AX.set(name, "AXFocused", kCFBooleanTrue)
                     AX.set(name, "AXValue", "" as CFString)
                 }
@@ -2374,7 +2512,7 @@ public final class Engine {
             throw ToolError("Go to Folder didn't open in the file panel, so nothing was chosen. Read the window and pick the file by clicking its row, then the panel's button.")
         }
         try stillGoing()
-        let err = guarded(w, cause: "entering the path") { AX.set(field, "AXValue", goTo as CFString) }
+        let err = try guarded(w, cause: "entering the path") { AX.set(field, "AXValue", goTo as CFString) }
         guard err == .success, waitUntil(500, { AX.string(field, "AXValue") == goTo }) else {
             try? press("escape")
             throw ToolError("couldn't enter the path in Go to Folder (\(AX.errorName(err))), so nothing was chosen")
@@ -2387,7 +2525,7 @@ public final class Engine {
         if saving {
             guard let nameField = Panel.nameField(panel.sheet) else { throw ToolError("went to \(goTo), but found no file name field in the save panel") }
             try stillGoing()
-            let e = guarded(w, cause: "entering the file name") { AX.set(nameField, "AXValue", name as CFString) }
+            let e = try guarded(w, cause: "entering the file name") { AX.set(nameField, "AXValue", name as CFString) }
             guard e == .success, waitUntil(500, { AX.string(nameField, "AXValue") == name }) else {
                 throw ToolError("went to \(goTo), but couldn't enter the name \"\(name)\" (\(AX.errorName(e)))")
             }
@@ -2407,7 +2545,7 @@ public final class Engine {
             throw ToolError("\(what), but \"\(title)\" is disabled: the panel may not accept this kind of file")
         }
         try stillGoing()
-        let e = guarded(w, cause: "pressing \(title)") { AX.perform(button, "AXPress") }
+        let e = try guarded(w, cause: "pressing \(title)") { AX.perform(button, "AXPress") }
         guard e == .success else { throw ToolError("\(what), but pressing \"\(title)\" failed (\(AX.errorName(e)))") }
         let closed = waitUntil(3000) {
             guard let now = AX.window(pid: w.pid, id: w.id).flatMap(AX.sheet(of:)) else { return true }
@@ -2488,7 +2626,7 @@ public final class Engine {
             if shared && cover == nil { openCover(w, cause: "loading a URL") }
             covered = shared
             let userWindow = shared ? (cover?.userWindow ?? focusGuard.userWindow(of: w.pid)) : nil
-            let sent = guarded(w, cause: "loading a URL") { () -> Bool? in
+            let sent = try guarded(w, cause: "loading a URL") { () -> Bool? in
                 // Its turn came (another agent's step in the browser first)
                 // and the copy is up: not if they've started typing meanwhile.
                 if shared && userTyping { return nil }
@@ -2600,7 +2738,7 @@ public final class Engine {
     }
 
     private func handoff(_ args: Args) throws -> ToolResult {
-        let id = CGWindowID(try args.requireInt("window_id"))
+        let id = try args.requireWindowID("window_id")
         let reason = try args.requireString("reason")
         try windows.handoff(id, reason: reason)
         log("Handed off: \(reason)")
@@ -2608,7 +2746,7 @@ public final class Engine {
     }
 
     private func takeBack(_ args: Args) throws -> ToolResult {
-        let id = CGWindowID(try args.requireInt("window_id"))
+        let id = try args.requireWindowID("window_id")
         try windows.takeBack(id)
         return ToolResult(text: "Window \(id) is back on your display.")
     }
