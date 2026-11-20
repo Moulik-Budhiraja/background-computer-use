@@ -258,6 +258,16 @@ public enum KeyMap {
         throw ToolError("unknown key \"\(key)\". Use a letter, digit, punctuation, or one of: \(named.keys.sorted().joined(separator: ", "))")
     }
 
+    /// The key code for `key` and the flags for `modifiers`, pressed as
+    /// given (no Shift added for an uppercase letter). For the test hooks
+    /// and the user simulator. `lookup` is `code(for:command:)`.
+    static func shortcut(_ key: String, modifiers: [String],
+                         lookup: (String, Bool) throws -> (CGKeyCode, Bool) = { try KeyMap.code(for: $0, command: $1) }) throws -> (CGKeyCode, CGEventFlags) {
+        let flags = flags(modifiers)
+        let (code, _) = try lookup(key, false)
+        return (code, flags)
+    }
+
     /// The keys a 'uchr' keyboard layout types: character to key code and
     /// whether it takes shift. The main keys win over the keypad, then
     /// unshifted over shifted. `command` reads the layout's cmd table.
