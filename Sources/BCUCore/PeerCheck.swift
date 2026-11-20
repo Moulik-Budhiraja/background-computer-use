@@ -308,6 +308,11 @@ public final class PeerScope {
     public func admitCall(session: String, parent: String?, host: String?, windowOwners: [String] = [],
                           _ trust: PeerTrust) -> String? {
         lock.lock(); defer { lock.unlock() }
+        // A call without `_session` lands in the default session, `bcu
+        // call`'s, which is the engine's own: another app names its own.
+        if trust != .owner, session == Hub.defaultSession || parent == Hub.defaultSession {
+            return "Name a session with _session: the default session belongs to the engine's own app."
+        }
         for s in [session, parent].compactMap({ $0 }) {
             if let o = sessions[s], !trust.mayUse(o) { return "Session \(s) belongs to another app." }
         }
