@@ -110,6 +110,7 @@ public final class WindowManager {
         Self.registeredAnywhere[w.id] = (sessionKey, w.pid)
         if w.kind != .borrowed { Self.agentMade.insert(w.id) }
         Self.sharedLock.unlock()
+        Self.ownedAgain(w.id)
         persist()
     }
 
@@ -1001,6 +1002,8 @@ public final class WindowManager {
     private static var keptOpen: Set<CGWindowID> = []
     static func keep(_ id: CGWindowID) { keptLock.lock(); keptOpen.insert(id); keptLock.unlock() }
     static func isKept(_ id: CGWindowID) -> Bool { keptLock.lock(); defer { keptLock.unlock() }; return keptOpen.contains(id) }
+    /// A session has the window again (`register`).
+    static func ownedAgain(_ id: CGWindowID) {}
 
     /// What cleanup does with a window nobody has left on an agent display:
     /// close one an agent opened or caught (and didn't keep open); put any
