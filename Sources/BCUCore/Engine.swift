@@ -92,6 +92,12 @@ public final class Engine {
     /// A Chromium browser's own id for each of this session's windows of it
     /// (`navigate` names the window by it), found the first time it's needed.
     private var browserWindowIDs: [CGWindowID: String] = [:]
+    /// The watch for "Leave site?" in each browser this session acts in
+    /// (see `LeaveWatch`), and whether each app is a Chromium browser.
+    private var leaveWatches: [pid_t: LeaveWatch] = [:]
+    private var isChromium: [pid_t: Bool] = [:]
+    /// Answers of watches that ended before the next call took them.
+    private var leaveNotes: [String] = []
     /// Steps that take key focus in the app the user is in wait for a pause
     /// in their input (see `QuietWait`), within this session's budget.
     private let waitBudget = WaitBudget()
@@ -618,6 +624,7 @@ public final class Engine {
                     focusGuard.record("\(tool): \(focusNote)")
                     result.text += "\n[focus guard] \(focusNote)"
                 }
+                if let note = takeLeaveNotes() { result.text += note }
                 if let note = takeUserNotes() { result.text += note }
                 if tool != "status" && tool != "guard_report" {
                     log("\(tool) (\(Int(nowMs() - startMs)) ms): \(result.text.split(separator: "\n").first.map(String.init) ?? "")")
@@ -1160,6 +1167,7 @@ public final class Engine {
         touched.insert(w.pid)
         focusGuard.beginAction(pid: w.pid, cause: cause)
         windows.noteBefore(pid: w.pid)
+        watchForLeave(w)
         defer { focusGuard.endAction(pid: w.pid) }
         let shared = userIsIn(w.pid)
         // Waiting for the lock can take as long as another agent's step in
@@ -1490,8 +1498,44 @@ public final class Engine {
         touched.insert(w.pid)
         focusGuard.beginAction(pid: w.pid, cause: cause)
         windows.noteBefore(pid: w.pid)
+        watchForLeave(w)
         defer { focusGuard.endAction(pid: w.pid) }
         return try body()
+    }
+
+    /// How long after a step in a browser begins it looks out for a page
+    /// asking "Leave site?" (it keeps looking after the step returns).
+    static let leaveWatchMs = 4000.0
+
+    /// A step in a Chromium browser can leave a page (navigate, a click on a
+    /// link, Return in a form), and the page can ask "Leave site?" first:
+    /// watch for it (see `LeaveWatch`).
+    private func watchForLeave(_ w: AgentWindow) {
+        stateLock.lock()
+        let known = isChromium[w.pid], current = leaveWatches[w.pid]
+        stateLock.unlock()
+        let chromium = known ?? (NSRunningApplication(processIdentifier: w.pid)?.bundleURL.map(BrowserAutomation.isScriptableChromium) ?? false)
+        guard chromium else {
+            if known == nil { stateLock.lock(); isChromium[w.pid] = false; stateLock.unlock() }
+            return
+        }
+        if current?.extend(forMs: Self.leaveWatchMs) == true { return }
+        let ended = current?.takeAnswers() ?? []
+        let pid = w.pid, guardian = focusGuard
+        let watch = LeaveWatch(pid: pid, forMs: Self.leaveWatchMs) { [weak self] stepStart in
+            guard let self else { return false }
+            return WindowManager.stepAnswersLeave(userInApp: self.userIsIn(pid), userOpenInputMs: guardian.lastUserOpenInputMs,
+                                                  stepStartMs: stepStart, userControlsDisplay: self.userInControl)
+        }
+        stateLock.lock(); isChromium[pid] = true; leaveWatches[pid] = watch; leaveNotes += ended; stateLock.unlock()
+    }
+
+    /// What pages asked and got Leave since the last call, for its result.
+    private func takeLeaveNotes() -> String? {
+        stateLock.lock(); let watches = Array(leaveWatches.values), ended = leaveNotes; leaveNotes = []; stateLock.unlock()
+        let asked = ended + watches.flatMap { $0.takeAnswers() }
+        guard !asked.isEmpty else { return nil }
+        return "\n[page] " + asked.map { "A page asked \"\($0)\" as your step left it: answered Leave." }.joined(separator: " ")
     }
 
     /// The panel service window behind the sheet over `w`, when that sheet
