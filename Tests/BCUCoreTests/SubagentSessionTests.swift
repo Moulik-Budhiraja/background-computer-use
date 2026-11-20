@@ -93,4 +93,21 @@ final class SubagentSessionTests: XCTestCase {
         XCTAssertTrue(Hub.abandoned("parent/agent-1", attached: [:], usedBy: [:], userInControl: false))
         XCTAssertFalse(Hub.abandoned("parent/agent-1", attached: [:], usedBy: [:], userInControl: true))
     }
+
+    func testAnOpenedHandoffStaysWhenItsAgentGoes() {
+        // The user opened it from the menu bar and is still working in it.
+        XCTAssertEqual(Engine.abandonedFate(withUser: true, handedOff: true), .keepForUser)
+    }
+
+    func testAFailedBorrowGivesItsClaimBack() {
+        let id: CGWindowID = 0xFFFF_FF03
+        XCTAssertTrue(WindowManager.claim(id, pid: 1, for: "a"))
+        WindowManager.unclaim(id, for: "a")
+        XCTAssertFalse(WindowManager.isRegistered(id))
+        XCTAssertTrue(WindowManager.claim(id, pid: 1, for: "b"))
+        // Only the session's own claim.
+        WindowManager.unclaim(id, for: "a")
+        XCTAssertTrue(WindowManager.isRegistered(id, byOtherThan: "a"))
+        WindowManager.unclaim(id, for: "b")
+    }
 }
