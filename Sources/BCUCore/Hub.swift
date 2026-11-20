@@ -8,9 +8,10 @@ import BCUShared
 /// watches over all of them.
 ///
 /// A session can belong to a host app (`bcu mcp --host <id>`), which shows
-/// it in its own UI. While that host is connected and subscribed (see
-/// `HostServer`), the session is left out of `shownEngines`, which is what
-/// the menu bar app shows.
+/// it in its own UI. The menu bar app shows it too, with the same controls,
+/// so there is one menu bar icon for every agent. While that host is
+/// connected and subscribed (see `HostServer`), the host notifies the user
+/// of its handoffs itself (`hostShowsItself`).
 public final class Hub {
     public let focusGuard = FocusGuard()
     /// Main thread: status, activity or sessions changed.
@@ -19,6 +20,8 @@ public final class Hub {
     private var nextObserver = 0
     /// Live subscriptions per host ID.
     private var claims: [String: Int] = [:]
+    /// The process of each host's latest subscription, for its icon.
+    private var hostPIDs: [String: pid_t] = [:]
     /// Where each host keeps its sessions' recordings, by host ID ("" for
     /// sessions without a host: the menu bar app's). A host without one
     /// isn't recorded.
@@ -60,15 +63,18 @@ public final class Hub {
         engines.filter { $0.display.isRunning || !$0.windows.windows.isEmpty }
     }
 
-    /// Sessions no connected host app shows itself: the menu bar app's.
-    public var shownEngines: [Engine] {
+    /// The session belongs to a host app that's connected and subscribed,
+    /// which tells the user about its handoffs itself.
+    public func hostShowsItself(_ e: Engine) -> Bool {
+        guard let host = e.host else { return false }
         lock.lock(); defer { lock.unlock() }
-        return order.compactMap { byID[$0] }.filter { e in e.host.map { (claims[$0] ?? 0) == 0 } ?? true }
+        return (claims[host] ?? 0) > 0
     }
 
-    /// `activeEngines`, of the shown ones.
-    public var shownActiveEngines: [Engine] {
-        shownEngines.filter { $0.display.isRunning || !$0.windows.windows.isEmpty }
+    /// The process of a subscribed host app (nil once none is subscribed).
+    public func hostPID(_ host: String) -> pid_t? {
+        lock.lock(); defer { lock.unlock() }
+        return (claims[host] ?? 0) > 0 ? hostPIDs[host] : nil
     }
 
     public func engine(id: String) -> Engine? {
@@ -117,9 +123,13 @@ public final class Hub {
         return parentOf[id]
     }
 
-    /// A host app shows its sessions itself until the returned release is called.
-    public func claim(host: String) -> () -> Void {
-        lock.lock(); claims[host, default: 0] += 1; lock.unlock()
+    /// A host app is subscribed to its sessions until the returned release
+    /// is called. `pid` is its process, when known.
+    public func claim(host: String, pid: pid_t? = nil) -> () -> Void {
+        lock.lock()
+        claims[host, default: 0] += 1
+        if let pid { hostPIDs[host] = pid }
+        lock.unlock()
         changed()
         var released = false
         return { [weak self] in
@@ -127,7 +137,7 @@ public final class Hub {
             released = true
             self.lock.lock()
             self.claims[host, default: 1] -= 1
-            if self.claims[host] == 0 { self.claims[host] = nil }
+            if self.claims[host] == 0 { self.claims[host] = nil; self.hostPIDs[host] = nil }
             self.lock.unlock()
             self.changed()
         }
@@ -376,35 +386,33 @@ public final class Hub {
         AgentDisplay.reapSpares(all: true)
     }
 
-    /// The menu bar's pause and stop act on the sessions it shows; a host
-    /// app pauses and stops its own.
+    /// The menu bar's pause and stop act on every session, a host app's too.
     public var allPaused: Bool {
-        let a = shownActiveEngines
+        let a = activeEngines
         return !a.isEmpty && a.allSatisfy(\.paused)
     }
 
     public func setPausedAll(_ value: Bool) {
-        for e in shownEngines { e.setPaused(value) }
+        for e in engines { e.setPaused(value) }
     }
 
+    /// The user stopped every agent from the menu bar app; each host hears
+    /// about its own sessions (`Engine.stoppedByUserNotification`).
     public func stopAll() {
-        for e in shownEngines { e.stopAll() }
+        for e in engines { e.stopAll(byUser: true) }
     }
 
-    /// Any session working, shown or not (for updates, which wait for every agent).
+    /// Any session working.
     public var isActive: Bool { engines.contains { $0.isActive } }
-
-    /// A session the menu bar shows is working.
-    public var shownIsActive: Bool { shownEngines.contains { $0.isActive } }
 
     /// For the menu bar icon: anything waiting on the user wins, then
     /// take-over, then work, then pause.
     public var status: EngineStatus {
-        let all = shownEngines.map(\.status)
+        let all = engines.map(\.status)
         if let w = all.first(where: { if case .waiting = $0 { return true }; return false }) { return w }
         if all.contains(.userInControl) { return .userInControl }
         if let w = all.first(where: { if case .working = $0 { return true }; return false }) { return w }
-        if !shownActiveEngines.isEmpty && allPaused { return .paused }
+        if !activeEngines.isEmpty && allPaused { return .paused }
         return .idle
     }
 
