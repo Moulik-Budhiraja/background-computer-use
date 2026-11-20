@@ -652,10 +652,13 @@ public final class RemoteControl {
         return windows().first { $0.bounds.contains(point) }
     }
 
-    /// Where a key goes: the window the user last clicked, else the front
-    /// window on the agent display (`onDisplay`, front to back).
+    /// Where a key goes: the window the user last clicked while it's still
+    /// on the agent display (`onDisplay`, front to back), else the front
+    /// window there. A window the session gave back may be another app's
+    /// agent's by now.
     static func keyWindow(cached: WindowInfo?, onDisplay: [WindowInfo]) -> WindowInfo? {
-        cached ?? onDisplay.first { $0.layer == 0 }
+        if let cached, let current = onDisplay.first(where: { $0.id == cached.id }) { return current }
+        return onDisplay.first { $0.layer == 0 }
     }
 
     private func frontWindow() -> WindowInfo? {
