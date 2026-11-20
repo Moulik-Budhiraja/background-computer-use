@@ -1,11 +1,14 @@
 import AppKit
 import AVFoundation
+import os
 import CoreAudio
+import CPrivate
 
 /// Sound from apps that only the agent is using (every window on an agent
 /// display) is muted on the speakers and recorded to a file that exists for
 /// as long as the session's display does. Apps the user also has windows in
-/// play normally.
+/// play normally, unless the agent claims one before playing sound in it
+/// (see `Engine.claimAudio`).
 ///
 /// Uses a Core Audio process tap: the apps' audio processes (helpers
 /// included, matched by bundle ID) are mixed to stereo, muted, and read
@@ -21,21 +24,67 @@ public final class SessionAudio {
         set { stateLock.lock(); _routedApps = newValue; stateLock.unlock() }
     }
     private var _routedApps: [String] = []
+    /// The pids of the apps routed now. Any thread.
+    public var routedPids: Set<pid_t> {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _routedPids }
+        set { stateLock.lock(); _routedPids = newValue; stateLock.unlock() }
+    }
+    private var _routedPids: Set<pid_t> = []
     private let stateLock = NSLock()
+
+    /// Read the tap even while nothing plays. A muted tap only mutes once a
+    /// device is reading it: started when the app starts playing, the first
+    /// ~0.7 s still reaches the speakers. Set while the agent has said it's
+    /// about to play (`AudioClaims`); off otherwise, since reading lights
+    /// the menu bar's recording indicator. Any thread.
+    public var keepRecording: Bool {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _keepRecording }
+        set {
+            stateLock.lock(); _keepRecording = newValue; stateLock.unlock()
+            queue.async { self.updateRecorder() }
+        }
+    }
+    private var _keepRecording = false
+
+    /// When the tap last carried sound (not silence), while the recorder
+    /// reads it. IO thread writes, any thread reads.
+    private let lastSound = OSAllocatedUnfairLock(initialState: -Double.infinity)
+    private let reading = OSAllocatedUnfairLock(initialState: false)
+
+    /// Whether the routed apps made any sound in the last `ms`, or nil when
+    /// the recorder isn't reading the tap and so can't tell. Sharper than
+    /// `isPlaying`: an app keeps its output running for a while after it
+    /// goes silent (WebKit for seconds).
+    public func soundWithin(ms: Double) -> Bool? {
+        guard reading.withLock({ $0 }) else { return nil }
+        return nowMs() - lastSound.withLock { $0 } < ms
+    }
 
     private let queue = DispatchQueue(label: "bcu.audio")
     /// The recorder's callback. Separate from `queue`, because stopping the
     /// device from `queue` waits for the callback to return.
     private let ioQueue = DispatchQueue(label: "bcu.audio.io", qos: .userInteractive)
+    /// Core Audio's property listeners. Not `queue`: removing a listener
+    /// waits for its blocks in flight, and one of those waiting on `queue`,
+    /// which is removing it, held both for minutes. Each only hands its work
+    /// on to `queue`.
+    private let listenerQueue = DispatchQueue(label: "bcu.audio.listeners")
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
+    /// The tap's part of the recorder's input, rebuilt each cycle.
+    private var tapList: UnsafeMutableAudioBufferListPointer?
     private var tapDescription: AnyObject?
     private var processes: [AudioObjectID] = []
     private var file: AVAudioFile?
     private var fileFormat: AVAudioFormat?
     private var converter: AVAudioConverter?
     private var failedAt: Date?
+    /// Why the tap or the recorder last failed, for `state`.
+    private var lastError: String?
+    /// The apps last asked for, applied again when an app opens its audio.
+    private var wantedApps: [NSRunningApplication] = []
+    private var processListListener: AudioObjectPropertyListenerBlock?
     private var outputListeners: [AudioObjectID: AudioObjectPropertyListenerBlock] = [:]
 
     public init(name: String) {
@@ -50,9 +99,122 @@ public final class SessionAudio {
         queue.async { self.apply(apps) }
     }
 
+    /// `route`, with the apps worked out when it runs: a list taken before
+    /// a `routeNow` and applied after it would undo it (an app the user
+    /// just took back muted again until the next tick).
+    public func route(_ apps: @escaping () -> [NSRunningApplication]) {
+        queue.async { self.apply(apps()) }
+    }
+
+    /// `route`, done by the time it returns: before the agent plays sound
+    /// it asked to have muted, or before a user who's taken an app back
+    /// starts theirs.
+    public func routeNow(_ apps: [NSRunningApplication]) {
+        queue.sync { self.apply(apps) }
+    }
+
+    /// Whether the app is making sound you could hear, by listening to it
+    /// (unmuted) for `ms`; nil if it can't be listened to (no permission).
+    /// `isPlaying` isn't enough to tell: WebKit keeps a muted tab's output
+    /// running, silent, for as long as its media plays.
+    public static func audible(_ app: NSRunningApplication, ms: Double = 200) -> Bool? {
+        guard #available(macOS 14.2, *) else { return nil }
+        let processes = audioProcesses(of: [app])
+        guard !processes.isEmpty else { return false }
+        guard processes.contains(where: running) else { return false }
+        let d = CATapDescription(stereoMixdownOfProcesses: processes)
+        d.name = "Background Computer Use check"
+        d.isPrivate = true
+        d.muteBehavior = .unmuted
+        var tap = AudioObjectID(kAudioObjectUnknown)
+        guard AudioHardwareCreateProcessTap(d, &tap) == noErr else { return nil }
+        defer { AudioHardwareDestroyProcessTap(tap) }
+        guard let output = defaultOutputUID() else { return nil }
+        let description: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "Background Computer Use check",
+            kAudioAggregateDeviceUIDKey: UUID().uuidString,
+            kAudioAggregateDeviceMainSubDeviceKey: output,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: output]],
+            kAudioAggregateDeviceTapListKey: [[kAudioSubTapDriftCompensationKey: true, kAudioSubTapUIDKey: d.uuid.uuidString]],
+        ]
+        var agg = AudioObjectID(kAudioObjectUnknown)
+        guard AudioHardwareCreateAggregateDevice(description as CFDictionary, &agg) == noErr else { return nil }
+        defer { AudioHardwareDestroyAggregateDevice(agg) }
+        var asbd = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        var formatAddr = address(kAudioTapPropertyFormat)
+        guard AudioObjectGetPropertyData(tap, &formatAddr, 0, nil, &size, &asbd) == noErr,
+              asbd.mFormatID == kAudioFormatLinearPCM, asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0 else { return nil }
+        // The tap's buffers come last (see `startRecorder`).
+        let tapBuffers = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0 ? Int(asbd.mChannelsPerFrame) : 1
+        let heard = OSAllocatedUnfairLock(initialState: false)
+        var proc: AudioDeviceIOProcID?
+        let ioQueue = DispatchQueue(label: "bcu.audio.check", qos: .userInteractive)
+        guard AudioDeviceCreateIOProcIDWithBlock(&proc, agg, ioQueue, { _, input, _, _, _ in
+            let all = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
+            guard all.count >= tapBuffers else { return }
+            for b in all.suffix(tapBuffers) {
+                guard let p = b.mData?.assumingMemoryBound(to: Float.self) else { continue }
+                for i in 0..<Int(b.mDataByteSize) / 4 where abs(p[i]) > 0.0005 { heard.withLock { $0 = true }; return }
+            }
+        }) == noErr, let proc else { return nil }
+        defer { AudioDeviceDestroyIOProcID(agg, proc) }
+        guard AudioDeviceStart(agg, proc) == noErr else { return nil }
+        let deadline = nowMs() + ms
+        while nowMs() < deadline && !heard.withLock({ $0 }) { usleep(10_000) }
+        AudioDeviceStop(agg, proc)
+        return heard.withLock { $0 }
+    }
+
+    private static func running(_ id: AudioObjectID) -> Bool {
+        var running: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var addr = address(kAudioProcessPropertyIsRunningOutput)
+        return AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &running) == noErr && running != 0
+    }
+
+    /// Any of the app's audio processes (helpers included) is sending sound
+    /// to an output right now.
+    public static func isPlaying(_ app: NSRunningApplication) -> Bool {
+        audioProcesses(of: [app]).contains { id in
+            var running: UInt32 = 0
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            var addr = address(kAudioProcessPropertyIsRunningOutput)
+            return AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &running) == noErr && running != 0
+        }
+    }
+
+    /// Whether an app's sound is kept off the speakers right now.
+    public enum State: Equatable {
+        /// Tapped, and the recorder is reading the tap (which is what mutes).
+        case muted
+        /// It hasn't opened its audio yet; it's muted the moment it does.
+        case notOpenedYet
+        case failed(String)
+    }
+
+    /// What routing did for this app (after `routeNow`).
+    public func state(of app: NSRunningApplication) -> State {
+        guard #available(macOS 14.2, *) else { return .failed("macOS before 14.2 has no process taps") }
+        return queue.sync {
+            let ids = Self.audioProcesses(of: [app])
+            if ids.isEmpty { return .notOpenedYet }
+            guard tapID != kAudioObjectUnknown, Set(ids).isSubset(of: processes) else {
+                return .failed(lastError ?? "its audio couldn't be tapped")
+            }
+            guard aggregateID != kAudioObjectUnknown else { return .failed(lastError ?? "its audio couldn't be read") }
+            return .muted
+        }
+    }
+
     /// Stop and delete the file.
     public func end() {
         queue.sync {
+            self.wantedApps = []
+            self.watchProcessList(false)
             self.teardownTap()
             self.file = nil
             self.converter = nil
@@ -63,6 +225,7 @@ public final class SessionAudio {
                 Log.info("audio: removed \(self.url.lastPathComponent)")
             }
             self.routedApps = []
+            self.routedPids = []
         }
     }
 
@@ -76,6 +239,11 @@ public final class SessionAudio {
         guard #available(macOS 14.2, *) else { return }
         let wanted = Self.audioProcesses(of: apps)
         let names = apps.compactMap(\.localizedName).sorted()
+        let pids = Set(apps.map(\.processIdentifier))
+        wantedApps = apps
+        // An app gets its audio processes when it first opens its audio:
+        // tap them then, not at the next routing pass up to a second later.
+        watchProcessList(!apps.isEmpty)
         defer { updateRecorder() }
         if wanted.isEmpty {
             if tapID != kAudioObjectUnknown {
@@ -83,6 +251,7 @@ public final class SessionAudio {
                 Log.info("audio: stopped routing")
             }
             routedApps = []
+            routedPids = []
             return
         }
         if wanted == processes, tapID != kAudioObjectUnknown { return }
@@ -98,6 +267,7 @@ public final class SessionAudio {
                 tapDescription = d
                 setProcesses(wanted)
                 routedApps = names
+                routedPids = pids
                 Log.info("audio: now muting \(names.joined(separator: ", "))")
                 return
             }
@@ -111,6 +281,7 @@ public final class SessionAudio {
         let err = AudioHardwareCreateProcessTap(d, &tap)
         guard err == noErr else {
             failedAt = Date()
+            lastError = "macOS refused to tap it (\(err)); System Audio Recording may not be allowed for Background Computer Use"
             Log.info("audio: couldn't tap app audio (\(err)); allow System Audio Recording for Background Computer Use")
             return
         }
@@ -118,8 +289,27 @@ public final class SessionAudio {
         tapDescription = d
         setProcesses(wanted)
         routedApps = names
+        routedPids = pids
         failedAt = nil
+        lastError = nil
         Log.info("audio: muted \(names.joined(separator: ", ")) on the speakers")
+    }
+
+    /// On `queue`.
+    private func watchProcessList(_ on: Bool) {
+        var addr = Self.address(kAudioHardwarePropertyProcessObjectList)
+        if on, processListListener == nil {
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                guard let self else { return }
+                self.queue.async { if !self.wantedApps.isEmpty { self.apply(self.wantedApps) } }
+            }
+            if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, listenerQueue, block) == noErr {
+                processListListener = block
+            }
+        } else if !on, let block = processListListener {
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, listenerQueue, block)
+            processListListener = nil
+        }
     }
 
     @available(macOS 14.2, *)
@@ -133,13 +323,16 @@ public final class SessionAudio {
     private func setProcesses(_ ids: [AudioObjectID]) {
         for (id, block) in outputListeners where !ids.contains(id) {
             var addr = Self.address(kAudioProcessPropertyIsRunningOutput)
-            AudioObjectRemovePropertyListenerBlock(id, &addr, queue, block)
+            AudioObjectRemovePropertyListenerBlock(id, &addr, listenerQueue, block)
             outputListeners[id] = nil
         }
         for id in ids where outputListeners[id] == nil {
-            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.updateRecorder() }
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                guard let self else { return }
+                self.queue.async { self.updateRecorder() }
+            }
             var addr = Self.address(kAudioProcessPropertyIsRunningOutput)
-            if AudioObjectAddPropertyListenerBlock(id, &addr, queue, block) == noErr { outputListeners[id] = block }
+            if AudioObjectAddPropertyListenerBlock(id, &addr, listenerQueue, block) == noErr { outputListeners[id] = block }
         }
         processes = ids
     }
@@ -155,18 +348,20 @@ public final class SessionAudio {
 
     /// On `queue`.
     private func updateRecorder() {
-        let want = tapID != kAudioObjectUnknown && playing
+        let want = tapID != kAudioObjectUnknown && (playing || keepRecording)
         if want, aggregateID == kAudioObjectUnknown {
             do {
                 try startRecorder()
+                lastError = nil
                 Log.info("audio: recording \(routedApps.joined(separator: ", ")) to \(url.path)")
             } catch {
                 stopRecorder()
+                lastError = "\(error)"
                 Log.info("audio: \(error)")
             }
         } else if !want, aggregateID != kAudioObjectUnknown {
             stopRecorder()
-            Log.info("audio: recording paused, nothing playing")
+            Log.info("audio: recording paused")
         }
     }
 
@@ -196,18 +391,41 @@ public final class SessionAudio {
         try openFile(for: format)
 
         var proc: AudioDeviceIOProcID?
+        // The aggregate's input is its sub-device's input streams (the
+        // output device's, when it has any: an audio interface, BlackHole),
+        // then the tap's: read the tap's, the last ones.
+        let tapBuffers = format.isInterleaved ? 1 : Int(format.channelCount)
+        let tapList = AudioBufferList.allocate(maximumBuffers: tapBuffers)
+        self.tapList = tapList
         err = AudioDeviceCreateIOProcIDWithBlock(&proc, agg, ioQueue) { [weak self] _, input, _, _, _ in
-            guard let self,
-                  let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: input, deallocator: nil) else { return }
+            let all = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
+            guard let self, all.count >= tapBuffers else { return }
+            for i in 0..<tapBuffers { tapList[i] = all[all.count - tapBuffers + i] }
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: tapList.unsafePointer, deallocator: nil) else { return }
+            if Self.audible(buffer) { self.lastSound.withLock { $0 = nowMs() } }
             self.write(buffer)
         }
         guard err == noErr, let proc else { throw ToolError("couldn't read the tap (\(err))") }
         procID = proc
         err = AudioDeviceStart(agg, proc)
         guard err == noErr else { throw ToolError("couldn't start reading the tap (\(err))") }
+        reading.withLock { $0 = true }
+    }
+
+    /// Any sample louder than about -66 dBFS.
+    private static func audible(_ buffer: AVAudioPCMBuffer) -> Bool {
+        guard let channels = buffer.floatChannelData else { return false }
+        let n = Int(buffer.frameLength) * (buffer.format.isInterleaved ? Int(buffer.format.channelCount) : 1)
+        let lists = buffer.format.isInterleaved ? 1 : Int(buffer.format.channelCount)
+        for c in 0..<lists {
+            let d = channels[c]
+            for i in 0..<n where abs(d[i]) > 0.0005 { return true }
+        }
+        return false
     }
 
     private func stopRecorder() {
+        reading.withLock { $0 = false }
         if aggregateID != kAudioObjectUnknown {
             if let procID {
                 AudioDeviceStop(aggregateID, procID)
@@ -215,6 +433,9 @@ public final class SessionAudio {
             }
             AudioHardwareDestroyAggregateDevice(aggregateID)
         }
+        // After the IO proc is gone: it reads it.
+        tapList.map { free($0.unsafeMutablePointer) }
+        tapList = nil
         procID = nil
         aggregateID = AudioObjectID(kAudioObjectUnknown)
     }
@@ -282,7 +503,9 @@ public final class SessionAudio {
     }
 
     /// Every Core Audio process object belonging to these apps: the apps
-    /// themselves and helpers whose bundle ID extends theirs.
+    /// themselves, helpers whose bundle ID extends theirs (Chromium's), and
+    /// processes they're responsible for (WebKit's GPU process, which plays
+    /// the sound of Safari and of any app showing web content).
     static func audioProcesses(of apps: [NSRunningApplication]) -> [AudioObjectID] {
         guard !apps.isEmpty else { return [] }
         let pids = Set(apps.map(\.processIdentifier))
@@ -296,7 +519,9 @@ public final class SessionAudio {
             var pid: pid_t = 0
             var psize = UInt32(MemoryLayout<pid_t>.size)
             var paddr = address(kAudioProcessPropertyPID)
-            if AudioObjectGetPropertyData(id, &paddr, 0, nil, &psize, &pid) == noErr, pids.contains(pid) { return true }
+            if AudioObjectGetPropertyData(id, &paddr, 0, nil, &psize, &pid) == noErr {
+                if pids.contains(pid) || pids.contains(BCUResponsiblePID(pid)) { return true }
+            }
             var bundle: CFString = "" as CFString
             var bsize = UInt32(MemoryLayout<CFString>.size)
             var baddr = address(kAudioProcessPropertyBundleID)
