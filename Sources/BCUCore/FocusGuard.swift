@@ -1047,7 +1047,13 @@ public final class FocusGuard {
         guard BCUFrontProcessPID() == pid, let key = AX.focusedWindowID(pid), Self.onAgentDisplay(key) else { return false }
         let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"
         guard let user = userWindow(of: pid, prefer: prefer) else {
-            strand(pid, key: key, name: name)
+            let bounds = WindowList.info(key)?.bounds ?? .zero
+            if Self.strandsKey(bounds: bounds, agents: AgentDisplay.running.map(\.liveBounds),
+                               users: AgentDisplay.userDisplayIDs().map { CGDisplayBounds($0) }) {
+                strand(pid, key: key, name: name)
+            } else {
+                record("\(name) was in front with key window \(key) where an agent display lies over one of the user's; left it, as it's on their screen")
+            }
             return true
         }
         var ok = false
@@ -1066,6 +1072,12 @@ public final class FocusGuard {
         }
         record("\(name) was in front with an agent window (\(key)) as its key window; \(ok ? "gave key back to" : "COULD NOT give key back to") the user's window \(user)")
         return true
+    }
+
+    /// Whether a key window with these bounds is an agent's to take key
+    /// off (`strand`).
+    static func strandsKey(bounds: CGRect, agents: [CGRect], users: [CGRect]) -> Bool {
+        agents.contains { $0.intersects(bounds) }
     }
 
     /// The user is in `pid` with an agent's window as its key window and no
