@@ -113,9 +113,10 @@ public final class Hub {
         e.agentLeft(graceMs: Self.orphanGraceMs) { [weak self, weak e] in e.flatMap { self?.isAttached($0) } ?? true }
     }
 
-    /// Whether a session's windows are up for another session to take over.
+    /// Whether a session's windows are up for another session to take over:
+    /// not while it's `present`, a relative using them included.
     static func abandoned(_ id: String, attached: [String: Int], usedBy: [String: Set<String>]) -> Bool {
-        (attached[id] ?? 0) == 0
+        !present(id, attached: attached, usedBy: usedBy)
     }
 
     /// When each session's agent went away, once `left` have nobody left:
