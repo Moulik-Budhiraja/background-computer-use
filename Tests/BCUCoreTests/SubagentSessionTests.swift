@@ -35,19 +35,6 @@ final class SubagentSessionTests: XCTestCase {
         XCTAssertEqual(winners.count, 1)
     }
 
-    func testTheAgentGetsItsDisplayBackOnlyWhenEveryViewerHasGivenItBack() {
-        var n = 0
-        n = Engine.controllers(n, taking: true)   // a host app's client
-        n = Engine.controllers(n, taking: true)   // the menu bar viewer
-        n = Engine.controllers(n, taking: false)
-        XCTAssertGreaterThan(n, 0)
-        n = Engine.controllers(n, taking: false)
-        XCTAssertEqual(n, 0)
-        // An extra give-back doesn't count against a later take-over.
-        n = Engine.controllers(n, taking: false)
-        XCTAssertEqual(Engine.controllers(n, taking: true), 1)
-    }
-
     func testASubagentIsStillThereWhileItsParentUsesItsWindows() {
         // The subagent's connection closed; its parent, still connected,
         // has been working in one of its windows.

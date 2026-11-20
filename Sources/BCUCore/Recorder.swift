@@ -107,7 +107,7 @@ public final class RecordedRun {
 
     // MARK: Reading frames
 
-    private let decodeLock = NSLock()
+    let decodeLock = NSLock()
     private var generators: [String: AVAssetImageGenerator] = [:]
 
     /// The picture of a frame: from its video once compacted, else its JPEG.
@@ -123,6 +123,16 @@ public final class RecordedRun {
             // Compacted between the two checks: look again.
         }
         return nil
+    }
+
+    /// Lets go of the video decoders kept for quick reads; the next read
+    /// makes them again. Returns at once: a decode in flight holds the lock
+    /// for as long as the video read takes, so the teardown waits for it on
+    /// another thread.
+    public func releaseDecoders() {
+        DispatchQueue.global(qos: .utility).async { [self] in
+            decodeLock.lock(); generators.removeAll(); decodeLock.unlock()
+        }
     }
 
     private func decode(_ c: RecordedChunk, at t: Double) -> CGImage? {
@@ -383,6 +393,7 @@ public final class Recordings {
         lock.lock(); let liveIDs = Set(live.keys); lock.unlock()
         let dirs = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
         for d in dirs where !liveIDs.contains(d.lastPathComponent) { try? FileManager.default.removeItem(at: d) }
+        post()
     }
 }
 

@@ -61,6 +61,9 @@ public final class Engine {
     /// Posted on the main thread with the engine as object and an
     /// `AgentPointer` under "pointer" just before an action lands somewhere.
     public static let pointerNotification = Notification.Name("bcu.agentPointer")
+    /// Posted with the engine as object after the user stopped it from the
+    /// menu bar app (`stopAll(byUser:)`). Any thread.
+    public static let stoppedByUserNotification = Notification.Name("bcu.stoppedByUser")
     private var _lastPointer: CGPoint?
     /// Where the last action landed, for a preview that opens later.
     public var lastPointer: CGPoint? {
@@ -109,8 +112,11 @@ public final class Engine {
     private var batching = false
     private var _activity: [ActivityItem] = []
     private var _paused = false
-    /// How many viewers (the menu bar's, host apps') have taken over the display.
-    private var controllers = 0
+    /// Who has the user in control of the display: the menu bar app's
+    /// expanded view (`appController`) and each host client that took it
+    /// over. The user is in control until every one of them has ended.
+    private var controllers: Set<String> = []
+    private var _userInControl: Bool { !controllers.isEmpty }
     private lazy var testRemote = RemoteControl(engine: self)
     private var _waitingReason: String?
     /// What the user did from the menu bar (pressed Done on a handoff), for
@@ -339,7 +345,7 @@ public final class Engine {
 
     public func setPaused(_ value: Bool) {
         stateLock.lock()
-        if Self.userReturns(paused: (_paused, value), inControl: (controllers > 0, controllers > 0)) { userReturnedMs = nowMs() }
+        if Self.userReturns(paused: (_paused, value), inControl: (_userInControl, _userInControl)) { userReturnedMs = nowMs() }
         _paused = value
         stateLock.unlock()
         log(value ? "Paused by you" : "Resumed")
@@ -353,7 +359,7 @@ public final class Engine {
 
     public var status: EngineStatus {
         stateLock.lock(); defer { stateLock.unlock() }
-        if controllers > 0 { return .userInControl }
+        if _userInControl { return .userInControl }
         if _paused { return .paused }
         if let r = _waitingReason { return .waiting(r) }
         if let handoff = windows.windows.first(where: { $0.handedOff }) {
@@ -408,37 +414,48 @@ public final class Engine {
         DispatchQueue.main.async { self.onChange?() }
     }
 
-    /// Stop: release every window and clear waiting state.
-    public func stopAll() {
+    /// Stop: release every window and clear waiting state. `byUser` when
+    /// the user stopped it from the menu bar app, rather than a host app
+    /// stopping its own session: once the windows are released,
+    /// `stoppedByUserNotification` tells the session's host.
+    public func stopAll(byUser: Bool = false) {
         queue.async {
             let results = self.windows.releaseAll()
             self.snapshots.removeAll()
             self.log("Stopped by you: " + (results.isEmpty ? "no windows open" : results.joined(separator: "; ")))
+            if byUser { NotificationCenter.default.post(name: Self.stoppedByUserNotification, object: self) }
         }
     }
 
-    /// The user is driving the agent display from the expanded view. The
-    /// agent's actions are refused until they give it back.
+    /// The user is driving the agent display, from the menu bar app's
+    /// expanded view or a host app. The agent's actions are refused until
+    /// every one of those gives it back.
     public var userInControl: Bool {
         stateLock.lock(); defer { stateLock.unlock() }
-        return controllers > 0
+        return _userInControl
     }
 
-    /// A viewer took over the display (`true`) or gave it back (`false`).
-    /// Each viewer that takes it gives it back once; the agent gets it back
-    /// only when the last one has.
-    public func setUserInControl(_ value: Bool) {
+    /// The menu bar app's expanded view, as a controller.
+    public static let appController = "app"
+
+    /// Whether `controller` has the user in control (and hasn't given it back).
+    public func hasControl(_ controller: String) -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return controllers.contains(controller)
+    }
+
+    /// `controller` takes the display over for the user, or gives it back.
+    /// The agent gets it back only when no controller holds it.
+    public func setUserInControl(_ on: Bool, by controller: String = Engine.appController) {
         stateLock.lock()
-        let was = controllers > 0
-        controllers = Self.controllers(controllers, taking: value)
-        let now = controllers > 0
-        if Self.userReturns(paused: (_paused, _paused), inControl: (was, now)) { userReturnedMs = nowMs() }
+        let was = _userInControl
+        if on { controllers.insert(controller) } else { controllers.remove(controller) }
+        let value = _userInControl
+        if Self.userReturns(paused: (_paused, _paused), inControl: (was, value)) { userReturnedMs = nowMs() }
         stateLock.unlock()
-        windows.userArranging = now
-        if was != now { log(now ? "You took over the agent display" : "You gave the agent display back") }
+        windows.userArranging = value
+        if was != value { log(value ? "You took over the agent display" : "You gave the agent display back") }
     }
-
-    static func controllers(_ n: Int, taking: Bool) -> Int { taking ? n + 1 : max(0, n - 1) }
 
     /// The user is done: move handed-off windows back to the agent display,
     /// and tell the agent on its next call. A pause the user set stays.
@@ -2651,6 +2668,10 @@ public final class Engine {
         // the start, so wait for it to say it's done, 3 s at most, with
         // nothing covered or held meanwhile.
         if covered { closeCover(); covered = false }
+        // The browser brings itself forward while it loads, not only when
+        // handed the URL: the guard counts that as the step's until it's done.
+        focusGuard.beginAction(pid: w.pid, cause: "loading a URL")
+        defer { focusGuard.endAction(pid: w.pid) }
         let since = nowMs()
         var loading: Bool? = true
         while loading == true && nowMs() - since < 3000 {
