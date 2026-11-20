@@ -31,6 +31,13 @@ final class SocketProtocolTests: XCTestCase {
         XCTAssertEqual(buffer.nextLine()?.count, 64 * 65536)
     }
 
+    /// `status` answers at once, so a stuck app shows within seconds
+    /// (`bcu status`, `bcu call status`). Other tools keep the long wait.
+    func testStatusTimesOutSoonOtherToolsWaitLonger() {
+        XCTAssertLessThanOrEqual(SocketClient.timeout(for: "status"), 15)
+        XCTAssertEqual(SocketClient.timeout(for: "type_text"), SocketClient.callTimeout)
+    }
+
     private var path = ""
     private var server: SocketServer!
 
