@@ -130,6 +130,10 @@ public final class FocusGuard {
     /// until the key window there is theirs (`handOver`), what they type
     /// into it is held.
     private var arriving: [pid_t: Double] = [:]
+    /// Apps the user is in whose key window is an agent's and won't let go,
+    /// with no window of theirs to take it (see `strand`): what they type
+    /// there is held, and dropped after `maxPidHoldMs`, until that changes.
+    private var stranded: Set<pid_t> = []
     /// Apps being launched for an agent, by bundle ID: kept from the front
     /// from the moment they appear, before the launch reports a pid.
     private var launching: [String: Int] = [:]
@@ -259,6 +263,10 @@ public final class FocusGuard {
             guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
             self?.activated(app)
         }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            self?.terminated(app.processIdentifier)
+        }
         installTap()
         Thread.detachNewThread { [weak self] in self?.watchAttention() }
         Thread.detachNewThread { [weak self] in self?.watchUserScreen() }
@@ -359,9 +367,8 @@ public final class FocusGuard {
         // An agent display lying over one of the user's (macOS wouldn't
         // place it while the screens slept): the cursor there is on their
         // screen, where it belongs. Warping it to the same spot every few
-        // ms would end every hover effect under it.
-        let overlapped = fenced.first(where: { $0.contains(p) }).map { a in users.contains { $0.contains(p) && $0.intersects(a) } } ?? false
-        guard !overlapped, let agent = fenced.first(where: { $0.contains(p) }) else {
+        // ms would end every hover effect under it. (The tap lets it be too.)
+        guard let agent = AgentDisplay.fenced(at: p, agents: fenced, users: users) else {
             // Off every display (an event posted with a far-off location can
             // leave it there): just as invisible, and macOS only brings it
             // back when the displays change.
@@ -699,6 +706,39 @@ public final class FocusGuard {
         lock.unlock()
     }
 
+    /// An app quit. If it was the user's, a restore would put a pid that's
+    /// gone back in front, and keys would wait on it: whichever app macOS
+    /// brings forward in its place is theirs now.
+    private func terminated(_ pid: pid_t) {
+        lock.lock()
+        taints[pid] = nil
+        parked[pid] = nil
+        arriving[pid] = nil
+        stranded.remove(pid)
+        restoredAwayMs[pid] = nil
+        if Self.dropsHeldOnQuit(swapping: swapping[pid] != nil) { pidHeld[pid] = nil }
+        if userRegularPid == pid { userRegularPid = 0 }
+        let wasUsers = userFrontPid == pid
+        if wasUsers { userFrontPid = 0; userFrontWindow = nil }
+        lock.unlock()
+        guard wasUsers else { return }
+        DispatchQueue.global(qos: .userInteractive).async {
+            let deadline = nowMs() + 500
+            var front = BCUFrontProcessPID()
+            while (front == 0 || front == pid) && nowMs() < deadline { sleepMs(5); front = BCUFrontProcessPID() }
+            guard front != 0, front != pid, front != getpid() else { return }
+            Log.info("guard: the user's app (pid \(pid)) quit; pid \(front) is theirs now")
+            self.arrived(front)
+        }
+    }
+
+    /// Whether keys held for an app that quit are dropped: always, even
+    /// while a swap in it unwinds, or its end would replay them into the
+    /// app the user is in next.
+    static func dropsHeldOnQuit(swapping: Bool) -> Bool {
+        true
+    }
+
     // MARK: Front watch
 
     /// One change of the front app, for the report each tool call gives.
@@ -780,6 +820,8 @@ public final class FocusGuard {
     private func watchUserWindow() {
         while true {
             usleep(300_000)
+            refreshSystemShortcuts()
+            checkStranded()
             guard !WindowManager.agentPids().isEmpty || !activeTaints.isEmpty else { continue }
             let front = BCUFrontProcessPID()
             lock.lock()
@@ -1154,7 +1196,13 @@ public final class FocusGuard {
         guard BCUFrontProcessPID() == pid, let key = AX.focusedWindowID(pid), Self.onAgentDisplay(key) else { return false }
         let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"
         guard let user = userWindow(of: pid, prefer: prefer) else {
-            record("\(name) was in front with an agent window (\(key)) as its key window; COULD NOT give key back: no window of the user's on their screens")
+            let bounds = WindowList.info(key)?.bounds ?? .zero
+            if Self.strandsKey(bounds: bounds, agents: AgentDisplay.running.map(\.liveBounds),
+                               users: AgentDisplay.userDisplayIDs().map { CGDisplayBounds($0) }) {
+                strand(pid, key: key, name: name)
+            } else {
+                record("\(name) was in front with key window \(key) where an agent display lies over one of the user's; left it, as it's on their screen")
+            }
             return true
         }
         var ok = false
@@ -1173,6 +1221,89 @@ public final class FocusGuard {
         }
         record("\(name) was in front with an agent window (\(key)) as its key window; \(ok ? "gave key back to" : "COULD NOT give key back to") the user's window \(user)")
         return true
+    }
+
+    /// Whether a key window with these bounds is an agent's to take key
+    /// off (`strand`): its center is on an agent display and not on a user
+    /// display lying over it, by the cursor fence's rule.
+    static func strandsKey(bounds: CGRect, agents: [CGRect], users: [CGRect]) -> Bool {
+        AgentDisplay.fenced(at: CGPoint(x: bounds.midX, y: bounds.midY), agents: agents, users: users) != nil
+    }
+
+    /// The user is in `pid` with an agent's window as its key window and no
+    /// window of theirs to give key to: the app's only windows are agents'
+    /// (they cmd+Tabbed to it, or clicked it in the Dock), or they lent an
+    /// agent their only one. Take key off the agent's window: with no key
+    /// window, typing goes nowhere and the app's menus still take shortcuts
+    /// (cmd+N opens them a window). If it won't let go, their keys for the
+    /// app are held (`stranded`) rather than typed into the agent's window.
+    private func strand(_ pid: pid_t, key: CGWindowID, name: String) {
+        // Not the user's doing: the restore that's under way deals with it.
+        guard !agentCaused(pid) else {
+            record("\(name) was in front with an agent window (\(key)) as its key window; COULD NOT give key back: no window of the user's on their screens")
+            return
+        }
+        _ = BCUPostFocusRecord(pid, key, false)
+        let deadline = nowMs() + 250
+        while AX.focusedWindowID(pid) == key && nowMs() < deadline { sleepMs(2) }
+        let off = AX.focusedWindowID(pid) != key
+        lock.lock()
+        let fresh = !off && stranded.insert(pid).inserted
+        lock.unlock()
+        if off {
+            record("\(name) was in front with an agent window (\(key)) as its key window and no window of the user's on their screens; took key off it")
+        } else if fresh {
+            record("\(name) was in front with an agent window (\(key)) as its key window and no window of the user's on their screens; COULD NOT take key off it, so your keys for it are held until a window of yours has key")
+        }
+    }
+
+    /// Every 300 ms: a stranded app's keys go on once its key window isn't
+    /// an agent's (the user opened a window, say), and are dropped once
+    /// the user has left it.
+    private func checkStranded() {
+        lock.lock(); let pids = stranded; lock.unlock()
+        guard !pids.isEmpty else { return }
+        let front = BCUFrontProcessPID()
+        for pid in pids {
+            var safe = false
+            var frontAfter = front
+            if pid == front {
+                let appLock = Engine.inputLock(pid)
+                guard appLock.lock(before: Date().addingTimeInterval(0.05)) else { continue }
+                if !isSwapping(pid) { reclaimKey(pid) }
+                appLock.unlock()
+                safe = keySafe(pid)
+                frontAfter = BCUFrontProcessPID()
+            }
+            lock.lock()
+            let outcome = Self.strandedOutcome(pid: pid, frontBefore: front, frontAfter: frontAfter, keySafe: safe, swapping: swapping[pid] != nil)
+            if outcome != .wait { stranded.remove(pid) }
+            let dropped = outcome == .drop ? pidHeld.removeValue(forKey: pid)?.events.count ?? 0 : 0
+            lock.unlock()
+            if dropped > 0 {
+                record("dropped \(dropped) of your key events typed into pid \(pid) while an agent's window had key there, rather than type them into it")
+            }
+            if outcome == .release { releasePidHeld(pid) }
+        }
+    }
+
+    /// What `checkStranded` does with a stranded app's held keys.
+    enum StrandedOutcome: Equatable {
+        /// Still stranded: keep holding them.
+        case wait
+        /// A window of the user's has key: send them on.
+        case release
+        /// The user left the app: drop them, even mid-swap (the swap's
+        /// end would replay them into the app they're in now).
+        case drop
+    }
+
+    /// `frontBefore` and `frontAfter`: the front app before and after the
+    /// accessibility calls that tried to give key back (they can take a
+    /// second); `keySafe` is from those calls.
+    static func strandedOutcome(pid: pid_t, frontBefore: pid_t, frontAfter: pid_t, keySafe: Bool, swapping: Bool) -> StrandedOutcome {
+        if pid != frontBefore || pid != frontAfter { return .drop }
+        return keySafe ? .release : .wait
     }
 
     /// The window of `pid` the user would expect to be key: a standard
@@ -1447,7 +1578,7 @@ public final class FocusGuard {
             }
             lock.lock()
             let alreadyHolding = holding || !holdTokens.isEmpty || draining || !held.isEmpty || replaysInFlight > 0
-            let anySwap = !swapping.isEmpty || !pidHeld.isEmpty || !parked.isEmpty || !arriving.isEmpty
+            let anySwap = !swapping.isEmpty || !pidHeld.isEmpty || !parked.isEmpty || !arriving.isEmpty || !stranded.isEmpty
             let now = nowMs()
             let anyTaint = taints.values.contains { $0.count > 0 || $0.until >= now }
             lock.unlock()
@@ -1457,13 +1588,14 @@ public final class FocusGuard {
             }
             // Keys for an app whose key window is an agent's right now wait
             // for it to be the user's again. Modifier changes carry no text,
-            // and cmd+Tab goes to the app switcher, not the app.
-            if anySwap && type != .flagsChanged && !cmdTab {
+            // and system shortcuts (cmd+Tab) go to macOS, not the app.
+            lock.lock(); let enabledShortcuts = enabledSystemShortcuts; lock.unlock()
+            if anySwap && type != .flagsChanged && !Self.systemShortcut(code: event.getIntegerValueField(.keyboardEventKeycode), flags: event.flags, enabled: enabledShortcuts) {
                 let front = BCUFrontProcessPID()
                 lock.lock()
                 // Or one left on an agent's window: the user just switched
                 // to the app, and key moves to their window in a moment.
-                let mid = swapping[front] != nil || pidHeld[front] != nil || parked[front] != nil || arriving[front] != nil
+                let mid = swapping[front] != nil || pidHeld[front] != nil || parked[front] != nil || arriving[front] != nil || stranded.contains(front)
                 if mid, let copy = event.copy() {
                     if firstCapture(copy, "held for an app mid-swap") {
                         var p = pidHeld[front] ?? (nowMs(), [])
@@ -1529,6 +1661,79 @@ public final class FocusGuard {
     static let keyLiftMs = 1500.0
     /// F1–F20, Mission Control and Launchpad: keys that can show another app.
     static let functionKeys: Set<Int64> = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106, 64, 79, 80, 90, 160, 131]
+
+    /// A key macOS takes for itself rather than the front app's key
+    /// window: holding it for that app would only keep the system from it.
+    /// The app switcher (cmd+Tab), Spotlight (cmd+Space), input sources
+    /// (ctrl+Space), Mission Control and Spaces (ctrl+arrows, the Mission
+    /// Control and Launchpad keys) and Force Quit (cmd+opt+Esc).
+    /// Only the whole chord: with another modifier it's the app's shortcut
+    /// (ctrl+cmd+arrows in Xcode).
+    /// `enabled`: the shortcuts in `configurableShortcuts` that are on.
+    static func systemShortcut(code: Int64, flags: CGEventFlags, enabled: Set<Chord> = Set(configurableShortcuts.values)) -> Bool {
+        let mods = flags.intersection(chordModifiers)
+        switch code {
+        case 48: return mods == .maskCommand || mods == [.maskCommand, .maskShift]
+        case 160, 131: return mods.isEmpty
+        case 53: return mods == [.maskCommand, .maskAlternate]
+        default: return enabled.contains(Chord(code: code, modifiers: mods.rawValue))
+        }
+    }
+
+    /// A key with exactly these of cmd, ctrl, opt and shift.
+    struct Chord: Hashable {
+        let code: Int64
+        let modifiers: UInt64
+    }
+
+    static let chordModifiers: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
+
+    /// The system shortcuts the user can turn off or change in Keyboard
+    /// Shortcuts, by their ID in com.apple.symbolichotkeys, with their
+    /// default chords: Spotlight, the input source switches, Mission
+    /// Control, application windows, and moving a Space left or right.
+    static let configurableShortcuts: [String: Chord] = [
+        "64": Chord(code: 49, modifiers: CGEventFlags.maskCommand.rawValue),
+        "60": Chord(code: 49, modifiers: CGEventFlags.maskControl.rawValue),
+        "61": Chord(code: 49, modifiers: CGEventFlags([.maskControl, .maskAlternate]).rawValue),
+        "32": Chord(code: 126, modifiers: CGEventFlags.maskControl.rawValue),
+        "33": Chord(code: 125, modifiers: CGEventFlags.maskControl.rawValue),
+        "79": Chord(code: 123, modifiers: CGEventFlags.maskControl.rawValue),
+        "81": Chord(code: 124, modifiers: CGEventFlags.maskControl.rawValue),
+    ]
+
+    /// The `configurableShortcuts` that are on, by the user's
+    /// `AppleSymbolicHotKeys` (nil: never changed, so all on as default).
+    static func enabledShortcuts(_ hotKeys: [String: Any]?) -> Set<Chord> {
+        var out = Set<Chord>()
+        for (id, chord) in configurableShortcuts {
+            guard let entry = hotKeys?[id] as? [String: Any] else { out.insert(chord); continue }
+            if let on = entry["enabled"] as? NSNumber, !on.boolValue { continue }
+            // parameters: the character (65535 for none), the key code, the modifiers.
+            if let value = entry["value"] as? [String: Any], let p = value["parameters"] as? [NSNumber], p.count >= 3 {
+                out.insert(Chord(code: p[1].int64Value, modifiers: p[2].uint64Value & chordModifiers.rawValue))
+            } else {
+                out.insert(chord)
+            }
+        }
+        return out
+    }
+
+    /// Read off the tap's thread (`watchUserWindow`): the tap only looks.
+    private var enabledSystemShortcuts = Set(FocusGuard.configurableShortcuts.values)
+    private var systemShortcutsReadMs = -1.0
+
+    private func refreshSystemShortcuts() {
+        guard nowMs() - systemShortcutsReadMs > 5000 else { return }
+        let domain = "com.apple.symbolichotkeys" as CFString
+        CFPreferencesAppSynchronize(domain)
+        let hotKeys = CFPreferencesCopyAppValue("AppleSymbolicHotKeys" as CFString, domain) as? [String: Any]
+        let enabled = Self.enabledShortcuts(hotKeys)
+        lock.lock()
+        enabledSystemShortcuts = enabled
+        systemShortcutsReadMs = nowMs()
+        lock.unlock()
+    }
 
     private static func isMouseDown(_ t: CGEventType) -> Bool {
         t == .leftMouseDown || t == .rightMouseDown || t == .otherMouseDown
@@ -1674,19 +1879,29 @@ public final class FocusGuard {
         for pid in stalePids {
             lock.lock()
             let p = pidHeld.removeValue(forKey: pid)
-            let still = swapping[pid] != nil
-            if let p, !still {
+            let drop = Self.dropsExpiredHold(swapping: swapping[pid] != nil, stranded: stranded.contains(pid))
+            if let p, !drop {
                 if held.isEmpty { heldSinceMs = p.sinceMs }
                 held.insert(contentsOf: p.events.map { ($0, pid) }, at: 0)
             }
             lock.unlock()
-            if still, let p {
-                // The app has been mid-swap all this time (it isn't answering).
+            if drop, let p {
+                // The app has been mid-swap all this time (it isn't answering),
+                // or an agent's window still has key there.
                 record("COULD NOT give key back in pid \(pid) within \(Int(Self.maxPidHoldMs)) ms: dropped \(p.events.count) of your key events rather than type them into an agent's window")
             } else {
                 drain(force: true)
             }
         }
+    }
+
+    /// Whether keys held for an app past `maxPidHoldMs` are dropped rather
+    /// than replayed.
+    /// A stranded app's keys are, like a stuck swap's: the agent's window
+    /// still has key there, and replayed they'd go to whatever app the user
+    /// has moved to.
+    static func dropsExpiredHold(swapping: Bool, stranded: Bool) -> Bool {
+        swapping || stranded
     }
 
     /// Replay held events in order, about 1 ms apart. Events the user makes
@@ -1705,6 +1920,7 @@ public final class FocusGuard {
         var safeFor: pid_t = -1
         var retry = false
         var gaveUp: Set<pid_t> = []
+        var reclaims = ReclaimTries()
         while true {
             lock.lock()
             if held.isEmpty || holding || !holdTokens.isEmpty { draining = false; lock.unlock(); break }
@@ -1737,7 +1953,7 @@ public final class FocusGuard {
                     continue
                 }
                 if safeFor != front {
-                    if !keySafe(front) {
+                    if !keySafe(front) && reclaims.shouldTry(front) {
                         // Reclaim, but without waiting on a swap that may be stuck.
                         let appLock = Engine.inputLock(front)
                         if appLock.lock(before: Date().addingTimeInterval(0.05)) {
@@ -1792,6 +2008,17 @@ public final class FocusGuard {
         }
         if retry { scheduleDrain() }
         return n
+    }
+
+    /// The apps one `drain` has tried to give key back in. A try can take
+    /// most of a second (`reclaimKey`, `strand`), and a forced drain drops
+    /// the keys it can't send one by one.
+    struct ReclaimTries {
+        private var tried: Set<pid_t> = []
+        /// Whether to try giving key back in `pid` before its next held key.
+        mutating func shouldTry(_ pid: pid_t) -> Bool {
+            tried.insert(pid).inserted
+        }
     }
 
     /// Lock held. False if this key event was captured already (by `path`).

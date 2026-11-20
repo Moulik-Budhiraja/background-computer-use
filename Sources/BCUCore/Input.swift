@@ -1,4 +1,5 @@
 import AppKit
+import Carbon
 import CoreGraphics
 import CPrivate
 
@@ -225,7 +226,9 @@ public enum Input {
     }
 }
 
-/// US-layout key codes.
+/// Key codes. Characters go through the user's keyboard layout (so cmd+"a"
+/// is the key that types "a" on AZERTY too), then the US layout's codes.
+/// Named keys are the same on every layout.
 public enum KeyMap {
     static let named: [String: CGKeyCode] = [
         "return": 36, "enter": 36, "tab": 48, "space": 49, "delete": 51, "backspace": 51,
@@ -250,10 +253,13 @@ public enum KeyMap {
         "\"": "'", "<": ",", ">": ".", "?": "/", "~": "`",
     ]
 
-    public static func code(for key: String) throws -> (CGKeyCode, Bool) {
+    /// `command`: the key is pressed with cmd, which some layouts map
+    /// differently (Dvorak - QWERTY ⌘, the number row on AZERTY).
+    public static func code(for key: String, command: Bool = false) throws -> (CGKeyCode, Bool) {
         let folded = key.lowercased().replacingOccurrences(of: "_", with: "").replacingOccurrences(of: "-", with: "").replacingOccurrences(of: " ", with: "")
         if key.count > 1, let c = named[folded] { return (c, false) }
         if key.count == 1, let ch = key.first {
+            if ch != " ", let hit = try LayoutKeys.code(for: ch, command: command) { return hit }
             if let c = chars[Character(ch.lowercased())] { return (c, ch.isUppercase) }
             if let base = shifted[ch], let c = chars[base] { return (c, true) }
             if ch == " " { return (49, false) }
@@ -262,14 +268,56 @@ public enum KeyMap {
         throw ToolError("unknown key \"\(key)\". Use a letter, digit, punctuation, or one of: \(named.keys.sorted().joined(separator: ", "))")
     }
 
+    /// The key code for `key` and the flags for `modifiers`, pressed as
+    /// given (no Shift added for an uppercase letter). For the test hooks
+    /// and the user simulator. `lookup` is `code(for:command:)`.
+    static func shortcut(_ key: String, modifiers: [String],
+                         lookup: (String, Bool) throws -> (CGKeyCode, Bool) = { try KeyMap.code(for: $0, command: $1) }) throws -> (CGKeyCode, CGEventFlags) {
+        let flags = flags(modifiers)
+        let (code, _) = try lookup(key, flags.contains(.maskCommand))
+        return (code, flags)
+    }
+
+    /// The keys a 'uchr' keyboard layout types: character to key code and
+    /// whether it takes shift. The main keys win over the keypad, then
+    /// unshifted over shifted. `command` reads the layout's cmd table.
+    static func layoutTable(_ layout: Data, command: Bool, keyboardType: UInt32 = UInt32(LMGetKbdType())) -> [Character: (CGKeyCode, Bool)] {
+        // The typing keys (and JIS ¥ and _), then the keypad; not return, tab or space.
+        let groups = [(0...50).filter { $0 != 36 && $0 != 48 && $0 != 49 } + [93, 94], Array(65...92)]
+        var table: [Character: (CGKeyCode, Bool)] = [:]
+        layout.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            let uchr = base.assumingMemoryBound(to: UCKeyboardLayout.self)
+            for keys in groups { for shift in [false, true] {
+                // Carbon modifier bits shifted right 8: cmdKey 1, shiftKey 2.
+                let mods = UInt32((command ? cmdKey : 0) | (shift ? shiftKey : 0)) >> 8
+                for code in keys {
+                    var dead: UInt32 = 0
+                    var length = 0
+                    var chars = [UniChar](repeating: 0, count: 4)
+                    let err = UCKeyTranslate(uchr, UInt16(code), UInt16(kUCKeyActionDown), mods, keyboardType,
+                                             0, &dead, chars.count, &length, &chars)
+                    // A dead key types nothing by itself.
+                    guard err == noErr, dead == 0, length > 0 else { continue }
+                    let s = String(utf16CodeUnits: chars, count: length)
+                    guard s.count == 1, let ch = s.first, !ch.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f }) else { continue }
+                    if table[ch] == nil { table[ch] = (CGKeyCode(code), shift) }
+                }
+            } }
+        }
+        return table
+    }
+
     /// The key code and flags press_key sends. An unknown modifier throws
     /// rather than leaving it out and pressing the bare key. A shifted
     /// character ("?", "A") adds Shift on its own, except that with other
     /// modifiers a letter's case doesn't matter: cmd+"A" is Cmd+A, and
     /// Cmd+Shift+A needs "shift" in the list.
-    public static func press(key: String, modifiers: [String]) throws -> (CGKeyCode, CGEventFlags) {
-        let (code, implicitShift) = try code(for: key)
+    /// `lookup` is `code(for:command:)`.
+    public static func press(key: String, modifiers: [String],
+                             lookup: (String, Bool) throws -> (CGKeyCode, Bool) = { try KeyMap.code(for: $0, command: $1) }) throws -> (CGKeyCode, CGEventFlags) {
         var flags = try modifierFlags(modifiers)
+        let (code, implicitShift) = try lookup(key, flags.contains(.maskCommand))
         let letter = key.count == 1 && key.first!.isLetter
         if implicitShift && !(letter && !flags.isEmpty) { flags.insert(.maskShift) }
         return (code, flags)
@@ -309,5 +357,92 @@ public enum KeyMap {
             }
         }
         return f
+    }
+}
+
+
+/// The current keyboard layout's keys, read once and again after the user
+/// switches input source. A character the layout doesn't type (a Latin
+/// letter on Russian) comes from the ASCII-capable layout macOS uses for
+/// shortcuts.
+enum LayoutKeys {
+    typealias Table = [Character: (CGKeyCode, Bool)]
+    private struct Tables { var plain: [Table]; var command: [Table] }
+    private static let cache = Invalidated<Tables>()
+    private static var observer: NSObjectProtocol?
+
+    /// Runs `work` on the main thread and waits for it; false if it didn't
+    /// run (BCU is quitting).
+    static var runOnMain: (@escaping () -> Void) -> Bool = onMainUnlessQuitting
+
+    /// Drops the tables, as a change of input source does.
+    static func forget() { cache.invalidate() }
+
+    static func code(for ch: Character, command: Bool) throws -> (CGKeyCode, Bool)? {
+        let (cached, generation) = cache.read()
+        var t = cached
+        if t == nil {
+            // Text Input Sources wants the main thread.
+            var read: Tables?
+            if Thread.isMainThread {
+                read = load()
+            } else if !runOnMain({ read = load() }) {
+                throw ToolError("BCU is quitting, so no key was pressed")
+            }
+            if let read { cache.publish(read, readAt: generation) }
+            t = read
+        }
+        guard let t else { return nil }
+        for table in command ? t.command : t.plain { if let hit = table[ch] { return hit } }
+        return nil
+    }
+
+    private static func load() -> Tables {
+        if observer == nil {
+            observer = DistributedNotificationCenter.default().addObserver(
+                forName: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String), object: nil, queue: nil
+            ) { _ in
+                cache.invalidate()
+            }
+        }
+        var layouts: [Data] = []
+        for source in [TISCopyCurrentKeyboardLayoutInputSource(), TISCopyCurrentASCIICapableKeyboardLayoutInputSource()] {
+            guard let src = source?.takeRetainedValue(), let data = layoutData(src), !layouts.contains(data) else { continue }
+            layouts.append(data)
+        }
+        return Tables(plain: layouts.map { KeyMap.layoutTable($0, command: false) },
+                      command: layouts.map { KeyMap.layoutTable($0, command: true) })
+    }
+
+    static func layoutData(_ source: TISInputSource) -> Data? {
+        guard let p = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return nil }
+        return Unmanaged<CFData>.fromOpaque(p).takeUnretainedValue() as Data
+    }
+}
+
+/// A value worked out once and dropped when what it was read from changes.
+/// Each drop starts a new generation, so a value read before it isn't kept.
+final class Invalidated<Value> {
+    private let lock = NSLock()
+    private var value: Value?
+    private var generation = 0
+
+    /// The value if there is one, and the generation to publish a new one at.
+    func read() -> (Value?, Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (value, generation)
+    }
+
+    func invalidate() {
+        lock.lock(); defer { lock.unlock() }
+        value = nil
+        generation += 1
+    }
+
+    /// Keep `v`, worked out after `read` returned `generation`.
+    func publish(_ v: Value, readAt generation: Int) {
+        lock.lock(); defer { lock.unlock() }
+        guard generation == self.generation else { return }
+        value = v
     }
 }
