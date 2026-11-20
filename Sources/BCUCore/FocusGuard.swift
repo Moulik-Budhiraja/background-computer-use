@@ -1479,8 +1479,19 @@ public final class FocusGuard {
 
     /// A key macOS takes for itself rather than the front app's key
     /// window: holding it for that app would only keep the system from it.
+    /// The app switcher (cmd+Tab), Spotlight (cmd+Space), input sources
+    /// (ctrl+Space), Mission Control and Spaces (ctrl+arrows, the Mission
+    /// Control and Launchpad keys) and Force Quit (cmd+opt+Esc).
     static func systemShortcut(code: Int64, flags: CGEventFlags) -> Bool {
-        flags.contains(.maskCommand) && code == 48
+        let cmd = flags.contains(.maskCommand), ctrl = flags.contains(.maskControl)
+        switch code {
+        case 48: return cmd
+        case 49: return cmd || ctrl
+        case 123, 124, 125, 126: return ctrl
+        case 160, 131: return true
+        case 53: return cmd && flags.contains(.maskAlternate)
+        default: return false
+        }
     }
 
     private static func isMouseDown(_ t: CGEventType) -> Bool {
