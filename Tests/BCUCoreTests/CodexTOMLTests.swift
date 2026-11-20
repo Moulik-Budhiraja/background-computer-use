@@ -311,6 +311,25 @@ final class CodexTOMLTests: XCTestCase {
         """)
     }
 
+    /// Codex won't load a server with both a URL and a command.
+    func testDropsHTTPKeysFromAnHTTPEntry() throws {
+        let text = "[mcp_servers.background-computer-use]\nurl = \"http://127.0.0.1:9000/mcp\"\nbearer_token_env_var = \"T\"\nstartup_timeout_sec = 30\n"
+        XCTAssertEqual(try set(text), """
+        [mcp_servers.background-computer-use]
+        command = "\(bcu)"
+        args = ["mcp"]
+        startup_timeout_sec = 30
+
+        """)
+    }
+
+    func testRefusesAnHTTPEntryItCantTakeApart() {
+        let inline = "[mcp_servers]\nbackground-computer-use = { url = \"http://127.0.0.1:9000/mcp\" }\n"
+        XCTAssertThrowsError(try CodexTOML.settingServer(in: inline, name: server, command: bcu, args: ["mcp"]))
+        let headers = "[mcp_servers.background-computer-use]\nurl = \"http://x\"\n\n[mcp_servers.background-computer-use.http_headers]\nA = \"1\"\n"
+        XCTAssertThrowsError(try CodexTOML.settingServer(in: headers, name: server, command: bcu, args: ["mcp"]))
+    }
+
     func testRefusesFileItCantParse() {
         XCTAssertThrowsError(try CodexTOML.settingServer(in: "model = \"unterminated\n", name: server, command: bcu, args: ["mcp"]))
         XCTAssertThrowsError(try CodexTOML.settingServer(in: "[mcp_servers\n", name: server, command: bcu, args: ["mcp"]))
