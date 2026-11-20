@@ -47,16 +47,11 @@ final class MCPServer {
 
     func run() {
         while let line = readLine(strippingNewline: true) {
-            guard !line.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
-            guard let data = line.data(using: .utf8), let parsed = try? JSONSerialization.jsonObject(with: data) else {
-                replyError(NSNull(), code: -32700, message: "parse error: not JSON")
-                continue
+            switch JSONRPCLine.classify(line) {
+            case .blank: continue
+            case .invalid(let code, let message): replyError(NSNull(), code: code, message: message)
+            case .message(let message): handle(message as? JSONObject ?? [:])
             }
-            guard let message = parsed as? JSONObject else {
-                replyError(NSNull(), code: -32600, message: "invalid request: expected a JSON-RPC object")
-                continue
-            }
-            handle(message)
         }
     }
 
