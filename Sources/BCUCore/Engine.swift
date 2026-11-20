@@ -406,7 +406,7 @@ public final class Engine {
     /// Tools that only read state kept under locks, answered without
     /// waiting for the session's running call.
     static func answersOffQueue(_ tool: String) -> Bool {
-        false
+        tool == "status"
     }
 
     public func call(tool: String, args: JSONObject) -> ToolResult {
