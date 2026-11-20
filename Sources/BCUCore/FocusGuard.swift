@@ -167,6 +167,8 @@ public final class FocusGuard {
     /// agents work, so a click has a look from before anything it opened.
     private var screenLook: [CGWindowID: String]?
     private let clickQueue = DispatchQueue(label: "bcu.guard.click", qos: .userInteractive)
+    /// Accessibility's answer for a click, which a busy app can make slow.
+    private let axClickQueue = DispatchQueue(label: "bcu.guard.click.ax", qos: .userInteractive)
     /// When an agent's step on each app last ended (see `Bounce`).
     private var lastActedMs: [pid_t: Double] = [:]
     private var lastUserSwitchKeyMs = 0.0
@@ -601,8 +603,11 @@ public final class FocusGuard {
         var roles: [String] = []
         var url = false
         var element: AXUIElement? = hit
+        // Each ask can take the full timeout in a busy app: 300 ms in all,
+        // then what's known so far.
+        let deadline = nowMs() + 300
         for _ in 0..<8 {
-            guard let el = element else { break }
+            guard let el = element, nowMs() < deadline else { break }
             AXUIElementSetMessagingTimeout(el, 0.25)
             let role = AX.string(el, "AXRole") ?? ""
             roles.append(role)
@@ -1555,22 +1560,38 @@ public final class FocusGuard {
     private func noteClick(at p: CGPoint) {
         let ms = nowMs()
         lock.lock(); let look = screenLook; lastClick = Click(ms: ms, point: p, windows: look); lock.unlock()
+        // The window list first, on its own queue: a slow accessibility
+        // answer for one click mustn't hold up the next click's fallback.
         clickQueue.async {
-            let windows = look ?? Self.userScreenWindows()
             let fallback = Self.listedTarget(at: p)
             self.lock.lock()
-            if self.lastClick.ms == ms { self.lastClick.fallback = fallback; self.lastClick.windows = windows }
+            if self.lastClick.ms == ms { self.lastClick.fallback = fallback }
+            self.lock.unlock()
+            let windows = look ?? Self.userScreenWindows()
+            self.lock.lock()
+            if self.lastClick.ms == ms { self.lastClick.windows = windows }
             self.lock.unlock()
             let busy = !WindowManager.agentPids().isEmpty || !self.activeTaints.isEmpty
-            let (target, element) = busy ? Self.whatWasClicked(at: p, listed: fallback) : (fallback, nil)
-            self.lock.lock()
-            if self.lastClick.ms == ms {
-                // (settleClick may have given up waiting and gone by the
-                // window list; what comes after goes by this.)
-                self.lastClick.target = target
-                self.lastClick.element = element
+            guard busy else {
+                self.lock.lock()
+                if self.lastClick.ms == ms { self.lastClick.target = fallback }
+                self.lock.unlock()
+                return
             }
-            self.lock.unlock()
+            self.axClickQueue.async {
+                // A newer click came while this one waited: its answer is the one asked for.
+                self.lock.lock(); let current = self.lastClick.ms == ms; self.lock.unlock()
+                guard current else { return }
+                let (target, element) = Self.whatWasClicked(at: p, listed: fallback)
+                self.lock.lock()
+                if self.lastClick.ms == ms {
+                    // (settleClick may have given up waiting and gone by the
+                    // window list; what comes after goes by this.)
+                    self.lastClick.target = target
+                    self.lastClick.element = element
+                }
+                self.lock.unlock()
+            }
         }
     }
 
