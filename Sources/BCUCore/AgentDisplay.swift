@@ -348,7 +348,8 @@ public final class AgentDisplay {
             // spare that's staying.
             gone.removeAll { $0.slot < furthestInUse }
             // Not with a window on it (an app put one there since): it would
-            // land on the user's screen. Close it first; next time, then.
+            // land on the user's screen. Clean it up first (closed if an
+            // agent's, else put on the user's screen); next time, then.
             let busy = gone.filter { !WindowManager.windows(on: CGDisplayBounds($0.id)).isEmpty }
             gone.removeAll { g in busy.contains { $0.id == g.id } }
             // (After the busy ones are held back: one of those staying means
@@ -721,7 +722,17 @@ public final class AgentDisplay {
         let kept = spares.map { CGDisplayBounds($0.id) }
         registryLock.unlock()
         WindowManager.rescue(fromSpares: kept)
+        // A stray only once it's been one a while: not one of ours caught
+        // in the moment between coming online and being registered.
+        let now = nowMs()
+        let strays = strayIDs
+        strayFirstSeen = strayFirstSeen.filter { strays.contains($0.key) }
+        for id in strays where strayFirstSeen[id] == nil { strayFirstSeen[id] = now }
+        WindowManager.rescue(fromStrays: strays.filter { now - (strayFirstSeen[$0] ?? now) >= 5000 }.map { CGDisplayBounds($0) })
     }
+
+    /// When each stray display was first seen (main thread).
+    private static var strayFirstSeen: [CGDirectDisplayID: Double] = [:]
 
     /// No user display to sit beside the last time this looked.
     private var unplaced = false
