@@ -1362,6 +1362,11 @@ public final class Engine {
         return p
     }
 
+    /// A window coordinate from the agent, for a message.
+    static func windowPoint(_ v: Double) -> String {
+        "\(Int(v))"
+    }
+
     /// A point outside the window would land on whatever is next to it on
     /// the display (another window, or nothing). A sheet or popup of the
     /// window can reach past its edges, so a point on one of those is fine.
@@ -1370,7 +1375,7 @@ public final class Engine {
         let sheets = AX.children(ax).filter { AX.string($0, "AXRole") == "AXSheet" }
         let over = (sheets + popupWindows(of: w, frame: f)).compactMap { AX.frame($0) }
         if over.contains(where: { $0.contains(p) }) { return }
-        throw ToolError("(\(Int(x)), \(Int(y))) is outside window \(w.id), which is \(Int(f.width))x\(Int(f.height)) points. x and y are window points from its top-left corner, matching the screenshot's pixels.")
+        throw ToolError("(\(Self.windowPoint(x)), \(Self.windowPoint(y))) is outside window \(w.id), which is \(Int(f.width))x\(Int(f.height)) points. x and y are window points from its top-left corner, matching the screenshot's pixels.")
     }
 
     public static func defaultBrowser() -> (name: String, bundleID: String)? {

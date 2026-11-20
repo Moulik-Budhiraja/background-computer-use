@@ -25,6 +25,9 @@ public struct AXSnapshotResult {
     let unlisted: Set<Int>
     /// Numbered elements still in the window but scrolled out of view.
     let scrolledOut: Set<Int>
+    /// The last line listed for each number in `unlisted` and `scrolledOut`,
+    /// to report its removal if it goes before it's listed again.
+    let hiddenLines: [Int: String]
     let nextIndex: Int
     /// True when numbering restarted at 1, so numbers from the last read mean nothing.
     public let renumbered: Bool
@@ -222,12 +225,14 @@ public enum AXSnapshot {
         // numbers, so they can be acted on by them.
         var unlisted = Set<Int>()
         var scrolledOut = Set<Int>()
+        var hiddenLines: [Int: String] = [:]
         if !renumber, let prev = previous {
             for o in overflow {
                 if let old = prev.indexByElement[o.element], !used.contains(old) {
                     used.insert(old)
                     indexByElement[o.element] = old
                     unlisted.insert(old)
+                    hiddenLines[old] = prev.lines[old] ?? prev.hiddenLines[old]
                     nodes[old] = AXNode(index: old, element: o.element, role: o.role, frame: o.frame,
                                         actions: AX.actions(o.element), valueSettable: AX.isSettable(o.element, "AXValue"))
                 }
@@ -237,6 +242,7 @@ public enum AXSnapshot {
                     used.insert(old)
                     indexByElement[el] = old
                     scrolledOut.insert(old)
+                    hiddenLines[old] = prev.lines[old] ?? prev.hiddenLines[old]
                 }
             }
         }
@@ -248,7 +254,7 @@ public enum AXSnapshot {
         if skippedOffscreen > 0 { footer.append("(\(skippedOffscreen) elements scrolled out of view not listed)") }
         let text = ([header] + listing + footer).joined(separator: "\n")
         return AXSnapshotResult(windowID: windowID, nodes: nodes, text: text, visited: visited, header: header, footer: footer,
-                                lines: lineByIndex, indexByElement: indexByElement, unlisted: unlisted, scrolledOut: scrolledOut, nextIndex: next, renumbered: renumber && previous != nil)
+                                lines: lineByIndex, indexByElement: indexByElement, unlisted: unlisted, scrolledOut: scrolledOut, hiddenLines: hiddenLines, nextIndex: next, renumbered: renumber && previous != nil)
     }
 
     /// Numbering restarts only when most listed elements are new and most
