@@ -204,6 +204,7 @@ public final class Hub {
     /// A tool call from the socket. `_session` and `_client` say which
     /// session it's for; `_parent`, that it's a subagent's of that session.
     public func call(tool: String, args: JSONObject) -> ToolResult {
+        if Quitting.now { return .error("Background Computer Use is quitting. Try again once it's running.") }
         var args = args
         let id = (args.removeValue(forKey: "_session") as? String) ?? Self.defaultSession
         let client = args.removeValue(forKey: "_client") as? String
@@ -363,6 +364,8 @@ public final class Hub {
 
     /// Main thread. Releases every session's windows, then removes the displays.
     public func shutdown() {
+        // No new calls, and none already running waits on this thread.
+        Quitting.begin()
         // First: no app stays kept from the front once the engine is gone.
         focusGuard.gate.stop()
         let group = DispatchGroup()

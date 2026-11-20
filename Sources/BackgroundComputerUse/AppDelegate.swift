@@ -32,7 +32,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         CrashLog.install()
         SafeTypingSetting.apply()
-        updater = Updater(hub: hub)
+        updater = Updater(hub: hub, setupOpen: { [weak self] in
+            guard let self else { return false }
+            return self.onboarding != nil || self.settings?.isShown == true
+        })
         // A host app's `bcu serve` reads this to start this app rather than run
         // an engine of its own. Kept current as permissions are granted or taken away.
         var record = AppRecord.current()
@@ -53,13 +56,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 self.hub.setPausedAll(!self.hub.allPaused)
             },
-            stop: { [weak self] in self?.hub.stopAll() }
+            stop: { [weak self] in
+                guard let self, StopConfirm.confirm(self.hub.shownEngines) else { return }
+                self.hub.stopAll()
+            }
         )
 
         if OnboardingModel.shouldShow() {
             showOnboarding()
-        } else if !AX.isTrusted || !Capture.hasPermission {
-            showSettings()
+        } else {
+            if !AX.isTrusted || !Capture.hasPermission { showSettings() }
+            // If the app moved since setup, agents' entries point at a bcu that's gone.
+            let bundle = Bundle.main.bundleURL
+            if !AgentSetup.isTemporaryLocation(bundle) {
+                let bcu = bundle.appendingPathComponent("Contents/MacOS/bcu").path
+                DispatchQueue.global(qos: .utility).async { AgentSetup.repairMovedServers(bcuPath: bcu) }
+            }
         }
         // The event tap needs Accessibility; install it as soon as it's granted.
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] timer in
@@ -107,10 +119,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Opened again from Finder, Spotlight or the Dock: the menu bar icon
+    /// may be hidden (behind the notch, or by a menu bar manager), so this
+    /// is the other way in.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if onboarding != nil { showOnboarding() } else { statusController?.reveal() }
+        return false
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         guard engineLock != nil else { return }
-        hub.shutdown()
+        // No new connections while the windows are being released.
         server?.stop()
+        hub.shutdown()
     }
 
     /// Expand one session's display. Only one expanded view shows at a time.
@@ -121,7 +142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let viewer = viewers[engine.sessionID] ?? ViewerWindowController(engine: engine, openSettings: { [weak self] in self?.showSettings() },
                                                                           openHistory: { [weak self] e in self?.showHistory(session: e.sessionID) })
         viewers[engine.sessionID] = viewer
-        if control { viewer.showInControl() } else { viewer.toggle() }
+        if control { viewer.showInControl() } else { viewer.show() }
     }
 
     /// A viewer whose display was torn down, or whose session a host app

@@ -41,11 +41,25 @@ enum Theme {
 enum LaunchAtLogin {
     static var isEnabled: Bool { SMAppService.mainApp.status == .enabled }
 
+    private static var lastError: String?
+
+    /// Why it isn't doing what the user asked, for Settings to show.
+    static var problem: String? {
+        if let lastError { return lastError }
+        // Registered, but macOS wants the user to allow it.
+        if SMAppService.mainApp.status == .requiresApproval {
+            return "Open at login needs your OK: allow Background Computer Use in System Settings > General > Login Items."
+        }
+        return nil
+    }
+
     static func set(_ on: Bool) {
         do {
             if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+            lastError = nil
         } catch {
             NSLog("[bcu] launch at login: \(error)")
+            lastError = "Couldn't turn \(on ? "on" : "off") Open at login: \(error.localizedDescription)"
         }
     }
 }

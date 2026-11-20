@@ -47,13 +47,13 @@ Your windows. With `app`, also lists that app's other windows so you can pick on
 
 ### borrow_window
 
-Move one of the user's existing windows onto your display. Use only for single-window apps whose accounts the user has allowed for this task; release_window puts it back exactly where it was.
+Move one of the user's existing windows onto your display. Use only for single-window apps whose accounts the user has allowed for this task; release_window puts it back exactly where it was. Fails, leaving the window with the user, if it can't be moved (full screen, say).
 
 - `window_id` (integer, required): Window id from list_windows.
 
 ### release_window
 
-Finish with a window: closes windows you opened, returns borrowed ones to the user.
+Finish with a window: closes windows you opened, returns borrowed ones to the user. Fails on a window handed off to the user until you call take_back.
 
 - `window_id` (integer, required): Your window.
 - `keep_open` (boolean): Leave an opened window open on your display instead of closing it.
@@ -75,7 +75,7 @@ Screenshot of one of your windows, or of your whole display when window_id is om
 
 ### click
 
-Click an element (by number) or a point (x, y in window points). Element clicks use accessibility actions when the element supports them. A point click takes key focus in the app for a moment, so while the user is in that app it first waits for a pause in their input (see priority).
+Click an element (by number) or a point (x, y in window points). Element clicks use accessibility actions when the element supports them; if the element is gone or its action fails, nothing else is done. A point click takes key focus in the app for a moment, so while the user is in that app it first waits for a pause in their input (see priority).
 
 - `window_id` (integer, required): Your window.
 - `button` (string): left (default) or right.
@@ -103,7 +103,7 @@ Perform a named accessibility action on an element, e.g. AXPress, AXShowMenu, AX
 
 ### type_text
 
-Type text into your window. With `element`, that element is focused first. Uses accessibility insertion when it works, otherwise keystrokes.
+Type text into your window. With `element`, that element is focused first, and if it can't be, nothing is typed. Uses accessibility insertion when it works, otherwise keystrokes.
 
 - `text` (string, required): Text to type. \n presses Return.
 - `window_id` (integer, required): Your window.
@@ -112,11 +112,11 @@ Type text into your window. With `element`, that element is focused first. Uses 
 
 ### press_key
 
-Press a key or shortcut in your window, e.g. key "return", or key "l" with modifiers ["cmd"]. While the user is in the same app it first waits for a pause in their input (see priority).
+Press a key or shortcut in your window, e.g. key "return", or key "l" with modifiers ["cmd"]. With modifiers a letter's case doesn't matter: add "shift" for Shift. While the user is in the same app it first waits for a pause in their input (see priority).
 
 - `key` (string, required): Key name: a letter or digit, return, tab, space, escape, delete, forward_delete, up, down, left, right, home, end, page_up, page_down, f1-f12, or a punctuation character.
 - `window_id` (integer, required): Your window.
-- `modifiers` (array of string): Any of cmd, shift, option, ctrl, fn.
+- `modifiers` (array of string): Any of cmd, shift, option, ctrl, fn. Any other name fails the step.
 - `priority` (string): Omit to wait for a pause in the user's input when they're in the same app (up to 3 s for clicks and scrolling; for as long as they keep typing, and after 30 s of that the step fails with nothing done). "now" skips the wait except for their typing, which goes first; only for steps that can't wait. (If the user has turned Safe typing off in Settings, typing is waited for up to 3 s like the rest and "now" skips that too.)
 
 ### scroll
@@ -124,8 +124,8 @@ Press a key or shortcut in your window, e.g. key "return", or key "l" with modif
 Scroll in your window at an element or point. Positive dy scrolls down.
 
 - `window_id` (integer, required): Your window.
-- `dx` (integer): Horizontal lines (positive = right).
-- `dy` (integer): Vertical lines (positive = down).
+- `dx` (integer): Horizontal wheel notches, about 3 lines each (positive = right). At most 100 per call.
+- `dy` (integer): Vertical wheel notches, about 3 lines each (positive = down). At most 100 per call.
 - `element` (integer): Optional element to scroll at.
 - `x` (number): Window-relative x.
 - `y` (number): Window-relative y.
