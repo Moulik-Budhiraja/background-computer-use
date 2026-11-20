@@ -142,10 +142,27 @@ public final class FocusGuard {
     private var shownSpaces: [CGDirectDisplayID: UInt64] = [:]
     private var userFrontWindow: CGWindowID?
     private var lastUserMouseDownMs = 0.0
-    /// Where the user's last click landed (the app whose window it was on),
-    /// and the windows on their screens just before it (id to title), for a
-    /// second look at an app that came forward just after it (`SecondLook`).
-    private var lastClick: (ms: Double, owner: pid_t?, windows: [CGWindowID: String]?) = (0, nil, nil)
+    /// The user's last click: where it landed, what it was on, and the
+    /// windows on their screens from just before it (id to title).
+    private struct Click {
+        var ms: Double
+        var point: CGPoint
+        /// Worked out off the event tap, right after the click (`noteClick`).
+        var target: ClickTarget = .pending
+        /// The window list's answer, first and fast, for when accessibility is slow.
+        var fallback: ClickTarget?
+        var element: ClickElement?
+        var windows: [CGWindowID: String]?
+    }
+    private var lastClick = Click(ms: -.infinity, point: .zero, target: .app(nil))
+    /// Agents' apps put back though the user had just clicked elsewhere,
+    /// with when and the click: if they then go to the app themselves, the
+    /// guard was probably wrong, and says so in the log.
+    private var putBackOnClick: [pid_t: (ms: Double, click: Click)] = [:]
+    /// Agents' apps left in front because the user had just clicked them or
+    /// pressed cmd+Tab, with when and the app they were in: if they go
+    /// straight back to it, the guard was probably wrong, and says so.
+    private var leftOnInput: [pid_t: (ms: Double, previous: pid_t)] = [:]
     /// The windows on the user's screens, looked at every 250 ms while
     /// agents work, so a click has a look from before anything it opened.
     private var screenLook: [CGWindowID: String]?
@@ -504,7 +521,25 @@ public final class FocusGuard {
         let now = nowMs()
         let until = taints[pid].map { $0.count > 0 ? "running" : "\(Int($0.until - now))ms left" } ?? "none"
         let restored = restoredAwayMs[pid].map { " restored=\(Int(now - $0))ms" } ?? ""
-        return "taint=\(until) key=\(Int(now - lastUserKeyMs))ms openKey=\(Int(now - lastUserOpenKeyMs))ms click=\(Int(now - lastUserMouseDownMs))ms\(restored)"
+        return "taint=\(until) key=\(Int(now - lastUserKeyMs))ms openKey=\(Int(now - lastUserOpenKeyMs))ms click=\(Int(now - lastUserMouseDownMs))ms clickOn=\(Self.describe(lastClick))\(restored)"
+    }
+
+    /// Where a click landed and on what, for the log: "T3 Code (AXButton)",
+    /// "Dock: Helium", "pending".
+    private static func describe(_ c: Click) -> String {
+        let name = { (p: pid_t) in NSRunningApplication(processIdentifier: p)?.localizedName ?? "pid \(p)" }
+        let what: String
+        switch c.target {
+        case .pending: what = "pending"
+        case .app(let p): what = p.map(name) ?? "nothing"
+        case .dock(let p): what = "Dock: " + (p.map { $0 == 0 ? "not running" : name($0) } ?? "unknown")
+        }
+        switch c.element {
+        case .link: return what + " (link)"
+        case .other(let role): return what + " (\(role))"
+        case .unknown: return what + " (unknown)"
+        case nil: return what
+        }
     }
 
     /// Whether `pid` becoming frontmost right now is the agent's doing
@@ -523,7 +558,99 @@ public final class FocusGuard {
             step: taints[pid].map { Attribution.Step(running: $0.count, settleUntilMs: $0.until, strict: $0.strict) },
             restoredAwayMs: restoredAwayMs[pid],
             lastMouseDownMs: lastUserMouseDownMs, lastSwitchKeyMs: lastUserSwitchKeyMs, lastOpenKeyMs: lastUserOpenKeyMs,
-            arrivedElsewhereMs: arrivals.last(where: { $0.pid != pid })?.ms ?? -.infinity)
+            arrivedElsewhereMs: arrivals.last(where: { $0.pid != pid })?.ms ?? -.infinity,
+            clickOnApp: lastClick.target.explains(pid))
+    }
+
+    /// Where the user's last click landed is worked out just after it, off
+    /// the event tap. Before deciding whether a click explains an app
+    /// coming forward, wait for that (50 ms at most; accessibility is
+    /// usually back in a few). Still not known: the window list's answer,
+    /// else nothing known, which explains no app.
+    private func settleClick() {
+        let deadline = nowMs() + 50
+        while true {
+            lock.lock()
+            let c = lastClick
+            if c.target != .pending || nowMs() - c.ms >= Attribution.switchMs { lock.unlock(); return }
+            if nowMs() >= deadline {
+                lastClick.target = c.fallback ?? .app(nil)
+                lock.unlock()
+                Log.info("guard: where your click landed took over 50 ms to work out; going by \(Self.describe(lastClick))")
+                return
+            }
+            lock.unlock()
+            usleep(2000)
+        }
+    }
+
+    /// What's under a click at `p` (global, top-left origin), asked of
+    /// accessibility, which skips windows clicks pass through, then up
+    /// through its parents: the app, the Dock icon's app, and whether it's
+    /// a link. Without accessibility, the window list's owner.
+    private static func whatWasClicked(at p: CGPoint, windowOwner: pid_t?) -> (ClickTarget, ClickElement?) {
+        func isDock(_ pid: pid_t) -> Bool { NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "com.apple.dock" }
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.25)
+        var hit: AXUIElement?
+        var pid: pid_t = 0
+        guard AXUIElementCopyElementAtPosition(system, Float(p.x), Float(p.y), &hit) == .success, let hit,
+              AXUIElementGetPid(hit, &pid) == .success, pid > 0 else {
+            guard let owner = windowOwner else { return (.app(nil), nil) }
+            return (isDock(owner) ? .dock(nil) : .app(owner), nil)
+        }
+        var roles: [String] = []
+        var url = false
+        var element: AXUIElement? = hit
+        for _ in 0..<8 {
+            guard let el = element else { break }
+            AXUIElementSetMessagingTimeout(el, 0.25)
+            let role = AX.string(el, "AXRole") ?? ""
+            roles.append(role)
+            if role == "AXDockItem" {
+                guard let link = AX.attr(el, "AXURL") as? URL else { return (.dock(nil), nil) }
+                let path = link.standardizedFileURL.path
+                let app = NSWorkspace.shared.runningApplications.first { $0.bundleURL?.standardizedFileURL.path == path }
+                return (.dock(app?.processIdentifier ?? 0), nil)
+            }
+            if AX.attr(el, "AXURL") != nil { url = true }
+            if role == "AXWindow" || role == "AXApplication" { break }
+            element = AX.element(el, "AXParent")
+        }
+        if isDock(pid) { return (.dock(nil), nil) }
+        return (.app(pid), ClickElement.classify(roles: roles, url: url))
+    }
+
+    /// An agent's app was put back though the user had just clicked
+    /// elsewhere (`click`). If the click opened something there after all (a
+    /// link in their chat app, opening in the browser an agent works in),
+    /// bring the app forward with it once it shows (`LateLook`).
+    private func lookLate(at pid: pid_t, click: Click, putBackMs: Double) {
+        let name = { (p: pid_t) in NSRunningApplication(processIdentifier: p)?.localizedName ?? "pid \(p)" }
+        DispatchQueue.global(qos: .userInitiated).async {
+            while nowMs() - click.ms < LateLook.forMs {
+                sleepMs(LateLook.everyMs)
+                self.lock.lock()
+                let now = self.lastClick.ms == click.ms ? self.lastClick : click
+                let inputSince = self.lastUserMouseDownMs > click.ms || self.lastUserKeyMs > putBackMs
+                self.lock.unlock()
+                guard LateLook.wanted(now.element) else { return }
+                let mine = Dictionary(WindowList.of(pid: pid, onScreenOnly: true)
+                    .filter { $0.layer == 0 && !Self.onAgentDisplay($0.id) }.map { ($0.id, $0.title) }, uniquingKeysWith: { a, _ in a })
+                let front = BCUFrontProcessPID() == pid
+                let facts = LateLook.Facts(front: front, inputSince: inputSince, opened: LateLook.opened(before: now.windows, now: mine))
+                guard let window = LateLook.bringForward(facts) else {
+                    if front || inputSince { return }
+                    continue
+                }
+                self.lock.lock(); self.putBackOnClick[pid] = nil; self.lock.unlock()
+                // Theirs: the switch the guard makes for them counts as their cmd+Tab.
+                self.noteUserSwitch()
+                _ = BCUSetFrontProcess(pid, window, 0x200)
+                self.record("\(name(pid)) opened something from your click \(Int(nowMs() - click.ms)) ms ago in \(Self.describe(now)); brought it forward")
+                return
+            }
+        }
     }
 
     /// The user's windows on their screens: id to title.
@@ -531,45 +658,6 @@ public final class FocusGuard {
         var out: [CGWindowID: String] = [:]
         for w in WindowList.all(onScreenOnly: true) where w.layer == 0 && !onAgentDisplay(w.id) { out[w.id] = w.title }
         return out
-    }
-
-    /// `pid` came forward during an agent's step on it, put down to a click
-    /// of the user's: look again in a moment, and if the click was in the
-    /// app they were in and opened nothing here, and they haven't touched
-    /// this app since, it was the agent's step after all: put their app
-    /// back. Better late than leaving them in the agent's app.
-    private func scheduleSecondLook(_ pid: pid_t) {
-        lock.lock()
-        let previous = (pid: userFrontPid, window: userFrontWindow)
-        let click = lastClick
-        lock.unlock()
-        guard previous.pid != 0, previous.pid != pid else { return }
-        let arrivedMs = nowMs()
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(Int(SecondLook.delayMs))) {
-            self.lock.lock()
-            let inputSince = self.lastUserMouseDownMs > arrivedMs || self.lastUserKeyMs > arrivedMs
-            // The click's owner is worked out off the event tap, right after it.
-            let owner = self.lastClick.ms == click.ms ? self.lastClick.owner : click.owner
-            let before = click.windows
-            self.lock.unlock()
-            let mine = Dictionary(uniqueKeysWithValues: WindowList.of(pid: pid, onScreenOnly: true)
-                .filter { $0.layer == 0 && !Self.onAgentDisplay($0.id) }.map { ($0.id, $0.title) })
-            let look = SecondLook.Facts(stillFront: BCUFrontProcessPID() == pid, clickInPrevious: owner == previous.pid,
-                                        inputSince: inputSince, openedForUser: SecondLook.opened(before: before, now: mine))
-            let name = { (p: pid_t) in NSRunningApplication(processIdentifier: p)?.localizedName ?? "pid \(p)" }
-            guard SecondLook.restore(look) else {
-                if look.stillFront {
-                    Log.info("guard: second look at \(name(pid)): left in front (click in \(owner.map(name) ?? "nothing known"), input since \(look.inputSince), opened for the user \(look.openedForUser))")
-                }
-                return
-            }
-            self.lock.lock()
-            self.userFrontPid = previous.pid
-            self.userFrontWindow = previous.window
-            self.lock.unlock()
-            self.record("second look: \(name(pid)) came forward during an agent's step just after a click in \(name(previous.pid)) that opened nothing in it; put \(name(previous.pid)) back in front")
-            self.restoreUserFront(from: pid, reason: "second look", immediate: true)
-        }
     }
 
     /// When the user last clicked or pressed a key that could open a window
@@ -706,7 +794,10 @@ public final class FocusGuard {
     }
 
     private func frontChanged(to pid: pid_t) {
-        let agent = pid != getpid() && pid != userFront && agentCaused(pid)
+        if pid != getpid() { settleClick() }
+        let f = facts(pid)
+        let user = userFront
+        let agent = pid != getpid() && pid != user && Attribution.agentCaused(f)
         lock.lock()
         frontSeq += 1
         frontLog.append(FrontChange(seq: frontSeq, ms: nowMs(), pid: pid, agent: agent))
@@ -714,10 +805,31 @@ public final class FocusGuard {
         lock.unlock()
         if agent {
             restoreUserFront(from: pid, reason: "self-activation", immediate: true)
+            notePutBack(pid, f)
         } else if pid != getpid() {
-            if SecondLook.wanted(facts(pid)) { scheduleSecondLook(pid) }
+            // Left in front during an agent's step because of their click on
+            // it or their cmd+Tab: if they go straight back, say so (`arrived`).
+            if Attribution.acting(f) && pid != user && user != 0 {
+                lock.lock(); leftOnInput[pid] = (f.nowMs, user); lock.unlock()
+            }
             arrived(pid)
         }
+    }
+
+    /// The guard put `pid` back. If the user had just clicked somewhere
+    /// else, log it, and look a while for what the click may have opened
+    /// there (`lookLate`). Once per click: Chromium often comes forward twice.
+    private func notePutBack(_ pid: pid_t, _ f: Attribution.Facts) {
+        lock.lock()
+        let c = lastClick
+        let recent = f.nowMs - c.ms < Attribution.switchMs && c.ms > f.arrivedElsewhereMs
+        let seen = putBackOnClick[pid]?.click.ms == c.ms
+        if recent && !seen { putBackOnClick[pid] = (f.nowMs, c) }
+        lock.unlock()
+        guard recent, !seen else { return }
+        let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"
+        Log.info("guard: put \(name) back though you clicked \(Int(f.nowMs - c.ms)) ms before, in \(Self.describe(c))")
+        lookLate(at: pid, click: c, putBackMs: f.nowMs)
     }
 
     /// Where the record of front-app changes stands; pass it to `frontReport` later.
@@ -753,7 +865,14 @@ public final class FocusGuard {
     /// The user came to `pid`: they switched to it, it wasn't an agent's doing.
     private func arrived(_ pid: pid_t) {
         let agentApp = parkedKey(pid) != nil || WindowManager.agentPids().contains(pid)
+        let now = nowMs()
         lock.lock()
+        // Where the guard was probably wrong: they went to an app it had
+        // just put back, or straight back from one it had left in front.
+        let putBack = putBackOnClick.removeValue(forKey: pid)
+        let wentBack = leftOnInput.filter { $0.value.previous == pid && now - $0.value.ms < 3000 }
+        leftOnInput = leftOnInput.filter { $0.value.previous != pid && now - $0.value.ms < 3000 }
+        putBackOnClick = putBackOnClick.filter { now - $0.value.ms < 5000 }
         let known = userFrontPid == pid
         // (Once per arrival: NSWorkspace's word of the same change comes here too.)
         if !known, arrivals.last?.pid != pid {
@@ -762,6 +881,13 @@ public final class FocusGuard {
         }
         if agentApp { arriving[pid] = nowMs() }
         lock.unlock()
+        let name = { (p: pid_t) in NSRunningApplication(processIdentifier: p)?.localizedName ?? "pid \(p)" }
+        if let putBack, now - putBack.ms < 5000 {
+            Log.info("guard: probably wrong: you went to \(name(pid)) yourself \(Int(now - putBack.ms)) ms after it was put back on your click in \(Self.describe(putBack.click))")
+        }
+        for (app, left) in wentBack {
+            Log.info("guard: probably wrong: \(name(app)) was left in front on your click or cmd+Tab, and you went back to \(name(pid)) after \(Int(now - left.ms)) ms")
+        }
         if agentApp {
             arriveQueue.async {
                 self.handOver(pid)
@@ -892,8 +1018,21 @@ public final class FocusGuard {
     }
 
     /// NSWorkspace's word that an app became active, about 25 ms after the
-    /// front watch saw it: the backup for both of its jobs.
+    /// front watch saw it: the backup for both of its jobs. Right after a
+    /// click whose target isn't known yet, it waits for that off the main
+    /// thread, so both decide alike.
     private func activated(_ app: NSRunningApplication) {
+        lock.lock()
+        let pending = lastClick.target == .pending && nowMs() - lastClick.ms < Attribution.switchMs
+        lock.unlock()
+        guard pending else { return handleActivated(app) }
+        DispatchQueue.global(qos: .userInteractive).async {
+            self.settleClick()
+            self.handleActivated(app)
+        }
+    }
+
+    private func handleActivated(_ app: NSRunningApplication) {
         let pid = app.processIdentifier
         Log.info("guard: activated \(app.localizedName ?? "?") pid \(pid) tainted=\(isTainted(pid)) userFront=\(userFront) agentCaused=\(agentCaused(pid)) \(debugCause(pid))")
         if pid == getpid() { return }
@@ -1399,15 +1538,30 @@ public final class FocusGuard {
 
     /// The app whose window is on top at a global point (not this app's
     /// click-through covers).
-    /// Note where a click landed, off the event tap: the window list takes a
-    /// few milliseconds, and the windows under the point don't change that fast.
+    /// Note where a click landed and what on, off the event tap: the window
+    /// list takes a few milliseconds, accessibility a few more (0.25 s at
+    /// most for a busy app), and the windows under the point don't change
+    /// that fast. Accessibility only while agents work: it's asked only to
+    /// tell whether a click explains an agent's app coming forward.
     private func noteClick(at p: CGPoint) {
         let ms = nowMs()
-        lock.lock(); lastClick = (ms, nil, screenLook); lock.unlock()
+        lock.lock(); let look = screenLook; lastClick = Click(ms: ms, point: p, windows: look); lock.unlock()
         clickQueue.async {
+            let windows = look ?? Self.userScreenWindows()
             let owner = Self.windowOwner(at: p)
+            let fallback: ClickTarget = owner.map { NSRunningApplication(processIdentifier: $0)?.bundleIdentifier == "com.apple.dock" ? .dock(nil) : .app($0) } ?? .app(nil)
             self.lock.lock()
-            if self.lastClick.ms == ms { self.lastClick.owner = owner }
+            if self.lastClick.ms == ms { self.lastClick.fallback = fallback; self.lastClick.windows = windows }
+            self.lock.unlock()
+            let busy = !WindowManager.agentPids().isEmpty || !self.activeTaints.isEmpty
+            let (target, element) = busy ? Self.whatWasClicked(at: p, windowOwner: owner) : (fallback, nil)
+            self.lock.lock()
+            if self.lastClick.ms == ms {
+                // (settleClick may have given up waiting and gone by the
+                // window list; what comes after goes by this.)
+                self.lastClick.target = target
+                self.lastClick.element = element
+            }
             self.lock.unlock()
         }
     }

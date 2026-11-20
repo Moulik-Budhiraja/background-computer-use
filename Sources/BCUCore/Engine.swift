@@ -2624,6 +2624,10 @@ public final class Engine {
         // the start, so wait for it to say it's done, 3 s at most, with
         // nothing covered or held meanwhile.
         if covered { closeCover(); covered = false }
+        // The browser brings itself forward while it loads, not only when
+        // handed the URL: the guard counts that as the step's until it's done.
+        focusGuard.beginAction(pid: w.pid, cause: "loading a URL")
+        defer { focusGuard.endAction(pid: w.pid) }
         let since = nowMs()
         var loading: Bool? = true
         while loading == true && nowMs() - since < 3000 {
