@@ -550,7 +550,7 @@ enum HostInput {
             let down = type == "keydown"
             let code = a.string("code") ?? ""
             let key = a.string("key") ?? ""
-            guard let keyCode = keyCode(code: code, key: key) else { throw ToolError("unknown key code \(code)") }
+            guard let keyCode = keyCode(code: code, key: key, command: flags.contains(.maskCommand)) else { throw ToolError("unknown key code \(code)") }
             // cmd+Q would quit the whole app, the user's own windows included.
             if flags.contains(.maskCommand) && keyCode == ((try? KeyMap.code(for: "q", command: true).0) ?? 12) { return }
             guard let e = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: down) else { return }
@@ -601,10 +601,13 @@ enum HostInput {
         "NumpadEnter": 76, "NumpadEqual": 81, "NumLock": 71,
     ]
 
-    static func keyCode(code: String, key: String) -> CGKeyCode? {
+    /// `command`: cmd is held, which some layouts map differently (see
+    /// `KeyMap.code(for:command:)`, which `lookup` is).
+    static func keyCode(code: String, key: String, command: Bool = false,
+                        lookup: (String, Bool) throws -> (CGKeyCode, Bool) = { try KeyMap.code(for: $0, command: $1) }) -> CGKeyCode? {
         if let c = codes[code] { return c }
         if code.hasPrefix("Key"), code.count == 4, let ch = code.last, let c = KeyMap.chars[Character(ch.lowercased())] { return c }
         if code.hasPrefix("Digit"), code.count == 6, let ch = code.last, let c = KeyMap.chars[ch] { return c }
-        return try? KeyMap.code(for: key).0
+        return try? lookup(key, false).0
     }
 }
