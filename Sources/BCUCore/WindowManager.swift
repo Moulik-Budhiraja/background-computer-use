@@ -1055,8 +1055,11 @@ public final class WindowManager {
     /// A session has the window again (`register`): not kept any more, so
     /// its sweep looks after it.
     static func ownedAgain(_ id: CGWindowID) { keptLock.lock(); keptOpen.remove(id); keptLock.unlock() }
-    /// A borrowed window went back to the user (`release`).
-    static func returnedToUser(_ id: CGWindowID) {}
+    /// A borrowed window went back to the user (`release`): theirs again,
+    /// so kept, as one released with `keep_open` is. It may have been
+    /// opened by an agent (and kept) before it was borrowed, and cleanup
+    /// mustn't close it.
+    static func returnedToUser(_ id: CGWindowID) { keep(id) }
 
     /// What cleanup does with a window nobody has left on an agent display:
     /// close one an agent opened or caught (and didn't keep open); put any
