@@ -33,7 +33,9 @@ public enum UpdateGate {
             if s.handedOff || s.userInControl { return false }
             // A call just ran; give the agent a moment to make its next.
             if s.msSinceLastCall < 3000 { return false }
-            return !s.hasWindows || s.msSinceLastCall >= quietMs
+            // The user handing windows back counts as a call: the agent
+            // may be waiting for that to carry on.
+            return !s.hasWindows || min(s.msSinceLastCall, s.msSinceUserReturned) >= quietMs
         }
     }
 }

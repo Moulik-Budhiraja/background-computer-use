@@ -415,10 +415,10 @@ public final class Engine {
     static func refusal(tool: String, userInControl: Bool, paused: Bool, notes: () -> String?) -> String? {
         // Closing a window the user is working in would pull it out from under them.
         if userInControl && (!readOnlyTools.contains(tool) || tool == "release_window") {
-            return "The user took over your display and is using your windows. Wait and retry later, or tell the user you're blocked."
+            return "The user took over your display and is using your windows. Wait and retry later, or tell the user you're blocked." + (notes() ?? "")
         }
         if paused && !readOnlyTools.contains(tool) {
-            return "Paused by the user from the menu bar. Wait and retry later, or tell the user you're blocked."
+            return "Paused by the user from the menu bar. Wait and retry later, or tell the user you're blocked." + (notes() ?? "")
         }
         return nil
     }
