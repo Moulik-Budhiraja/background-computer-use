@@ -196,7 +196,13 @@ public final class SocketServer {
     static func windowIDs(in args: JSONObject) -> [CGWindowID]? {
         var objects = [args]
         objects += (args["actions"] as? [JSONObject]) ?? []
-        return objects.compactMap { Args($0).int("window_id").flatMap { CGWindowID(exactly: $0) } }
+        var ids: [CGWindowID] = []
+        for o in objects where o["window_id"] != nil && !(o["window_id"] is NSNull) {
+            // The hub routes by the number's low 32 bits; anything else isn't a window.
+            guard let n = Args(o).int("window_id"), let id = CGWindowID(exactly: n) else { return nil }
+            ids.append(id)
+        }
+        return ids
     }
 
     private func serve(_ connection: SocketConnection) {
