@@ -268,8 +268,10 @@ public final class RemoteControl {
 
     /// May a press keep acting on its window? `onDisplay`: the windows on
     /// the agent display now.
+    /// Only while its window is still on the display: one the session gave
+    /// back (and another app's agent may have borrowed since) is left alone.
     static func pressStillHere(_ window: CGWindowID, onDisplay: [WindowInfo]) -> Bool {
-        true
+        onDisplay.contains { $0.id == window }
     }
 
     /// Forget a press without acting on its window again.
