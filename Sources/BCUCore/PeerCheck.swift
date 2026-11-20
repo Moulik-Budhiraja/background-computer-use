@@ -99,8 +99,13 @@ public struct PeerPolicy: Equatable {
     }
 
     /// A `--trust-client` path as the policy compares it with peers' paths.
+    /// A peer running an app's main executable has the app's path, so that
+    /// executable (`process.execPath` in Electron) stands for its app.
     public static func trustedPath(_ path: String, bundleExecutable: (String) -> String?) -> String {
-        path
+        guard let range = path.range(of: ".app/Contents/MacOS/", options: .backwards),
+              !path[range.upperBound...].contains("/") else { return path }
+        let app = String(path[..<range.lowerBound]) + ".app"
+        return bundleExecutable(app) == path ? app : path
     }
 
     public static func path(_ path: String, isInside dir: String) -> Bool {
