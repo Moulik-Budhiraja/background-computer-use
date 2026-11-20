@@ -375,3 +375,37 @@ final class FrontGateWindowServerTests: XCTestCase {
         XCTAssertEqual(counts, [:])
     }
 }
+
+extension FrontGateWindowServerTests {
+    /// The watchdog holding the record lock doesn't hold up a click in the
+    /// input tap: the click goes on at once, and the agent's app is let
+    /// through as soon as the lock is free.
+    func testAClickDoesntWaitForTheWatchdogsLock() {
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        let held = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            _ = FrontGate.withRecordLock(wait: true) { () -> Bool in
+                held.signal()
+                release.wait()
+                return true
+            }
+        }
+        held.wait()
+        let start = nowMs()
+        gate.pointer(down: true, ms: 30)
+        XCTAssertLessThan(nowMs() - start, 100)
+        // Read from the fake list, not `blocks`: the change waiting for the
+        // record lock holds the gate's lock, and `blocks` would wait on it
+        // while the record lock waits on this thread.
+        XCTAssertFalse(list.contains(psn(agent)), "not let through while the watchdog has the lock")
+        release.signal()
+        let deadline = nowMs() + 2000
+        while gate.blocks(agent) && nowMs() < deadline { sleepMs(10) }
+        XCTAssertFalse(gate.blocks(agent))
+        XCTAssertTrue(list.contains(psn(agent)))
+        gate.pointer(down: false, ms: 0)
+        gate.stop()
+    }
+}
