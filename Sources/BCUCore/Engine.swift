@@ -313,7 +313,7 @@ public final class Engine {
     /// The user gave the agent its windows back, as a state goes from `was`
     /// to `now`: the update gate counts it like a call.
     static func userReturns(paused: (was: Bool, now: Bool), inControl: (was: Bool, now: Bool)) -> Bool {
-        inControl.was && !inControl.now
+        (paused.was && !paused.now) || (inControl.was && !inControl.now)
     }
 
     public var status: EngineStatus {
