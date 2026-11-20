@@ -10,7 +10,7 @@ public enum JSONRPCLine: Equatable {
 
     public static func classify(_ line: String) -> JSONRPCLine {
         guard !line.trimmingCharacters(in: .whitespaces).isEmpty else { return .blank }
-        guard let data = line.data(using: .utf8), let parsed = try? JSONSerialization.jsonObject(with: data) else {
+        guard let data = line.data(using: .utf8), let parsed = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed) else {
             return .invalid(code: -32700, message: "parse error: not JSON")
         }
         guard let message = parsed as? JSONObject else {
