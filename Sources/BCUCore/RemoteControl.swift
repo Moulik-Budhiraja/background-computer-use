@@ -71,14 +71,17 @@ public final class RemoteControl {
     /// answering doesn't freeze the viewer.
     static let appLockWaitS: TimeInterval = 2
 
-    /// How long an event of this type waits for the app's input lock.
-    static func appLockWait(_ type: CGEventType) -> TimeInterval { appLockWaitS }
+    /// How long an event of this type waits for the app's input lock. A
+    /// pointer move doesn't: moves queue one behind another, each waiting
+    /// would hold up the viewer's input to every app, and the next move
+    /// replaces a dropped one.
+    static func appLockWait(_ type: CGEventType) -> TimeInterval { type == .mouseMoved ? 0 : appLockWaitS }
 
     /// Takes the app's input lock (`Engine.inputLock`), as an agent's step
     /// does; returns what lets it go.
-    private func lockApp(_ pid: pid_t, wait: TimeInterval = RemoteControl.appLockWaitS) -> () -> Void {
+    private func lockApp(_ pid: pid_t) -> () -> Void {
         let lock = Engine.inputLock(pid)
-        let locked = lock.lock(before: Date().addingTimeInterval(wait))
+        let locked = lock.lock(before: Date().addingTimeInterval(Self.appLockWaitS))
         return { if locked { lock.unlock() } }
     }
 
@@ -283,8 +286,9 @@ public final class RemoteControl {
             scheduleRelease()
         case .mouseMoved:
             guard press == nil, let w = window(at: point) else { return }
-            let unlock = lockApp(w.pid, wait: Self.appLockWait(.mouseMoved))
-            defer { unlock() }
+            let lock = Engine.inputLock(w.pid)
+            guard lock.lock(before: Date().addingTimeInterval(Self.appLockWait(.mouseMoved))) else { return }
+            defer { lock.unlock() }
             post(.mouseMoved, w, point, phase: 2, state: 0, button: 0, flags: flags)
             lastMove = point
         default:

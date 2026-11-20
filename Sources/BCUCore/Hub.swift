@@ -111,15 +111,18 @@ public final class Hub {
         e.agentLeft(graceMs: Self.orphanGraceMs) { [weak self, weak e] in e.flatMap { self?.isAttached($0) } ?? true }
     }
 
-    /// Whether a session's agent is still around.
+    /// Whether a session's agent is still around: a connection carries its
+    /// calls, or a relative's does that has used its windows. A subagent's
+    /// connection closes when it's idle (`bcu mcp`), while its parent may
+    /// still be working in a window the subagent opened.
     static func present(_ id: String, attached: [String: Int], usedBy: [String: Set<String>]) -> Bool {
-        (attached[id] ?? 0) > 0
+        (attached[id] ?? 0) > 0 || (usedBy[id] ?? []).contains { (attached[$0] ?? 0) > 0 }
     }
 
     /// Sessions whose agent is gone and that nobody is left to use once
-    /// `id`'s last connection has gone.
+    /// `id`'s last connection has gone: their windows go after the grace.
     static func leftWithNobody(after id: String, attached: [String: Int], usedBy: [String: Set<String>]) -> [String] {
-        []
+        usedBy.filter { $0.key != id && $0.value.contains(id) && !present($0.key, attached: attached, usedBy: usedBy) }.map(\.key).sorted()
     }
 
     /// Whether a connection carries this session's calls now, under any id
