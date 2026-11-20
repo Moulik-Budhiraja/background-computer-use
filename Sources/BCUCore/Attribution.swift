@@ -107,6 +107,14 @@ enum ClickTarget: Equatable {
         case .dock(let app): return app == nil || app == pid
         }
     }
+
+    /// The window list's answer, for when accessibility is too slow: the
+    /// apps whose windows are under the click, top first, and which of them
+    /// is the Dock.
+    static func listed(_ owners: [(pid: pid_t, dock: Bool)]) -> ClickTarget {
+        guard let top = owners.first else { return .app(nil) }
+        return top.dock ? .dock(nil) : .app(top.pid)
+    }
 }
 
 /// What the user clicked, as accessibility tells it.

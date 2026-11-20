@@ -88,6 +88,17 @@ final class AttributionTests: XCTestCase {
         XCTAssertTrue(ClickTarget.pending.explains(42))
     }
 
+    /// On macOS 26 and later the Dock has a window over the whole screen
+    /// that clicks pass through. With accessibility too slow, the window
+    /// list put a click in TextEdit down to the Dock, which explains any
+    /// app: the browser stayed in front.
+    func testTheWindowListLooksPastTheDocksWindowOverTheScreen() {
+        XCTAssertEqual(ClickTarget.listed([(pid: 5, dock: true), (pid: 42, dock: false)]), .app(42))
+        XCTAssertEqual(ClickTarget.listed([(pid: 42, dock: false)]), .app(42))
+        XCTAssertEqual(ClickTarget.listed([(pid: 5, dock: true)]), .dock(nil))
+        XCTAssertEqual(ClickTarget.listed([]), .app(nil))
+    }
+
     func testWhatWasClickedIsALinkWhenAnythingAroundItIsOne() {
         XCTAssertEqual(ClickElement.classify(roles: ["AXStaticText", "AXLink", "AXGroup"], url: false), .link)
         XCTAssertEqual(ClickElement.classify(roles: ["AXStaticText", "AXGroup"], url: true), .link)

@@ -587,8 +587,8 @@ public final class FocusGuard {
     /// What's under a click at `p` (global, top-left origin), asked of
     /// accessibility, which skips windows clicks pass through, then up
     /// through its parents: the app, the Dock icon's app, and whether it's
-    /// a link. Without accessibility, the window list's owner.
-    private static func whatWasClicked(at p: CGPoint, windowOwner: pid_t?) -> (ClickTarget, ClickElement?) {
+    /// a link. Without accessibility, the window list's answer (`listed`).
+    private static func whatWasClicked(at p: CGPoint, listed: ClickTarget) -> (ClickTarget, ClickElement?) {
         func isDock(_ pid: pid_t) -> Bool { NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "com.apple.dock" }
         let system = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(system, 0.25)
@@ -596,8 +596,7 @@ public final class FocusGuard {
         var pid: pid_t = 0
         guard AXUIElementCopyElementAtPosition(system, Float(p.x), Float(p.y), &hit) == .success, let hit,
               AXUIElementGetPid(hit, &pid) == .success, pid > 0 else {
-            guard let owner = windowOwner else { return (.app(nil), nil) }
-            return (isDock(owner) ? .dock(nil) : .app(owner), nil)
+            return (listed, nil)
         }
         var roles: [String] = []
         var url = false
@@ -1543,18 +1542,27 @@ public final class FocusGuard {
     /// most for a busy app), and the windows under the point don't change
     /// that fast. Accessibility only while agents work: it's asked only to
     /// tell whether a click explains an agent's app coming forward.
+    /// What the window list says is under a click at `p` (see `ClickTarget.listed`).
+    private static func listedTarget(at p: CGPoint) -> ClickTarget {
+        let me = getpid()
+        let top = Int(CGWindowLevelForKey(.mainMenuWindow))
+        let owners = WindowList.all(onScreenOnly: true)
+            .filter { $0.pid != me && $0.alpha > 0 && $0.layer < top && $0.bounds.contains(p) }
+            .map { (pid: $0.pid, dock: NSRunningApplication(processIdentifier: $0.pid)?.bundleIdentifier == "com.apple.dock") }
+        return ClickTarget.listed(owners)
+    }
+
     private func noteClick(at p: CGPoint) {
         let ms = nowMs()
         lock.lock(); let look = screenLook; lastClick = Click(ms: ms, point: p, windows: look); lock.unlock()
         clickQueue.async {
             let windows = look ?? Self.userScreenWindows()
-            let owner = Self.windowOwner(at: p)
-            let fallback: ClickTarget = owner.map { NSRunningApplication(processIdentifier: $0)?.bundleIdentifier == "com.apple.dock" ? .dock(nil) : .app($0) } ?? .app(nil)
+            let fallback = Self.listedTarget(at: p)
             self.lock.lock()
             if self.lastClick.ms == ms { self.lastClick.fallback = fallback; self.lastClick.windows = windows }
             self.lock.unlock()
             let busy = !WindowManager.agentPids().isEmpty || !self.activeTaints.isEmpty
-            let (target, element) = busy ? Self.whatWasClicked(at: p, windowOwner: owner) : (fallback, nil)
+            let (target, element) = busy ? Self.whatWasClicked(at: p, listed: fallback) : (fallback, nil)
             self.lock.lock()
             if self.lastClick.ms == ms {
                 // (settleClick may have given up waiting and gone by the
