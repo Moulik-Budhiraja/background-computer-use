@@ -144,7 +144,7 @@ final class SettingsModel: ObservableObject {
     func clearHistory() {
         let alert = NSAlert()
         alert.messageText = "Clear History?"
-        alert.informativeText = "This deletes every recording of what agents did on their screens. Recordings being made right now are kept."
+        alert.informativeText = "Deletes every recording."
         alert.addButton(withTitle: "Clear History")
         alert.addButton(withTitle: "Cancel")
         alert.buttons[0].hasDestructiveAction = true
@@ -209,7 +209,7 @@ struct SettingsView: View {
                 }
                 if model.screenRecordingNeedsRestart {
                     HStack {
-                        Text("Screen Recording is on, but works once the app reopens.")
+                        Text("Reopen to finish turning it on.")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                         Spacer()
@@ -261,9 +261,6 @@ struct SettingsView: View {
                     .generalRow()
                     RowDivider(inset: 14)
                     HStack {
-                        Text("Recordings are kept up to a week, or less once they reach this size.")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
                         Spacer()
                         Button("Clear History…", action: model.clearHistory)
                             .controlSize(.small)

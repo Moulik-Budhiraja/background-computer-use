@@ -275,7 +275,7 @@ struct HistoryView: View {
         VStack(spacing: 8) {
             Image(systemName: "clock.arrow.circlepath").font(.system(size: 20, weight: .regular))
             Text("No recordings yet").font(.system(size: 13, weight: .semibold)).foregroundStyle(.white.opacity(0.8))
-            Text("Whatever agents do on their screens shows up here, kept up to a week or until History reaches its size limit.")
+            Text("Whatever agents do on their screens shows up here for a week.")
                 .font(.system(size: 12))
         }
         .foregroundStyle(.white.opacity(0.45))

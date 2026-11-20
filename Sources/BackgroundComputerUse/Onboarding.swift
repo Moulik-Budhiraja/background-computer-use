@@ -361,10 +361,10 @@ struct OnboardingView: View {
         case .accessibility: return "Turn on Background Computer Use in this list."
         case .screenRecording:
             if stillOff {
-                return "Check that Background Computer Use is on in the Screen Recording list. If it is, turn it off and on again, then reopen."
+                return "Turn it off and on again in the list, then reopen."
             }
             if needsRestart { return "macOS won't let it record until it restarts." }
-            return "Same thing, but in the Screen Recording list. If macOS later asks about System Audio Recording, allow it too: it keeps sound from agents' apps off your speakers."
+            return "Same thing, but in the Screen Recording list."
         case .browser: return "Allow it to control \(model.browser?.name ?? "your browser") so new windows open on the agent's screen."
         case .connect: return "Pick the agents you want to use this with."
         case .done: return "Ask an agent to use any app. You can watch it from the menu bar."
