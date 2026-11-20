@@ -264,7 +264,7 @@ public enum KeyMap {
     static func shortcut(_ key: String, modifiers: [String],
                          lookup: (String, Bool) throws -> (CGKeyCode, Bool) = { try KeyMap.code(for: $0, command: $1) }) throws -> (CGKeyCode, CGEventFlags) {
         let flags = flags(modifiers)
-        let (code, _) = try lookup(key, false)
+        let (code, _) = try lookup(key, flags.contains(.maskCommand))
         return (code, flags)
     }
 
