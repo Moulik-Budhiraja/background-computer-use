@@ -65,9 +65,9 @@ public struct PeerPolicy: Equatable {
         self.trusted = trusted
     }
 
-    /// `shipsBCU(bundle, team)`: that app bundle has a `bcu` signed by that
-    /// team. Asked only when nothing cheaper decided.
-    public func decide(_ peer: PeerIdentity?, shipsBCU: (String, String) -> Bool) -> PeerDecision {
+    /// `shipsBCU(bundle, peer)`: that app bundle has a `bcu` signed by the
+    /// peer's team (`HostCheck.vouches`). Asked only when nothing cheaper decided.
+    public func decide(_ peer: PeerIdentity?, shipsBCU: (String, PeerIdentity) -> Bool) -> PeerDecision {
         guard let peer else { return .deny("the connecting process went away or its code signature couldn't be read") }
         let name = peer.path ?? "the connecting process"
         for t in trusted {
@@ -87,7 +87,7 @@ public struct PeerPolicy: Equatable {
             return .allow(.owner)
         }
         // Another developer's app that ships bcu, signed by that developer.
-        if let theirs = peer.team, let app = peer.path.flatMap(Self.outermostApp), shipsBCU(app, theirs) {
+        if let theirs = peer.team, let app = peer.path.flatMap(Self.outermostApp), shipsBCU(app, peer) {
             return .allow(.app(team: theirs))
         }
         return .deny("\(name) isn't part of an app that ships bcu, signed by the same developer")
@@ -96,6 +96,11 @@ public struct PeerPolicy: Equatable {
     /// A developer team ID: ten uppercase letters and digits.
     public static func isTeamID(_ s: String) -> Bool {
         s.count == 10 && s.allSatisfy { ("A"..."Z").contains($0) || ("0"..."9").contains($0) }
+    }
+
+    /// A `--trust-client` path as the policy compares it with peers' paths.
+    public static func trustedPath(_ path: String, bundleExecutable: (String) -> String?) -> String {
+        path
     }
 
     public static func path(_ path: String, isInside dir: String) -> Bool {
@@ -138,7 +143,12 @@ public enum PeerInspector {
         let me = SecCodeCopySelf([], &code) == errSecSuccess ? code.map(identity(of:)) : nil
         let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
         let home = PeerPolicy.outermostApp(exe) ?? (exe as NSString).deletingLastPathComponent
-        let resolved = trusted.map { PeerPolicy.isTeamID($0) ? $0 : URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
+        let resolved = trusted.map { t -> String in
+            if PeerPolicy.isTeamID(t) { return t }
+            return PeerPolicy.trustedPath(URL(fileURLWithPath: t).resolvingSymlinksInPath().path) {
+                Bundle(path: $0)?.executableURL?.resolvingSymlinksInPath().path
+            }
+        }
         return PeerPolicy(team: me?.team, cdhash: me?.cdhash, home: home, trusted: resolved)
     }
 
@@ -173,29 +183,87 @@ public enum PeerInspector {
     private static let cacheLock = NSLock()
     nonisolated(unsafe) private static var shipping: Set<String> = []
 
-    /// The app bundle has a `bcu` (see `PeerPolicy.bcuLocations`) signed by
-    /// that team. Remembered once true.
-    public static func shipsBCU(app: String, team: String) -> Bool {
-        let key = "\(team) \(app)"
+    /// `HostCheck.vouches` on the real disk. Remembered once true.
+    public static func shipsBCU(app: String, peer: PeerIdentity) -> Bool {
+        let key = "\(peer.team ?? "") \(app)"
         cacheLock.lock()
         let known = shipping.contains(key)
         cacheLock.unlock()
         if known { return true }
-        guard let req = requirement(team: team) else { return false }
+        guard HostCheck.vouches(app: app, peer: peer, disk: RealDisk()) else { return false }
+        cacheLock.lock(); shipping.insert(key); cacheLock.unlock()
+        return true
+    }
+
+    /// Code on disk, read through the Security framework.
+    struct RealDisk: CodeOnDisk {
+        func isSealedApp(_ path: String, team: String) -> Bool {
+            guard let req = PeerInspector.requirement(team: team), let code = staticCode(path) else { return false }
+            return SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), req) == errSecSuccess
+        }
+
+        func isSigned(_ path: String, team: String) -> Bool {
+            guard let req = PeerInspector.requirement(team: team), let code = staticCode(path) else { return false }
+            return SecStaticCodeCheckValidity(code, [], req) == errSecSuccess
+        }
+
+        func cdhashes(_ path: String) -> Set<Data> {
+            // Each slice of a universal binary has its own; a process under
+            // Rosetta runs the Intel one.
+            var hashes: Set<Data> = []
+            for arch in [nil, "arm64", "x86_64"] as [String?] {
+                var code: SecStaticCode?
+                let attrs = (arch.map { [kSecCodeAttributeArchitecture: $0] } ?? [:]) as CFDictionary
+                guard SecStaticCodeCreateWithPathAndAttributes(URL(fileURLWithPath: path) as CFURL, [], attrs, &code) == errSecSuccess,
+                      let code else { continue }
+                var info: CFDictionary?
+                SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &info)
+                if let h = (info as? [String: Any])?[kSecCodeInfoUnique as String] as? Data { hashes.insert(h) }
+            }
+            return hashes
+        }
+
+        func isExecutable(_ path: String) -> Bool {
+            FileManager.default.isExecutableFile(atPath: path)
+        }
+
+        func subfolders(_ path: String) -> [String] {
+            (try? FileManager.default.contentsOfDirectory(atPath: path)) ?? []
+        }
+
+        private func staticCode(_ path: String) -> SecStaticCode? {
+            var code: SecStaticCode?
+            guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code) == errSecSuccess else { return nil }
+            return code
+        }
+    }
+}
+
+/// What `HostCheck` reads from disk: real signatures in the engine
+/// (`PeerInspector.RealDisk`), a fake in tests.
+public protocol CodeOnDisk {
+    /// The app bundle's signature and resource seal are intact, and an
+    /// Apple-issued certificate for `team` signed it.
+    func isSealedApp(_ path: String, team: String) -> Bool
+    /// The code at `path` is validly signed by `team` through an Apple-issued certificate.
+    func isSigned(_ path: String, team: String) -> Bool
+    /// The code directory hashes of the code at `path` (of a bundle's main
+    /// executable, for a bundle), one per architecture.
+    func cdhashes(_ path: String) -> Set<Data>
+    func isExecutable(_ path: String) -> Bool
+    func subfolders(_ path: String) -> [String]
+}
+
+/// Whether another developer's app vouches for a process in it.
+public enum HostCheck {
+    /// The app at `app` ships a `bcu` (see `PeerPolicy.bcuLocations`) signed
+    /// by the peer's team.
+    public static func vouches(app: String, peer: PeerIdentity, disk: CodeOnDisk) -> Bool {
+        guard let team = peer.team else { return false }
         var candidates = PeerPolicy.bcuLocations.map { "\(app)/\($0)" }
         let resources = "\(app)/Contents/Resources"
-        for sub in (try? FileManager.default.contentsOfDirectory(atPath: resources)) ?? [] {
-            candidates.append("\(resources)/\(sub)/bcu")
-        }
-        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
-            var code: SecStaticCode?
-            guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code) == errSecSuccess, let code else { continue }
-            if SecStaticCodeCheckValidity(code, [], req) == errSecSuccess {
-                cacheLock.lock(); shipping.insert(key); cacheLock.unlock()
-                return true
-            }
-        }
-        return false
+        for sub in disk.subfolders(resources) { candidates.append("\(resources)/\(sub)/bcu") }
+        return candidates.contains { disk.isExecutable($0) && disk.isSigned($0, team: team) }
     }
 }
 
@@ -223,7 +291,9 @@ public final class PeerScope {
 
     /// A tool call: claims its session (and host ID) for the caller, or
     /// says why it can't have them.
-    public func admitCall(session: String, parent: String?, host: String?, _ trust: PeerTrust) -> String? {
+    /// `windowOwners`: the sessions that have the windows the call names.
+    public func admitCall(session: String, parent: String?, host: String?, windowOwners: [String] = [],
+                          _ trust: PeerTrust) -> String? {
         lock.lock(); defer { lock.unlock() }
         for s in [session, parent].compactMap({ $0 }) {
             if let o = sessions[s], !trust.mayUse(o) { return "Session \(s) belongs to another app." }

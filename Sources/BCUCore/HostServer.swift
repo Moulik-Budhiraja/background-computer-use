@@ -241,7 +241,7 @@ public final class HostServer {
                 guard let s, connection.backlog < 2 else { return }
                 self.sendFrame(s, image, connection)
             }
-            s.frames.window = CGWindowID(a.int("window") ?? 0)
+            s.frames.window = try Self.streamWindow(a, owns: { e.windows.window($0) != nil }) ?? 0
             s.frames.excluded = CGWindowID(a.int("exclude") ?? 0)
             lock.lock(); c.streams[s.id] = s; lock.unlock()
             s.frames.start(fps: a.int("fps") ?? 15)
@@ -249,7 +249,7 @@ public final class HostServer {
 
         case "frames_update":
             let s = try stream(a, c)
-            if let w = a.int("window") { s.frames.window = CGWindowID(w) }
+            if let w = try Self.streamWindow(a, owns: { s.engine.windows.window($0) != nil }) { s.frames.window = w }
             if let x = a.int("exclude") { s.frames.excluded = CGWindowID(x) }
             if let m = a.int("max_width") { s.maxWidth = m }
             if let q = a.double("quality") { s.quality = q }
@@ -296,6 +296,11 @@ public final class HostServer {
         // Another app's session looks the same as none.
         guard let e = hub.engine(id: id), scope.mayUse(session: id, c.connection.trust) else { throw ToolError("no session \(id)") }
         return e
+    }
+
+    /// The window a frame stream shows (`window`), if the request names one.
+    static func streamWindow(_ a: Args, owns: (CGWindowID) -> Bool) throws -> CGWindowID? {
+        a.int("window").map { CGWindowID($0) }
     }
 
     private func stream(_ a: Args, _ c: Client) throws -> Stream {

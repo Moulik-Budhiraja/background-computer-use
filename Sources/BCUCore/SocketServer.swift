@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import BCUShared
 
@@ -97,6 +98,8 @@ public final class SocketServer {
     public var policy: PeerPolicy?
     /// Which app owns each session; share it with `HostServer.scope`.
     public let scope = PeerScope()
+    /// The sessions that have a window (`Hub.sessions(owningWindow:)`).
+    public var windowOwners: ((CGWindowID) -> [String])?
     private var listenFD: Int32 = -1
     private var nextID = 0
     private let idLock = NSLock()
@@ -167,7 +170,7 @@ public final class SocketServer {
     /// why (in reply form, so a client waiting for a reply shows it) and is closed.
     private func admit(_ connection: SocketConnection) -> Bool {
         let peer = PeerInspector.identity(fd: connection.fd)
-        let decision = (policy ?? PeerInspector.ownPolicy()).decide(peer) { PeerInspector.shipsBCU(app: $0, team: $1) }
+        let decision = (policy ?? PeerInspector.ownPolicy()).decide(peer) { PeerInspector.shipsBCU(app: $0, peer: $1) }
         switch decision {
         case .allow(let trust):
             connection.trust = trust
@@ -178,6 +181,13 @@ public final class SocketServer {
                              "error": "The computer use engine refused this connection: \(why). Only its own app and apps that ship bcu signed by their developer can connect (docs/embedding.md)."])
             return false
         }
+    }
+
+    /// The windows a tool call names: its `window_id`, and each batch step's.
+    static func windowIDs(in args: JSONObject) -> [CGWindowID] {
+        var objects = [args]
+        objects += (args["actions"] as? [JSONObject]) ?? []
+        return objects.compactMap { Args($0).int("window_id").flatMap { CGWindowID(exactly: $0) } }
     }
 
     private func serve(_ connection: SocketConnection) {
@@ -207,8 +217,10 @@ public final class SocketServer {
                 let tool = request["tool"] as? String ?? ""
                 let args = request["args"] as? JSONObject ?? [:]
                 let session = args["_session"] as? String
+                // The engine's own clients may use every window; look up the rest.
+                let owners = connection.trust == .owner ? [] : Self.windowIDs(in: args).flatMap { windowOwners?($0) ?? [] }
                 if let why = scope.admitCall(session: session ?? Hub.defaultSession, parent: args["_parent"] as? String,
-                                             host: args["_host"] as? String, connection.trust) {
+                                             host: args["_host"] as? String, windowOwners: owners, connection.trust) {
                     connection.send(ToolResult.error(why).wire(id: id))
                     continue
                 }

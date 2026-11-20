@@ -20,8 +20,8 @@ final class PeerPolicyTests: XCTestCase {
         PeerPolicy(team: nil, cdhash: Data([1]), home: "/Users/me/bcu/build/Background Computer Use.app", trusted: trusted)
     }
 
-    private let hostShipsBCU: (String, String) -> Bool = { app, team in app == "/Applications/Host.app" && team == "BBBBBBBBBB" }
-    private let noneShip: (String, String) -> Bool = { _, _ in false }
+    private let hostShipsBCU: (String, PeerIdentity) -> Bool = { app, peer in app == "/Applications/Host.app" && peer.team == "BBBBBBBBBB" }
+    private let noneShip: (String, PeerIdentity) -> Bool = { _, _ in false }
 
     private func isDenied(_ d: PeerDecision) -> Bool {
         if case .deny = d { return true }

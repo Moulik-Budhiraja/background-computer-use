@@ -70,6 +70,7 @@ enum Serve {
         server.hostHandler = { op, req, connection in host.handle(op, req, connection) }
         server.sessionHandler = { [hub] session, on in hub.sessionAttached(session, on) }
         host.scope = server.scope
+        server.windowOwners = { [hub] in hub.sessions(owningWindow: $0) }
         do {
             try server.start()
         } catch {
