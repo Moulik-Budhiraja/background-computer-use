@@ -1,3 +1,4 @@
+import CoreGraphics
 import XCTest
 @testable import BCUCore
 
@@ -133,5 +134,33 @@ final class PeerPolicyTests: XCTestCase {
         XCTAssertTrue(scope.claimHost("host", .owner))
         XCTAssertTrue(scope.claimHost("fresh", other))
         XCTAssertFalse(scope.claimHost("fresh", host))
+    }
+
+    // MARK: Host apps on disk
+
+    /// Code on a pretend disk.
+    private final class FakeDisk: CodeOnDisk {
+        var sealedApps: [String: String] = [:]   // app path: team
+        var signed: [String: String] = [:]       // code path: team
+        var hashes: [String: Data] = [:]
+        func isSealedApp(_ path: String, team: String) -> Bool { sealedApps[path] == team }
+        func isSigned(_ path: String, team: String) -> Bool { signed[path] == team }
+        func cdhashes(_ path: String) -> Set<Data> { hashes[path].map { [$0] } ?? [] }
+        func isExecutable(_ path: String) -> Bool { signed[path] != nil }
+        func subfolders(_ path: String) -> [String] { [] }
+    }
+
+    /// Another developer's signed program (an interpreter, say) copied to
+    /// Fake.app/Contents/Resources/bcu: no signed app ships it.
+    func testAFileNamedBCUInAFolderNamedAppDoesntVouch() {
+        let disk = FakeDisk()
+        let exe = "/tmp/Fake.app/Contents/Resources/bcu"
+        disk.signed[exe] = theirs
+        disk.hashes[exe] = Data([7])
+        let interpreter = PeerIdentity(path: exe, valid: true, team: theirs, cdhash: Data([7]))
+        XCTAssertFalse(HostCheck.vouches(app: "/tmp/Fake.app", peer: interpreter, disk: disk))
+        // The same layout in an app signed and sealed by that team does.
+        disk.sealedApps["/tmp/Fake.app"] = theirs
+        XCTAssertTrue(HostCheck.vouches(app: "/tmp/Fake.app", peer: interpreter, disk: disk))
     }
 }
