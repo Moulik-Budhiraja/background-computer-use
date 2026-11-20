@@ -631,7 +631,7 @@ public final class FocusGuard {
                 sleepMs(LateLook.everyMs)
                 self.lock.lock()
                 let now = self.lastClick.ms == click.ms ? self.lastClick : click
-                let inputSince = self.lastUserMouseDownMs > click.ms || self.lastUserKeyMs > putBackMs
+                let inputSince = LateLook.inputSince(clickMs: click.ms, putBackMs: putBackMs, mouseDownMs: self.lastUserMouseDownMs, keyMs: self.lastUserKeyMs)
                 self.lock.unlock()
                 guard LateLook.wanted(now.element) else { return }
                 let mine = Dictionary(WindowList.of(pid: pid, onScreenOnly: true)
