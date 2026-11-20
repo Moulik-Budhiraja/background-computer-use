@@ -3,7 +3,7 @@ import Foundation
 /// Blocking line-based client for the app's unix socket.
 public final class SocketClient {
     private let fd: Int32
-    private var buffer = Data()
+    private var buffer = LineBuffer()
     private var nextID = 1
 
     public init(path: String = BCUPaths.socketPath) throws {
@@ -48,13 +48,24 @@ public final class SocketClient {
         return recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) > 0
     }
 
-    public func call(tool: String, args: JSONObject) throws -> ToolResult {
-        ToolResult(wire: try request(["tool": tool, "args": args]))
+    /// How long a tool call may take before the app counts as stuck. The
+    /// longest legitimate wait (for a free display) is well under this.
+    public static let callTimeout: TimeInterval = 300
+
+    /// How long a call of this tool may take. `status` answers at once, so
+    /// a stuck app shows within seconds.
+    public static func timeout(for tool: String) -> TimeInterval {
+        tool == "status" ? 10 : callTimeout
+    }
+
+    public func call(tool: String, args: JSONObject, timeout: TimeInterval? = nil) throws -> ToolResult {
+        ToolResult(wire: try request(["tool": tool, "args": args], timeout: timeout ?? Self.timeout(for: tool)))
     }
 
     /// One request (a tool call, or a host `op`) and its reply. Not for a
-    /// connection that has subscribed to events.
-    public func request(_ object: JSONObject) throws -> JSONObject {
+    /// connection that has subscribed to events. After a timeout the
+    /// connection is spent: make a new client.
+    public func request(_ object: JSONObject, timeout: TimeInterval = SocketClient.callTimeout) throws -> JSONObject {
         let id = nextID
         nextID += 1
         var object = object
@@ -64,30 +75,79 @@ public final class SocketClient {
             var offset = 0
             while offset < raw.count {
                 let n = write(fd, raw.baseAddress!.advanced(by: offset), raw.count - offset)
+                if n < 0 && errno == EINTR { continue }
                 // Without its newline the app can't have run any of it.
                 if n <= 0 { throw SocketError.notSent }
                 offset += n
             }
         }
-        let response = try readLine()
-        guard let object = WireCodec.decode(response) else {
-            throw SocketError.message("bad response from app")
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            let response = try readLine(deadline: deadline, timeout: timeout)
+            guard let reply = WireCodec.decode(response) else {
+                throw SocketError.message("bad response from app")
+            }
+            // Ours, or the app's answer to a line it couldn't read (no id).
+            // Anything else is a late reply to an earlier request.
+            if let got = reply["id"] as? Int, got == id { return reply }
+            if reply["id"] == nil || reply["id"] is NSNull, reply["event"] == nil { return reply }
         }
-        return object
     }
 
-    private func readLine() throws -> Data {
+    private func readLine(deadline: Date, timeout: TimeInterval) throws -> Data {
         var chunk = [UInt8](repeating: 0, count: 65536)
         while true {
-            if let newline = buffer.firstIndex(of: 0x0A) {
-                let line = buffer.subdata(in: buffer.startIndex..<newline)
-                buffer.removeSubrange(buffer.startIndex...newline)
-                return line
+            if let line = buffer.nextLine() { return line }
+            let ms = Int(deadline.timeIntervalSinceNow * 1000)
+            if ms <= 0 {
+                shutdown(fd, SHUT_RDWR)
+                throw SocketError.message("\(BCUPaths.appName) isn't answering (no reply in \(Int(timeout)) s)")
             }
+            var p = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&p, 1, Int32(min(ms, Int(Int32.max))))
+            if ready < 0 && errno == EINTR { continue }
+            if ready < 0 { throw SocketError.message("app closed the connection") }
+            if ready == 0 { continue }
             let n = read(fd, &chunk, chunk.count)
+            if n < 0 && errno == EINTR { continue }
             if n <= 0 { throw SocketError.message("app closed the connection") }
             buffer.append(chunk, count: n)
         }
+    }
+}
+
+/// Splits a byte stream into newline-terminated lines. Each byte is looked
+/// at once, so a multi-megabyte line (a screenshot) arriving in 64 KB reads
+/// costs linear time, not quadratic.
+public struct LineBuffer {
+    private var data = Data()
+    /// Bytes before this offset hold no newline.
+    private var scanned = 0
+
+    public init() {}
+
+    public var count: Int { data.count }
+
+    public mutating func append(_ bytes: [UInt8], count: Int) {
+        data.append(contentsOf: bytes[0..<count])
+    }
+
+    public mutating func append(_ bytes: Data) {
+        data.append(bytes)
+    }
+
+    /// The next whole line, without its newline, or nil until one arrives.
+    public mutating func nextLine() -> Data? {
+        let start = data.startIndex
+        guard let newline = data[(start + scanned)...].firstIndex(of: 0x0A) else {
+            scanned = data.count
+            return nil
+        }
+        let line = Data(data[start..<newline])
+        // Keep only what follows (usually nothing); a fresh Data restarts at index 0.
+        data = Data(data[(newline + 1)...])
+        scanned = 0
+        return line
     }
 }
 
