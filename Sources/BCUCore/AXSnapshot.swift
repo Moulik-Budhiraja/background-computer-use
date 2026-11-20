@@ -93,7 +93,7 @@ public enum AXSnapshot {
         // plain text line (the popup heading).
         struct Entry { let element: AXUIElement?; let indent: String; let body: String; let node: (String, CGRect, [String], Bool)? }
         var entries: [Entry] = []
-        var overflow: [AXUIElement] = []
+        var overflow: [(element: AXUIElement, role: String, frame: CGRect)] = []
         var visited = 0
         var listed = 0
         var skippedOffscreen = 0
@@ -121,7 +121,7 @@ public enum AXSnapshot {
                     skippedOffscreen += 1
                 } else if listed >= maxElements {
                     truncated = true
-                    overflow.append(el)
+                    overflow.append((el, raw.role, f))
                 } else {
                     listed += 1
                     let actions = AX.actions(el)
@@ -206,14 +206,17 @@ public enum AXSnapshot {
         }
 
         // Elements pushed past max_elements keep their numbers for when
-        // they're listed again, and aren't reported as removed.
+        // they're listed again, and aren't reported as removed. The agent
+        // was told they keep their numbers, so they can be acted on by them.
         var unlisted = Set<Int>()
         if !renumber, let prev = previous {
-            for el in overflow {
-                if let old = prev.indexByElement[el], !used.contains(old) {
+            for o in overflow {
+                if let old = prev.indexByElement[o.element], !used.contains(old) {
                     used.insert(old)
-                    indexByElement[el] = old
+                    indexByElement[o.element] = old
                     unlisted.insert(old)
+                    nodes[old] = AXNode(index: old, element: o.element, role: o.role, frame: o.frame,
+                                        actions: AX.actions(o.element), valueSettable: AX.isSettable(o.element, "AXValue"))
                 }
             }
         }
