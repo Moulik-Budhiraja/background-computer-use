@@ -13,12 +13,13 @@ public enum ToolCatalog {
     user's own profile). Use `borrow_window` only for single-window apps.
     3. `get_window_state` returns the window's accessibility tree with numbered elements and a screenshot. \
     Act on elements by number. Use x/y (window points, matching the screenshot pixels) only when no element fits. \
-    An element keeps its number for as long as it exists. After the first read, `get_window_state` lists only \
+    An element keeps its number for as long as it exists, even while it's scrolled out of view. After the first read, `get_window_state` lists only \
     what changed (- removed, + added, ~ changed); pass full=true when you need the whole list again. Right \
     after an action it waits (up to 5 s) for the window to settle, so you don't need to sleep.
     4. Prefer `click` on an element and `set_value`: they work through accessibility. While the user is in \
     the same app, `type_text` writes into the field through accessibility too (pass `element` when you know \
-    the field); only Return and Tab go as keys. Keys and pixel clicks make your window its app's key window. \
+    the field); only Return and Tab go as keys. Keys and pixel clicks (a click at x/y, a double or right click, or a click on an element \
+    without a press action) make your window its app's key window. \
     In an app the user isn't in, a field you focused stays focused for your next step and a menu you opened stays open; when the user is in it, key goes \
     straight back to them (their input is held for that moment and replayed). When the user is in that app, such a step first \
     waits for a pause in their clicking or scrolling (3 s at most, usually much less) and for them to stop \

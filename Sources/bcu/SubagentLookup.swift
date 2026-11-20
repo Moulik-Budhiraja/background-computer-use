@@ -22,6 +22,7 @@ final class SubagentLookup {
     private var owners: [String: String] = [:]
     private var sessionDirs: [URL] = []
     private var lastDirScanMs = 0.0
+    private let lock = NSLock()
 
     /// nil outside Claude Code.
     init?(environment: [String: String] = ProcessInfo.processInfo.environment) {
@@ -38,9 +39,12 @@ final class SubagentLookup {
     func agent(for toolUseID: String, waitMs: Double = 400) -> String? {
         let deadline = Self.nowMs() + waitMs
         while true {
-            if let owner = owners[toolUseID] { return owner.isEmpty ? nil : owner }
-            scan()
-            if let owner = owners[toolUseID] { return owner.isEmpty ? nil : owner }
+            // Calls look up from several threads; only the wait is outside the lock.
+            lock.lock()
+            var owner = owners[toolUseID]
+            if owner == nil { scan(); owner = owners[toolUseID] }
+            lock.unlock()
+            if let owner { return owner.isEmpty ? nil : owner }
             if Self.nowMs() >= deadline { return nil }
             usleep(10_000)
         }
