@@ -47,4 +47,24 @@ final class SubagentSessionTests: XCTestCase {
         n = Engine.controllers(n, taking: false)
         XCTAssertEqual(Engine.controllers(n, taking: true), 1)
     }
+
+    func testASubagentIsStillThereWhileItsParentUsesItsWindows() {
+        // The subagent's connection closed; its parent, still connected,
+        // has been working in one of its windows.
+        let attached = ["parent": 1]
+        let usedBy = ["parent/agent-1": Set(["parent"])]
+        XCTAssertTrue(Hub.present("parent/agent-1", attached: attached, usedBy: usedBy))
+        XCTAssertFalse(Hub.present("parent/agent-2", attached: attached, usedBy: usedBy))
+        // The parent goes too: the subagent's windows have nobody left.
+        XCTAssertFalse(Hub.present("parent/agent-1", attached: [:], usedBy: usedBy))
+        XCTAssertEqual(Hub.leftWithNobody(after: "parent", attached: [:], usedBy: usedBy), ["parent/agent-1"])
+        // Not one that's still connected itself.
+        XCTAssertEqual(Hub.leftWithNobody(after: "parent", attached: ["parent/agent-1": 1], usedBy: usedBy), [])
+    }
+
+    func testAPointerMoveDoesntWaitForABusyApp() {
+        XCTAssertEqual(RemoteControl.appLockWait(.mouseMoved), 0)
+        XCTAssertEqual(RemoteControl.appLockWait(.leftMouseDown), RemoteControl.appLockWaitS)
+        XCTAssertEqual(RemoteControl.appLockWait(.keyDown), RemoteControl.appLockWaitS)
+    }
 }
