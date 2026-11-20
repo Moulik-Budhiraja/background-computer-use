@@ -1027,14 +1027,25 @@ public final class WindowManager {
         return AX.setPosition(ax, CGPoint(x: (main.midX - w / 2).rounded(), y: (main.midY - h / 2).rounded()))
     }
 
-    /// The display `putOnUserScreen` puts a window on.
+    /// The display `putOnUserScreen` puts a window on: the main one, unless
+    /// that's an agent's (with the user's displays asleep, macOS can make
+    /// one main), then another of the user's. None: the window stays.
     static func userScreen(main: CGDirectDisplayID, users: [CGDirectDisplayID]) -> CGDirectDisplayID? {
-        main
+        users.contains(main) ? main : users.first
     }
 
-    /// One stray rescue queued or running at a time (`rescue(fromStrays:)`).
-    static func takeStrayTurn() -> Bool { true }
-    static func endStrayTurn() {}
+    /// One stray rescue queued or running at a time (`rescue(fromStrays:)`):
+    /// one can wait on an app that isn't answering for longer than the
+    /// second between asks, and they'd pile up ahead of spare rescues.
+    private static let strayTurnLock = NSLock()
+    private static var strayTurnTaken = false
+    static func takeStrayTurn() -> Bool {
+        strayTurnLock.lock(); defer { strayTurnLock.unlock() }
+        if strayTurnTaken { return false }
+        strayTurnTaken = true
+        return true
+    }
+    static func endStrayTurn() { strayTurnLock.lock(); strayTurnTaken = false; strayTurnLock.unlock() }
 
     /// Clean up what's left on a display no agent is using any more: when
     /// the display goes, macOS moves every window on it to the user's
