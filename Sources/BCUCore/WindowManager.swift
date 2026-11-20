@@ -87,6 +87,9 @@ public final class WindowManager {
         return true
     }
 
+    /// Undo `claim`: the borrow it was for failed.
+    static func unclaim(_ id: CGWindowID, for session: String) {}
+
     /// Some session's window, as of right now.
     static func isRegistered(_ id: CGWindowID) -> Bool {
         sharedLock.lock(); defer { sharedLock.unlock() }
@@ -814,7 +817,11 @@ public final class WindowManager {
             throw ToolError("window \(id) is full screen, and a full-screen window can't be moved. Ask the user to leave full screen in it, then retry.")
         }
         // Checked and claimed in one step: two sessions borrowing it at once.
+        lock.lock(); let hadIt = registry[id] != nil; lock.unlock()
         guard Self.claim(id, pid: info.pid, for: sessionKey) else { throw ToolError("window \(id) is another agent's") }
+        // Given back if the borrow fails before the window is registered.
+        var borrowed = false
+        defer { if !borrowed && !hadIt { Self.unclaim(id, for: sessionKey) } }
         // Every other window of the app is the user's, not one this spawned.
         noteBefore(pid: info.pid)
         focusGuard.beginAction(pid: info.pid, cause: "borrowing a window")
@@ -835,6 +842,7 @@ public final class WindowManager {
         }
         let aw = AgentWindow(id: id, pid: info.pid, appName: app?.localizedName ?? info.owner, bundleID: app?.bundleIdentifier, kind: .borrowed, originalFrame: original)
         register(aw)
+        borrowed = true
         return aw
     }
 
