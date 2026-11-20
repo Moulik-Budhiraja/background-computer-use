@@ -1523,8 +1523,9 @@ public final class Engine {
         let ended = current?.takeAnswers() ?? []
         let pid = w.pid, guardian = focusGuard
         let watch = LeaveWatch(pid: pid, forMs: Self.leaveWatchMs) { [weak self] stepStart in
-            WindowManager.stepAnswersLeave(userInApp: self?.userIsIn(pid) ?? true,
-                                           userOpenInputMs: guardian.lastUserOpenInputMs, stepStartMs: stepStart)
+            guard let self else { return false }
+            return WindowManager.stepAnswersLeave(userInApp: self.userIsIn(pid), userOpenInputMs: guardian.lastUserOpenInputMs,
+                                                  stepStartMs: stepStart, userControlsDisplay: self.userInControl)
         }
         stateLock.lock(); isChromium[pid] = true; leaveWatches[pid] = watch; leaveNotes += ended; stateLock.unlock()
     }

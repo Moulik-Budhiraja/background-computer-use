@@ -23,4 +23,10 @@ final class LeaveDialogTests: XCTestCase {
     func testADialogThatMayBeTheUsersIsLeftAlone() {
         XCTAssertFalse(WindowManager.stepAnswersLeave(userInApp: true, userOpenInputMs: began + 30, stepStartMs: began))
     }
+
+    /// The user took over the agent display: what they do there reaches the
+    /// browser without making it their front app, so any dialog may be theirs.
+    func testNothingIsAnsweredWhileTheUserControlsTheDisplay() {
+        XCTAssertFalse(WindowManager.stepAnswersLeave(userInApp: false, userOpenInputMs: began - 1, stepStartMs: began, userControlsDisplay: true))
+    }
 }

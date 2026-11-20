@@ -1024,9 +1024,11 @@ public final class WindowManager {
     /// Whether a "Leave site?" that came up after an agent's step in the
     /// browser began is the agent's to answer: its step left the page. Not
     /// when the user, in that browser, clicked or pressed an opening key
-    /// since the step began: then it may be about a page of theirs.
-    static func stepAnswersLeave(userInApp: Bool, userOpenInputMs: Double, stepStartMs: Double) -> Bool {
-        !(userInApp && userOpenInputMs >= stepStartMs)
+    /// since the step began: then it may be about a page of theirs. Never
+    /// while the user controls the agent display: their input there reaches
+    /// the browser without bringing it to the front.
+    static func stepAnswersLeave(userInApp: Bool, userOpenInputMs: Double, stepStartMs: Double, userControlsDisplay: Bool = false) -> Bool {
+        !userControlsDisplay && !(userInApp && userOpenInputMs >= stepStartMs)
     }
 
     static func texts(in el: AXUIElement) -> [String] {
