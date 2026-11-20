@@ -92,6 +92,8 @@ public final class Engine {
     /// A Chromium browser's own id for each of this session's windows of it
     /// (`navigate` names the window by it), found the first time it's needed.
     private var browserWindowIDs: [CGWindowID: String] = [:]
+    /// Each window's latest `navigate` watch for "Leave site?" (see `LeaveWatch`).
+    private var leaveWatches: [CGWindowID: LeaveWatch] = [:]
     /// Steps that take key focus in the app the user is in wait for a pause
     /// in their input (see `QuietWait`), within this session's budget.
     private let waitBudget = WaitBudget()
@@ -2708,6 +2710,7 @@ public final class Engine {
             if covered { if batching { cover?.lastUsedMs = nowMs() } else { closeCover() } }
         }
         var loaded = false
+        var leaveWatch: LeaveWatch?
         while true {
             dropStaleCover(w)
             let inBrowser = userIsIn(w.pid)
@@ -2728,7 +2731,22 @@ public final class Engine {
                 // them, so none of it lands in the agent's page.
                 focusGuard.beginSwap(w.pid)
                 defer { focusGuard.endSwap(w.pid) }
+                // Leaving the page can make it ask "Leave site?" first. The
+                // agent asked to leave it, so Leave, the moment it shows: it
+                // comes up on the user's screen and holds the whole browser.
+                let pid = w.pid, sentMs = nowMs(), guardian = focusGuard
+                let watch = LeaveWatch(pid: pid, before: Set(AX.windows(pid).compactMap { AX.windowID($0) }),
+                                       forMs: Self.leaveWatchMs) { [weak self] in
+                    WindowManager.navigateAnswersLeave(userInApp: self?.userIsIn(pid) ?? true,
+                                                       userOpenInputMs: guardian.lastUserOpenInputMs, sentMs: sentMs)
+                }
+                // The window's last load's watch would answer this one's
+                // dialog, and this step wouldn't know.
+                stateLock.lock(); let earlier = leaveWatches.updateValue(watch, forKey: w.id); stateLock.unlock()
+                _ = earlier?.stop()
                 let ok = BrowserAutomation.setURL(bundleID: bundleID, window: browserID, url: url)
+                leaveWatch = watch
+                if !ok { _ = watch.stop() }
                 if shared { _ = focusGuard.reclaimKey(w.pid, prefer: userWindow) }
                 return ok
             }
@@ -2763,8 +2781,13 @@ public final class Engine {
             loading = BrowserAutomation.isLoading(bundleID: bundleID, window: browserID)
         }
         let state = loading == false ? "Loaded" : "Loading"
-        return ToolResult(text: "\(state) \(url) in window \(w.id). Next: get_window_state window_id=\(w.id) (it waits for the page to settle).")
+        let asked = leaveWatch?.answered.map { " (the page asked \"\($0)\"; answered Leave)" } ?? ""
+        return ToolResult(text: "\(state) \(url) in window \(w.id)\(asked). Next: get_window_state window_id=\(w.id) (it waits for the page to settle).")
     }
+
+    /// How long after sending a URL `navigate` looks out for the page
+    /// asking "Leave site?" (it keeps looking after the step returns).
+    static let leaveWatchMs = 4000.0
 
     /// The browser's own id for an agent's window, proven instead of
     /// matched. Matching by frame goes wrong in both directions: a window

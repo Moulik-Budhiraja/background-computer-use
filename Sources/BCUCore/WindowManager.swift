@@ -1021,6 +1021,14 @@ public final class WindowManager {
         return AX.perform(leave.element, "AXPress") == .success
     }
 
+    /// Whether a "Leave site?" that came up while an agent's `navigate`
+    /// loaded a URL is the agent's to answer: it asked to leave the page.
+    /// Not when the user, in that browser, clicked or pressed an opening key
+    /// since the URL was sent: then it may be about a page of theirs.
+    static func navigateAnswersLeave(userInApp: Bool, userOpenInputMs: Double, sentMs: Double) -> Bool {
+        !(userInApp && userOpenInputMs >= sentMs)
+    }
+
     static func texts(in el: AXUIElement) -> [String] {
         var out: [String] = []
         walk(el) { e, role in
@@ -1715,4 +1723,57 @@ final class WindowCatcher {
 private func catcherCallback(_ observer: AXObserver, _ element: AXUIElement, _ notification: CFString, _ refcon: UnsafeMutableRawPointer?) {
     guard let refcon else { return }
     Unmanaged<WindowCatcher>.fromOpaque(refcon).takeUnretainedValue().created(element)
+}
+
+/// Watches a browser while `navigate` loads a URL in an agent's window, and
+/// answers Leave the moment the page asks "Leave site?". Chromium asks in an
+/// app-wide alert that comes up on the user's screen (not over the agent's
+/// window), and until it's answered no window of the browser takes input,
+/// the user's included.
+final class LeaveWatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var running = true
+    private var said: String?
+
+    /// `before`: the browser's windows (as accessibility lists them) before
+    /// the URL was sent. `mayAnswer` is asked once per new dialog, just
+    /// before pressing.
+    ///
+    /// Found through accessibility, not the window list: on macOS 27 the
+    /// window server lists the alert itself as off screen at layer 0 while
+    /// a separate window without accessibility shows it.
+    init(pid: pid_t, before: Set<CGWindowID>, forMs ms: Double, mayAnswer: @escaping () -> Bool) {
+        let deadline = nowMs() + ms
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            var looked: Set<CGWindowID> = []
+            while isRunning && nowMs() < deadline {
+                for dialog in AX.windows(pid) {
+                    guard let id = AX.windowID(dialog), !before.contains(id), !looked.contains(id) else { continue }
+                    if AX.string(dialog, "AXSubrole") == "AXStandardWindow" { looked.insert(id); continue }
+                    // (No buttons yet: look again next time round.)
+                    guard !WindowManager.buttons(in: dialog).isEmpty else { continue }
+                    looked.insert(id)
+                    guard mayAnswer() else { continue }
+                    let text = WindowManager.texts(in: dialog).joined(separator: " ")
+                    if WindowManager.answerLeave(dialog) {
+                        lock.lock(); said = text; running = false; lock.unlock()
+                        return
+                    }
+                }
+                sleepMs(10)
+            }
+        }
+    }
+
+    private var isRunning: Bool { lock.lock(); defer { lock.unlock() }; return running }
+
+    /// Stop watching. What the page asked, if Leave was pressed.
+    func stop() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        running = false
+        return said
+    }
+
+    /// What the page asked, once Leave was pressed.
+    var answered: String? { lock.lock(); defer { lock.unlock() }; return said }
 }
