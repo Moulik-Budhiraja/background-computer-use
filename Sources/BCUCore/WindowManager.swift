@@ -1020,11 +1020,21 @@ public final class WindowManager {
     /// first, so AppKit doesn't push it back to a screen it fits).
     @discardableResult
     static func putOnUserScreen(_ ax: AXUIElement, bounds: CGRect) -> Bool {
-        let main = CGDisplayBounds(CGMainDisplayID())
+        guard let target = userScreen(main: CGMainDisplayID(), users: AgentDisplay.userDisplayIDs()) else { return false }
+        let main = CGDisplayBounds(target)
         let w = min(bounds.width, main.width - 80), h = min(bounds.height, main.height - 120)
         AX.setSize(ax, CGSize(width: w, height: h))
         return AX.setPosition(ax, CGPoint(x: (main.midX - w / 2).rounded(), y: (main.midY - h / 2).rounded()))
     }
+
+    /// The display `putOnUserScreen` puts a window on.
+    static func userScreen(main: CGDirectDisplayID, users: [CGDirectDisplayID]) -> CGDirectDisplayID? {
+        main
+    }
+
+    /// One stray rescue queued or running at a time (`rescue(fromStrays:)`).
+    static func takeStrayTurn() -> Bool { true }
+    static func endStrayTurn() {}
 
     /// Clean up what's left on a display no agent is using any more: when
     /// the display goes, macOS moves every window on it to the user's
@@ -1078,8 +1088,9 @@ public final class WindowManager {
     /// last run's own windows are closed, see `recoverFromPreviousRun`).
     /// Done off the caller's thread.
     static func rescue(fromStrays strays: [CGRect]) {
-        guard !strays.isEmpty else { return }
+        guard !strays.isEmpty, takeStrayTurn() else { return }
         rescueQueue.async {
+            defer { endStrayTurn() }
             let users = AgentDisplay.userDisplayIDs().map { CGDisplayBounds($0) }
             for bounds in strays {
                 for info in windows(on: bounds) where !isRegistered(info.id) && !isOpening(info.pid)
