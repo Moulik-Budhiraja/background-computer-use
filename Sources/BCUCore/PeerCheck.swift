@@ -319,16 +319,17 @@ public final class PeerScope {
         // A subagent's family is its parent's: claim the parent with it, or
         // another app could claim it and reach the subagent through it.
         if let parent, sessions[parent] == nil { sessions[parent] = trust }
-        if let host, !host.isEmpty, hosts[host] == nil, trust != .owner { hosts[host] = trust }
+        if let host, !host.isEmpty, hosts[host] == nil { hosts[host] = trust }
         return nil
     }
 
     /// A host op naming a host ID (`subscribe`, `recordings`): the first
-    /// app to name it keeps it.
+    /// app to name it keeps it, the engine's own code included (a host
+    /// running its own engine), so no other app can set its recordings.
     public func claimHost(_ host: String, _ trust: PeerTrust) -> Bool {
         lock.lock(); defer { lock.unlock() }
         if let o = hosts[host] { return trust.mayUse(o) }
-        if trust != .owner { hosts[host] = trust }
+        hosts[host] = trust
         return true
     }
 }
