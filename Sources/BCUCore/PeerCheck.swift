@@ -274,13 +274,15 @@ final class VouchCache {
     /// `verify`'s answer for `key`, or a remembered pass. `fingerprint`
     /// describes what the answer depends on (nil: can't tell).
     func check(_ key: String, fingerprint: () -> Int?, verify: () -> Bool) -> Bool {
+        // Taken before checking: a change during the check shows next time.
+        let now = fingerprint()
         lock.lock()
-        let known = passed[key] != nil
+        let known = now != nil && passed[key] == now
         lock.unlock()
         if known { return true }
-        guard verify() else { return false }
-        lock.lock(); passed[key] = 0; lock.unlock()
-        return true
+        let ok = verify()
+        lock.lock(); passed[key] = ok ? now : nil; lock.unlock()
+        return ok
     }
 }
 
