@@ -20,6 +20,10 @@ export type EngineInfo = {
   permissions: { accessibility: boolean; screen_recording: boolean }
   max_displays: number
   display: { width: number; height: number }
+  // The Background Computer Use app runs this engine and shows your
+  // sessions in its menu bar, with pause, stop and take-over, so you
+  // needn't show a menu bar icon of your own. Absent for a host's own engine.
+  shows_hosts?: boolean
 }
 
 export type SessionState = 'idle' | 'working' | 'waiting' | 'paused' | 'user_in_control'
@@ -115,7 +119,11 @@ export type DragEvent =
     }
   | { event: 'drag'; session: string; phase: 'ended'; window: number; frame: Rect }
 
-export type EngineEvent = SessionsEvent | PointerEvent | FrameEvent | CursorEvent | MenuEvent | DragEvent
+// The user stopped one of your sessions from the Background Computer Use
+// menu bar app, and its windows are closed. Your own `stop` isn't echoed.
+export type StoppedEvent = { event: 'stopped'; session: string }
+
+export type EngineEvent = SessionsEvent | PointerEvent | FrameEvent | CursorEvent | MenuEvent | DragEvent | StoppedEvent
 
 // Take-over input, in DOM terms. x and y are display points.
 export type Modifiers = { shiftKey?: boolean; ctrlKey?: boolean; altKey?: boolean; metaKey?: boolean }

@@ -59,7 +59,7 @@ final class StatusController: NSObject, NSPopoverDelegate, NSWindowDelegate {
         switch hub.status {
         case .paused, .userInControl: next = .paused
         case .waiting: next = .waiting
-        default: next = hub.shownIsActive ? .working : .idle
+        default: next = hub.isActive ? .working : .idle
         }
         if next != icon {
             icon = next
@@ -156,10 +156,11 @@ final class StatusController: NSObject, NSPopoverDelegate, NSWindowDelegate {
     }
 
     /// A notification out of the menu bar icon for each new handoff; one
-    /// that ended before it showed is dropped.
+    /// that ended before it showed is dropped. A host app that's connected
+    /// tells the user about its own sessions' handoffs.
     private func announceHandoffs() {
         var live: Set<String> = []
-        for e in hub.shownEngines {
+        for e in hub.engines where !hub.hostShowsItself(e) {
             guard let w = e.handoffWindow else { continue }
             let key = "\(e.sessionID)/\(w.id)"
             live.insert(key)

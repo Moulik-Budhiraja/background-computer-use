@@ -50,6 +50,8 @@ final class PopoverModel: ObservableObject {
     var takeOver: (() -> Void)?
     /// Opens history at this session's newest frame (the expanded view sets it).
     var openHistory: (() -> Void)?
+    /// The app this session belongs to, for a host app's session (the popover sets it).
+    @Published var hostIcon: NSImage?
     private var previewFPS = 8
     private var previewing = false
     /// A preview was asked for; it starts once the display is up, if it wasn't yet.
@@ -367,7 +369,7 @@ struct HeaderBar: View {
                     model.engine.setPaused(!model.paused)
                 }
                 IconButton(symbol: "stop.fill", help: "Stop: close the agent's windows (⌃⌥⌘.)") {
-                    if StopConfirm.confirm([model.engine]) { model.engine.stopAll() }
+                    if StopConfirm.confirm([model.engine]) { model.engine.stopAll(byUser: true) }
                 }
                 .disabled(!model.hasWindows)
                 if model.controlling {
@@ -600,7 +602,7 @@ final class MenuModel: ObservableObject {
     private var fps: Int { sessions.count > 1 ? 10 : 15 }
 
     func refresh() {
-        let active = Array(hub.shownActiveEngines.prefix(6))
+        let active = Array(hub.activeEngines.prefix(6))
         var next: [PopoverModel] = []
         for e in active {
             if let m = sessions.first(where: { $0.engine === e }) {
@@ -618,7 +620,11 @@ final class MenuModel: ObservableObject {
             sessions = next
             if previewing { for m in sessions { m.setPreviewFPS(fps) } }
         }
-        for m in sessions { m.refresh() }
+        for m in sessions {
+            m.refresh()
+            let icon = hostIcon(m.engine)
+            if m.hostIcon !== icon { m.hostIcon = icon }
+        }
         screenRecordingMissing = !Capture.hasPermission
         permissionsMissing = !AX.isTrusted || screenRecordingMissing
         allPaused = hub.allPaused
@@ -643,6 +649,19 @@ final class MenuModel: ObservableObject {
     func startPreviews() {
         previewing = true
         for m in sessions { m.startPreview(fps: fps) }
+    }
+
+    /// Icons of host apps, by process, so a tile keeps the same image.
+    private var hostIcons: [pid_t: NSImage] = [:]
+
+    /// The icon of the app a host session belongs to (Ping's, say), while
+    /// that app is subscribed.
+    private func hostIcon(_ e: Engine) -> NSImage? {
+        guard let host = e.host, let pid = hub.hostPID(host) else { return nil }
+        if let icon = hostIcons[pid] { return icon }
+        let icon = NSRunningApplication(processIdentifier: pid)?.icon
+        hostIcons[pid] = icon
+        return icon
     }
 
     func stopPreviews() {
@@ -740,7 +759,7 @@ private struct MenuHeader: View {
                 }
                 .disabled(menu.sessions.isEmpty)
                 IconButton(symbol: "stop.fill", help: "Stop: close every agent's windows (⌃⌥⌘.)") {
-                    if StopConfirm.confirm(menu.hub.shownEngines) { menu.hub.stopAll() }
+                    if StopConfirm.confirm(menu.hub.engines) { menu.hub.stopAll() }
                 }
                 .disabled(menu.sessions.isEmpty)
                 IconButton(symbol: "clock.arrow.circlepath", help: "History: look back at what agents did", action: menu.openHistory)
@@ -804,6 +823,9 @@ private struct SessionTile: View {
     private var label: some View {
         HStack(spacing: 5) {
             Tally(kind: model.tally).frame(width: 12, height: 16)
+            if let icon = model.hostIcon {
+                Image(nsImage: icon).resizable().frame(width: 14, height: 14)
+            }
             Text(model.engine.label).font(.system(size: 11, weight: .semibold))
             ForEach(model.apps.prefix(3)) { app in
                 if let icon = app.icon {
