@@ -189,4 +189,20 @@ final class PeerPolicyTests: XCTestCase {
         XCTAssertNil(try HostServer.streamWindow(Args([:]), owns: owns))
         XCTAssertThrowsError(try HostServer.streamWindow(Args(["window": 77]), owns: owns))
     }
+
+    /// Naming a window of another app's session (one whose agent went away,
+    /// say) doesn't get a call into it.
+    func testCallsCantNameAnotherAppsWindows() {
+        let scope = PeerScope()
+        let host = PeerTrust.app(team: theirs)
+        let other = PeerTrust.app(team: "CCCCCCCCCC")
+        XCTAssertNil(scope.admitCall(session: "victim", parent: nil, host: nil, host))
+        XCTAssertNotNil(scope.admitCall(session: "fresh", parent: nil, host: nil, windowOwners: ["victim"], other))
+        XCTAssertNil(scope.owner(ofSession: "fresh"), "a refused call claims nothing")
+        // A session no app has called for yet is the engine's own.
+        XCTAssertNotNil(scope.admitCall(session: "fresh", parent: nil, host: nil, windowOwners: ["restored"], other))
+        // The same app may (its agent came back after a restart), and so may the engine's own code.
+        XCTAssertNil(scope.admitCall(session: "back", parent: nil, host: nil, windowOwners: ["victim"], host))
+        XCTAssertNil(scope.admitCall(session: "mine", parent: nil, host: nil, windowOwners: ["victim"], .owner))
+    }
 }
