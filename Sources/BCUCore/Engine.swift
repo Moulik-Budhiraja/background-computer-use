@@ -1919,11 +1919,16 @@ public final class Engine {
         return ToolError("\(doing) element \(n.index) through accessibility failed (\(AX.errorName(err))), and nothing else was tried: a click at its place could hit something else. It may have worked anyway: call get_window_state to check before retrying.")
     }
 
+    /// Whether writing AXFocused gave an element keyboard focus. Some
+    /// elements refuse the write but have focus anyway.
+    static func focusTook(write: AXError, settable: Bool, focused: Bool?) -> Bool {
+        write == .success || focused == true
+    }
+
     /// Give `el` keyboard focus so keys go to it, or throw with nothing typed.
     private func focusForKeys(_ w: AgentWindow, _ el: AXUIElement, index: Int?, alreadyTyped: Int = 0) throws {
         let err = try guarded(w, cause: "focusing") { AX.set(el, "AXFocused", kCFBooleanTrue) }
-        // Some elements refuse the write but have focus anyway.
-        guard err != .success && AX.bool(el, "AXFocused") != true else { sleepMs(50); return }
+        guard !Self.focusTook(write: err, settable: AX.isSettable(el, "AXFocused"), focused: AX.bool(el, "AXFocused")) else { sleepMs(50); return }
         let which = index.map { "element \($0)" } ?? "the field"
         let done = alreadyTyped == 0 ? "nothing was typed" : "only the \(alreadyTyped) characters before it went in (through accessibility)"
         if err == .invalidUIElement {
