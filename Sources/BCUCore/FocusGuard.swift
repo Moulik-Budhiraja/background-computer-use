@@ -716,7 +716,7 @@ public final class FocusGuard {
         arriving[pid] = nil
         stranded.remove(pid)
         restoredAwayMs[pid] = nil
-        if swapping[pid] == nil { pidHeld[pid] = nil }
+        if Self.dropsHeldOnQuit(swapping: swapping[pid] != nil) { pidHeld[pid] = nil }
         if userRegularPid == pid { userRegularPid = 0 }
         let wasUsers = userFrontPid == pid
         if wasUsers { userFrontPid = 0; userFrontWindow = nil }
@@ -730,6 +730,11 @@ public final class FocusGuard {
             Log.info("guard: the user's app (pid \(pid)) quit; pid \(front) is theirs now")
             self.arrived(front)
         }
+    }
+
+    /// Whether keys held for an app that quit are dropped.
+    static func dropsHeldOnQuit(swapping: Bool) -> Bool {
+        !swapping
     }
 
     // MARK: Front watch
