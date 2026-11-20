@@ -1140,7 +1140,7 @@ public final class FocusGuard {
     /// accessibility calls that tried to give key back (they can take a
     /// second); `keySafe` is from those calls.
     static func strandedOutcome(pid: pid_t, frontBefore: pid_t, frontAfter: pid_t, keySafe: Bool, swapping: Bool) -> StrandedOutcome {
-        if pid != frontBefore { return .drop }
+        if pid != frontBefore || pid != frontAfter { return .drop }
         return keySafe ? .release : .wait
     }
 
