@@ -2,6 +2,7 @@ import AppKit
 import Carbon.HIToolbox
 import CoreGraphics
 import CPrivate
+import os
 
 public struct GuardEvent {
     public let time: Date
@@ -30,6 +31,9 @@ public final class FocusGuard {
     public var onEvent: ((GuardEvent) -> Void)?
     /// The user's recent input, for waiting until they pause (see `QuietWait`).
     public let activity = UserActivity()
+    /// When the tap last saw the user move the mouse (tap thread writes,
+    /// cursor watch reads).
+    private let lastUserMoveMs = OSAllocatedUnfairLock(initialState: -Double.infinity)
     /// Keeps agents' apps from bringing themselves to the front (see `FrontGate`).
     public let gate = FrontGate()
     /// Called from the input tap when the user presses a key or a mouse
@@ -387,7 +391,7 @@ public final class FocusGuard {
             }
             return fenced.contains { $0.insetBy(dx: -400, dy: -400).contains(p) }
         }
-        let q = nearestUserPoint(p, agent: agent)
+        let q = returnPoint(p, agent: agent, msSinceUserMove: nowMs() - lastUserMoveMs.withLock { $0 })
         // Nowhere better to put it (no user display): leave it be.
         guard q != p, !fenced.contains(where: { $0.contains(q) }) else { return false }
         CGWarpMouseCursorPosition(q)
@@ -1509,8 +1513,9 @@ public final class FocusGuard {
         switch type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .tabletPointer:
             let p = event.location
+            lastUserMoveMs.withLock { $0 = nowMs() }
             if let agent = AgentDisplay.fenced(at: p) {
-                let q = nearestUserPoint(p, agent: agent)
+                let q = returnPoint(p, agent: agent, msSinceUserMove: 0)
                 if q != p && AgentDisplay.fenced(at: q) == nil {
                     event.location = q
                     CGWarpMouseCursorPosition(q)
@@ -2080,6 +2085,25 @@ public final class FocusGuard {
         Self.nearestUserPoint(p, agent: agent, users: AgentDisplay.userDisplayIDs().map { CGDisplayBounds($0) }, fenced: AgentDisplay.fencedBounds)
     }
 
+    private func returnPoint(_ p: CGPoint, agent: CGRect, msSinceUserMove: Double) -> CGPoint {
+        Self.returnPoint(p, agent: agent, users: AgentDisplay.userDisplayIDs().map { CGDisplayBounds($0) }, fenced: AgentDisplay.fencedBounds, msSinceUserMove: msSinceUserMove)
+    }
+
+    /// A cursor found on the agent display this soon after the user moved
+    /// the mouse got there by that move (the watch can see it a moment
+    /// before the tap takes it back).
+    static let userMoveMs = 100.0
+
+    /// Where a cursor found on the agent display `agent` at `p` goes back to,
+    /// `msSinceUserMove` after the user last moved the mouse. The user's own
+    /// move stops on the edge of their screen, as at any edge, so they can
+    /// reach the corner the agent display touches. Anything else put it
+    /// there (a warp, a posted event, the tap off): it comes back
+    /// `escapeInset` inside, where they can see it.
+    static func returnPoint(_ p: CGPoint, agent: CGRect, users: [CGRect], fenced: [CGRect], msSinceUserMove: Double) -> CGPoint {
+        nearestUserPoint(p, agent: agent, users: users, fenced: fenced, inset: msSinceUserMove > userMoveMs)
+    }
+
     /// How far inside the screen an escaped cursor goes back: on the edge's
     /// last pixel the arrow is drawn past it (all of it, in the corner the
     /// agent display touches), and the user can't find it.
@@ -2088,8 +2112,9 @@ public final class FocusGuard {
     /// Where to put a cursor found at `p`, on the agent display `agent` (or
     /// off every display, with `.null`): on the nearest of the user's
     /// displays `users`, `escapeInset` inside each edge it crossed, at a
-    /// point no fenced display covers.
-    static func nearestUserPoint(_ p: CGPoint, agent: CGRect, users: [CGRect], fenced agents: [CGRect]) -> CGPoint {
+    /// point no fenced display covers. With `inset` false, on the edge's last
+    /// pixel instead.
+    static func nearestUserPoint(_ p: CGPoint, agent: CGRect, users: [CGRect], fenced agents: [CGRect], inset useInset: Bool = true) -> CGPoint {
         var best = p
         var bestDistance = CGFloat.infinity
         for r in users {
@@ -2101,7 +2126,7 @@ public final class FocusGuard {
             if agent.contains(q) || agents.contains(where: { $0.contains(q) }) { continue }
             if d < bestDistance {
                 bestDistance = d
-                let dx = min(escapeInset, (r.width - 1) / 2), dy = min(escapeInset, (r.height - 1) / 2)
+                let dx = useInset ? min(escapeInset, (r.width - 1) / 2) : 0, dy = useInset ? min(escapeInset, (r.height - 1) / 2) : 0
                 var inside = q
                 if p.x < r.minX { inside.x += dx } else if p.x > r.maxX - 1 { inside.x -= dx }
                 if p.y < r.minY { inside.y += dy } else if p.y > r.maxY - 1 { inside.y -= dy }
