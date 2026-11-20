@@ -732,9 +732,11 @@ public final class FocusGuard {
         }
     }
 
-    /// Whether keys held for an app that quit are dropped.
+    /// Whether keys held for an app that quit are dropped: always, even
+    /// while a swap in it unwinds, or its end would replay them into the
+    /// app the user is in next.
     static func dropsHeldOnQuit(swapping: Bool) -> Bool {
-        !swapping
+        true
     }
 
     // MARK: Front watch
