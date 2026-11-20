@@ -21,3 +21,12 @@ final class StrandedOutcomeTests: XCTestCase {
         XCTAssertEqual(FocusGuard.strandedOutcome(pid: 5, frontBefore: 9, frontAfter: 9, keySafe: false, swapping: true), .drop)
     }
 }
+
+/// The user switched apps while the guard was giving key back.
+final class StrandedOutcomeLateSwitchTests: XCTestCase {
+    /// Key came back in the app after the user had left it: the keys
+    /// would go to the app they're in now.
+    func testLeavingDuringTheCallsDrops() {
+        XCTAssertEqual(FocusGuard.strandedOutcome(pid: 5, frontBefore: 5, frontAfter: 9, keySafe: true, swapping: false), .drop)
+    }
+}
