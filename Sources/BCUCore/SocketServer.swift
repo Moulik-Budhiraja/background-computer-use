@@ -192,7 +192,8 @@ public final class SocketServer {
     }
 
     /// The windows a tool call names: its `window_id`, and each batch step's.
-    static func windowIDs(in args: JSONObject) -> [CGWindowID] {
+    /// nil when one of them isn't a window ID at all.
+    static func windowIDs(in args: JSONObject) -> [CGWindowID]? {
         var objects = [args]
         objects += (args["actions"] as? [JSONObject]) ?? []
         return objects.compactMap { Args($0).int("window_id").flatMap { CGWindowID(exactly: $0) } }
@@ -226,7 +227,11 @@ public final class SocketServer {
                 let args = request["args"] as? JSONObject ?? [:]
                 let session = args["_session"] as? String
                 // The engine's own clients may use every window; look up the rest.
-                let owners = connection.trust == .owner ? [] : Self.windowIDs(in: args).flatMap { windowOwners?($0) ?? [] }
+                guard let windows = Self.windowIDs(in: args) else {
+                    connection.send(ToolResult.error("`window_id` must be a window ID from list_windows or open_window").wire(id: id))
+                    continue
+                }
+                let owners = connection.trust == .owner ? [] : windows.flatMap { windowOwners?($0) ?? [] }
                 if let why = scope.admitCall(session: session ?? Hub.defaultSession, parent: args["_parent"] as? String,
                                              host: args["_host"] as? String, windowOwners: owners, connection.trust) {
                     connection.send(ToolResult.error(why).wire(id: id))

@@ -143,10 +143,15 @@ public enum PeerInspector {
         return identity(of: code)
     }
 
+    /// This process's executable, symlinks resolved.
+    static func ownExecutable(argv0: String, mainExecutable: String?) -> String {
+        URL(fileURLWithPath: argv0).resolvingSymlinksInPath().path
+    }
+
     public static func ownPolicy(trusted: [String] = []) -> PeerPolicy {
         var code: SecCode?
         let me = SecCodeCopySelf([], &code) == errSecSuccess ? code.map(identity(of:)) : nil
-        let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
+        let exe = ownExecutable(argv0: CommandLine.arguments[0], mainExecutable: Bundle.main.executableURL?.path)
         let home = PeerPolicy.outermostApp(exe) ?? (exe as NSString).deletingLastPathComponent
         let resolved = trusted.map { t -> String in
             if PeerPolicy.isTeamID(t) { return t }
@@ -185,20 +190,35 @@ public enum PeerInspector {
         return SecRequirementCreateWithString(text, [], &req) == errSecSuccess ? req : nil
     }
 
-    private static let cacheLock = NSLock()
-    nonisolated(unsafe) private static var shipping: Set<String> = []
+    private static let vouched = VouchCache()
 
     /// `HostCheck.vouches` on the real disk. Remembered once true, for that
-    /// code (its cdhash): the same code in the same place passes again.
+    /// code (its cdhash) in that app.
     public static func shipsBCU(app: String, peer: PeerIdentity) -> Bool {
         let key = "\(peer.team ?? "") \(peer.cdhash?.map { String(format: "%02x", $0) }.joined() ?? "") \(app)"
-        cacheLock.lock()
-        let known = shipping.contains(key)
-        cacheLock.unlock()
-        if known { return true }
-        guard HostCheck.vouches(app: app, peer: peer, disk: RealDisk()) else { return false }
-        cacheLock.lock(); shipping.insert(key); cacheLock.unlock()
-        return true
+        return vouched.check(key, fingerprint: { bundleFingerprint(app) }) {
+            HostCheck.vouches(app: app, peer: peer, disk: RealDisk())
+        }
+    }
+
+    /// Every file and folder in the bundle, by inode, change time and size.
+    /// The change time is the kernel's: no one can set it back, so a file
+    /// replaced or rewritten since gives another fingerprint.
+    static func bundleFingerprint(_ app: String) -> Int? {
+        var hasher = Hasher()
+        func add(_ path: String) -> Bool {
+            var st = stat()
+            guard lstat(path, &st) == 0 else { return false }
+            hasher.combine(path)
+            hasher.combine(st.st_dev); hasher.combine(st.st_ino); hasher.combine(st.st_mode); hasher.combine(st.st_size)
+            hasher.combine(st.st_ctimespec.tv_sec); hasher.combine(st.st_ctimespec.tv_nsec)
+            return true
+        }
+        guard add(app), let items = FileManager.default.enumerator(atPath: app) else { return nil }
+        while let item = items.nextObject() as? String {
+            guard add("\(app)/\(item)") else { return nil }
+        }
+        return hasher.finalize()
     }
 
     /// Code on disk, read through the Security framework.
@@ -242,6 +262,25 @@ public enum PeerInspector {
             guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code) == errSecSuccess else { return nil }
             return code
         }
+    }
+}
+
+/// `HostCheck.vouches` results that passed, so a host's next connection
+/// doesn't check its whole bundle again.
+final class VouchCache {
+    private let lock = NSLock()
+    private var passed: [String: Int] = [:]
+
+    /// `verify`'s answer for `key`, or a remembered pass. `fingerprint`
+    /// describes what the answer depends on (nil: can't tell).
+    func check(_ key: String, fingerprint: () -> Int?, verify: () -> Bool) -> Bool {
+        lock.lock()
+        let known = passed[key] != nil
+        lock.unlock()
+        if known { return true }
+        guard verify() else { return false }
+        lock.lock(); passed[key] = 0; lock.unlock()
+        return true
     }
 }
 
