@@ -253,4 +253,16 @@ final class PeerPolicyTests: XCTestCase {
         XCTAssertEqual(FrameStream.target(window: 42, excluded: 0, owns: { _ in false }), .nothing)
         XCTAssertEqual(FrameStream.target(window: 0, excluded: 7, owns: { _ in false }), .display(excluding: 7))
     }
+
+    /// Keys go to the window the user last clicked only while it's still on
+    /// the session's display. One the session gave back (and another app's
+    /// agent may have borrowed since) doesn't get them.
+    func testKeysDontFollowAWindowOffTheDisplay() {
+        func w(_ id: CGWindowID, layer: Int = 0) -> WindowInfo {
+            WindowInfo(id: id, pid: 1, owner: "", title: "", bounds: .zero, layer: layer, onScreen: true, alpha: 1)
+        }
+        XCTAssertEqual(RemoteControl.keyWindow(cached: w(5), onDisplay: [w(9, layer: 3), w(5), w(6)])?.id, 5)
+        XCTAssertEqual(RemoteControl.keyWindow(cached: w(5), onDisplay: [w(9, layer: 3), w(6)])?.id, 6)
+        XCTAssertNil(RemoteControl.keyWindow(cached: w(5), onDisplay: []))
+    }
 }
