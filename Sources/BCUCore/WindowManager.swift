@@ -1119,8 +1119,10 @@ public final class WindowManager {
     }
 
     /// Mark a window on a stray display kept, for the user, before moving
-    /// it there. False: don't move it.
+    /// it there. False: don't move it, a session has it since the rescue
+    /// picked it (it may have waited on the app for a while).
     static func claimForRescue(_ id: CGWindowID, registered: (CGWindowID) -> Bool) -> Bool {
+        guard !registered(id) else { return false }
         keep(id)
         return true
     }

@@ -256,7 +256,7 @@ public final class Engine {
 
     /// Whether a release asked for during departure `queuedFor` may still
     /// run, the agent's latest departure being `latest`.
-    static func departureStillCurrent(_ queuedFor: Int, latest: Int) -> Bool { true }
+    static func departureStillCurrent(_ queuedFor: Int, latest: Int) -> Bool { queuedFor == latest }
 
     /// Close what an agent that went away left open, and give up its
     /// display, unless it's `back`. Any thread; safe to call twice.
