@@ -101,7 +101,9 @@ public final class Hub {
         attached[id] = n == 0 ? nil : n
         departedAtMs[id] = n == 0 && !on ? nowMs() : nil
         let e = byID[id]
-        let left = !on && n == 0 ? Self.leftWithNobody(after: id, attached: attached, usedBy: usedBy).compactMap { byID[$0] } : []
+        let leftIDs = !on && n == 0 ? Self.leftWithNobody(after: id, attached: attached, usedBy: usedBy) : []
+        departedAtMs = Self.departedTimes(departedAtMs, left: leftIDs, now: nowMs())
+        let left = leftIDs.compactMap { byID[$0] }
         lock.unlock()
         for o in left where o !== e {
             o.agentLeft(graceMs: Self.orphanGraceMs) { [weak self, weak o] in o.flatMap { self?.isAttached($0) } ?? true }
@@ -109,6 +111,18 @@ public final class Hub {
         guard !on, n == 0, let e else { return }
         Log.info("session \(Self.short(id)): its agent went away")
         e.agentLeft(graceMs: Self.orphanGraceMs) { [weak self, weak e] in e.flatMap { self?.isAttached($0) } ?? true }
+    }
+
+    /// When each session's agent went away, once `left` have nobody left.
+    static func departedTimes(_ departedAtMs: [String: Double], left: [String], now: Double) -> [String: Double] {
+        departedAtMs
+    }
+
+    /// `usedBy` without the sessions `forgetDormant` dropped.
+    static func prunedUsers(_ usedBy: [String: Set<String>], gone: [String], attached: [String: Int]) -> [String: Set<String>] {
+        var kept = usedBy.filter { !gone.contains($0.key) }
+        for (owner, users) in kept { kept[owner] = users.subtracting(gone) }
+        return kept
     }
 
     /// Whether a session's agent is still around: a connection carries its
@@ -376,8 +390,8 @@ public final class Hub {
     private func forgetDormant() {
         lock.lock()
         let gone = byID.filter { $0.key != Self.defaultSession && $0.value.isDormant(idleMs: Self.idleTeardownMs * 2) }.map(\.key)
-        for id in gone { byID[id]?.audio.end(); byID[id] = nil; parentOf[id] = nil; departedAtMs[id] = nil; usedBy[id] = nil }
-        for (owner, users) in usedBy { usedBy[owner] = users.subtracting(gone) }
+        for id in gone { byID[id]?.audio.end(); byID[id] = nil; parentOf[id] = nil; departedAtMs[id] = nil }
+        usedBy = Self.prunedUsers(usedBy, gone: gone, attached: attached)
         order.removeAll { gone.contains($0) }
         lock.unlock()
         for id in gone { Log.info("session \(Self.short(id)) ended") }
