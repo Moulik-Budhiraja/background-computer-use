@@ -1076,12 +1076,14 @@ public final class WindowManager {
     /// A session has the window again (`register`): not kept any more, so
     /// its sweep looks after it.
     static func ownedAgain(_ id: CGWindowID) { keptLock.lock(); keptOpen.remove(id); keptLock.unlock() }
-    /// An abandoned session left this window with the user (`Engine.releaseAbandoned`).
-    static func leftWithUser(_ id: CGWindowID) {}
+    /// An abandoned session left this window with the user
+    /// (`Engine.releaseAbandoned`): theirs, so kept, as a returned one is.
+    static func leftWithUser(_ id: CGWindowID) { keep(id) }
 
     /// Whether a leftover cleanup found is still nobody's, just before
-    /// cleanup acts on it.
-    static func leftoverStillUnowned(_ id: CGWindowID, registered: (CGWindowID) -> Bool) -> Bool { true }
+    /// cleanup acts on it: a session may have borrowed it while cleanup
+    /// waited on the app.
+    static func leftoverStillUnowned(_ id: CGWindowID, registered: (CGWindowID) -> Bool) -> Bool { !registered(id) }
 
     /// A borrowed window went back to the user (`release`): theirs again,
     /// so kept, as one released with `keep_open` is. It may have been
