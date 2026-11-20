@@ -403,8 +403,15 @@ public final class Engine {
     // MARK: Dispatch
 
     /// Called from socket threads. Blocks until the tool finishes.
+    /// Tools that only read state kept under locks, answered without
+    /// waiting for the session's running call.
+    static func answersOffQueue(_ tool: String) -> Bool {
+        false
+    }
+
     public func call(tool: String, args: JSONObject) -> ToolResult {
-        queue.sync {
+        if Self.answersOffQueue(tool) { return status(Args(args)) }
+        return queue.sync {
             stateLock.lock()
             lastCallMs = nowMs()
             _busy = Self.describe(tool)
