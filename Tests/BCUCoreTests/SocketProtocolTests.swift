@@ -100,3 +100,13 @@ final class SocketProtocolTests: XCTestCase {
         XCTAssertTrue(object["id"] is NSNull)
     }
 }
+
+/// `status` has a short timeout, so it can't wait behind a session's
+/// long call (a batch of waits, slow typing).
+final class StatusOffQueueTests: XCTestCase {
+    func testStatusSkipsTheSessionQueue() {
+        XCTAssertTrue(Engine.answersOffQueue("status"))
+        XCTAssertFalse(Engine.answersOffQueue("type_text"))
+        XCTAssertFalse(Engine.answersOffQueue("get_window_state"))
+    }
+}
