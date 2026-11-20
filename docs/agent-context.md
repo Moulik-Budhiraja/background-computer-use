@@ -171,7 +171,7 @@ Move a handed-off window back onto your display once the user is done.
 
 ### batch
 
-Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {"tool": "click", "element": 6}, {"tool": "type_text", "text": "example.com\n"}, {"tool": "wait", "ms": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, navigate, wait. Element numbers refer to your last get_window_state. Steps that take key focus in an app the user is in wait for a pause in their input once, and back-to-back steps like that then run together.
+Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {"tool": "click", "element": 6}, {"tool": "type_text", "text": "example.com\n"}, {"tool": "wait", "ms": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, navigate, choose_file, wait. Element numbers refer to your last get_window_state. Steps that take key focus in an app the user is in wait for a pause in their input once, and back-to-back steps like that then run together.
 
 - `actions` (array of object, required): Up to 40 actions: {"tool": name, ...that tool's arguments}.
 - `full` (boolean): List every element in that state instead of the changes (default false).
