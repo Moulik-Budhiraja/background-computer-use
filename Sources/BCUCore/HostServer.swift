@@ -604,10 +604,12 @@ enum HostInput {
 
     /// Whether a host's key event is cmd+Q, which the take-over never sends.
     /// `quitCode`: the key that types Q with cmd on the current layout.
-    /// The key's text counts too: the event carries it, and a host on
-    /// another layout sends Q's code there, not ours.
+    /// By the key's text when it has one: the event carries it, and a host
+    /// on another layout sends codes by its own layout, not ours. Without
+    /// text, by the code.
     static func quitBlocked(command: Bool, keyCode: CGKeyCode, key: String, quitCode: CGKeyCode) -> Bool {
-        command && (keyCode == quitCode || key.lowercased() == "q")
+        guard command else { return false }
+        return key.isEmpty ? keyCode == quitCode : key.lowercased() == "q"
     }
 
     /// `command`: cmd is held, which some layouts map differently (see
