@@ -404,7 +404,12 @@ public final class Engine {
     public func handBack() {
         queue.async {
             var done: [String] = []
-            for w in self.windows.windows where w.handedOff {
+            let handedOff = self.windows.windows.filter(\.handedOff)
+            guard !handedOff.isEmpty else { return }
+            // Before the move: `takeBack` stops the window counting as handed
+            // off before it's back, and an update mustn't install in between.
+            self.stateLock.lock(); self.userReturnedMs = nowMs(); self.stateLock.unlock()
+            for w in handedOff {
                 guard (try? self.windows.takeBack(w.id)) != nil else { continue }
                 done.append("window \(w.id) (\(w.appName))")
             }
