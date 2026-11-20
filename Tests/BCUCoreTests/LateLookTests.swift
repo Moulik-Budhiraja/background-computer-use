@@ -28,6 +28,15 @@ final class LateLookTests: XCTestCase {
         XCTAssertNil(LateLook.bringForward(facts(front: true)))
     }
 
+    /// They clicked a link at 1000 and went on typing in their app at 1080;
+    /// the browser came forward and was put back at 1150. They've moved
+    /// on: bringing the browser forward now would take their typing.
+    func testTypingSinceTheClickCountsEvenBeforeThePutBack() {
+        XCTAssertTrue(LateLook.inputSince(clickMs: 1000, putBackMs: 1150, mouseDownMs: 1000, keyMs: 1080))
+        XCTAssertTrue(LateLook.inputSince(clickMs: 1000, putBackMs: 1150, mouseDownMs: 1200, keyMs: 0))
+        XCTAssertFalse(LateLook.inputSince(clickMs: 1000, putBackMs: 1150, mouseDownMs: 1000, keyMs: 900))
+    }
+
     func testOnlyClicksThatCouldOpenSomethingAreLookedAt() {
         XCTAssertTrue(LateLook.wanted(.link))
         XCTAssertTrue(LateLook.wanted(.unknown))
