@@ -265,4 +265,16 @@ final class PeerPolicyTests: XCTestCase {
         XCTAssertEqual(RemoteControl.keyWindow(cached: w(5), onDisplay: [w(9, layer: 3), w(6)])?.id, 6)
         XCTAssertNil(RemoteControl.keyWindow(cached: w(5), onDisplay: []))
     }
+
+    /// The session a call without `_session` lands in is `bcu call`'s, the
+    /// engine's own. Another app can't take it, explicitly or as a parent.
+    func testAnotherAppCantClaimTheDefaultSession() {
+        let scope = PeerScope()
+        let host = PeerTrust.app(team: theirs)
+        XCTAssertNotNil(scope.admitCall(session: Hub.defaultSession, parent: nil, host: nil, host))
+        XCTAssertNotNil(scope.admitCall(session: "x/sub", parent: Hub.defaultSession, host: nil, host))
+        XCTAssertNil(scope.owner(ofSession: Hub.defaultSession))
+        XCTAssertNil(scope.admitCall(session: Hub.defaultSession, parent: nil, host: nil, .owner))
+        XCTAssertFalse(scope.mayUse(session: Hub.defaultSession, host))
+    }
 }
