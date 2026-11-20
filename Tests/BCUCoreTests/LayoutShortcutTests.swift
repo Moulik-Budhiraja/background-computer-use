@@ -44,3 +44,23 @@ final class HostKeyFallbackTests: XCTestCase {
         XCTAssertEqual(HostInput.keyCode(code: "", key: "q", command: false, lookup: dvorakQwertyCmd), 7)
     }
 }
+
+/// The take-over never sends cmd+Q, whatever layout the host typed it on.
+final class HostQuitBlockTests: XCTestCase {
+    /// A US host's cmd+Q (code KeyQ, key 12) with French selected here,
+    /// where Q is key 0: its text is still "q", and the app quits on it.
+    func testCommandQFromAnotherLayoutIsBlocked() {
+        XCTAssertTrue(HostInput.quitBlocked(command: true, keyCode: 12, key: "q", quitCode: 0))
+        XCTAssertTrue(HostInput.quitBlocked(command: true, keyCode: 12, key: "Q", quitCode: 0))
+    }
+
+    func testCommandQOnThisLayoutIsBlocked() {
+        XCTAssertTrue(HostInput.quitBlocked(command: true, keyCode: 0, key: "", quitCode: 0))
+    }
+
+    func testOtherKeysGoThrough() {
+        // cmd+A typed on a French host: key 12 here, text "a".
+        XCTAssertFalse(HostInput.quitBlocked(command: true, keyCode: 12, key: "a", quitCode: 0))
+        XCTAssertFalse(HostInput.quitBlocked(command: false, keyCode: 0, key: "q", quitCode: 0))
+    }
+}
