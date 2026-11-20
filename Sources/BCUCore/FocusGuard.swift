@@ -1103,23 +1103,47 @@ public final class FocusGuard {
         guard !pids.isEmpty else { return }
         let front = BCUFrontProcessPID()
         for pid in pids {
-            let left = pid != front
-            if !left {
+            var safe = false
+            var frontAfter = front
+            if pid == front {
                 let appLock = Engine.inputLock(pid)
                 guard appLock.lock(before: Date().addingTimeInterval(0.05)) else { continue }
                 if !isSwapping(pid) { reclaimKey(pid) }
                 appLock.unlock()
-                guard keySafe(pid) else { continue }
+                safe = keySafe(pid)
+                frontAfter = BCUFrontProcessPID()
             }
             lock.lock()
-            stranded.remove(pid)
-            let dropped = left && swapping[pid] == nil ? pidHeld.removeValue(forKey: pid)?.events.count ?? 0 : 0
+            let outcome = Self.strandedOutcome(pid: pid, frontBefore: front, frontAfter: frontAfter, keySafe: safe, swapping: swapping[pid] != nil)
+            if outcome != .wait { stranded.remove(pid) }
+            let dropped = outcome == .drop ? pidHeld.removeValue(forKey: pid)?.events.count ?? 0 : 0
             lock.unlock()
             if dropped > 0 {
                 record("dropped \(dropped) of your key events typed into pid \(pid) while an agent's window had key there, rather than type them into it")
             }
-            if !left { releasePidHeld(pid) }
+            if outcome == .release { releasePidHeld(pid) }
         }
+    }
+
+    /// What `checkStranded` does with a stranded app's held keys.
+    enum StrandedOutcome: Equatable {
+        /// Still stranded: keep holding them.
+        case wait
+        /// A window of the user's has key: send them on.
+        case release
+        /// The user left the app: drop them.
+        case drop
+        /// The user left mid-swap: no longer stranded, the swap's end
+        /// deals with them.
+        case unmark
+    }
+
+    /// `frontBefore` and `frontAfter`: the front app before and after the
+    /// accessibility calls that tried to give key back (they can take a
+    /// second); `keySafe` is from those calls.
+    static func strandedOutcome(pid: pid_t, frontBefore: pid_t, frontAfter: pid_t, keySafe: Bool, swapping: Bool) -> StrandedOutcome {
+        if pid != frontBefore { return swapping ? .unmark : .drop }
+        return keySafe ? .release : .wait
     }
 
     /// The window of `pid` the user would expect to be key: a standard
