@@ -19,7 +19,8 @@ what the user would have seen and felt:
   run.py summarize DIR
 
 Build first: Tools/Lab/build.sh. Needs the engine running (the app, or
-`bcu serve`). Python 3.9 is enough.
+`bcu serve`). Agents' calls go through `bcu mcp` (set BCU to the bcu
+next to that engine if it isn't the installed app's). Python 3.9 is enough.
 """
 
 import argparse
@@ -41,6 +42,7 @@ FIXTURE_APP = os.path.join(ROOT, "build", "lab", "BCU Fixture.app")
 SUPPORT = os.environ.get("BCU_HOME") or os.path.expanduser("~/Library/Application Support/BackgroundComputerUse")
 SOCK = os.path.join(SUPPORT, "bcu.sock")
 LOG = os.path.join(SUPPORT, "logs", "bcu.log")
+BCU = os.environ.get("BCU") or "/Applications/Background Computer Use.app/Contents/MacOS/bcu"
 
 PARAGRAPH = ("the quick brown fox jumps over the lazy dog near the river bank. "
              "a small boat drifts past the old mill while children play on the grass. ")
@@ -59,39 +61,65 @@ def say(msg):
 
 
 class Client:
-    """One agent session's connection to the engine (the `bcu call` protocol)."""
+    """One agent session, through `bcu mcp` as an agent would use it. The
+    engine lets in only signed clients, so the lab can't use its socket
+    directly. `BCU` names the bcu to run (default: the installed app's)."""
 
     def __init__(self, session):
         self.session = session
-        self.sock = socket.socket(socket.AF_UNIX)
-        self.sock.connect(SOCK)
-        self.file = self.sock.makefile("rb")
+        self.proc = subprocess.Popen([BCU, "mcp", "--session", session],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.n = 0
         self.calls = []
+        self._rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "bcu-lab", "version": "1"}})
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _send(self, obj):
+        self.proc.stdin.write((json.dumps(obj) + "\n").encode())
+        self.proc.stdin.flush()
+
+    def _rpc(self, method, params):
+        self.n += 1
+        self._send({"jsonrpc": "2.0", "id": self.n, "method": method, "params": params})
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                return None
+            r = json.loads(line)
+            # Skip notifications (tools/list_changed).
+            if r.get("id") == self.n:
+                return r
 
     def call(self, tool, **args):
-        self.n += 1
-        args["_session"] = self.session
         t0 = uptime_ms()
-        self.sock.sendall((json.dumps({"id": self.n, "tool": tool, "args": args}) + "\n").encode())
-        line = self.file.readline()
+        r = self._rpc("tools/call", {"name": tool, "arguments": args})
         t1 = uptime_ms()
-        r = json.loads(line) if line else {"ok": False, "error": "connection closed"}
-        text = r.get("text") or r.get("error") or ""
-        self.calls.append({"session": self.session, "tool": tool, "t0": t0, "t1": t1, "ok": bool(r.get("ok")),
+        if r is None:
+            ok, text = False, "bcu mcp exited"
+        elif "error" in r:
+            ok, text = False, r["error"].get("message", "")
+        else:
+            result = r.get("result", {})
+            ok = not result.get("isError")
+            text = "\n".join(c.get("text", "") for c in result.get("content", []) if c.get("type") == "text")
+        self.calls.append({"session": self.session, "tool": tool, "t0": t0, "t1": t1, "ok": ok,
                            "first": text.split("\n")[0][:200],
                            "guard": [l for l in text.split("\n") if l.startswith("[focus guard]")],
                            "notes": [l for l in text.split("\n") if l.startswith("[user first]") or l.startswith("[other agents]")]})
-        return bool(r.get("ok")), text
+        return ok, text
 
     def close(self):
-        # shutdown first: the file made from the socket keeps it open
-        # otherwise, and the engine never learns the agent went away.
-        for step in (lambda: self.sock.shutdown(socket.SHUT_RDWR), self.file.close, self.sock.close):
-            try:
-                step()
-            except OSError:
-                pass
+        # bcu mcp exits at the end of its input, which closes its
+        # connections, so the engine learns the agent went away.
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
 
 
 # ------------------------------------------------------------------ web pages

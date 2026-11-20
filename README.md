@@ -138,7 +138,7 @@ Known gaps:
 
 ## Testing
 
-`Tools/Lab` measures, from outside the app, what a user would see and feel while agents work. `Tools/Lab/build.sh` builds `build/lab/lab` (the observer and a simulated user that types and moves the pointer through the real input stream) and `BCU Fixture.app` (an app standing in for the one the user is in, which writes down every key with how long it took to arrive, every time it lost or gained key or active state, and every hover that ended). Then, with the engine running:
+`Tools/Lab` measures, from outside the app, what a user would see and feel while agents work. `Tools/Lab/build.sh` builds `build/lab/lab` (the observer and a simulated user that types and moves the pointer through the real input stream) and `BCU Fixture.app` (an app standing in for the one the user is in, which writes down every key with how long it took to arrive, every time it lost or gained key or active state, and every hover that ended). Then, with the engine running (the scripted agents call it through `bcu mcp`; set `BCU` to the `bcu` next to that engine if it isn't the installed app's):
 
 ```bash
 python3 Tools/Lab/run.py scenario --agents 2 --kinds helium,finder --out /tmp/lab-run
