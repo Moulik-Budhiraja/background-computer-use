@@ -552,7 +552,8 @@ enum HostInput {
             let key = a.string("key") ?? ""
             guard let keyCode = keyCode(code: code, key: key, command: flags.contains(.maskCommand)) else { throw ToolError("unknown key code \(code)") }
             // cmd+Q would quit the whole app, the user's own windows included.
-            if flags.contains(.maskCommand) && keyCode == ((try? KeyMap.code(for: "q", command: true).0) ?? 12) { return }
+            if quitBlocked(command: flags.contains(.maskCommand), keyCode: keyCode, key: key,
+                           quitCode: (try? KeyMap.code(for: "q", command: true).0) ?? 12) { return }
             guard let e = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: down) else { return }
             if modifierCodes.contains(keyCode) {
                 e.type = .flagsChanged
@@ -600,6 +601,12 @@ enum HostInput {
         "NumpadMultiply": 67, "NumpadAdd": 69, "NumpadSubtract": 78, "NumpadDivide": 75,
         "NumpadEnter": 76, "NumpadEqual": 81, "NumLock": 71,
     ]
+
+    /// Whether a host's key event is cmd+Q, which the take-over never sends.
+    /// `quitCode`: the key that types Q with cmd on the current layout.
+    static func quitBlocked(command: Bool, keyCode: CGKeyCode, key: String, quitCode: CGKeyCode) -> Bool {
+        command && keyCode == quitCode
+    }
 
     /// `command`: cmd is held, which some layouts map differently (see
     /// `KeyMap.code(for:command:)`, which `lookup` is).
