@@ -340,21 +340,13 @@ public final class Hub {
 
     /// Apps whose every window is on an agent display play into their
     /// session's audio file instead of the speakers. Apps the user also has
-    /// windows in (minimized and hidden ones count) are left alone.
+    /// windows in (minimized and hidden ones count) are left alone, unless
+    /// the session claimed one before playing sound in it.
     private func routeAudio() {
-        let displays = AgentDisplay.running.map(\.bounds)
         let engines = self.engines.filter { $0.display.isRunning }
         guard !engines.isEmpty else { return }
-        var onAgent: [pid_t: Bool] = [:]
-        for w in WindowList.all() where w.layer == 0 && w.bounds.width > 40 && w.bounds.height > 40 {
-            let c = CGPoint(x: w.bounds.midX, y: w.bounds.midY)
-            let mine = displays.contains { $0.contains(c) }
-            onAgent[w.pid] = (onAgent[w.pid] ?? true) && mine
-        }
-        for e in engines {
-            let pids = Set(e.windows.windows.filter { !$0.withUser }.map(\.pid)).filter { onAgent[$0] == true }
-            e.audio.route(pids.compactMap { NSRunningApplication(processIdentifier: $0) })
-        }
+        let onAgent = Engine.appsOnAgent(checking: Set(engines.flatMap { $0.windows.windows.map(\.pid) }))
+        for e in engines { e.audio.route { e.audioApps(onAgent: onAgent) } }
     }
 
     /// Sessions whose agent has gone away (its display removed, nothing open)

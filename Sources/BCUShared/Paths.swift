@@ -24,9 +24,23 @@ public enum BCUPaths {
         if let home = ProcessInfo.processInfo.environment["BCU_HOME"], !home.isEmpty {
             return URL(fileURLWithPath: home, isDirectory: true)
         }
+        if let testHome { return testHome }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("BackgroundComputerUse", isDirectory: true)
     }
+
+    /// In a test runner, a folder of the run's own. The installed engine's
+    /// state must never be touched by a test: the front gate's tests delete
+    /// its record of WindowServer's permitted-front list, and the engine then
+    /// forgets entries that stay on the list, so every app launched after
+    /// that is refused the front. Nil in the app and in `bcu` (no XCTest).
+    private static let testHome: URL? = {
+        guard NSClassFromString("XCTestCase") != nil else { return nil }
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bcu-test-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
 
     /// The engine listens here; `bcu` and host apps connect here.
     public static var socketPath: String {
