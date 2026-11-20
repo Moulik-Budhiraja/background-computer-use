@@ -224,9 +224,12 @@ public enum AgentSetup {
         return started ? word : nil
     }
 
-    /// A file that can be run.
+    /// A file that can be run. A folder counts as executable too (it can
+    /// be searched), and a shell profile can print one.
     static func isProgram(_ path: String) -> Bool {
-        FileManager.default.isExecutableFile(atPath: path)
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && !isDir.boolValue
+            && FileManager.default.isExecutableFile(atPath: path)
     }
 
     static func expandTilde(_ path: String) -> String {
