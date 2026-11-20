@@ -14,7 +14,7 @@ public enum UpdateGate {
         public var handedOff: Bool
         public var userInControl: Bool
         /// Since the user last gave the agent its windows back (Done on a
-        /// handoff, or the end of a take-over); `.infinity` if never.
+        /// handoff, Resume, or the end of a take-over); `.infinity` if never.
         public var msSinceUserReturned: Double
 
         public init(msSinceLastCall: Double, hasWindows: Bool, handedOff: Bool, userInControl: Bool, msSinceUserReturned: Double = .infinity) {
