@@ -145,3 +145,45 @@ final class Locked<T>: @unchecked Sendable {
         return body(&stored)
     }
 }
+
+/// BCU is quitting: `Hub.shutdown` waits on the main thread for every
+/// session to let go of its windows, so nothing may wait on the main
+/// thread from then on (see `onMainUnlessQuitting`).
+public enum Quitting {
+    private static let flag = Locked(false)
+    public static var now: Bool { flag.value }
+    static func begin() { flag.value = true }
+    static func resetForTests() { flag.value = false }
+}
+
+/// Run `work` on the main thread and wait for it, unless BCU starts quitting
+/// before it gets to run: then it never runs, and this returns false.
+/// Waiting on the main thread while `Hub.shutdown` waits on this thread
+/// would hold both up until the shutdown gives up.
+@discardableResult
+func onMainUnlessQuitting(_ work: @escaping () -> Void) -> Bool {
+    if Thread.isMainThread { work(); return true }
+    if Quitting.now { return false }
+    // 0: not run yet, 1: running or done, 2: dropped.
+    let state = Locked(0)
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.main.async {
+        let run = state.with { s -> Bool in
+            guard s == 0 else { return false }
+            s = 1
+            return true
+        }
+        if run { work() }
+        done.signal()
+    }
+    while done.wait(timeout: .now() + .milliseconds(50)) == .timedOut {
+        guard Quitting.now else { continue }
+        let dropped = state.with { s -> Bool in
+            guard s == 0 else { return false }
+            s = 2
+            return true
+        }
+        if dropped { return false }
+    }
+    return state.value == 1
+}
