@@ -93,6 +93,12 @@ public struct PeerPolicy: Equatable {
         return .deny("\(name) isn't part of an app that ships bcu, signed by the same developer")
     }
 
+    /// `decide`, with `later()` for names added to `trusted` while the
+    /// engine runs.
+    public func decide(_ peer: PeerIdentity?, later: () -> [String], shipsBCU: (String, PeerIdentity) -> Bool) -> PeerDecision {
+        decide(peer, shipsBCU: shipsBCU)
+    }
+
     /// A developer team ID: ten uppercase letters and digits.
     public static func isTeamID(_ s: String) -> Bool {
         s.count == 10 && s.allSatisfy { ("A"..."Z").contains($0) || ("0"..."9").contains($0) }
@@ -156,13 +162,18 @@ public enum PeerInspector {
         let me = SecCodeCopySelf([], &code) == errSecSuccess ? code.map(identity(of:)) : nil
         let exe = ownExecutable(argv0: CommandLine.arguments[0], mainExecutable: Bundle.main.executableURL?.path)
         let home = PeerPolicy.outermostApp(exe) ?? (exe as NSString).deletingLastPathComponent
-        let resolved = trusted.map { t -> String in
+        return PeerPolicy(team: me?.team, cdhash: me?.cdhash, home: home, trusted: resolve(trusted: trusted))
+    }
+
+    /// Trusted names as the policy compares them: team IDs as they are,
+    /// paths with symlinks resolved and a main executable as its app.
+    public static func resolve(trusted: [String]) -> [String] {
+        trusted.map { t -> String in
             if PeerPolicy.isTeamID(t) { return t }
             return PeerPolicy.trustedPath(URL(fileURLWithPath: t).resolvingSymlinksInPath().path) {
                 Bundle(path: $0)?.executableURL?.resolvingSymlinksInPath().path
             }
         }
-        return PeerPolicy(team: me?.team, cdhash: me?.cdhash, home: home, trusted: resolved)
     }
 
     private static func identity(of code: SecCode) -> PeerIdentity {
