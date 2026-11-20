@@ -307,6 +307,9 @@ public final class PeerScope {
             if let o = sessions[s], !trust.mayUse(o) { return "Session \(s) belongs to another app." }
         }
         if let host, !host.isEmpty, let o = hosts[host], !trust.mayUse(o) { return "Host \(host) belongs to another app." }
+        // A window of another app's session: the hub would send the call to
+        // that session, or hand its windows over if its agent went away.
+        for s in windowOwners where !trust.mayUse(sessions[s] ?? .owner) { return "That window belongs to another app." }
         if sessions[session] == nil { sessions[session] = trust }
         if let host, !host.isEmpty, hosts[host] == nil, trust != .owner { hosts[host] = trust }
         return nil
