@@ -1076,6 +1076,13 @@ public final class WindowManager {
     /// A session has the window again (`register`): not kept any more, so
     /// its sweep looks after it.
     static func ownedAgain(_ id: CGWindowID) { keptLock.lock(); keptOpen.remove(id); keptLock.unlock() }
+    /// An abandoned session left this window with the user (`Engine.releaseAbandoned`).
+    static func leftWithUser(_ id: CGWindowID) {}
+
+    /// Whether a leftover cleanup found is still nobody's, just before
+    /// cleanup acts on it.
+    static func leftoverStillUnowned(_ id: CGWindowID, registered: (CGWindowID) -> Bool) -> Bool { true }
+
     /// A borrowed window went back to the user (`release`): theirs again,
     /// so kept, as one released with `keep_open` is. It may have been
     /// opened by an agent (and kept) before it was borrowed, and cleanup
@@ -1141,6 +1148,7 @@ public final class WindowManager {
         let present = Set(found.map(\.0.id))
         let toClose = found.filter { leftoverFate($0.0.id, agentMade: wasAgentMade($0.0.id), kept: kept) == .close }
         for (info, ax) in found where !toClose.contains(where: { $0.0.id == info.id }) {
+            guard leftoverStillUnowned(info.id, registered: isRegistered) else { continue }
             keep(info.id)
             putOnUserScreen(ax, bounds: info.bounds)
             // (Told once: one that won't move is tried again next time.)
@@ -1149,8 +1157,8 @@ public final class WindowManager {
             FocusGuard.shared?.record("moved a \(info.owner) window from an agent display to your screen")
         }
         // Dialogs first: one that's asking about a window keeps it open.
-        for (_, ax) in toClose where answerLeave(ax) { sleepMs(400) }
-        for (info, ax) in toClose where WindowList.info(info.id) != nil {
+        for (info, ax) in toClose where leftoverStillUnowned(info.id, registered: isRegistered) && answerLeave(ax) { sleepMs(400) }
+        for (info, ax) in toClose where WindowList.info(info.id) != nil && leftoverStillUnowned(info.id, registered: isRegistered) {
             if let close = AX.element(ax, "AXCloseButton") { AX.perform(close, "AXPress") } else { AX.perform(ax, "AXCancel") }
             let deadline = nowMs() + 1200
             while WindowList.info(info.id) != nil && nowMs() < deadline { sleepMs(50) }

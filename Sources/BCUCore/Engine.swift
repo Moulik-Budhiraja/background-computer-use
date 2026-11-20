@@ -304,6 +304,7 @@ public final class Engine {
             for w in mine {
                 if w.withUser {
                     self.windows.unregister(w.id)
+                    WindowManager.leftWithUser(w.id)
                     notes.append("left \(w.appName) window \(w.id) with you")
                 } else {
                     notes.append((try? self.windows.release(w.id, keepOpen: false)) ?? "window \(w.id): failed")
