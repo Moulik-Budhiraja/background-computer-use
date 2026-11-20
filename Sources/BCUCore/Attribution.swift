@@ -33,6 +33,8 @@ enum Attribution {
         var lastOpenKeyMs: Double
         /// When the user last came to an app other than this one.
         var arrivedElsewhereMs: Double
+        /// Whether the user's last click landed on this app (see `ClickTarget.explains`).
+        var clickOnApp: Bool = true
     }
 
     /// How long after a click or cmd+Tab an app coming forward is the user's doing.
@@ -45,7 +47,15 @@ enum Attribution {
     ///
     /// It is while a step on it is running or settling, or just after the
     /// guard put the user's app back in front of it, unless the user clicked
-    /// or pressed cmd+Tab in the last `switchMs`.
+    /// the app (one of its windows, its Dock icon) or pressed cmd+Tab in the
+    /// last `switchMs`.
+    ///
+    /// A click anywhere else isn't evidence. People click all the time in
+    /// the app they're in while an agent works, and a click there 200 ms
+    /// before the browser came forward left the browser in front of them.
+    /// A click that opens something in the agent's app (a link in their
+    /// chat app) is caught after the fact (`LateLook`): the app is put back
+    /// first, and comes forward once what the click opened shows up.
     ///
     /// One click or cmd+Tab explains one front change. Once the user has
     /// come to another app since, it's used up: they switch away from the
@@ -61,57 +71,122 @@ enum Attribution {
         let reasserting = f.restoredAwayMs.map { f.nowMs - $0 < reassertMs } ?? false
         guard reasserting || f.step.map({ $0.running > 0 || $0.settleUntilMs >= f.nowMs }) == true else { return false }
         func unanswered(_ ms: Double) -> Bool { f.nowMs - ms < switchMs && ms > f.arrivedElsewhereMs }
-        let click = f.step?.strict != true && unanswered(f.lastMouseDownMs)
+        let click = f.step?.strict != true && f.clickOnApp && unanswered(f.lastMouseDownMs)
         return !(click || unanswered(f.lastSwitchKeyMs))
+    }
+
+    /// Whether an agent is acting on the app: a step on it running or
+    /// settling, or the guard just put the user's app back in front of it.
+    static func acting(_ f: Facts) -> Bool {
+        let reasserting = f.restoredAwayMs.map { f.nowMs - $0 < reassertMs } ?? false
+        return reasserting || f.step.map({ $0.running > 0 || $0.settleUntilMs >= f.nowMs }) == true
     }
 }
 
-/// A second look at an app an agent's step was acting on, which came
-/// forward and was put down to the user only because they had just clicked.
-///
-/// A click explains a front change when it lands on the app (its window,
-/// its Dock icon) or opens something in it (a link). It doesn't when it
-/// landed in the app the user was already in and the agent's app opened
-/// nothing of theirs: say they clicked a button in their app that started
-/// the agent, whose step then brought the browser forward. Left alone, the
-/// user had to switch back themselves.
-enum SecondLook {
-    /// How long after the app came forward to look again.
-    static let delayMs = 900.0
+/// Where a click of the user's landed, for whether it explains an app
+/// coming forward.
+enum ClickTarget: Equatable {
+    /// Not worked out yet: that's done off the event tap, just after the click.
+    case pending
+    /// A window of this app (nil: no window the guard could name).
+    case app(pid_t?)
+    /// The Dock: the app whose icon it was, 0 for an icon of something
+    /// that isn't running (a folder, the Trash), nil if accessibility
+    /// couldn't say.
+    case dock(pid_t?)
 
-    /// Whether to look again: the app came forward while a step on it was
-    /// running or settling, and only a click (not cmd+Tab) made it the user's.
-    static func wanted(_ f: Attribution.Facts) -> Bool {
-        guard let step = f.step, step.running > 0 || step.settleUntilMs >= f.nowMs, !step.strict else { return false }
-        if Attribution.agentCaused(f) { return false }
-        func unanswered(_ ms: Double) -> Bool { f.nowMs - ms < Attribution.switchMs && ms > f.arrivedElsewhereMs }
-        return unanswered(f.lastMouseDownMs) && !unanswered(f.lastSwitchKeyMs)
+    /// Whether the click explains `pid` coming forward: it landed on one of
+    /// its windows or on its Dock icon. A Dock icon nobody could name may
+    /// have been the app's. While it's pending, any click counts: what
+    /// asks before it's known (the tap, deciding where a key goes) keeps
+    /// the old rule.
+    func explains(_ pid: pid_t) -> Bool {
+        switch self {
+        case .pending: return true
+        case .app(let owner): return owner == pid
+        case .dock(let app): return app == nil || app == pid
+        }
+    }
+
+    /// The window list's answer, for when accessibility is too slow: the
+    /// apps whose windows are under the click, top first, and which of them
+    /// is the Dock. On macOS 26 and later the Dock keeps a window over the
+    /// whole screen that clicks pass through, so the first window that isn't
+    /// the Dock's is where it went; only Dock windows there, the Dock.
+    static func listed(_ owners: [(pid: pid_t, dock: Bool)]) -> ClickTarget {
+        if let app = owners.first(where: { !$0.dock }) { return .app(app.pid) }
+        return owners.isEmpty ? .app(nil) : .dock(nil)
+    }
+}
+
+/// What the user clicked, as accessibility tells it.
+enum ClickElement: Equatable {
+    /// A link, or anything with a URL: it can open a page in a browser.
+    case link
+    /// Something that isn't a link (its role).
+    case other(String)
+    /// Nothing useful: an Electron app with its accessibility tree off, a
+    /// busy app, a plain container.
+    case unknown
+
+    /// Roles that say nothing about what a click does.
+    static let generic: Set<String> = ["", "AXWindow", "AXGroup", "AXScrollArea", "AXWebArea", "AXUnknown", "AXSplitGroup", "AXLayoutArea", "AXApplication"]
+
+    /// `roles`: the element's and its parents', innermost first. `url`:
+    /// whether any of them has one.
+    static func classify(roles: [String], url: Bool) -> ClickElement {
+        if url || roles.contains("AXLink") { return .link }
+        guard let first = roles.first, !generic.contains(first) else { return .unknown }
+        return .other(first)
+    }
+}
+
+/// An agent's app the guard put back though the user had just clicked
+/// somewhere else. The click may still have opened something in it: a link
+/// in their chat app opens in the browser an agent is working in. So the
+/// guard looks for a while, and if a window of the app on the user's
+/// screens is new or shows another page, brings the app forward with it.
+enum LateLook {
+    /// How long after the click to keep looking.
+    static let forMs = 2000.0
+    static let everyMs = 150.0
+
+    /// Not for a click on something that isn't a link. Unknown or not yet
+    /// known: look.
+    static func wanted(_ element: ClickElement?) -> Bool {
+        if case .other = element { return false }
+        return true
     }
 
     struct Facts {
-        /// The app is still in front.
-        var stillFront: Bool
-        /// The click landed on a window of the app the user was in before.
-        var clickInPrevious: Bool
-        /// The user clicked or pressed a key since the app came forward.
+        /// The app is in front already.
+        var front: Bool
+        /// The user clicked or typed since: they've moved on.
         var inputSince: Bool
-        /// A window of the app on the user's screens is new since the
-        /// click, or shows another title: the click opened something there.
-        var openedForUser: Bool
+        /// The window the click opened or changed in the app, if any.
+        var opened: CGWindowID?
     }
 
-    /// Whether the user's previous app goes back in front.
-    static func restore(_ f: Facts) -> Bool {
-        f.stillFront && f.clickInPrevious && !f.inputSince && !f.openedForUser
+    /// The window to bring the app forward with, or nil to leave it.
+    /// Whether the user clicked or typed since the click the guard is
+    /// looking late for (at `clickMs`). Keys count from the click too, not
+    /// from when the app was put back (`putBackMs`): typing in their own app
+    /// in between means they've moved on as much.
+    static func inputSince(clickMs: Double, putBackMs: Double, mouseDownMs: Double, keyMs: Double) -> Bool {
+        mouseDownMs > clickMs || keyMs > clickMs
     }
 
-    /// Whether `now` (the app's windows on the user's screens, id to title)
-    /// shows something opened since `before` (every window on the user's
-    /// screens, from a look taken before the click). With no such look,
-    /// nothing can be ruled out: count it as opened.
-    static func opened(before: [CGWindowID: String]?, now: [CGWindowID: String]) -> Bool {
-        guard let before else { return true }
-        return now.contains { id, title in before[id].map { $0 != title } ?? true }
+    static func bringForward(_ f: Facts) -> CGWindowID? {
+        f.front || f.inputSince ? nil : f.opened
+    }
+
+    /// A window in `now` (the app's windows on the user's screens, id to
+    /// title) that's new since `before` (every window on their screens at
+    /// the click), or shows another title. With no look from before, nil:
+    /// nothing is brought forward on a guess.
+    static func opened(before: [CGWindowID: String]?, now: [CGWindowID: String]) -> CGWindowID? {
+        guard let before else { return nil }
+        return now.keys.sorted().first { id in before[id].map { $0 != now[id] } ?? true }
     }
 }
 

@@ -33,10 +33,14 @@ final class ViewerWindowController {
         close = { [weak self] in self?.close() }
         model.remote = remote
         model.takeOver = { [weak model] in model?.beginControl() }
-        model.openHistory = { [weak self] in
-            guard let self else { return }
-            self.close()
-            openHistory(self.engine)
+        // A host app keeps its own sessions' recordings, so this app's
+        // history has none of them.
+        if engine.host == nil {
+            model.openHistory = { [weak self] in
+                guard let self else { return }
+                self.close()
+                openHistory(self.engine)
+            }
         }
         model.onControlChange = { [weak self] on in self?.controlChanged(on) }
         model.onDragPoint = { [weak self] p in self?.dragMoved(to: p) }
@@ -132,12 +136,14 @@ final class ViewerWindowController {
 
     var isShown: Bool { panel != nil }
 
-    func toggle() {
-        if isShown { close() } else { show() }
-    }
-
+    /// Already open: bring it forward.
     func show() {
-        guard panel == nil else { return }
+        if let panel, let dim {
+            dim.orderFrontRegardless()
+            panel.orderFrontRegardless()
+            panel.makeKey()
+            return
+        }
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main ?? NSScreen.screens[0]
 
