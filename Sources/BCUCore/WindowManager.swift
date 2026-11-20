@@ -1343,6 +1343,13 @@ public final class WindowManager {
     /// it on the agent display with nobody to bring it off.
     static func sweepStillOwns(registeredNow: Bool, kept: Bool) -> Bool { registeredNow && !kept }
 
+    /// What the sweep does with a window on its display that isn't this
+    /// session's: `registered` covers another session's and one mid-open.
+    enum Newcomer: Equatable { case skip, giveToUser, judge }
+    static func newcomerOnAgentDisplay(registered: Bool, kept: Bool) -> Newcomer {
+        registered || kept ? .skip : .judge
+    }
+
     /// Keep agent windows off the user's displays and catch new windows an
     /// agent action spawned there (dialogs, popups, extra windows).
     private func sweep() {
@@ -1368,7 +1375,17 @@ public final class WindowManager {
             // newer flag took an agent's new window for one the user opened,
             // and put it on their screen.
             lock.lock(); let mine = opening.contains(info.pid); lock.unlock()
-            if mine || Self.isOpening(info.pid) || Self.isRegistered(info.id) || Self.isKept(info.id) { continue }
+            switch Self.newcomerOnAgentDisplay(registered: mine || Self.isOpening(info.pid) || Self.isRegistered(info.id), kept: Self.isKept(info.id)) {
+            case .skip: continue
+            case .giveToUser:
+                // Tried once: one that won't move isn't asked again every sweep.
+                lock.lock(); let tried = seenOnAgent[info.id] == -1e12; seenOnAgent[info.id] = -1e12; lock.unlock()
+                if !tried, let ax = AX.window(pid: info.pid, id: info.id), Self.putOnUserScreen(ax, bounds: info.bounds) {
+                    focusGuard.record("moved your \(info.owner) window from the agent display to your screen")
+                }
+                continue
+            case .judge: break
+            }
             // Judge each new window for 1.5 s: the guard learns the user's front
             // app a moment after it changes.
             lock.lock()
