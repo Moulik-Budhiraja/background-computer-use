@@ -1482,14 +1482,16 @@ public final class FocusGuard {
     /// The app switcher (cmd+Tab), Spotlight (cmd+Space), input sources
     /// (ctrl+Space), Mission Control and Spaces (ctrl+arrows, the Mission
     /// Control and Launchpad keys) and Force Quit (cmd+opt+Esc).
+    /// Only the whole chord: with another modifier it's the app's shortcut
+    /// (ctrl+cmd+arrows in Xcode).
     static func systemShortcut(code: Int64, flags: CGEventFlags) -> Bool {
-        let cmd = flags.contains(.maskCommand), ctrl = flags.contains(.maskControl)
+        let mods = flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift])
         switch code {
-        case 48: return cmd
-        case 49: return cmd || ctrl
-        case 123, 124, 125, 126: return ctrl
-        case 160, 131: return true
-        case 53: return cmd && flags.contains(.maskAlternate)
+        case 48: return mods == .maskCommand || mods == [.maskCommand, .maskShift]
+        case 49: return mods == .maskCommand || mods == .maskControl || mods == [.maskControl, .maskAlternate]
+        case 123, 124, 125, 126: return mods == .maskControl
+        case 160, 131: return mods.isEmpty
+        case 53: return mods == [.maskCommand, .maskAlternate]
         default: return false
         }
     }
