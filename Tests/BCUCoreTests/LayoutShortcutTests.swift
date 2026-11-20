@@ -77,3 +77,12 @@ final class PressLayoutTests: XCTestCase {
         XCTAssertEqual(try KeyMap.press(key: "s", modifiers: [], lookup: dvorakQwertyCmd).0, 41)
     }
 }
+
+/// A host on another layout than this Mac's sends keys by its own layout.
+final class HostQuitBlockOtherKeysTests: XCTestCase {
+    /// A US host's cmd+A (code KeyA, key 0) with French selected here,
+    /// where key 0 types Q: the event's text is "a", so it's Select All.
+    func testCommandAFromAnotherLayoutGoesThrough() {
+        XCTAssertFalse(HostInput.quitBlocked(command: true, keyCode: 0, key: "a", quitCode: 0))
+    }
+}
