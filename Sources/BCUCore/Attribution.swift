@@ -33,6 +33,8 @@ enum Attribution {
         var lastOpenKeyMs: Double
         /// When the user last came to an app other than this one.
         var arrivedElsewhereMs: Double
+        /// Whether the user's last click landed on this app (see `ClickTarget.explains`).
+        var clickOnApp: Bool = true
     }
 
     /// How long after a click or cmd+Tab an app coming forward is the user's doing.
@@ -63,6 +65,95 @@ enum Attribution {
         func unanswered(_ ms: Double) -> Bool { f.nowMs - ms < switchMs && ms > f.arrivedElsewhereMs }
         let click = f.step?.strict != true && unanswered(f.lastMouseDownMs)
         return !(click || unanswered(f.lastSwitchKeyMs))
+    }
+}
+
+/// Where a click of the user's landed, for whether it explains an app
+/// coming forward.
+enum ClickTarget: Equatable {
+    /// Not worked out yet: that's done off the event tap, just after the click.
+    case pending
+    /// A window of this app (nil: no window the guard could name).
+    case app(pid_t?)
+    /// The Dock: the app whose icon it was, 0 for an icon of something
+    /// that isn't running (a folder, the Trash), nil if accessibility
+    /// couldn't say.
+    case dock(pid_t?)
+
+    /// Whether the click explains `pid` coming forward: it landed on one of
+    /// its windows or on its Dock icon. A Dock icon nobody could name may
+    /// have been the app's. While it's pending, any click counts: what
+    /// asks before it's known (the tap, deciding where a key goes) keeps
+    /// the old rule.
+    func explains(_ pid: pid_t) -> Bool {
+        switch self {
+        case .pending: return true
+        case .app(let owner): return owner == pid
+        case .dock(let app): return app == nil || app == pid
+        }
+    }
+}
+
+/// What the user clicked, as accessibility tells it.
+enum ClickElement: Equatable {
+    /// A link, or anything with a URL: it can open a page in a browser.
+    case link
+    /// Something that isn't a link (its role).
+    case other(String)
+    /// Nothing useful: an Electron app with its accessibility tree off, a
+    /// busy app, a plain container.
+    case unknown
+
+    /// Roles that say nothing about what a click does.
+    static let generic: Set<String> = ["", "AXWindow", "AXGroup", "AXScrollArea", "AXWebArea", "AXUnknown", "AXSplitGroup", "AXLayoutArea", "AXApplication"]
+
+    /// `roles`: the element's and its parents', innermost first. `url`:
+    /// whether any of them has one.
+    static func classify(roles: [String], url: Bool) -> ClickElement {
+        if url || roles.contains("AXLink") { return .link }
+        guard let first = roles.first, !generic.contains(first) else { return .unknown }
+        return .other(first)
+    }
+}
+
+/// An agent's app the guard put back though the user had just clicked
+/// somewhere else. The click may still have opened something in it: a link
+/// in their chat app opens in the browser an agent is working in. So the
+/// guard looks for a while, and if a window of the app on the user's
+/// screens is new or shows another page, brings the app forward with it.
+enum LateLook {
+    /// How long after the click to keep looking.
+    static let forMs = 2000.0
+    static let everyMs = 150.0
+
+    /// Not for a click on something that isn't a link. Unknown or not yet
+    /// known: look.
+    static func wanted(_ element: ClickElement?) -> Bool {
+        if case .other = element { return false }
+        return true
+    }
+
+    struct Facts {
+        /// The app is in front already.
+        var front: Bool
+        /// The user clicked or typed since: they've moved on.
+        var inputSince: Bool
+        /// The window the click opened or changed in the app, if any.
+        var opened: CGWindowID?
+    }
+
+    /// The window to bring the app forward with, or nil to leave it.
+    static func bringForward(_ f: Facts) -> CGWindowID? {
+        nil
+    }
+
+    /// A window in `now` (the app's windows on the user's screens, id to
+    /// title) that's new since `before` (every window on their screens at
+    /// the click), or shows another title. With no look from before, nil:
+    /// nothing is brought forward on a guess.
+    static func opened(before: [CGWindowID: String]?, now: [CGWindowID: String]) -> CGWindowID? {
+        guard let before else { return nil }
+        return now.keys.sorted().first { id in before[id].map { $0 != now[id] } ?? true }
     }
 }
 
