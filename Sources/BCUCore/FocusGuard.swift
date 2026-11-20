@@ -1707,8 +1707,7 @@ public final class FocusGuard {
         private var tried: Set<pid_t> = []
         /// Whether to try giving key back in `pid` before its next held key.
         mutating func shouldTry(_ pid: pid_t) -> Bool {
-            tried.insert(pid)
-            return true
+            tried.insert(pid).inserted
         }
     }
 
