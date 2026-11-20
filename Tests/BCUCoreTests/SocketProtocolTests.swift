@@ -109,4 +109,15 @@ final class StatusOffQueueTests: XCTestCase {
         XCTAssertFalse(Engine.answersOffQueue("type_text"))
         XCTAssertFalse(Engine.answersOffQueue("get_window_state"))
     }
+
+    /// An agent that only polls status is still alive: its session isn't
+    /// forgotten as dormant.
+    func testStatusOffQueueCountsAsACall() {
+        var touched = 0
+        let result = Engine.answerOffQueue("status", touch: { touched += 1 }, run: { ToolResult(text: "ok") })
+        XCTAssertEqual(result?.text, "ok")
+        XCTAssertEqual(touched, 1)
+        XCTAssertNil(Engine.answerOffQueue("click", touch: { touched += 1 }, run: { ToolResult(text: "no") }))
+        XCTAssertEqual(touched, 1)
+    }
 }
