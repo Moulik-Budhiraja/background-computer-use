@@ -90,8 +90,15 @@ public enum Input {
         }
     }
 
-    /// Scroll wheel at a global point. Positive dy scrolls content down (towards the end).
+    /// The most wheel notches one scroll posts on each axis (30 ms each).
+    public static let maxScrollNotches = 100
+
+    /// Scroll wheel at a global point, in wheel notches of 3 lines each, at
+    /// most `maxScrollNotches` on each axis. Positive dy scrolls content down
+    /// (towards the end).
     public static func scroll(pid: pid_t, windowID: CGWindowID, at point: CGPoint, dx: Int, dy: Int, origin known: CGPoint? = nil) throws {
+        let dx = max(-maxScrollNotches, min(dx, maxScrollNotches))
+        let dy = max(-maxScrollNotches, min(dy, maxScrollNotches))
         guard let src = source() else { throw ToolError("could not create an event source") }
         guard let origin = known ?? origin(of: windowID) else { throw ToolError("window \(windowID) is gone") }
         if let move = CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) {
@@ -161,9 +168,7 @@ public enum Input {
     /// `shortcutsToMenu`: false for a process with no menu bar of its own
     /// (an open or save panel's), where a shortcut is an ordinary key.
     public static func pressKey(pid: pid_t, key: String, modifiers: [String], windowID: CGWindowID = 0, shortcutsToMenu: Bool = true) throws {
-        let (code, implicitShift) = try KeyMap.code(for: key)
-        var flags = KeyMap.flags(modifiers)
-        if implicitShift { flags.insert(.maskShift) }
+        let (code, flags) = try KeyMap.press(key: key, modifiers: modifiers)
         let menuRoute = shortcutsToMenu && (flags.contains(.maskCommand) || flags.contains(.maskControl))
         try postKey(pid: pid, code: code, down: true, flags: flags, auth: !menuRoute, windowID: windowID)
         sleepMs(keyGapMs)
@@ -180,6 +185,11 @@ public enum Input {
         BCUPostEventToPid(pid, e, auth)
     }
 
+    /// A line break that types as Return. "\r\n" is one Character in Swift.
+    public static func isReturn(_ ch: Character) -> Bool {
+        ch == "\n" || ch == "\r" || ch == "\r\n"
+    }
+
     /// Type text as Unicode payloads on key code 0; newline and tab become
     /// real keys. `before(i)` runs before character `i`: it throws to stop
     /// (nothing more is posted) or returns false to end early. Returns how
@@ -191,7 +201,7 @@ public enum Input {
         for ch in text {
             guard try before(typed) else { return typed }
             defer { typed += 1 }
-            if ch == "\n" || ch == "\r" {
+            if isReturn(ch) {
                 try pressKey(pid: pid, key: "return", modifiers: [], windowID: windowID)
                 sleepMs(keyGapMs)
                 continue
@@ -252,6 +262,40 @@ public enum KeyMap {
         throw ToolError("unknown key \"\(key)\". Use a letter, digit, punctuation, or one of: \(named.keys.sorted().joined(separator: ", "))")
     }
 
+    /// The key code and flags press_key sends. An unknown modifier throws
+    /// rather than leaving it out and pressing the bare key. A shifted
+    /// character ("?", "A") adds Shift on its own, except that with other
+    /// modifiers a letter's case doesn't matter: cmd+"A" is Cmd+A, and
+    /// Cmd+Shift+A needs "shift" in the list.
+    public static func press(key: String, modifiers: [String]) throws -> (CGKeyCode, CGEventFlags) {
+        let (code, implicitShift) = try code(for: key)
+        var flags = try modifierFlags(modifiers)
+        let letter = key.count == 1 && key.first!.isLetter
+        if implicitShift && !(letter && !flags.isEmpty) { flags.insert(.maskShift) }
+        return (code, flags)
+    }
+
+    static let modifierNames: [String: CGEventFlags] = [
+        "cmd": .maskCommand, "command": .maskCommand, "meta": .maskCommand, "super": .maskCommand, "⌘": .maskCommand,
+        "shift": .maskShift, "⇧": .maskShift,
+        "option": .maskAlternate, "opt": .maskAlternate, "alt": .maskAlternate, "⌥": .maskAlternate,
+        "ctrl": .maskControl, "control": .maskControl, "⌃": .maskControl,
+        "fn": .maskSecondaryFn,
+    ]
+
+    /// Modifier names to flags; throws on a name it doesn't know.
+    public static func modifierFlags(_ modifiers: [String]) throws -> CGEventFlags {
+        var f: CGEventFlags = []
+        for m in modifiers {
+            guard let flag = modifierNames[m.trimmingCharacters(in: .whitespaces).lowercased()] else {
+                throw ToolError("unknown modifier \"\(m)\". Use any of: cmd, shift, option, ctrl, fn. Nothing was pressed.")
+            }
+            f.insert(flag)
+        }
+        return f
+    }
+
+    /// Modifier names to flags, leaving out names it doesn't know.
     public static func flags(_ modifiers: [String]) -> CGEventFlags {
         var f: CGEventFlags = []
         for m in modifiers {

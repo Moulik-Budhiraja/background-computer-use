@@ -215,6 +215,13 @@ public enum AX {
         AXUIElementPerformAction(el, action as CFString)
     }
 
+    /// Whether the element is still there: .success, or the error reading
+    /// its role (.invalidUIElement once it's gone).
+    public static func liveness(_ el: AXUIElement) -> AXError {
+        var v: AnyObject?
+        return AXUIElementCopyAttributeValue(el, "AXRole" as CFString, &v)
+    }
+
     public static func actions(_ el: AXUIElement) -> [String] {
         var names: CFArray?
         guard AXUIElementCopyActionNames(el, &names) == .success, let list = names as? [String] else { return [] }
