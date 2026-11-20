@@ -205,4 +205,31 @@ final class PeerPolicyTests: XCTestCase {
         XCTAssertNil(scope.admitCall(session: "back", parent: nil, host: nil, windowOwners: ["victim"], host))
         XCTAssertNil(scope.admitCall(session: "mine", parent: nil, host: nil, windowOwners: ["victim"], .owner))
     }
+
+    /// A subagent's first call claims its parent too, so another app can't
+    /// claim the parent and reach the subagent through it.
+    func testFirstChildCallClaimsItsParent() {
+        let scope = PeerScope()
+        let host = PeerTrust.app(team: theirs)
+        let other = PeerTrust.app(team: "CCCCCCCCCC")
+        XCTAssertNil(scope.admitCall(session: "p/sub", parent: "p", host: nil, host))
+        XCTAssertEqual(scope.owner(ofSession: "p"), host)
+        XCTAssertNotNil(scope.admitCall(session: "p", parent: nil, host: nil, other))
+        XCTAssertNil(scope.admitCall(session: "p", parent: nil, host: nil, host))
+    }
+
+    /// `trustClients: [process.execPath]` names Electron's executable, and a
+    /// peer running it shows up as its app.
+    func testTrustedMainExecutableMeansItsApp() {
+        let app = "/Users/me/host/node_modules/electron/dist/Electron.app"
+        let exe = "\(app)/Contents/MacOS/Electron"
+        let mainOf: (String) -> String? = { $0 == app ? exe : nil }
+        let trusted = PeerPolicy.trustedPath(exe, bundleExecutable: mainOf)
+        XCTAssertEqual(trusted, app)
+        XCTAssertEqual(signed(trusted: [trusted]).decide(peer(app, team: "CCCCCCCCCC"), shipsBCU: noneShip), .allow(.owner))
+        // Another program in the app stays itself; so do bare programs and folders.
+        XCTAssertEqual(PeerPolicy.trustedPath("\(app)/Contents/MacOS/other", bundleExecutable: mainOf), "\(app)/Contents/MacOS/other")
+        XCTAssertEqual(PeerPolicy.trustedPath("/opt/node/bin/node", bundleExecutable: mainOf), "/opt/node/bin/node")
+        XCTAssertEqual(PeerPolicy.trustedPath("/opt/node", bundleExecutable: mainOf), "/opt/node")
+    }
 }
