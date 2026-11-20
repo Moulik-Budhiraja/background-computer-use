@@ -1667,11 +1667,16 @@ public final class FocusGuard {
     }
 
     private func nearestUserPoint(_ p: CGPoint, agent: CGRect) -> CGPoint {
+        Self.nearestUserPoint(p, agent: agent, users: AgentDisplay.userDisplayIDs().map { CGDisplayBounds($0) }, fenced: AgentDisplay.fencedBounds)
+    }
+
+    /// Where to put a cursor found at `p`, on the agent display `agent` (or
+    /// off every display, with `.null`): the nearest point on one of the
+    /// user's displays `users` that no fenced display covers.
+    static func nearestUserPoint(_ p: CGPoint, agent: CGRect, users: [CGRect], fenced agents: [CGRect]) -> CGPoint {
         var best = p
         var bestDistance = CGFloat.infinity
-        let agents = AgentDisplay.fencedBounds
-        for id in AgentDisplay.userDisplayIDs() {
-            let r = CGDisplayBounds(id)
+        for r in users {
             // Skip any display that overlaps the agent's (mirroring, mid-rearrangement).
             let overlap = r.intersection(agent)
             if !overlap.isNull && overlap.width > 0 && overlap.height > 0 { continue }
@@ -1682,8 +1687,7 @@ public final class FocusGuard {
         }
         if bestDistance == .infinity {
             // Not the main display: with the user's asleep, that can be an agent's.
-            guard let id = AgentDisplay.userDisplayIDs().first else { return p }
-            let r = CGDisplayBounds(id)
+            guard let r = users.first else { return p }
             return CGPoint(x: r.midX, y: r.midY)
         }
         return best
