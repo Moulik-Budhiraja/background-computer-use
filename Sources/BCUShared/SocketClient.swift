@@ -40,9 +40,10 @@ public final class SocketClient {
     /// longest legitimate wait (for a free display) is well under this.
     public static let callTimeout: TimeInterval = 300
 
-    /// How long a call of this tool may take.
+    /// How long a call of this tool may take. `status` answers at once, so
+    /// a stuck app shows within seconds.
     public static func timeout(for tool: String) -> TimeInterval {
-        callTimeout
+        tool == "status" ? 10 : callTimeout
     }
 
     public func call(tool: String, args: JSONObject, timeout: TimeInterval? = nil) throws -> ToolResult {
@@ -69,7 +70,7 @@ public final class SocketClient {
         }
         let deadline = Date().addingTimeInterval(timeout)
         while true {
-            let response = try readLine(deadline: deadline)
+            let response = try readLine(deadline: deadline, timeout: timeout)
             guard let reply = WireCodec.decode(response) else {
                 throw SocketError.message("bad response from app")
             }
@@ -80,14 +81,14 @@ public final class SocketClient {
         }
     }
 
-    private func readLine(deadline: Date) throws -> Data {
+    private func readLine(deadline: Date, timeout: TimeInterval) throws -> Data {
         var chunk = [UInt8](repeating: 0, count: 65536)
         while true {
             if let line = buffer.nextLine() { return line }
             let ms = Int(deadline.timeIntervalSinceNow * 1000)
             if ms <= 0 {
                 shutdown(fd, SHUT_RDWR)
-                throw SocketError.message("the app didn't answer in time")
+                throw SocketError.message("\(BCUPaths.appName) isn't answering (no reply in \(Int(timeout)) s)")
             }
             var p = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             let ready = poll(&p, 1, Int32(min(ms, Int(Int32.max))))
