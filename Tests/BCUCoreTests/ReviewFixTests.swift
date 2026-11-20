@@ -120,4 +120,14 @@ final class ReviewFixTests: XCTestCase {
         XCTAssertTrue(WindowManager.claimForRescue(id, registered: { _ in false }))
         XCTAssertTrue(WindowManager.isKept(id))
     }
+
+    func testAKeptWindowBorrowedAndReturnedIsKeptAgain() {
+        let id: CGWindowID = 0xFFFF_FE03
+        WindowManager.keep(id)
+        WindowManager.ownedAgain(id)
+        // Returned: the user's again, never closed as a leftover.
+        WindowManager.returnedToUser(id)
+        XCTAssertTrue(WindowManager.isKept(id))
+        XCTAssertEqual(WindowManager.leftoverFate(id, agentMade: true, kept: [id]), .giveToUser)
+    }
 }
