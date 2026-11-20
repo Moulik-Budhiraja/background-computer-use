@@ -282,6 +282,15 @@ public final class Engine {
         }
     }
 
+    /// What `releaseAbandoned` does with one of the agent's windows.
+    enum AbandonedFate: Equatable { case leaveWithUser, keepForUser, release }
+    /// A handed-off window stays, opened by the user or not: it's the
+    /// user's task now, however long they take, and the agent takes it back.
+    static func abandonedFate(withUser: Bool, handedOff: Bool) -> AbandonedFate {
+        if handedOff { return .keepForUser }
+        return withUser ? .leaveWithUser : .release
+    }
+
     /// Whether a release asked for during departure `queuedFor` may still
     /// run, the agent's latest departure being `latest`.
     static func departureStillCurrent(_ queuedFor: Int, latest: Int) -> Bool { queuedFor == latest }
@@ -304,11 +313,14 @@ public final class Engine {
             guard !mine.isEmpty else { self.tearDownIfIdle(idleMs: 0); return }
             var notes: [String] = []
             for w in mine {
-                if w.withUser {
+                switch Self.abandonedFate(withUser: w.withUser, handedOff: w.handedOff) {
+                case .leaveWithUser:
                     self.windows.unregister(w.id)
                     WindowManager.leftWithUser(w.id)
                     notes.append("left \(w.appName) window \(w.id) with you")
-                } else {
+                case .keepForUser:
+                    notes.append("kept \(w.appName) window \(w.id): it's waiting for you")
+                case .release:
                     notes.append((try? self.windows.release(w.id, keepOpen: false)) ?? "window \(w.id): failed")
                 }
             }

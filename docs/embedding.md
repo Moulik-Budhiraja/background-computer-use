@@ -81,7 +81,7 @@ The engine reads and writes one JSON object per line on the socket (mode 0600, s
 | `pause` | `session`, `paused` | the agent's next action fails with "Paused by the user" |
 | `stop` | `session` | releases every window of the session |
 | `rename` | `session`, `label` | the session goes by `label` from now on, in the menu bar and the run being recorded |
-| `take_over` | `session`, `on` | the user drives the display through `input`; the agent's actions (not its reads) are refused. Ends when the client disconnects. |
+| `take_over` | `session`, `on` | the user drives the display through `input`; the agent's actions (not its reads) are refused. Ends when the client disconnects. With several clients (or the menu bar viewer) in control, the agent gets the display back once all of them have let go. |
 | `input` | `session`, `events: [InputEvent]` | DOM-style mouse, wheel and key events, posted to the window under the point (see `types.ts`). cmd+Q is dropped. |
 | `menu_pick` | `session`, `token`, `path` | picks an item from a `menu` event |
 | `open_handoff` | `session`, `area?` | brings the handed-off window onto the user's screen, in front, in `area` (global points, top-left origin, the same as Electron's `screen`), or by default the screen under the pointer |

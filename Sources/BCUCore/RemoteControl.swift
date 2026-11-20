@@ -64,6 +64,27 @@ public final class RemoteControl {
         case resize(Edges)
     }
 
+    /// How long the user's input to an app waits for another agent's step
+    /// there. A step holds the app's input lock while its window has key,
+    /// so what the user types or clicks meanwhile would land in the agent's
+    /// window; it waits instead, but never long, so an app that isn't
+    /// answering doesn't freeze the viewer.
+    static let appLockWaitS: TimeInterval = 2
+
+    /// How long an event of this type waits for the app's input lock. A
+    /// pointer move doesn't: moves queue one behind another, each waiting
+    /// would hold up the viewer's input to every app, and the next move
+    /// replaces a dropped one.
+    static func appLockWait(_ type: CGEventType) -> TimeInterval { type == .mouseMoved ? 0 : appLockWaitS }
+
+    /// Takes the app's input lock (`Engine.inputLock`), as an agent's step
+    /// does; returns what lets it go.
+    private func lockApp(_ pid: pid_t) -> () -> Void {
+        let lock = Engine.inputLock(pid)
+        let locked = lock.lock(before: Date().addingTimeInterval(Self.appLockWaitS))
+        return { if locked { lock.unlock() } }
+    }
+
     /// Called on the main thread when the shape under the pointer changes.
     public var onCursor: ((Cursor) -> Void)?
     private let hoverQueue = DispatchQueue(label: "bcu.remote.hover", qos: .userInitiated)
@@ -165,6 +186,8 @@ public final class RemoteControl {
         guard let e = event.copy() else { return }
         queue.async {
             guard let w = self.window(at: point) else { return }
+            let unlock = self.lockApp(w.pid)
+            defer { unlock() }
             // Chromium scrolls whatever the pointer last moved over.
             if self.lastMove != point {
                 self.post(.mouseMoved, w, point, phase: 2, state: 0, button: 0, flags: [])
@@ -190,6 +213,8 @@ public final class RemoteControl {
                 press = nil
             }
             guard let (w, mode) = target(at: point, button: button) else { return }
+            let unlock = lockApp(w.pid)
+            defer { unlock() }
             // Popups (menus, suggestion lists) aren't key windows; keys keep
             // going to the window that opened them.
             if w.layer == 0 { makeKey(w) }
@@ -203,6 +228,8 @@ public final class RemoteControl {
         case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             guard var p = press else { return }
             guard Self.pressStillHere(p.window.id, onDisplay: windows()) else { return dropPress(p) }
+            let unlock = lockApp(p.window.pid)
+            defer { unlock() }
             if !p.dragging {
                 guard hypot(point.x - p.point.x, point.y - p.point.y) >= Self.dragThreshold else { return }
                 p.dragging = true
@@ -228,6 +255,8 @@ public final class RemoteControl {
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
             guard let p = press else { return }
             guard Self.pressStillHere(p.window.id, onDisplay: windows()) else { return dropPress(p) }
+            let unlock = lockApp(p.window.pid)
+            defer { unlock() }
             Log.info("remote: release button \(p.button) count \(p.clickCount) dragged \(p.dragging)")
             if !p.dragging {
                 if p.button == 0, p.window.layer > 0, pressMenuItem(at: p.point, pid: p.window.pid) {
@@ -259,6 +288,9 @@ public final class RemoteControl {
             scheduleRelease()
         case .mouseMoved:
             guard press == nil, let w = window(at: point) else { return }
+            let lock = Engine.inputLock(w.pid)
+            guard lock.lock(before: Date().addingTimeInterval(Self.appLockWait(.mouseMoved))) else { return }
+            defer { lock.unlock() }
             post(.mouseMoved, w, point, phase: 2, state: 0, button: 0, flags: flags)
             lastMove = point
         default:
@@ -484,6 +516,8 @@ public final class RemoteControl {
             }
             let before = Set(Self.menuWindows(pid).map(\.id))
             self.queue.sync {
+                let unlock = self.lockApp(pid)
+                defer { unlock() }
                 switch opener {
                 case .showMenu(let point, let pid): _ = self.showContextMenu(at: point, pid: pid)
                 case .click(let p):
@@ -606,6 +640,7 @@ public final class RemoteControl {
         guard let e = event.copy() else { return }
         queue.async {
             guard let w = Self.keyWindow(cached: self.keyTarget, onDisplay: self.windows()) else { return }
+            let unlock = self.lockApp(w.pid)
             self.makeKey(w)
             // A shortcut like cmd+N can make the app bring itself forward; undo that.
             self.engine.focusGuard.beginAction(pid: w.pid, cause: "your keys in the expanded view", strict: true)
@@ -613,6 +648,7 @@ public final class RemoteControl {
             let menu = e.flags.contains(.maskCommand) || e.flags.contains(.maskControl)
             BCUPostEventToPid(w.pid, e, !menu)
             self.engine.focusGuard.endAction(pid: w.pid)
+            unlock()
             self.scheduleRelease()
         }
     }
