@@ -6,6 +6,6 @@ public enum MenuSurface: Equatable {
 
     /// What has to close before `next` shows, given what's up now.
     public static func toClose(before next: MenuSurface, showing: [MenuSurface]) -> [MenuSurface] {
-        []
+        showing.filter { $0 != next }
     }
 }

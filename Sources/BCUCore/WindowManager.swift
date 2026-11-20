@@ -6,8 +6,9 @@ import CPrivate
 public final class AgentWindow {
     public enum Kind: String {
         case opened, borrowed, caught
-        /// Stop closes this kind of window rather than putting it back.
-        public var closesOnStop: Bool { self == .opened }
+        /// Stop closes this kind of window rather than putting it back:
+        /// `release` closes opened and caught windows alike.
+        public var closesOnStop: Bool { self != .borrowed }
     }
     public let id: CGWindowID
     public let pid: pid_t
