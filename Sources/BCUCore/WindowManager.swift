@@ -4,7 +4,12 @@ import BCUShared
 import CPrivate
 
 public final class AgentWindow {
-    public enum Kind: String { case opened, borrowed, caught }
+    public enum Kind: String {
+        case opened, borrowed, caught
+        /// Stop closes this kind of window rather than putting it back:
+        /// `release` closes opened and caught windows alike.
+        public var closesOnStop: Bool { self != .borrowed }
+    }
     public let id: CGWindowID
     public let pid: pid_t
     public let appName: String
@@ -829,11 +834,27 @@ public final class WindowManager {
         let original = AX.frame(ax) ?? info.bounds
         let app = NSRunningApplication(processIdentifier: info.pid)
         if Self.isRegistered(id, byOtherThan: sessionKey) { throw ToolError("window \(id) is another agent's") }
+        if AX.bool(ax, "AXFullScreen") == true {
+            throw ToolError("window \(id) is full screen, and a full-screen window can't be moved. Ask the user to leave full screen in it, then retry.")
+        }
         // Every other window of the app is the user's, not one this spawned.
         noteBefore(pid: info.pid)
         focusGuard.beginAction(pid: info.pid, cause: "borrowing a window")
         defer { focusGuard.endAction(pid: info.pid) }
         moveToAgent(ax, size: original.size)
+        // The app can refuse or undo the move. Then the window is still on
+        // the user's screen, where the agent mustn't work in it.
+        var moved = false
+        let deadline = nowMs() + 500
+        repeat {
+            if let f = AX.frame(ax), display.holds(f) { moved = true; break }
+            sleepMs(25)
+        } while nowMs() < deadline
+        if !moved {
+            AX.setPosition(ax, original.origin)
+            AX.setSize(ax, original.size)
+            throw ToolError("\(app?.localizedName ?? info.owner) didn't let window \(id) move onto your display, so it was left with the user and isn't borrowed.")
+        }
         let aw = AgentWindow(id: id, pid: info.pid, appName: app?.localizedName ?? info.owner, bundleID: app?.bundleIdentifier, kind: .borrowed, originalFrame: original)
         register(aw)
         return aw

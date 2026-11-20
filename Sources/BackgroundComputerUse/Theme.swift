@@ -28,6 +28,8 @@ extension Color {
 enum Theme {
     static let live = Color(hex: 0x2FB457)
     static let needs = Color(hex: 0xF09A0A)
+    /// Text in the live green, readable on light and dark grounds.
+    static let liveInk = Color(nsColor: .dynamic(light: 0x1E8A42, dark: 0x4CD472))
     static let needsInk = Color(nsColor: .dynamic(light: 0xC77700, dark: 0xF5A623))
     static let quiet = Color(hex: 0x8E8E93)
     /// Same gray the capture compositor paints behind the agent's windows.
@@ -41,11 +43,25 @@ enum Theme {
 enum LaunchAtLogin {
     static var isEnabled: Bool { SMAppService.mainApp.status == .enabled }
 
+    private static var lastError: String?
+
+    /// Why it isn't doing what the user asked, for Settings to show.
+    static var problem: String? {
+        if let lastError { return lastError }
+        // Registered, but macOS wants the user to allow it.
+        if SMAppService.mainApp.status == .requiresApproval {
+            return "Open at login needs your OK: allow Background Computer Use in System Settings > General > Login Items."
+        }
+        return nil
+    }
+
     static func set(_ on: Bool) {
         do {
             if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+            lastError = nil
         } catch {
             NSLog("[bcu] launch at login: \(error)")
+            lastError = "Couldn't turn \(on ? "on" : "off") Open at login: \(error.localizedDescription)"
         }
     }
 }

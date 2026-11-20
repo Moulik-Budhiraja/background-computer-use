@@ -60,7 +60,7 @@ final class HistoryModel: ObservableObject {
             case error
             static func < (a: Kind, b: Kind) -> Bool { a.rawValue < b.rawValue }
         }
-        let item: Int
+        var item: Int
         /// Oldest first, tidied.
         var lines: [String]
         /// Each line's kind, so the callout can show the one behind the color.
@@ -70,6 +70,10 @@ final class HistoryModel: ObservableObject {
     }
     /// By item, oldest first; at most one per item.
     private(set) var marks: [Mark] = []
+    /// Each run's marks from the last reload, by run id, with items counted
+    /// from the run's first: a live reload rebuilds only the runs that
+    /// gained events or frames.
+    private var runMarks: [String: (key: [Double], marks: [Mark])] = [:]
 
     @Published private(set) var loaded = false
     @Published private(set) var index = 0
@@ -89,6 +93,8 @@ final class HistoryModel: ObservableObject {
 
     private var observer: NSObjectProtocol?
     private var reloadPending = false
+    /// Bumped by `unload`, so a load that finishes after History closed is dropped.
+    private var generation = 0
     private let store = AppRecordings.store
 
     init() {
@@ -103,9 +109,11 @@ final class HistoryModel: ObservableObject {
 
     /// Reads the recordings and opens at the latest frame (of `session`, if given).
     func load(session: String? = nil) {
+        let generation = self.generation
         DispatchQueue.global(qos: .userInitiated).async {
             let runs = self.store.all()
             DispatchQueue.main.async {
+                guard generation == self.generation else { return }
                 self.apply(runs, keep: nil)
                 if let session, let last = self.items.lastIndex(where: { self.runs[$0.run].session == session }) {
                     self.index = last
@@ -117,6 +125,15 @@ final class HistoryModel: ObservableObject {
                 self.onIndexChanged?(false)
             }
         }
+    }
+
+    /// History closed: stop following live runs and let go of what they
+    /// hold for decoding. The next `load` reads everything again.
+    func unload() {
+        generation += 1
+        loaded = false
+        runs.forEach { $0.releaseDecoders() }
+        apply([], keep: nil)
     }
 
     /// A live run grew: rebuild, staying on the same frame, or on the
@@ -144,6 +161,7 @@ final class HistoryModel: ObservableObject {
             DispatchQueue.global(qos: .userInitiated).async {
                 let runs = self.store.all(reusing: loaded)
                 DispatchQueue.main.async {
+                    guard self.loaded else { return }
                     self.apply(runs, keep: following == nil && !newest ? keep : nil)
                     if let following {
                         if let r = self.runs.firstIndex(where: { $0.id == following }) {
@@ -169,8 +187,14 @@ final class HistoryModel: ObservableObject {
         self.runs = taken.map(\.0)
         var items: [Item] = [], segments: [Segment] = [], segmentOf: [Int] = [], acted: [Bool] = []
         var runItems: [ClosedRange<Int>] = []
+        var marks: [Mark] = [], runMarks: [String: (key: [Double], marks: [Mark])] = [:]
         for (r, (run, frames)) in taken.enumerated() {
-            let actions = run.events.filter { $0.text != nil }.map(\.t)
+            let events = run.events
+            let key = [Double(events.count), Double(frames.count), frames[0].t, frames[frames.count - 1].t]
+            let own = self.runMarks[run.id].flatMap { $0.key == key ? $0.marks : nil } ?? Self.marks(events, frames: frames)
+            runMarks[run.id] = (key, own)
+            marks += own.map { var m = $0; m.item += items.count; return m }
+            let actions = events.filter { $0.text != nil }.map(\.t)
             var a = 0
             var prevT = run.start
             for f in frames {
@@ -193,7 +217,8 @@ final class HistoryModel: ObservableObject {
         self.segmentOf = segmentOf
         self.acted = acted
         placeOnClock(runItems)
-        self.marks = Self.marks(self.runs, items: items)
+        self.marks = marks
+        self.runMarks = runMarks
         if let keep, let i = items.firstIndex(where: { self.runs[$0.run].id == keep.0 && $0.frame.t == keep.1 }) {
             index = i
         } else {
@@ -271,32 +296,27 @@ final class HistoryModel: ObservableObject {
         return byTime.indices.contains(s) ? byTime[s] : nil
     }
 
-    /// Each run's activity, put on the first frame at or after it (the frame
+    /// A run's activity, put on the first frame at or after it (the frame
     /// that shows what it did), or the run's last frame for what came after.
-    static func marks(_ runs: [RecordedRun], items: [Item]) -> [Mark] {
+    /// Items are the run's frame indices.
+    static func marks(_ events: [RecordedEvent], frames: [RecordedFrame]) -> [Mark] {
         var marks: [Mark] = []
-        var first = 0
-        while first < items.count {
-            let r = items[first].run
-            var last = first
-            while last + 1 < items.count && items[last + 1].run == r { last += 1 }
-            var at = first
-            for e in runs[r].events.sorted(by: { $0.t < $1.t }) {
-                guard let text = e.text, !text.isEmpty else { continue }
-                while at < last && items[at].frame.t < e.t { at += 1 }
-                let kind = kind(of: text, error: e.isError)
-                // The last mark's item only: holding the mark itself would
-                // copy its growing arrays on every append.
-                if marks.last?.item == at {
-                    let k = marks.count - 1
-                    marks[k].lines.append(tidy(text))
-                    marks[k].kinds.append(kind)
-                    marks[k].kind = max(marks[k].kind, kind)
-                } else {
-                    marks.append(Mark(item: at, lines: [tidy(text)], kinds: [kind], kind: kind))
-                }
+        let last = frames.count - 1
+        var at = 0
+        for e in events.sorted(by: { $0.t < $1.t }) {
+            guard let text = e.text, !text.isEmpty else { continue }
+            while at < last && frames[at].t < e.t { at += 1 }
+            let kind = kind(of: text, error: e.isError)
+            // The last mark's item only: holding the mark itself would
+            // copy its growing arrays on every append.
+            if marks.last?.item == at {
+                let k = marks.count - 1
+                marks[k].lines.append(tidy(text))
+                marks[k].kinds.append(kind)
+                marks[k].kind = max(marks[k].kind, kind)
+            } else {
+                marks.append(Mark(item: at, lines: [tidy(text)], kinds: [kind], kind: kind))
             }
-            first = last + 1
         }
         return marks
     }
@@ -462,7 +482,7 @@ enum AppIcons {
 }
 
 /// Decodes frames off the main thread, newest request first, and keeps the
-/// last few around for quick back and forth.
+/// last few around for quick back and forth, up to `limitBytes` of them.
 final class FrameLoader {
     private let queue = DispatchQueue(label: "bcu.history.decode", qos: .userInteractive)
     private let lock = NSLock()
@@ -470,10 +490,22 @@ final class FrameLoader {
     private var busy = false
     private var cache: [String: CGImage] = [:]
     private var order: [String] = []
+    private var bytes = 0
+    /// Bumped by `purge`, so a decode that was under way isn't kept.
+    private var epoch = 0
+    /// About ten full-size agent frames (2400×1500, 4 bytes a pixel).
+    let limitBytes: Int
     /// Main thread: a decoded frame (key, image).
     var onImage: ((String, CGImage) -> Void)?
 
+    init(limitBytes: Int = 150_000_000) { self.limitBytes = limitBytes }
+
     static func key(_ run: RecordedRun, _ f: RecordedFrame) -> String { "\(run.id)/\(Int64(f.t))" }
+
+    static func size(of image: CGImage) -> Int { image.bytesPerRow * image.height }
+
+    var cachedBytes: Int { lock.lock(); defer { lock.unlock() }; return bytes }
+    var cachedCount: Int { lock.lock(); defer { lock.unlock() }; return cache.count }
 
     func cached(_ run: RecordedRun, _ f: RecordedFrame) -> CGImage? {
         lock.lock(); defer { lock.unlock() }
@@ -489,6 +521,33 @@ final class FrameLoader {
         if start { queue.async { self.drain() } }
     }
 
+    /// Forgets every decoded frame and any pending request.
+    func purge() {
+        lock.lock()
+        wanted = nil
+        cache.removeAll()
+        order.removeAll()
+        bytes = 0
+        epoch += 1
+        lock.unlock()
+    }
+
+    /// Keeps `image`, dropping the oldest ones while over `limitBytes`
+    /// (the newest stays even when it alone is over). Under `lock`.
+    private func store(_ image: CGImage, key: String) {
+        cache[key] = image
+        order.append(key)
+        bytes += Self.size(of: image)
+        while bytes > limitBytes, order.count > 1 {
+            if let old = cache.removeValue(forKey: order.removeFirst()) { bytes -= Self.size(of: old) }
+        }
+    }
+
+    /// Test support: caches `image` as if it had been decoded.
+    func insertForTest(_ image: CGImage, key: String) {
+        lock.lock(); store(image, key: key); lock.unlock()
+    }
+
     private func drain() {
         while true {
             lock.lock()
@@ -496,16 +555,14 @@ final class FrameLoader {
             wanted = nil
             let key = Self.key(next.run, next.frame)
             let hit = cache[key]
+            let epoch = self.epoch
             lock.unlock()
             guard let image = hit ?? next.run.image(for: next.frame) else { continue }
             lock.lock()
-            if hit == nil {
-                cache[key] = image
-                order.append(key)
-                if order.count > 40 { cache[order.removeFirst()] = nil }
-            }
+            let current = epoch == self.epoch
+            if hit == nil, current { store(image, key: key) }
             lock.unlock()
-            DispatchQueue.main.async { self.onImage?(key, image) }
+            if current { DispatchQueue.main.async { self.onImage?(key, image) } }
         }
     }
 }

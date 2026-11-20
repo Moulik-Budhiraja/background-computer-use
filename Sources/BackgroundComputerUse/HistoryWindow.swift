@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import BCUCore
 
@@ -17,8 +18,15 @@ final class HistoryWindowController {
     private var dim: NSPanel?
     private var panel: OverlayPanel?
     private var keyMonitor: Any?
+    private var lanesObserver: AnyCancellable?
 
     init() {
+        // A lane more grows the panel, not the track into the frame.
+        // On the next turn: lanes is published mid-reload, before it's set.
+        lanesObserver = model.$lanes.removeDuplicates().dropFirst().receive(on: DispatchQueue.main).sink { [weak self] lanes in
+            guard let self, let p = self.panel, let screen = p.screen else { return }
+            p.setFrame(Self.panelFrame(in: screen.visibleFrame, lanes: lanes), display: true)
+        }
         trackView.model = model
         frameView.onScroll = { [weak self] e in self?.trackView.scrollWheel(with: e) }
         model.onItemsChanged = { [weak self] in self?.trackView.itemsChanged() }
@@ -35,6 +43,21 @@ final class HistoryWindowController {
     }
 
     var isShown: Bool { panel != nil }
+
+    /// Sized like the expanded view, with room for the track and its lanes.
+    /// Past the screen's height the frame gives up the room instead.
+    static func panelFrame(in area: NSRect, lanes: Int) -> NSRect {
+        let aspect = CGFloat(AgentDisplay.defaultWidth) / CGFloat(AgentDisplay.defaultHeight)
+        let padX = HistoryView.horizontalChrome
+        let padY = HistoryView.verticalChrome + CGFloat(max(1, lanes) - 1) * HistoryTrackView.laneHeight
+        var w = area.width * 0.88
+        var h = (w - padX) / aspect + padY
+        if h > area.height * 0.92 {
+            h = area.height * 0.92
+            w = max(padX, (h - padY) * aspect + padX)
+        }
+        return NSRect(x: area.midX - w / 2, y: area.midY - h / 2, width: w, height: h)
+    }
     var frameViewForTest: HistoryFrameView { frameView }
     var trackViewForTest: HistoryTrackView { trackView }
 
@@ -64,18 +87,7 @@ final class HistoryWindowController {
         dimView.onClick = { [weak self] in self?.close() }
         dimPanel.contentView = dimView
 
-        // Sized like the expanded view, with room for the track.
-        let area = screen.visibleFrame
-        let aspect = CGFloat(AgentDisplay.defaultWidth) / CGFloat(AgentDisplay.defaultHeight)
-        let padX = HistoryView.horizontalChrome, padY = HistoryView.verticalChrome
-        var w = area.width * 0.88
-        var h = (w - padX) / aspect + padY
-        if h > area.height * 0.92 {
-            h = area.height * 0.92
-            w = (h - padY) * aspect + padX
-        }
-        let frame = NSRect(x: area.midX - w / 2, y: area.midY - h / 2, width: w, height: h)
-
+        let frame = Self.panelFrame(in: screen.visibleFrame, lanes: model.lanes)
         let p = OverlayPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         p.level = .floating
         p.isOpaque = false
@@ -149,9 +161,15 @@ final class HistoryWindowController {
             ctx.duration = 0.15
             p.animator().alphaValue = 0
             d.animator().alphaValue = 0
-        }, completionHandler: {
+        }, completionHandler: { [weak self] in
             p.orderOut(nil)
             d.orderOut(nil)
+            // Decoded frames and video decoders are large: don't hold them
+            // while nothing shows them. Unless it opened again meanwhile.
+            guard let self, self.panel == nil else { return }
+            self.loader.purge()
+            self.frameView.clear()
+            self.model.unload()
         })
     }
 }
