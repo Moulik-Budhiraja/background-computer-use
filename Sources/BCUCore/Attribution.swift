@@ -169,9 +169,11 @@ enum LateLook {
 
     /// The window to bring the app forward with, or nil to leave it.
     /// Whether the user clicked or typed since the click the guard is
-    /// looking late for (at `clickMs`), the app being put back at `putBackMs`.
+    /// looking late for (at `clickMs`). Keys count from the click too, not
+    /// from when the app was put back (`putBackMs`): typing in their own app
+    /// in between means they've moved on as much.
     static func inputSince(clickMs: Double, putBackMs: Double, mouseDownMs: Double, keyMs: Double) -> Bool {
-        mouseDownMs > clickMs || keyMs > putBackMs
+        mouseDownMs > clickMs || keyMs > clickMs
     }
 
     static func bringForward(_ f: Facts) -> CGWindowID? {
