@@ -324,4 +324,11 @@ final class PeerPolicyTests: XCTestCase {
         _ = unknown.check("k", fingerprint: { nil }) { unknownVerifies += 1; return true }
         XCTAssertEqual(unknownVerifies, 2)
     }
+
+    /// An ad hoc engine's own folder comes from its real executable, not
+    /// argv[0], which is a bare name when started through PATH.
+    func testOwnExecutableIsntTakenFromABareArgv0() {
+        XCTAssertEqual(PeerInspector.ownExecutable(argv0: "bcu", mainExecutable: "/opt/tools/bin/bcu"), "/opt/tools/bin/bcu")
+        XCTAssertEqual(PeerInspector.ownExecutable(argv0: "/opt/tools/bin/bcu", mainExecutable: nil), "/opt/tools/bin/bcu")
+    }
 }
