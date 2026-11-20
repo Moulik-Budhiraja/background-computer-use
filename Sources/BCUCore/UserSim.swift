@@ -146,9 +146,8 @@ final class UserSim {
                 type(a.string("text") ?? "", intervalMs: a.double("interval_ms") ?? 120, holdMs: a.double("hold_ms") ?? 60,
                      jitterMs: a.double("jitter_ms") ?? 0, wordPauseMs: a.double("word_pause_ms") ?? 0)
             case "key":
-                if let (code, _) = try? KeyMap.code(for: a.string("key") ?? "escape") {
+                if let (code, flags) = try? KeyMap.shortcut(a.string("key") ?? "escape", modifiers: a.strings("modifiers") ?? []) {
                     note("key \(a.string("key") ?? "")")
-                    let flags = KeyMap.flags(a.strings("modifiers") ?? [])
                     key(code, down: true, flags: flags); sleepMs(a.double("hold_ms") ?? 60); key(code, down: false, flags: flags)
                 }
             case "click":

@@ -583,9 +583,10 @@ enum HostInput {
             let down = type == "keydown"
             let code = a.string("code") ?? ""
             let key = a.string("key") ?? ""
-            guard let keyCode = keyCode(code: code, key: key) else { throw ToolError("unknown key code \(code)") }
+            guard let keyCode = keyCode(code: code, key: key, command: flags.contains(.maskCommand)) else { throw ToolError("unknown key code \(code)") }
             // cmd+Q would quit the whole app, the user's own windows included.
-            if flags.contains(.maskCommand) && keyCode == 12 { return }
+            if quitBlocked(command: flags.contains(.maskCommand), keyCode: keyCode, key: key,
+                           quitCode: (try? KeyMap.code(for: "q", command: true).0) ?? 12) { return }
             guard let e = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: down) else { return }
             if modifierCodes.contains(keyCode) {
                 e.type = .flagsChanged
@@ -634,10 +635,26 @@ enum HostInput {
         "NumpadEnter": 76, "NumpadEqual": 81, "NumLock": 71,
     ]
 
-    static func keyCode(code: String, key: String) -> CGKeyCode? {
+    /// Whether a host's key event is cmd+Q, which the take-over never sends.
+    /// `quitCode`: the key that types Q with cmd on the current layout.
+    /// By the key's text when it's a Latin letter: the event carries it,
+    /// and a host on another layout sends codes by its own layout, not
+    /// ours. Otherwise (no text, a letter of another alphabet, which macOS
+    /// matches shortcuts by the key for) by the code.
+    static func quitBlocked(command: Bool, keyCode: CGKeyCode, key: String, quitCode: CGKeyCode) -> Bool {
+        guard command else { return false }
+        let text = key.lowercased()
+        if text.count == 1, text.unicodeScalars.allSatisfy(\.isASCII) { return text == "q" }
+        return keyCode == quitCode
+    }
+
+    /// `command`: cmd is held, which some layouts map differently (see
+    /// `KeyMap.code(for:command:)`, which `lookup` is).
+    static func keyCode(code: String, key: String, command: Bool = false,
+                        lookup: (String, Bool) throws -> (CGKeyCode, Bool) = { try KeyMap.code(for: $0, command: $1) }) -> CGKeyCode? {
         if let c = codes[code] { return c }
         if code.hasPrefix("Key"), code.count == 4, let ch = code.last, let c = KeyMap.chars[Character(ch.lowercased())] { return c }
         if code.hasPrefix("Digit"), code.count == 6, let ch = code.last, let c = KeyMap.chars[ch] { return c }
-        return try? KeyMap.code(for: key).0
+        return try? lookup(key, command).0
     }
 }

@@ -874,8 +874,7 @@ public final class Engine {
                     }
                 }
             case "key":
-                let (code, _) = try KeyMap.code(for: try args.requireString("key"))
-                let flags = KeyMap.flags((args.raw["modifiers"] as? [String]) ?? [])
+                let (code, flags) = try KeyMap.shortcut(try args.requireString("key"), modifiers: (args.raw["modifiers"] as? [String]) ?? [])
                 for down in [true, false] {
                     guard let k = CGEvent(keyboardEventSource: CGEventSource(stateID: .hidSystemState), virtualKey: code, keyDown: down) else { continue }
                     k.flags = flags
