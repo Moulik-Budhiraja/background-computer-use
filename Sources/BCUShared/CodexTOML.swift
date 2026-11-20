@@ -89,6 +89,19 @@ enum CodexTOML {
         }
         let live = doc.assignments.filter { a in !removed.contains { $0.contains(a.statement.lowerBound) } }
 
+        // Codex won't load a server with both a URL and a command. Drop the
+        // HTTP keys when each is a line of its own; otherwise stop.
+        let httpKeys = ["url", "bearer_token_env_var", "http_headers", "env_http_headers"]
+        func isHTTP(_ path: [String]) -> Bool {
+            path.count > 2 && Array(path.prefix(2)) == server && httpKeys.contains(path[2])
+        }
+        let httpError = ParseError(description: "\(name) is set up as an HTTP server. Remove its url and connect again.")
+        if doc.headers.contains(where: { isHTTP($0.path) }) { throw httpError }
+        for a in live where isHTTP(a.path) {
+            guard !a.inline else { throw httpError }
+            edits.append((a.statement, ""))
+        }
+
         let existingCommand = live.first { $0.path == server + ["command"] }
         let existingArgs = live.first { $0.path == server + ["args"] }
         if let a = existingCommand { edits.append((a.value, commandValue)) }
