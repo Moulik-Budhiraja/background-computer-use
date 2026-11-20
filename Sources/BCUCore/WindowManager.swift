@@ -1002,8 +1002,9 @@ public final class WindowManager {
     private static var keptOpen: Set<CGWindowID> = []
     static func keep(_ id: CGWindowID) { keptLock.lock(); keptOpen.insert(id); keptLock.unlock() }
     static func isKept(_ id: CGWindowID) -> Bool { keptLock.lock(); defer { keptLock.unlock() }; return keptOpen.contains(id) }
-    /// A session has the window again (`register`).
-    static func ownedAgain(_ id: CGWindowID) {}
+    /// A session has the window again (`register`): not kept any more, so
+    /// its sweep looks after it.
+    static func ownedAgain(_ id: CGWindowID) { keptLock.lock(); keptOpen.remove(id); keptLock.unlock() }
 
     /// What cleanup does with a window nobody has left on an agent display:
     /// close one an agent opened or caught (and didn't keep open); put any
