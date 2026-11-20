@@ -1596,19 +1596,26 @@ public final class FocusGuard {
         for pid in stalePids {
             lock.lock()
             let p = pidHeld.removeValue(forKey: pid)
-            let still = swapping[pid] != nil
-            if let p, !still {
+            let drop = Self.dropsExpiredHold(swapping: swapping[pid] != nil, stranded: stranded.contains(pid))
+            if let p, !drop {
                 if held.isEmpty { heldSinceMs = p.sinceMs }
                 held.insert(contentsOf: p.events.map { ($0, pid) }, at: 0)
             }
             lock.unlock()
-            if still, let p {
-                // The app has been mid-swap all this time (it isn't answering).
+            if drop, let p {
+                // The app has been mid-swap all this time (it isn't answering),
+                // or an agent's window still has key there.
                 record("COULD NOT give key back in pid \(pid) within \(Int(Self.maxPidHoldMs)) ms: dropped \(p.events.count) of your key events rather than type them into an agent's window")
             } else {
                 drain(force: true)
             }
         }
+    }
+
+    /// Whether keys held for an app past `maxPidHoldMs` are dropped rather
+    /// than replayed.
+    static func dropsExpiredHold(swapping: Bool, stranded: Bool) -> Bool {
+        swapping
     }
 
     /// Replay held events in order, about 1 ms apart. Events the user makes
