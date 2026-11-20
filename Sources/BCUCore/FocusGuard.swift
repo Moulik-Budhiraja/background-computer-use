@@ -524,7 +524,7 @@ public final class FocusGuard {
         return "taint=\(until) key=\(Int(now - lastUserKeyMs))ms openKey=\(Int(now - lastUserOpenKeyMs))ms click=\(Int(now - lastUserMouseDownMs))ms clickOn=\(Self.describe(lastClick))\(restored)"
     }
 
-    /// Where a click landed and on what, for the log: "T3 Code (AXButton)",
+    /// Where a click landed and on what, for the log: "TextEdit (AXButton)",
     /// "Dock: Helium", "pending".
     private static func describe(_ c: Click) -> String {
         let name = { (p: pid_t) in NSRunningApplication(processIdentifier: p)?.localizedName ?? "pid \(p)" }
