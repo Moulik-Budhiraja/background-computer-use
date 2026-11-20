@@ -144,8 +144,11 @@ public enum PeerInspector {
     }
 
     /// This process's executable, symlinks resolved.
+    /// The kernel's path for it (`Bundle.main`); argv[0] is only a fallback,
+    /// since it's a bare name when the engine was started through PATH and
+    /// would resolve against the working folder.
     static func ownExecutable(argv0: String, mainExecutable: String?) -> String {
-        URL(fileURLWithPath: argv0).resolvingSymlinksInPath().path
+        URL(fileURLWithPath: mainExecutable ?? argv0).resolvingSymlinksInPath().path
     }
 
     public static func ownPolicy(trusted: [String] = []) -> PeerPolicy {
