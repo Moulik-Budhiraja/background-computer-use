@@ -23,6 +23,11 @@ public struct AXSnapshotResult {
     let indexByElement: [AXUIElement: Int]
     /// Numbered elements still in the window but past max_elements this time.
     let unlisted: Set<Int>
+    /// Numbered elements still in the window but scrolled out of view.
+    let scrolledOut: Set<Int>
+    /// The last line listed for each number in `unlisted` and `scrolledOut`,
+    /// to report its removal if it goes before it's listed again.
+    let hiddenLines: [Int: String]
     let nextIndex: Int
     /// True when numbering restarted at 1, so numbers from the last read mean nothing.
     public let renumbered: Bool
@@ -84,9 +89,10 @@ public enum AXSnapshot {
     }
 
     /// Element numbers carry over from `previous`: an element still there keeps
-    /// its number and new elements get new ones, so a diff between two reads
-    /// is meaningful. When most elements are new (another page), numbering
-    /// restarts at 1.
+    /// its number, even while it's scrolled out of view or past max_elements,
+    /// and new elements get new ones, so a diff between two reads is
+    /// meaningful. When most elements are new and most of the old ones are
+    /// gone (another page), numbering restarts at 1.
     public static func take(window: AXUIElement, windowID: CGWindowID, title: String, appName: String, pid: pid_t, maxElements: Int = 250, popups: [AXUIElement] = [], previous: AXSnapshotResult? = nil) -> AXSnapshotResult {
         let windowFrame = AX.frame(window) ?? .zero
         // Collected first and numbered after the walk. `element` is nil for a
@@ -94,6 +100,7 @@ public enum AXSnapshot {
         struct Entry { let element: AXUIElement?; let indent: String; let body: String; let node: (String, CGRect, [String], Bool)? }
         var entries: [Entry] = []
         var overflow: [(element: AXUIElement, role: String, frame: CGRect)] = []
+        var outOfView: [AXUIElement] = []
         var visited = 0
         var listed = 0
         var skippedOffscreen = 0
@@ -104,10 +111,13 @@ public enum AXSnapshot {
             return one.count > limit ? String(one.prefix(limit)) + "…" : one
         }
 
-        var bounds = windowFrame
         // Walked on their own, so not again as part of the window.
         var walkedApart = Set<AXUIElement>()
-        func walk(_ el: AXUIElement, depth: Int, indent: Int) {
+        /// `clip`: what of the window can show this element, the window cut
+        /// down to every scroll area it's in. A row scrolled out of a list
+        /// is inside the window's frame but hidden, and a click there would
+        /// land on whatever is drawn over it.
+        func walk(_ el: AXUIElement, depth: Int, indent: Int, clip: CGRect) {
             guard visited < 6000, depth < 60, !walkedApart.contains(el) else { return }
             visited += 1
             let raw = read(el)
@@ -116,9 +126,10 @@ public enum AXSnapshot {
             let hasText = !label.isEmpty || !raw.value.isEmpty || !raw.placeholder.isEmpty
             let interesting = interactiveRoles.contains(raw.role) && (raw.role != "AXStaticText" || hasText) && (raw.role != "AXImage" || !label.isEmpty)
             if interesting, let f = raw.frame, f.width > 0, f.height > 0 {
-                let visible = f.intersects(bounds.insetBy(dx: -2, dy: -2))
+                let visible = f.intersects(clip.insetBy(dx: -2, dy: -2))
                 if !visible {
                     skippedOffscreen += 1
+                    outOfView.append(el)
                 } else if listed >= maxElements {
                     truncated = true
                     overflow.append((el, raw.role, f))
@@ -151,7 +162,9 @@ public enum AXSnapshot {
                     childIndent = indent + 1
                 }
             }
-            for child in raw.children { walk(child, depth: depth + 1, indent: childIndent) }
+            var childClip = clip
+            if raw.role == "AXScrollArea", let f = raw.frame, f.width > 0, f.height > 0 { childClip = clip.intersection(f) }
+            for child in raw.children { walk(child, depth: depth + 1, indent: childIndent, clip: childClip) }
         }
 
         // A sheet (a file picker, a save panel, an alert) is the window's last
@@ -161,27 +174,28 @@ public enum AXSnapshot {
         let sheets = AX.children(window).filter { AX.string($0, "AXRole") == "AXSheet" }
         for sheet in sheets {
             // A sheet can reach past a small window's edges.
-            bounds = AX.frame(sheet).map { $0.union(windowFrame) } ?? windowFrame
+            let clip = AX.frame(sheet).map { $0.union(windowFrame) } ?? windowFrame
             entries.append(Entry(element: nil, indent: "", body: "Sheet over this window (the window behind it takes no input until it closes):", node: nil))
-            walk(sheet, depth: 0, indent: 1)
+            walk(sheet, depth: 0, indent: 1, clip: clip)
             walkedApart.insert(sheet)
         }
-        bounds = windowFrame
         if !sheets.isEmpty {
             entries.append(Entry(element: nil, indent: "", body: "The window behind the sheet:", node: nil))
         }
-        walk(window, depth: 0, indent: 0)
+        walk(window, depth: 0, indent: 0, clip: windowFrame)
         // Popups the window opened (suggestion lists, menus, dropdowns) are
         // separate windows; list them after it so their rows can be pressed.
         for popup in popups where !walkedApart.contains(popup) {
-            bounds = AX.frame(popup) ?? windowFrame
             entries.append(Entry(element: nil, indent: "", body: "Popup over this window:", node: nil))
-            walk(popup, depth: 0, indent: 1)
+            walk(popup, depth: 0, indent: 1, clip: AX.frame(popup) ?? windowFrame)
         }
         // Number the elements.
         let elements = entries.compactMap(\.element)
-        let matched = previous.map { prev in elements.filter { prev.indexByElement[$0] != nil }.count } ?? 0
-        let renumber = previous == nil || elements.isEmpty || Double(matched) < 0.4 * Double(elements.count)
+        let renumber = previous.map { prev in
+            Self.renumbers(listed: elements.count, listedKnown: elements.filter { prev.indexByElement[$0] != nil }.count,
+                           known: prev.indexByElement.count,
+                           stillThere: (elements + overflow.map(\.element) + outOfView).filter { prev.indexByElement[$0] != nil }.count)
+        } ?? true
         var next = renumber ? 1 : previous!.nextIndex
         var used = Set<Int>()
         var nodes: [Int: AXNode] = [:]
@@ -205,18 +219,30 @@ public enum AXSnapshot {
             listing.append(line)
         }
 
-        // Elements pushed past max_elements keep their numbers for when
-        // they're listed again, and aren't reported as removed. The agent
-        // was told they keep their numbers, so they can be acted on by them.
+        // Elements pushed past max_elements or scrolled out of view keep
+        // their numbers for when they're listed again, and aren't reported
+        // as removed. The agent was told those past max_elements keep their
+        // numbers, so they can be acted on by them.
         var unlisted = Set<Int>()
+        var scrolledOut = Set<Int>()
+        var hiddenLines: [Int: String] = [:]
         if !renumber, let prev = previous {
             for o in overflow {
                 if let old = prev.indexByElement[o.element], !used.contains(old) {
                     used.insert(old)
                     indexByElement[o.element] = old
                     unlisted.insert(old)
+                    hiddenLines[old] = prev.lines[old] ?? prev.hiddenLines[old]
                     nodes[old] = AXNode(index: old, element: o.element, role: o.role, frame: o.frame,
                                         actions: AX.actions(o.element), valueSettable: AX.isSettable(o.element, "AXValue"))
+                }
+            }
+            for el in outOfView {
+                if let old = prev.indexByElement[el], !used.contains(old) {
+                    used.insert(old)
+                    indexByElement[el] = old
+                    scrolledOut.insert(old)
+                    hiddenLines[old] = prev.lines[old] ?? prev.hiddenLines[old]
                 }
             }
         }
@@ -228,7 +254,18 @@ public enum AXSnapshot {
         if skippedOffscreen > 0 { footer.append("(\(skippedOffscreen) elements scrolled out of view not listed)") }
         let text = ([header] + listing + footer).joined(separator: "\n")
         return AXSnapshotResult(windowID: windowID, nodes: nodes, text: text, visited: visited, header: header, footer: footer,
-                                lines: lineByIndex, indexByElement: indexByElement, unlisted: unlisted, nextIndex: next, renumbered: renumber && previous != nil)
+                                lines: lineByIndex, indexByElement: indexByElement, unlisted: unlisted, scrolledOut: scrolledOut, hiddenLines: hiddenLines, nextIndex: next, renumbered: renumber && previous != nil)
+    }
+
+    /// Numbering restarts only when most listed elements are new and most
+    /// elements the last read numbered are gone: another page. Scrolling
+    /// lists mostly new elements, but the old ones are still there, out of
+    /// view, and keep their numbers.
+    static func renumbers(listed: Int, listedKnown: Int, known: Int, stillThere: Int) -> Bool {
+        if listed == 0 && stillThere == 0 { return true }
+        let mostlyNew = Double(listedKnown) < 0.4 * Double(listed)
+        let mostlyGone = known == 0 || Double(stillThere) < 0.4 * Double(known)
+        return mostlyNew && mostlyGone
     }
 
     /// What changed between two reads of the same window, or nil when the
@@ -238,8 +275,11 @@ public enum AXSnapshot {
         let order = new.lines.keys.sorted()
         let added = order.filter { old.lines[$0] == nil }
         let changed = order.filter { old.lines[$0] != nil && old.lines[$0] != new.lines[$0] }
-        let removed = old.lines.keys.sorted().filter { new.lines[$0] == nil && !new.unlisted.contains($0) }
+        // Including numbers the last read kept without listing them.
+        let oldLines = old.lines.merging(old.hiddenLines) { listed, _ in listed }
+        let removed = oldLines.keys.sorted().filter { new.lines[$0] == nil && !new.unlisted.contains($0) && !new.scrolledOut.contains($0) }
         let pushedOut = old.lines.keys.filter { new.unlisted.contains($0) }.count
+        let scrolledAway = old.lines.keys.filter { new.scrolledOut.contains($0) }.count
         let touched = added.count + changed.count + removed.count
         if touched > max(20, new.lines.count / 2) { return nil }
         var out = [new.header]
@@ -248,11 +288,12 @@ public enum AXSnapshot {
         } else {
             out.append("Changes since your last get_window_state of this window. The other \(new.lines.count - added.count - changed.count) elements are unchanged and keep their numbers; pass full=true for the whole list.")
             let trim: (String) -> String = { $0.trimmingCharacters(in: .whitespaces) }
-            for i in removed { out.append("- " + trim(old.lines[i]!)) }
+            for i in removed { out.append("- " + trim(oldLines[i]!)) }
             for i in added { out.append("+ " + trim(new.lines[i]!)) }
             for i in changed { out.append("~ " + trim(new.lines[i]!)) }
         }
         if pushedOut > 0 { out.append("(\(pushedOut) elements from your last read are still there but past max_elements now; they keep their numbers)") }
+        if scrolledAway > 0 { out.append("(\(scrolledAway) elements from your last read are scrolled out of view now; they keep their numbers)") }
         out += new.footer
         return out.joined(separator: "\n")
     }

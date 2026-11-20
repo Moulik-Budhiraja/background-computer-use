@@ -91,6 +91,10 @@ test('a host sees its own sessions, with their host, ID and label', async () => 
   assert.ok(everyone.sessions.some((s) => s.id === 'someone-else'))
   assert.equal(everyone.sessions.find((s) => s.id === 'someone-else')!.label, 'Codex')
 
+  await c.rename('helper-1', 'Get Google Approval')
+  assert.equal((await c.sessions({ host: 'test-host' })).sessions[0].label, 'Get Google Approval')
+  await assert.rejects(c.rename('helper-1', ' '), /label/)
+
   await c.pause('helper-1', true)
   const paused = await c.sessions({ host: 'test-host' })
   assert.equal(paused.sessions[0].status.state, 'paused')
