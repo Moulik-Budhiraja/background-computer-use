@@ -1021,12 +1021,12 @@ public final class WindowManager {
         return AX.perform(leave.element, "AXPress") == .success
     }
 
-    /// Whether a "Leave site?" that came up while an agent's `navigate`
-    /// loaded a URL is the agent's to answer: it asked to leave the page.
-    /// Not when the user, in that browser, clicked or pressed an opening key
-    /// since the URL was sent: then it may be about a page of theirs.
-    static func navigateAnswersLeave(userInApp: Bool, userOpenInputMs: Double, sentMs: Double) -> Bool {
-        !(userInApp && userOpenInputMs >= sentMs)
+    /// Whether a "Leave site?" that came up after an agent's step in the
+    /// browser began is the agent's to answer: its step left the page. Not
+    /// when the user, in that browser, clicked or pressed an opening key
+    /// since the step began: then it may be about a page of theirs.
+    static func stepAnswersLeave(userInApp: Bool, userOpenInputMs: Double, stepStartMs: Double) -> Bool {
+        !(userInApp && userOpenInputMs >= stepStartMs)
     }
 
     static func texts(in el: AXUIElement) -> [String] {
@@ -1725,39 +1725,44 @@ private func catcherCallback(_ observer: AXObserver, _ element: AXUIElement, _ n
     Unmanaged<WindowCatcher>.fromOpaque(refcon).takeUnretainedValue().created(element)
 }
 
-/// Watches a browser while `navigate` loads a URL in an agent's window, and
-/// answers Leave the moment the page asks "Leave site?". Chromium asks in an
-/// app-wide alert that comes up on the user's screen (not over the agent's
-/// window), and until it's answered no window of the browser takes input,
-/// the user's included.
+/// Watches a browser while an agent's steps act in it, and answers Leave
+/// the moment a page asks "Leave site?". Chromium asks in an app-wide alert
+/// that comes up on the user's main screen (not over the agent's window),
+/// and until it's answered no window of the browser takes input, the
+/// user's included. Each step keeps the watch going for `forMs` more.
+///
+/// Dialogs are found through accessibility, not the window list: on macOS
+/// 27 the window server lists the alert itself as off screen at layer 0,
+/// while a separate window that accessibility doesn't list shows it.
 final class LeaveWatch: @unchecked Sendable {
     private let lock = NSLock()
-    private var running = true
-    private var said: String?
+    private var deadline: Double
+    private var stepStartMs: Double
+    private var done = false
+    private var answers: [String] = []
 
-    /// `before`: the browser's windows (as accessibility lists them) before
-    /// the URL was sent. `mayAnswer` is asked once per new dialog, just
-    /// before pressing.
-    ///
-    /// Found through accessibility, not the window list: on macOS 27 the
-    /// window server lists the alert itself as off screen at layer 0 while
-    /// a separate window without accessibility shows it.
-    init(pid: pid_t, before: Set<CGWindowID>, forMs ms: Double, mayAnswer: @escaping () -> Bool) {
-        let deadline = nowMs() + ms
+    /// `mayAnswer` is asked once per new dialog, with when the latest step
+    /// began, just before pressing.
+    init(pid: pid_t, forMs ms: Double, mayAnswer: @escaping (_ stepStartMs: Double) -> Bool) {
+        let start = nowMs()
+        deadline = start + ms
+        stepStartMs = start
+        // Dialogs already up are someone else's business.
+        let before = Set(AX.windows(pid).compactMap { AX.windowID($0) })
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             var looked: Set<CGWindowID> = []
-            while isRunning && nowMs() < deadline {
+            while let stepStart = current() {
                 for dialog in AX.windows(pid) {
                     guard let id = AX.windowID(dialog), !before.contains(id), !looked.contains(id) else { continue }
                     if AX.string(dialog, "AXSubrole") == "AXStandardWindow" { looked.insert(id); continue }
                     // (No buttons yet: look again next time round.)
                     guard !WindowManager.buttons(in: dialog).isEmpty else { continue }
                     looked.insert(id)
-                    guard mayAnswer() else { continue }
+                    guard mayAnswer(stepStart) else { continue }
                     let text = WindowManager.texts(in: dialog).joined(separator: " ")
                     if WindowManager.answerLeave(dialog) {
-                        lock.lock(); said = text; running = false; lock.unlock()
-                        return
+                        Log.info("answered Leave for a page in pid \(pid) that asked \"\(text)\" after an agent's step")
+                        lock.lock(); answers.append(text); lock.unlock()
                     }
                 }
                 sleepMs(10)
@@ -1765,15 +1770,27 @@ final class LeaveWatch: @unchecked Sendable {
         }
     }
 
-    private var isRunning: Bool { lock.lock(); defer { lock.unlock() }; return running }
-
-    /// Stop watching. What the page asked, if Leave was pressed.
-    func stop() -> String? {
+    /// When the latest step began, or nil once the watch is over.
+    private func current() -> Double? {
         lock.lock(); defer { lock.unlock() }
-        running = false
-        return said
+        if done || nowMs() >= deadline { done = true; return nil }
+        return stepStartMs
     }
 
-    /// What the page asked, once Leave was pressed.
-    var answered: String? { lock.lock(); defer { lock.unlock() }; return said }
+    /// Another step began: watch for `ms` more. False once the watch is
+    /// over (start a new one).
+    func extend(forMs ms: Double) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if done || nowMs() >= deadline { done = true; return false }
+        deadline = max(deadline, nowMs() + ms)
+        stepStartMs = nowMs()
+        return true
+    }
+
+    /// What pages asked since the last call, for the agent.
+    func takeAnswers() -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        defer { answers = [] }
+        return answers
+    }
 }
