@@ -98,26 +98,22 @@ final class MCPServer {
                 return
             }
             let meta = params["_meta"] as? JSONObject ?? [:]
-            let dispatch = {
-                let caller = self.callerSession(meta)
-                let lane = self.lane(caller)
-                lane.queue.async {
-                    self.reply(id, result: self.callTool(name, arguments, session: caller, lane: lane))
-                }
-            }
             // Telling a subagent's call apart can wait for its transcript to
             // land; do that off this thread so other agents' calls go on.
-            if subagents != nil, meta["claudecode/toolUseId"] != nil {
-                lookupQueue.async(execute: dispatch)
-            } else {
-                dispatch()
-            }
+            dispatcher.submit(slow: subagents != nil && meta["claudecode/toolUseId"] != nil,
+                              resolve: { self.callerSession(meta) },
+                              deliver: { caller in
+                                  let lane = self.lane(caller)
+                                  lane.queue.async {
+                                      self.reply(id, result: self.callTool(name, arguments, session: caller, lane: lane))
+                                  }
+                              })
         default:
             replyError(id, code: -32601, message: "method not found: \(method)")
         }
     }
 
-    private let lookupQueue = DispatchQueue(label: "bcu.mcp.lookup", attributes: .concurrent)
+    private let dispatcher = CallDispatcher()
 
     private func lane(_ session: String) -> Lane {
         stateLock.lock(); defer { stateLock.unlock() }

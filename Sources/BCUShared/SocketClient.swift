@@ -40,8 +40,13 @@ public final class SocketClient {
     /// longest legitimate wait (for a free display) is well under this.
     public static let callTimeout: TimeInterval = 300
 
-    public func call(tool: String, args: JSONObject, timeout: TimeInterval = SocketClient.callTimeout) throws -> ToolResult {
-        ToolResult(wire: try request(["tool": tool, "args": args], timeout: timeout))
+    /// How long a call of this tool may take.
+    public static func timeout(for tool: String) -> TimeInterval {
+        callTimeout
+    }
+
+    public func call(tool: String, args: JSONObject, timeout: TimeInterval? = nil) throws -> ToolResult {
+        ToolResult(wire: try request(["tool": tool, "args": args], timeout: timeout ?? Self.timeout(for: tool)))
     }
 
     /// One request (a tool call, or a host `op`) and its reply. Not for a
