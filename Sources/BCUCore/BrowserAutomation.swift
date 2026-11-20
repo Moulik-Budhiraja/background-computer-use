@@ -17,12 +17,14 @@ public enum BrowserAutomation {
     /// "example.com" it loads nothing.
     public static func loadableURL(_ text: String) -> String? {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty, !t.contains(where: \.isWhitespace) else { return nil }
+        guard !t.isEmpty else { return nil }
         if t.range(of: "^[A-Za-z][A-Za-z0-9+.-]*://", options: .regularExpression) != nil { return t }
         let lower = t.lowercased()
         for scheme in ["about:", "data:", "javascript:", "mailto:", "file:", "chrome:", "view-source:", "blob:"] where lower.hasPrefix(scheme) {
             return t
         }
+        // A bare host has no spaces; with them it's words to search for.
+        guard !t.contains(where: \.isWhitespace) else { return nil }
         let hostPort = String(lower.prefix { !"/?#".contains($0) })
         var host = hostPort
         if hostPort.hasPrefix("[") {
