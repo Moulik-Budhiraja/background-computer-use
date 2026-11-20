@@ -1404,8 +1404,8 @@ public final class FocusGuard {
             }
             // Keys for an app whose key window is an agent's right now wait
             // for it to be the user's again. Modifier changes carry no text,
-            // and cmd+Tab goes to the app switcher, not the app.
-            if anySwap && type != .flagsChanged && !cmdTab {
+            // and system shortcuts (cmd+Tab) go to macOS, not the app.
+            if anySwap && type != .flagsChanged && !Self.systemShortcut(code: event.getIntegerValueField(.keyboardEventKeycode), flags: event.flags) {
                 let front = BCUFrontProcessPID()
                 lock.lock()
                 // Or one left on an agent's window: the user just switched
@@ -1476,6 +1476,12 @@ public final class FocusGuard {
     static let keyLiftMs = 1500.0
     /// F1–F20, Mission Control and Launchpad: keys that can show another app.
     static let functionKeys: Set<Int64> = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106, 64, 79, 80, 90, 160, 131]
+
+    /// A key macOS takes for itself rather than the front app's key
+    /// window: holding it for that app would only keep the system from it.
+    static func systemShortcut(code: Int64, flags: CGEventFlags) -> Bool {
+        flags.contains(.maskCommand) && code == 48
+    }
 
     private static func isMouseDown(_ t: CGEventType) -> Bool {
         t == .leftMouseDown || t == .rightMouseDown || t == .otherMouseDown
