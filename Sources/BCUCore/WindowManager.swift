@@ -1347,7 +1347,8 @@ public final class WindowManager {
     /// session's: `registered` covers another session's and one mid-open.
     enum Newcomer: Equatable { case skip, giveToUser, judge }
     static func newcomerOnAgentDisplay(registered: Bool, kept: Bool) -> Newcomer {
-        registered || kept ? .skip : .judge
+        if registered { return .skip }
+        return kept ? .giveToUser : .judge
     }
 
     /// Keep agent windows off the user's displays and catch new windows an
