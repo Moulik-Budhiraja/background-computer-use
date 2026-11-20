@@ -1075,9 +1075,10 @@ public final class FocusGuard {
     }
 
     /// Whether a key window with these bounds is an agent's to take key
-    /// off (`strand`).
+    /// off (`strand`): its center is on an agent display and not on a user
+    /// display lying over it, by the cursor fence's rule.
     static func strandsKey(bounds: CGRect, agents: [CGRect], users: [CGRect]) -> Bool {
-        agents.contains { $0.intersects(bounds) }
+        AgentDisplay.fenced(at: CGPoint(x: bounds.midX, y: bounds.midY), agents: agents, users: users) != nil
     }
 
     /// The user is in `pid` with an agent's window as its key window and no
