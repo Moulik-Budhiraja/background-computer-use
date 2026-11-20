@@ -236,6 +236,7 @@ public final class Hub {
         let label = Self.label(for: wanted ?? client, taken: Set(byID.values.map(\.label)), exact: wanted != nil)
         let e = Engine(sessionID: id, label: label, focusGuard: focusGuard, host: host)
         e.onChange = { [weak self] in self?.changed() }
+        e.anyUserInControl = { [weak self] in self?.engines.contains { $0.userInControl } ?? false }
         e.setRecordings(recordings[host ?? ""])
         byID[id] = e
         order.append(id)
