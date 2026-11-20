@@ -93,6 +93,8 @@ final class HistoryModel: ObservableObject {
 
     private var observer: NSObjectProtocol?
     private var reloadPending = false
+    /// Bumped by `unload`, so a load that finishes after History closed is dropped.
+    private var generation = 0
     private let store = AppRecordings.store
 
     init() {
@@ -107,9 +109,11 @@ final class HistoryModel: ObservableObject {
 
     /// Reads the recordings and opens at the latest frame (of `session`, if given).
     func load(session: String? = nil) {
+        let generation = self.generation
         DispatchQueue.global(qos: .userInitiated).async {
             let runs = self.store.all()
             DispatchQueue.main.async {
+                guard generation == self.generation else { return }
                 self.apply(runs, keep: nil)
                 if let session, let last = self.items.lastIndex(where: { self.runs[$0.run].session == session }) {
                     self.index = last
@@ -121,6 +125,15 @@ final class HistoryModel: ObservableObject {
                 self.onIndexChanged?(false)
             }
         }
+    }
+
+    /// History closed: stop following live runs and let go of what they
+    /// hold for decoding. The next `load` reads everything again.
+    func unload() {
+        generation += 1
+        loaded = false
+        runs.forEach { $0.releaseDecoders() }
+        apply([], keep: nil)
     }
 
     /// A live run grew: rebuild, staying on the same frame, or on the
@@ -148,6 +161,7 @@ final class HistoryModel: ObservableObject {
             DispatchQueue.global(qos: .userInitiated).async {
                 let runs = self.store.all(reusing: loaded)
                 DispatchQueue.main.async {
+                    guard self.loaded else { return }
                     self.apply(runs, keep: following == nil && !newest ? keep : nil)
                     if let following {
                         if let r = self.runs.firstIndex(where: { $0.id == following }) {
@@ -468,7 +482,7 @@ enum AppIcons {
 }
 
 /// Decodes frames off the main thread, newest request first, and keeps the
-/// last few around for quick back and forth.
+/// last few around for quick back and forth, up to `limitBytes` of them.
 final class FrameLoader {
     private let queue = DispatchQueue(label: "bcu.history.decode", qos: .userInteractive)
     private let lock = NSLock()
@@ -476,10 +490,22 @@ final class FrameLoader {
     private var busy = false
     private var cache: [String: CGImage] = [:]
     private var order: [String] = []
+    private var bytes = 0
+    /// Bumped by `purge`, so a decode that was under way isn't kept.
+    private var epoch = 0
+    /// About ten full-size agent frames (2400×1500, 4 bytes a pixel).
+    let limitBytes: Int
     /// Main thread: a decoded frame (key, image).
     var onImage: ((String, CGImage) -> Void)?
 
+    init(limitBytes: Int = 150_000_000) { self.limitBytes = limitBytes }
+
     static func key(_ run: RecordedRun, _ f: RecordedFrame) -> String { "\(run.id)/\(Int64(f.t))" }
+
+    static func size(of image: CGImage) -> Int { image.bytesPerRow * image.height }
+
+    var cachedBytes: Int { lock.lock(); defer { lock.unlock() }; return bytes }
+    var cachedCount: Int { lock.lock(); defer { lock.unlock() }; return cache.count }
 
     func cached(_ run: RecordedRun, _ f: RecordedFrame) -> CGImage? {
         lock.lock(); defer { lock.unlock() }
@@ -495,6 +521,33 @@ final class FrameLoader {
         if start { queue.async { self.drain() } }
     }
 
+    /// Forgets every decoded frame and any pending request.
+    func purge() {
+        lock.lock()
+        wanted = nil
+        cache.removeAll()
+        order.removeAll()
+        bytes = 0
+        epoch += 1
+        lock.unlock()
+    }
+
+    /// Keeps `image`, dropping the oldest ones while over `limitBytes`
+    /// (the newest stays even when it alone is over). Under `lock`.
+    private func store(_ image: CGImage, key: String) {
+        cache[key] = image
+        order.append(key)
+        bytes += Self.size(of: image)
+        while bytes > limitBytes, order.count > 1 {
+            if let old = cache.removeValue(forKey: order.removeFirst()) { bytes -= Self.size(of: old) }
+        }
+    }
+
+    /// Test support: caches `image` as if it had been decoded.
+    func insertForTest(_ image: CGImage, key: String) {
+        lock.lock(); store(image, key: key); lock.unlock()
+    }
+
     private func drain() {
         while true {
             lock.lock()
@@ -502,16 +555,14 @@ final class FrameLoader {
             wanted = nil
             let key = Self.key(next.run, next.frame)
             let hit = cache[key]
+            let epoch = self.epoch
             lock.unlock()
             guard let image = hit ?? next.run.image(for: next.frame) else { continue }
             lock.lock()
-            if hit == nil {
-                cache[key] = image
-                order.append(key)
-                if order.count > 40 { cache[order.removeFirst()] = nil }
-            }
+            let current = epoch == self.epoch
+            if hit == nil, current { store(image, key: key) }
             lock.unlock()
-            DispatchQueue.main.async { self.onImage?(key, image) }
+            if current { DispatchQueue.main.async { self.onImage?(key, image) } }
         }
     }
 }
