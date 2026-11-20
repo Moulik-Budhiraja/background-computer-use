@@ -37,3 +37,20 @@ final class PopoverFixTests: XCTestCase {
         XCTAssertTrue(box.put(4))
     }
 }
+
+/// Pure rules only, like the ones above.
+final class StopAndMenuSurfaceTests: XCTestCase {
+    func testStopAsksAboutEveryWindowItWouldClose() {
+        // The watchdog's catches (an agent's second window) close on Stop too.
+        XCTAssertTrue(AgentWindow.Kind.opened.closesOnStop)
+        XCTAssertTrue(AgentWindow.Kind.caught.closesOnStop)
+        XCTAssertFalse(AgentWindow.Kind.borrowed.closesOnStop)
+    }
+
+    func testThePopoverAndThePanelNeverShowTogether() {
+        XCTAssertEqual(MenuSurface.toClose(before: .popover, showing: [.panel]), [.panel])
+        XCTAssertEqual(MenuSurface.toClose(before: .panel, showing: [.popover]), [.popover])
+        XCTAssertEqual(MenuSurface.toClose(before: .popover, showing: [.popover]), [])
+        XCTAssertEqual(MenuSurface.toClose(before: .panel, showing: []), [])
+    }
+}
