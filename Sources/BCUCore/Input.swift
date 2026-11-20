@@ -55,11 +55,13 @@ public enum Input {
 
     /// Click at a global screen point inside `windowID`. `check` runs before
     /// anything is posted and again right before the button goes down.
+    /// `origin`: the window's top left, for a window the window list
+    /// doesn't give (a panel service's, drawn into a sheet).
     public static func click(pid: pid_t, windowID: CGWindowID, at point: CGPoint, button: Button = .left, count: Int = 1,
-                             check: () throws -> Void = {}) throws {
+                             origin known: CGPoint? = nil, check: () throws -> Void = {}) throws {
         try check()
         guard let src = source() else { throw ToolError("could not create an event source") }
-        guard let origin = origin(of: windowID) else { throw ToolError("window \(windowID) is gone") }
+        guard let origin = known ?? origin(of: windowID) else { throw ToolError("window \(windowID) is gone") }
         let offScreen = CGPoint(x: -1, y: -1)
         let (downType, upType, cgButton, buttonNumber): (CGEventType, CGEventType, CGMouseButton, Int64) =
             button == .left ? (.leftMouseDown, .leftMouseUp, .left, 0) : (.rightMouseDown, .rightMouseUp, .right, 1)
@@ -94,11 +96,11 @@ public enum Input {
     /// Scroll wheel at a global point, in wheel notches of 3 lines each, at
     /// most `maxScrollNotches` on each axis. Positive dy scrolls content down
     /// (towards the end).
-    public static func scroll(pid: pid_t, windowID: CGWindowID, at point: CGPoint, dx: Int, dy: Int) throws {
+    public static func scroll(pid: pid_t, windowID: CGWindowID, at point: CGPoint, dx: Int, dy: Int, origin known: CGPoint? = nil) throws {
         let dx = max(-maxScrollNotches, min(dx, maxScrollNotches))
         let dy = max(-maxScrollNotches, min(dy, maxScrollNotches))
         guard let src = source() else { throw ToolError("could not create an event source") }
-        guard let origin = origin(of: windowID) else { throw ToolError("window \(windowID) is gone") }
+        guard let origin = known ?? origin(of: windowID) else { throw ToolError("window \(windowID) is gone") }
         if let move = CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) {
             stampMouse(move, pid: pid, windowID: windowID, phase: 2, clickState: 0, button: 0, at: point, origin: origin)
             BCUPostEventToPid(pid, move, false)
@@ -124,9 +126,10 @@ public enum Input {
     }
 
     /// Press, move in steps, release.
-    public static func drag(pid: pid_t, windowID: CGWindowID, from: CGPoint, to: CGPoint, steps: Int = 20, durationMs: Double = 300) throws {
+    public static func drag(pid: pid_t, windowID: CGWindowID, from: CGPoint, to: CGPoint, steps: Int = 20, durationMs: Double = 300,
+                            origin known: CGPoint? = nil) throws {
         guard let src = source() else { throw ToolError("could not create an event source") }
-        guard let origin = origin(of: windowID) else { throw ToolError("window \(windowID) is gone") }
+        guard let origin = known ?? origin(of: windowID) else { throw ToolError("window \(windowID) is gone") }
         func post(_ type: CGEventType, _ at: CGPoint, phase: Int64, state: Int64) {
             guard let e = CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: at, mouseButton: .left) else { return }
             stampMouse(e, pid: pid, windowID: windowID, phase: phase, clickState: state, button: 0, at: at, origin: origin)
@@ -162,9 +165,11 @@ public enum Input {
         BCUEventSetIntegerField(e, 92, Int64(windowID))
     }
 
-    public static func pressKey(pid: pid_t, key: String, modifiers: [String], windowID: CGWindowID = 0) throws {
+    /// `shortcutsToMenu`: false for a process with no menu bar of its own
+    /// (an open or save panel's), where a shortcut is an ordinary key.
+    public static func pressKey(pid: pid_t, key: String, modifiers: [String], windowID: CGWindowID = 0, shortcutsToMenu: Bool = true) throws {
         let (code, flags) = try KeyMap.press(key: key, modifiers: modifiers)
-        let menuRoute = flags.contains(.maskCommand) || flags.contains(.maskControl)
+        let menuRoute = shortcutsToMenu && (flags.contains(.maskCommand) || flags.contains(.maskControl))
         try postKey(pid: pid, code: code, down: true, flags: flags, auth: !menuRoute, windowID: windowID)
         sleepMs(keyGapMs)
         try postKey(pid: pid, code: code, down: false, flags: flags, auth: !menuRoute, windowID: windowID)

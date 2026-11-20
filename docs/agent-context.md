@@ -14,7 +14,7 @@ How to work:
 2. `open_window` opens a new window of an app on your display (for a browser, a new window in the user's own profile). Use `borrow_window` only for single-window apps.
 3. `get_window_state` returns the window's accessibility tree with numbered elements and a screenshot. Act on elements by number. Use x/y (window points, matching the screenshot pixels) only when no element fits. An element keeps its number for as long as it exists. After the first read, `get_window_state` lists only what changed (- removed, + added, ~ changed); pass full=true when you need the whole list again. Right after an action it waits (up to 5 s) for the window to settle, so you don't need to sleep.
 4. Prefer `click` on an element and `set_value`: they work through accessibility. While the user is in the same app, `type_text` writes into the field through accessibility too (pass `element` when you know the field); only Return and Tab go as keys. Keys and pixel clicks make your window its app's key window. In an app the user isn't in, a field you focused stays focused for your next step and a menu you opened stays open; when the user is in it, key goes straight back to them (their input is held for that moment and replayed). When the user is in that app, such a step first waits for a pause in their clicking or scrolling (3 s at most, usually much less) and for them to stop typing (however long they type: their typing goes first), and the result says how long; that's expected, don't repeat the step. If the user has a menu open in that app, holds a mouse button or key (a drag), or is still typing after 30 s, the step fails instead of interrupting them, with nothing done: carry on with steps that need no key focus, or retry in a few seconds. (The user can turn Safe typing off in Settings: then typing is waited for 3 s at most, like clicking.) `open_window` waits the same way (for a menu or a held button anywhere). If another agent is mid-task in that app, the step waits its turn too. Keystroke typing stops if the user switches to that app partway; the error says how much was typed, so type the rest. Pass priority="now" only when the step can't wait (a dialog or toast about to close, a hover then a click, a code about to expire).
-Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's elements in `get_window_state`; click their rows by number. A sheet over your window (a file picker, a save panel, an alert) is listed first: pick a file by clicking its row by number, then the panel's button. In a browser, to go to a URL use `navigate` (it sends no keys, so it doesn't wait for the user to pause unless they're in that same browser); in a browser it doesn't support, click the address bar, then `type_text` the URL followed by "\n".
+Popups your window opens (address-bar suggestions, menus, dropdowns) are listed after the window's elements in `get_window_state`; click their rows by number. A sheet over your window (a file picker, a save panel, an alert) is listed first. To pick or save a file by path, use `choose_file`. In a browser, to go to a URL use `navigate` (it sends no keys, so it doesn't wait for the user to pause unless they're in that same browser); in a browser it doesn't support, click the address bar, then `type_text` the URL followed by "\n".
 5. When you already know the next few steps (fill a form and submit, type a URL and press Return), send them in one `batch` call: it runs them in order, stops at the first failure, and returns the window's state at the end. Otherwise check the result with `get_window_state` after each meaningful step.
 6. When finished, `release_window` every window you opened or borrowed.
 7. Never type, read or reveal the user's passwords: fill them from the browser's or password manager's autofill. You may enter 2FA codes for accounts the task allows. If you need the user (a sign-in no password manager can fill, a decision), call `handoff` with a reason and stop.
@@ -184,6 +184,21 @@ Run several actions in order in one call, stopping at the first failure, then re
 
 Focus-guard events: anything that touched the user's focus, cursor or screen, with the action that caused it.
 
+### choose_file
+
+Pick a file by path in the file picker or save panel open over your window (opened by an upload button, File > Open or Save), then press its Open or Save button. Works for any folder, including ones the picker's sidebar doesn't show. For a save panel, give the path to save to. Waits up to 3 s for the picker to open.
+
+- `path` (string, required): Absolute path of the file (~ allowed).
+- `window_id` (integer, required): Your window, the one the picker is over.
+- `confirm` (boolean): Press Open or Save after selecting the file (default true). False only selects it.
+
+### capture_audio
+
+Call before you play sound (a video, music, a call) in any app. In an app the user also has windows in, such as their browser, sound comes from the app as a whole and plays on the user's speakers otherwise: this mutes the app on their speakers and records it to a file for you, until the user clicks or types in that app or presses a media key. Then mute_element is pressed to silence yours, the app plays on their speakers again, and your next call says so. Once your window shows a mute or pause button for your sound (a browser tab's mute button appears only once it plays), call this again with it as mute_element. Fails while the app is already making sound.
+
+- `window_id` (integer, required): Your window that will play the sound.
+- `mute_element` (integer): An element in that window that silences your sound when pressed: the tab's mute button, or the player's mute or pause button.
+
 ## Skill
 
 `skills/background-computer-use/SKILL.md`. Agents see the `description` line up front and read the rest when they use the skill.
@@ -201,7 +216,7 @@ Use these tools when the task needs the user's logged-in session or an app with 
 
 #### Starting
 
-1. Call `status` once. It gives your display size, the user's default browser and any windows you still have open. Other agents may be working at the same time, each on its own display; you only see and control your own windows. Sound from apps that only you are using doesn't play on the user's speakers. While one plays, `status` gives the file it is recorded to, if the task needs what it says. Use that browser for anything on the web, because it holds the user's logins. Don't switch to another browser when that one gives you trouble: the others aren't signed in. On Windows, if `status` says you have no screen to work on, tell the user the reason it gives; you can't open windows until they fix it.
+1. Call `status` once. It gives your display size, the user's default browser and any windows you still have open. Other agents may be working at the same time, each on its own display; you only see and control your own windows. On a Mac, call `capture_audio` before you play sound in any app: it keeps your sound off the user's speakers, including in an app they also have windows in, such as their browser, and while it does, `status` gives the file it is recorded to, if the task needs what it says. Use that browser for anything on the web, because it holds the user's logins. Don't switch to another browser when that one gives you trouble: the others aren't signed in. On Windows, if `status` says you have no screen to work on, tell the user the reason it gives; you can't open windows until they fix it.
 2. Call `open_window` with the app name. It opens a new window on your display and returns its `window_id`. For a browser the window opens in the user's own profile, signed in to everything the user is. Open only apps and sites the task is allowed to use. Use `list_windows` and `borrow_window` only for apps that have a single window, such as System Settings. `release_window` puts a borrowed window back where it was.
 
 #### Reading a window
@@ -218,7 +233,7 @@ An element keeps its number for as long as it exists. After the first read, `get
 
 Popups that belong to your window (menus, dropdowns, address-bar suggestions) are listed after the window's own elements, with their own numbers.
 
-A sheet over your window, such as a file picker opened by an upload button, a save panel or an alert, is listed first, before the window behind it, which takes no input until the sheet closes. Click a file's row by number to select it, then click the panel's button (Upload, Open, Save). Selecting a row and pressing a button go through accessibility, so they work even though keys can't reach the panel. To go into a folder, select its row and press Open, or click it in the sidebar.
+A sheet over your window, such as a file picker opened by an upload button, a save panel or an alert, is listed first, before the window behind it, which takes no input until the sheet closes. To upload or save a file, call `choose_file` with its path: it goes to the file's folder (any folder, ~/Library too), selects it and presses Open or Save. You can also click a file's row by number and then the panel's button.
 
 Pass `screenshot=false` when the text is enough. Take the screenshot when layout matters, when the tree is thin (canvas apps, images, games) or when an action didn't do what you expected. Coordinates for `click` and `scroll` are window points, which match the screenshot's pixels.
 

@@ -248,6 +248,19 @@ public enum AX {
         windows(pid).first { windowID($0) == id }
     }
 
+    /// The sheet over `window` (a file picker, a save panel, an alert), if one is up.
+    public static func sheet(of window: AXUIElement) -> AXUIElement? {
+        children(window).first { string($0, "AXRole") == "AXSheet" }
+    }
+
+    /// The window id of the sheet over window `id` of `pid`. A sheet is a
+    /// window of its own, and while it's up it, not the window it's over,
+    /// is the one that can be key.
+    public static func sheetWindowID(pid: pid_t, window id: CGWindowID) -> CGWindowID? {
+        guard let w = window(pid: pid, id: id), let s = sheet(of: w), let sid = windowID(s), sid != id else { return nil }
+        return sid
+    }
+
     /// The app's key window as accessibility reports it.
     public static func focusedWindowID(_ pid: pid_t) -> CGWindowID? {
         guard let w = element(app(pid), "AXFocusedWindow") else { return nil }

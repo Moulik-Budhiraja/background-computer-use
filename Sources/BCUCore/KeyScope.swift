@@ -15,6 +15,9 @@ public final class KeyScope {
 
     public let pid: pid_t
     public let target: CGWindowID
+    /// The window made key: `target`, or the sheet over it (a file picker,
+    /// a save panel), which while it's up is the only one that can be key.
+    public let keyWindow: CGWindowID
     /// Where key goes back to on `exit()`.
     public let previous: CGWindowID?
     public let primed: Prime
@@ -25,9 +28,10 @@ public final class KeyScope {
 
     private static let settleMs: Double = 120
 
-    private init(pid: pid_t, target: CGWindowID, previous: CGWindowID?, primed: Prime, wasInactive: Bool) {
+    private init(pid: pid_t, target: CGWindowID, keyWindow: CGWindowID, previous: CGWindowID?, primed: Prime, wasInactive: Bool) {
         self.pid = pid
         self.target = target
+        self.keyWindow = keyWindow
         self.previous = previous
         self.primed = primed
         self.wasInactive = wasInactive
@@ -45,45 +49,72 @@ public final class KeyScope {
         // app land nowhere (and make it beep). AXFrontmost is AppKit's own
         // "active" flag.
         let active = AX.bool(AX.app(pid), "AXFrontmost") == true
+        // A sheet over the target takes its input, and the target can't be
+        // made key while it's up: make the sheet key instead.
+        let targetAX = AX.window(pid: pid, id: target)
+        let sheetAX = targetAX.flatMap(AX.sheet(of:))
+        let sheet = sheetAX.flatMap(AX.windowID).flatMap { $0 != target ? $0 : nil }
+        let key = sheet ?? target
         // The window to take key from: the one that has it, or the user's if
-        // accessibility says the target has it already.
-        let from = current == target ? user : current
+        // accessibility says ours has it already.
+        let from = current == key ? user : current
         // First try is quick (5 ms between records): fast enough that the
         // user's window never repaints as inactive. The second uses cua's settle.
         for settle in [5.0, settleMs] {
-            if postRecords(pid: pid, from: from, to: target, settle: settle) {
-                awaitKey(pid: pid, target: target, budgetMs: settle < 50 ? 250 : 400)
-                if AX.focusedWindowID(pid) == target {
-                    return KeyScope(pid: pid, target: target, previous: previous, primed: .records, wasInactive: !active)
+            if postRecords(pid: pid, from: from, to: key, settle: settle) {
+                awaitKey(pid: pid, target: key, budgetMs: settle < 50 ? 250 : 400)
+                if AX.focusedWindowID(pid) == key {
+                    return KeyScope(pid: pid, target: target, keyWindow: key, previous: previous, primed: .records, wasInactive: !active)
                 }
             }
         }
-        if let window = AX.window(pid: pid, id: target),
+        if let window = sheet != nil ? sheetAX : targetAX,
            AX.set(AX.app(pid), "AXFocusedWindow", window) == .success {
-            awaitKey(pid: pid, target: target, budgetMs: 200)
-            if AX.focusedWindowID(pid) == target {
-                return KeyScope(pid: pid, target: target, previous: previous, primed: .axFocus, wasInactive: !active)
+            awaitKey(pid: pid, target: key, budgetMs: 200)
+            if AX.focusedWindowID(pid) == key {
+                return KeyScope(pid: pid, target: target, keyWindow: key, previous: previous, primed: .axFocus, wasInactive: !active)
             }
         }
         // Undo what may still land: records the app hasn't handled yet would
         // make the target key after this returns.
-        if let previous, previous != target, WindowList.info(previous) != nil {
-            _ = postRecords(pid: pid, from: target, to: previous, settle: 5)
-            if let w = AX.window(pid: pid, id: previous), AX.focusedWindowID(pid) == target {
+        if let previous, previous != target, previous != key, WindowList.info(previous) != nil {
+            _ = postRecords(pid: pid, from: key, to: previous, settle: 5)
+            if let w = AX.window(pid: pid, id: previous), AX.focusedWindowID(pid) == key {
                 AX.set(AX.app(pid), "AXFocusedWindow", w)
             }
         } else if !active {
-            _ = BCUPostFocusRecord(pid, target, false)
+            _ = BCUPostFocusRecord(pid, key, false)
         }
-        Log.info("keyscope: could not make \(target) key in pid \(pid) (key is \(AX.focusedWindowID(pid).map(String.init) ?? "none")); undid the records")
-        throw ToolError("could not make window \(target) the app's key window without activating it (the app's key window is \(current.map(String.init) ?? "none")), so no keys were sent. Use accessibility actions (set_value, click on an element) instead.")
+        Log.info("keyscope: could not make \(key)\(sheet != nil ? " (the sheet over \(target))" : "") key in pid \(pid) (key is \(AX.focusedWindowID(pid).map(String.init) ?? "none")); undid the records")
+        throw ToolError(refusal(sheet: sheet != nil))
     }
+
+    /// Why a step that needed key focus did nothing. No window ids: an agent
+    /// took "the app's key window is N" to mean the user was in the app, and
+    /// waited for them.
+    static func refusal(sheet: Bool) -> String {
+        if sheet {
+            return "a sheet (a file picker, a save panel or an alert) is open over this window and couldn't be given key focus without activating the app, so keys and pixel clicks can't reach it and nothing was sent. Use its elements by number (click, set_value), or choose_file to pick a file by path. Waiting won't change this."
+        }
+        return "this window couldn't be made its app's key window without activating the app, so nothing was sent. That's not the user typing: waiting won't change it. Use accessibility actions (set_value, click on an element) instead, or list_windows to look for a dialog of yours that has to be answered first."
+    }
+
+    /// The window of ours that's key now: the target, or a sheet over it
+    /// (one may have opened or closed during the step).
+    private func ownKey() -> CGWindowID? {
+        guard let key = AX.focusedWindowID(pid) else { return nil }
+        if key == target || key == keyWindow { return key }
+        return AX.sheetWindowID(pid: pid, window: target) == key ? key : nil
+    }
+
+    /// Our window that's key now, else the one the scope made key.
+    public var heldBy: CGWindowID { ownKey() ?? (WindowList.info(keyWindow) != nil ? keyWindow : target) }
 
     /// End the scope leaving key on the target, in an app the user isn't
     /// in (see `FocusGuard.park`). Returns false, doing nothing, if the app
     /// is in front now or the target lost key: then call `exit`.
     public func keepKey() -> Bool {
-        guard !exited, BCUFrontProcessPID() != pid, AX.focusedWindowID(pid) == target else { return false }
+        guard !exited, BCUFrontProcessPID() != pid, ownKey() != nil else { return false }
         exited = true
         return true
     }
@@ -99,18 +130,19 @@ public final class KeyScope {
         // key so it goes back to counting itself inactive, instead of
         // handing key to `previous`. (If the user switched to it meanwhile,
         // their window gets key below.)
+        let held = heldBy
         if wasInactive && primed == .records && BCUFrontProcessPID() != pid {
-            _ = BCUPostFocusRecord(pid, target, false)
+            _ = BCUPostFocusRecord(pid, held, false)
             return true
         }
-        guard let previous, previous != target, WindowList.info(previous) != nil else {
-            if BCUFrontProcessPID() != pid { _ = BCUPostFocusRecord(pid, target, false) }
+        guard let previous, previous != target, previous != keyWindow, WindowList.info(previous) != nil else {
+            if BCUFrontProcessPID() != pid { _ = BCUPostFocusRecord(pid, held, false) }
             return true
         }
         for settle in [5.0, Self.settleMs] {
             switch primed {
             case .records:
-                _ = KeyScope.postRecords(pid: pid, from: target, to: previous, settle: settle)
+                _ = KeyScope.postRecords(pid: pid, from: held, to: previous, settle: settle)
             case .axFocus:
                 if let w = AX.window(pid: pid, id: previous) { AX.set(AX.app(pid), "AXFocusedWindow", w) }
             }
@@ -149,7 +181,7 @@ public final class KeyScope {
     public func handOff(to user: CGWindowID) -> Bool {
         guard !exited else { return false }
         exited = true
-        Self.postRecords(pid: pid, from: target, to: user, settle: 5)
+        Self.postRecords(pid: pid, from: heldBy, to: user, settle: 5)
         Self.awaitKey(pid: pid, target: user, budgetMs: 250)
         return AX.focusedWindowID(pid) == user
     }
