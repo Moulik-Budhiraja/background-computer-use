@@ -81,4 +81,13 @@ final class ReviewFixTests: XCTestCase {
         let visible = CGRect(x: 300, y: 200, width: 800, height: 600)
         XCTAssertFalse(WindowManager.strandedOnStray(visible, userDisplays: [main]))
     }
+
+    func testAKeptWindowBorrowedAgainIsntKeptAnyMore() {
+        let id: CGWindowID = 0xFFFF_FE01
+        WindowManager.keep(id)
+        XCTAssertTrue(WindowManager.isKept(id))
+        // Borrowed again: the session's sweep has to look after it.
+        WindowManager.ownedAgain(id)
+        XCTAssertFalse(WindowManager.isKept(id))
+    }
 }
