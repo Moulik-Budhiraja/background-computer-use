@@ -94,4 +94,16 @@ final class SubagentSessionTests: XCTestCase {
         // Left with nobody again later: that departure gets the whole grace.
         XCTAssertFalse(Engine.departureStillCurrent(2, latest: 3))
     }
+
+    func testAHandedOffWindowStaysWhenItsAgentGoes() {
+        XCTAssertEqual(Engine.abandonedFate(withUser: false, handedOff: false), .release)
+        XCTAssertEqual(Engine.abandonedFate(withUser: true, handedOff: false), .leaveWithUser)
+        // Waiting for the user, who hasn't opened it yet.
+        XCTAssertEqual(Engine.abandonedFate(withUser: false, handedOff: true), .keepForUser)
+    }
+
+    func testASessionAViewerIsDrivingIsntTakenOver() {
+        XCTAssertTrue(Hub.abandoned("parent/agent-1", attached: [:], usedBy: [:], userInControl: false))
+        XCTAssertFalse(Hub.abandoned("parent/agent-1", attached: [:], usedBy: [:], userInControl: true))
+    }
 }
