@@ -39,6 +39,14 @@ final class SnapshotAndDocsTests: XCTestCase {
         XCTAssertNil(BrowserAutomation.loadableURL("me@example.com"))
     }
 
+    /// A URL with a scheme goes as given, spaces in it included: Chromium
+    /// takes them in a data: page.
+    func testNavigateKeepsSchemedURLsWithSpaces() {
+        XCTAssertEqual(BrowserAutomation.loadableURL("data:text/html,<h1>Hello world</h1>"), "data:text/html,<h1>Hello world</h1>")
+        XCTAssertEqual(BrowserAutomation.loadableURL("javascript:alert(1 + 1)"), "javascript:alert(1 + 1)")
+        XCTAssertNil(BrowserAutomation.loadableURL("example.com is down"))
+    }
+
     func testBatchDocsListEveryBatchableTool() throws {
         let batch = try XCTUnwrap(ToolCatalog.tools.first { $0["name"] as? String == "batch" })
         let description = try XCTUnwrap(batch["description"] as? String)
