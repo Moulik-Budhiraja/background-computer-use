@@ -1614,8 +1614,11 @@ public final class FocusGuard {
 
     /// Whether keys held for an app past `maxPidHoldMs` are dropped rather
     /// than replayed.
+    /// A stranded app's keys are, like a stuck swap's: the agent's window
+    /// still has key there, and replayed they'd go to whatever app the user
+    /// has moved to.
     static func dropsExpiredHold(swapping: Bool, stranded: Bool) -> Bool {
-        swapping
+        swapping || stranded
     }
 
     /// Replay held events in order, about 1 ms apart. Events the user makes
