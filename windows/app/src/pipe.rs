@@ -1,6 +1,8 @@
 //! The named pipe bcu.exe connects to. One JSON request or response per line,
 //! the same format as the Mac app's unix socket. Only the signed-in user (and
-//! SYSTEM) may open it, and remote clients are refused.
+//! SYSTEM) may open it, and remote clients are refused. Pipe names are shared
+//! by every user on the PC, so bcu.exe also checks the pipe is served by its
+//! own user before it sends anything.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::io::FromRawHandle;
@@ -12,12 +14,24 @@ use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStr
 use windows::Win32::Security::{GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
 use windows::Win32::System::Pipes::*;
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, OpenProcessToken};
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
 use crate::engine::{self, Request, ToolResult};
 
+/// Per user and Windows session, like bcu.exe's `pipe_name`.
 pub fn pipe_name() -> String {
+    let mut session = 0u32;
+    unsafe {
+        let _ = ProcessIdToSessionId(GetCurrentProcessId(), &mut session);
+    }
+    format!("{}-{session}", legacy_pipe_name())
+}
+
+/// The name before the session was in it, still served for the `bcu mcp`
+/// processes agents started before an update.
+fn legacy_pipe_name() -> String {
     let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
     format!(r"\\.\pipe\BackgroundComputerUse-{user}")
 }
@@ -44,6 +58,11 @@ fn current_user_sid() -> Option<String> {
 /// Serve the pipe forever, one thread per connection. Each request runs on
 /// its agent session's thread.
 pub fn serve() -> Result<(), String> {
+    std::thread::spawn(|| serve_on(legacy_pipe_name()));
+    serve_on(pipe_name())
+}
+
+fn serve_on(name: String) -> Result<(), String> {
     let sid = current_user_sid().ok_or("couldn't read the current user's SID")?;
     let sddl = HSTRING::from(format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)"));
     let mut sd = PSECURITY_DESCRIPTOR::default();
@@ -56,12 +75,13 @@ pub fn serve() -> Result<(), String> {
         lpSecurityDescriptor: sd.0,
         bInheritHandle: false.into(),
     };
-    let name = HSTRING::from(pipe_name());
+    let name = HSTRING::from(name);
     let mut first = true;
     loop {
         let mut mode = PIPE_ACCESS_DUPLEX;
         if first {
-            // Fail if another copy of the app already owns the pipe.
+            // Fail if another copy of the app (or anyone else) already owns
+            // the pipe, rather than add an instance to theirs.
             mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
         }
         let handle = unsafe {
