@@ -301,4 +301,27 @@ final class PeerPolicyTests: XCTestCase {
         XCTAssertNil(SocketServer.windowIDs(in: ["window_id": "x"]))
         XCTAssertNil(SocketServer.windowIDs(in: ["window_id": 5, "actions": [["window_id": 4_294_967_296 + 42]]]))
     }
+
+    /// A host's bundle checked once isn't trusted after a file in it
+    /// changes (an Electron app's app.asar replaced): it's checked again.
+    func testVouchIsRecheckedWhenTheBundleChanges() {
+        let cache = VouchCache()
+        var fingerprint = 1
+        var verifies = 0
+        var sealed = true
+        func check() -> Bool { cache.check("k", fingerprint: { fingerprint }) { verifies += 1; return sealed } }
+        XCTAssertTrue(check())
+        XCTAssertTrue(check())
+        XCTAssertEqual(verifies, 1, "unchanged: remembered")
+        fingerprint = 2
+        sealed = false
+        XCTAssertFalse(check())
+        XCTAssertEqual(verifies, 2)
+        // Can't tell what's on disk: check every time.
+        let unknown = VouchCache()
+        var unknownVerifies = 0
+        _ = unknown.check("k", fingerprint: { nil }) { unknownVerifies += 1; return true }
+        _ = unknown.check("k", fingerprint: { nil }) { unknownVerifies += 1; return true }
+        XCTAssertEqual(unknownVerifies, 2)
+    }
 }
