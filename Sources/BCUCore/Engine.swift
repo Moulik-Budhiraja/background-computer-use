@@ -303,8 +303,17 @@ public final class Engine {
     }
 
     public func setPaused(_ value: Bool) {
-        stateLock.lock(); _paused = value; stateLock.unlock()
+        stateLock.lock()
+        if Self.userReturns(paused: (_paused, value), inControl: (_userInControl, _userInControl)) { userReturnedMs = nowMs() }
+        _paused = value
+        stateLock.unlock()
         log(value ? "Paused by you" : "Resumed")
+    }
+
+    /// The user gave the agent its windows back, as a state goes from `was`
+    /// to `now`: the update gate counts it like a call.
+    static func userReturns(paused: (was: Bool, now: Bool), inControl: (was: Bool, now: Bool)) -> Bool {
+        inControl.was && !inControl.now
     }
 
     public var status: EngineStatus {
@@ -383,8 +392,8 @@ public final class Engine {
     public func setUserInControl(_ value: Bool) {
         stateLock.lock()
         let was = _userInControl
+        if Self.userReturns(paused: (_paused, _paused), inControl: (was, value)) { userReturnedMs = nowMs() }
         _userInControl = value
-        if was, !value { userReturnedMs = nowMs() }
         stateLock.unlock()
         windows.userArranging = value
         if was != value { log(value ? "You took over the agent display" : "You gave the agent display back") }
