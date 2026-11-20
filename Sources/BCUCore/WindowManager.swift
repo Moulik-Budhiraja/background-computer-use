@@ -1092,8 +1092,13 @@ public final class WindowManager {
         }
     }
 
-    /// Whether a window on a stray display is stranded there.
-    static func strandedOnStray(_ bounds: CGRect, userDisplays: [CGRect]) -> Bool { true }
+    /// Whether a window on a stray display is stranded there. A stray
+    /// macOS left on top of a user display (see `AgentDisplay.tend`) holds
+    /// windows the user can see: those stay where they are.
+    static func strandedOnStray(_ bounds: CGRect, userDisplays: [CGRect]) -> Bool {
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        return !userDisplays.contains { $0.contains(center) }
+    }
 
     /// The window stays on the agent display until the user asks for it
     /// (`bringToUser`), so nothing appears on their screen unasked.
@@ -1212,8 +1217,10 @@ public final class WindowManager {
     private static let agentJudgeMs = 5000.0
 
     /// Whether the sweep still treats a window in its copy of the registry
-    /// as the session's.
-    static func sweepStillOwns(registeredNow: Bool, kept: Bool) -> Bool { true }
+    /// as the session's. One released since the copy (kept open and moved
+    /// to the user's screen, or closing) isn't: moving it back would leave
+    /// it on the agent display with nobody to bring it off.
+    static func sweepStillOwns(registeredNow: Bool, kept: Bool) -> Bool { registeredNow && !kept }
 
     /// Keep agent windows off the user's displays and catch new windows an
     /// agent action spawned there (dialogs, popups, extra windows).
