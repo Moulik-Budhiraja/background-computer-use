@@ -820,6 +820,7 @@ public final class FocusGuard {
     private func watchUserWindow() {
         while true {
             usleep(300_000)
+            refreshSystemShortcuts()
             checkStranded()
             guard !WindowManager.agentPids().isEmpty || !activeTaints.isEmpty else { continue }
             let front = BCUFrontProcessPID()
@@ -1588,7 +1589,8 @@ public final class FocusGuard {
             // Keys for an app whose key window is an agent's right now wait
             // for it to be the user's again. Modifier changes carry no text,
             // and system shortcuts (cmd+Tab) go to macOS, not the app.
-            if anySwap && type != .flagsChanged && !Self.systemShortcut(code: event.getIntegerValueField(.keyboardEventKeycode), flags: event.flags) {
+            lock.lock(); let enabledShortcuts = enabledSystemShortcuts; lock.unlock()
+            if anySwap && type != .flagsChanged && !Self.systemShortcut(code: event.getIntegerValueField(.keyboardEventKeycode), flags: event.flags, enabled: enabledShortcuts) {
                 let front = BCUFrontProcessPID()
                 lock.lock()
                 // Or one left on an agent's window: the user just switched
@@ -1667,16 +1669,59 @@ public final class FocusGuard {
     /// Control and Launchpad keys) and Force Quit (cmd+opt+Esc).
     /// Only the whole chord: with another modifier it's the app's shortcut
     /// (ctrl+cmd+arrows in Xcode).
-    static func systemShortcut(code: Int64, flags: CGEventFlags) -> Bool {
-        let mods = flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift])
+    /// `enabled`: the shortcuts in `configurableShortcuts` that are on.
+    static func systemShortcut(code: Int64, flags: CGEventFlags, enabled: Set<Chord> = Set(configurableShortcuts.values)) -> Bool {
+        let mods = flags.intersection(chordModifiers)
         switch code {
         case 48: return mods == .maskCommand || mods == [.maskCommand, .maskShift]
-        case 49: return mods == .maskCommand || mods == .maskControl || mods == [.maskControl, .maskAlternate]
-        case 123, 124, 125, 126: return mods == .maskControl
         case 160, 131: return mods.isEmpty
         case 53: return mods == [.maskCommand, .maskAlternate]
-        default: return false
+        default: return enabled.contains(Chord(code: code, modifiers: mods.rawValue))
         }
+    }
+
+    /// A key with exactly these of cmd, ctrl, opt and shift.
+    struct Chord: Hashable {
+        let code: Int64
+        let modifiers: UInt64
+    }
+
+    static let chordModifiers: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
+
+    /// The system shortcuts the user can turn off or change in Keyboard
+    /// Shortcuts, by their ID in com.apple.symbolichotkeys, with their
+    /// default chords: Spotlight, the input source switches, Mission
+    /// Control, application windows, and moving a Space left or right.
+    static let configurableShortcuts: [String: Chord] = [
+        "64": Chord(code: 49, modifiers: CGEventFlags.maskCommand.rawValue),
+        "60": Chord(code: 49, modifiers: CGEventFlags.maskControl.rawValue),
+        "61": Chord(code: 49, modifiers: CGEventFlags([.maskControl, .maskAlternate]).rawValue),
+        "32": Chord(code: 126, modifiers: CGEventFlags.maskControl.rawValue),
+        "33": Chord(code: 125, modifiers: CGEventFlags.maskControl.rawValue),
+        "79": Chord(code: 123, modifiers: CGEventFlags.maskControl.rawValue),
+        "81": Chord(code: 124, modifiers: CGEventFlags.maskControl.rawValue),
+    ]
+
+    /// The `configurableShortcuts` that are on, by the user's
+    /// `AppleSymbolicHotKeys` (nil: never changed, so all on as default).
+    static func enabledShortcuts(_ hotKeys: [String: Any]?) -> Set<Chord> {
+        Set(configurableShortcuts.values)
+    }
+
+    /// Read off the tap's thread (`watchUserWindow`): the tap only looks.
+    private var enabledSystemShortcuts = Set(FocusGuard.configurableShortcuts.values)
+    private var systemShortcutsReadMs = -1.0
+
+    private func refreshSystemShortcuts() {
+        guard nowMs() - systemShortcutsReadMs > 5000 else { return }
+        let domain = "com.apple.symbolichotkeys" as CFString
+        CFPreferencesAppSynchronize(domain)
+        let hotKeys = CFPreferencesCopyAppValue("AppleSymbolicHotKeys" as CFString, domain) as? [String: Any]
+        let enabled = Self.enabledShortcuts(hotKeys)
+        lock.lock()
+        enabledSystemShortcuts = enabled
+        systemShortcutsReadMs = nowMs()
+        lock.unlock()
     }
 
     private static func isMouseDown(_ t: CGEventType) -> Bool {
