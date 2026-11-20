@@ -227,6 +227,19 @@ final class CodexTOMLTests: XCTestCase {
         XCTAssertEqual(try headerCount(out), 0)
     }
 
+    func testOnlyASubtableOfTheServer() throws {
+        let text = "[mcp_servers.background-computer-use.env]\nA = \"1\"\n"
+        XCTAssertEqual(try set(text), """
+        [mcp_servers.background-computer-use.env]
+        A = "1"
+
+        [mcp_servers.background-computer-use]
+        command = "\(bcu)"
+        args = ["mcp"]
+
+        """)
+    }
+
     // MARK: Inline tables
 
     func testInlineTable() throws {
@@ -380,6 +393,11 @@ final class ClaudeLookupTests: XCTestCase {
         let r = AgentSetup.parseShellLookup("__BCU_PATH__=/a/bin /b/bin\n", marker: marker)
         XCTAssertNil(r.claude)
         XCTAssertEqual(r.path, ["/a/bin", "/b/bin"])
+    }
+
+    func testPathWithASpaceInADirectory() {
+        let r = AgentSetup.parseShellLookup("__BCU_PATH__=/Users/me/Node Versions/v22/bin:/usr/bin\n", marker: marker)
+        XCTAssertEqual(r.path, ["/Users/me/Node Versions/v22/bin", "/usr/bin"])
     }
 
     func testNotFound() {
