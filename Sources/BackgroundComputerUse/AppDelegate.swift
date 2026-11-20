@@ -97,6 +97,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         server.sessionHandler = { [hub] session, on in hub.sessionAttached(session, on) }
         host.scope = server.scope
         server.windowOwners = { [hub] in hub.sessions(owningWindow: $0) }
+        // A host under development names itself here (docs/embedding.md).
+        server.trustedLater = {
+            CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication)
+            return PeerInspector.resolve(trusted: UserDefaults.standard.stringArray(forKey: "trustClients") ?? [])
+        }
         do { try server.start() } catch { Log.info("socket failed: \(error)") }
         self.server = server
         self.host = host

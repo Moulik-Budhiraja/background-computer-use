@@ -96,7 +96,13 @@ public struct PeerPolicy: Equatable {
     /// `decide`, with `later()` for names added to `trusted` while the
     /// engine runs.
     public func decide(_ peer: PeerIdentity?, later: () -> [String], shipsBCU: (String, PeerIdentity) -> Bool) -> PeerDecision {
-        decide(peer, shipsBCU: shipsBCU)
+        let first = decide(peer, shipsBCU: shipsBCU)
+        guard case .deny = first else { return first }
+        let more = later()
+        guard !more.isEmpty else { return first }
+        var wider = self
+        wider.trusted += more
+        return wider.decide(peer, shipsBCU: shipsBCU)
     }
 
     /// A developer team ID: ten uppercase letters and digits.
