@@ -132,12 +132,14 @@ final class ViewerWindowController {
 
     var isShown: Bool { panel != nil }
 
-    func toggle() {
-        if isShown { close() } else { show() }
-    }
-
+    /// Already open: bring it forward.
     func show() {
-        guard panel == nil else { return }
+        if let panel, let dim {
+            dim.orderFrontRegardless()
+            panel.orderFrontRegardless()
+            panel.makeKey()
+            return
+        }
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main ?? NSScreen.screens[0]
 

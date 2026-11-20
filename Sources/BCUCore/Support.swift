@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import BCUShared
 
@@ -52,7 +53,8 @@ public struct Args {
 
     public func int(_ key: String) -> Int? {
         if let v = raw[key] as? Int { return v }
-        if let v = raw[key] as? Double { return Int(v) }
+        // Int() traps on a Double out of its range (1e300, NaN).
+        if let v = raw[key] as? Double { return v.isFinite && abs(v) < 9e18 ? Int(v) : nil }
         if let v = raw[key] as? String { return Int(v) }
         return nil
     }
@@ -81,6 +83,21 @@ public struct Args {
     public func requireInt(_ key: String) throws -> Int {
         guard let v = int(key) else { throw ToolError("missing integer argument `\(key)`") }
         return v
+    }
+
+    /// A window ID, or nil when the argument is absent. Throws on one that
+    /// isn't a window ID at all (negative, past UInt32), which CGWindowID() would trap on.
+    public func windowID(_ key: String) throws -> CGWindowID? {
+        guard raw[key] != nil, !(raw[key] is NSNull) else { return nil }
+        guard let v = int(key), let id = CGWindowID(exactly: v) else {
+            throw ToolError("`\(key)` must be a window ID from list_windows or open_window, not \(raw[key]!)")
+        }
+        return id
+    }
+
+    public func requireWindowID(_ key: String) throws -> CGWindowID {
+        guard let id = try windowID(key) else { throw ToolError("missing integer argument `\(key)`") }
+        return id
     }
 
     public func requireString(_ key: String) throws -> String {
@@ -144,4 +161,46 @@ final class Locked<T>: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return body(&stored)
     }
+}
+
+/// BCU is quitting: `Hub.shutdown` waits on the main thread for every
+/// session to let go of its windows, so nothing may wait on the main
+/// thread from then on (see `onMainUnlessQuitting`).
+public enum Quitting {
+    private static let flag = Locked(false)
+    public static var now: Bool { flag.value }
+    static func begin() { flag.value = true }
+    static func resetForTests() { flag.value = false }
+}
+
+/// Run `work` on the main thread and wait for it, unless BCU starts quitting
+/// before it gets to run: then it never runs, and this returns false.
+/// Waiting on the main thread while `Hub.shutdown` waits on this thread
+/// would hold both up until the shutdown gives up.
+@discardableResult
+func onMainUnlessQuitting(_ work: @escaping () -> Void) -> Bool {
+    if Thread.isMainThread { work(); return true }
+    if Quitting.now { return false }
+    // 0: not run yet, 1: running or done, 2: dropped.
+    let state = Locked(0)
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.main.async {
+        let run = state.with { s -> Bool in
+            guard s == 0 else { return false }
+            s = 1
+            return true
+        }
+        if run { work() }
+        done.signal()
+    }
+    while done.wait(timeout: .now() + .milliseconds(50)) == .timedOut {
+        guard Quitting.now else { continue }
+        let dropped = state.with { s -> Bool in
+            guard s == 0 else { return false }
+            s = 2
+            return true
+        }
+        if dropped { return false }
+    }
+    return state.value == 1
 }
