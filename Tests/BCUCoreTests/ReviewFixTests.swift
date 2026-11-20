@@ -144,4 +144,11 @@ final class ReviewFixTests: XCTestCase {
         // Borrowed while cleanup waited on the app.
         XCTAssertFalse(WindowManager.leftoverStillUnowned(7, registered: { _ in true }))
     }
+
+    func testAKeptWindowOnAnAgentDisplayGoesBackToTheUser() {
+        XCTAssertEqual(WindowManager.newcomerOnAgentDisplay(registered: false, kept: false), .judge)
+        XCTAssertEqual(WindowManager.newcomerOnAgentDisplay(registered: true, kept: false), .skip)
+        // The user's (kept open, or returned): never caught, but not left there either.
+        XCTAssertEqual(WindowManager.newcomerOnAgentDisplay(registered: false, kept: true), .giveToUser)
+    }
 }
