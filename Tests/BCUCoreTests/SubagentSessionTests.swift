@@ -81,4 +81,17 @@ final class SubagentSessionTests: XCTestCase {
         XCTAssertEqual(times["parent/agent-1"], 9000)
         XCTAssertEqual(times["x"], 2000)
     }
+
+    func testASubagentsWindowsInUseByItsParentArentTakenOver() {
+        let usedBy = ["parent/agent-1": Set(["parent"])]
+        XCTAssertFalse(Hub.abandoned("parent/agent-1", attached: ["parent": 1], usedBy: usedBy))
+        XCTAssertTrue(Hub.abandoned("parent/agent-1", attached: [:], usedBy: usedBy))
+        XCTAssertFalse(Hub.abandoned("parent/agent-1", attached: ["parent/agent-1": 1], usedBy: [:]))
+    }
+
+    func testAReleaseQueuedForAnEarlierDepartureDoesntRun() {
+        XCTAssertTrue(Engine.departureStillCurrent(3, latest: 3))
+        // Left with nobody again later: that departure gets the whole grace.
+        XCTAssertFalse(Engine.departureStillCurrent(2, latest: 3))
+    }
 }
