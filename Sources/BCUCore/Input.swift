@@ -313,8 +313,10 @@ public enum KeyMap {
     /// character ("?", "A") adds Shift on its own, except that with other
     /// modifiers a letter's case doesn't matter: cmd+"A" is Cmd+A, and
     /// Cmd+Shift+A needs "shift" in the list.
-    public static func press(key: String, modifiers: [String]) throws -> (CGKeyCode, CGEventFlags) {
-        let (code, implicitShift) = try code(for: key)
+    /// `lookup` is `code(for:command:)`.
+    public static func press(key: String, modifiers: [String],
+                             lookup: (String, Bool) throws -> (CGKeyCode, Bool) = { try KeyMap.code(for: $0, command: $1) }) throws -> (CGKeyCode, CGEventFlags) {
+        let (code, implicitShift) = try lookup(key, false)
         var flags = try modifierFlags(modifiers)
         let letter = key.count == 1 && key.first!.isLetter
         if implicitShift && !(letter && !flags.isEmpty) { flags.insert(.maskShift) }
