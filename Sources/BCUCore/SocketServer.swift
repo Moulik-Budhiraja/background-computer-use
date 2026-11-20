@@ -30,6 +30,14 @@ public final class SocketConnection {
         return queued
     }
 
+    /// The process on the other end, if the system says.
+    public var peerPID: pid_t? {
+        var pid: pid_t = 0
+        var size = socklen_t(MemoryLayout<pid_t>.size)
+        guard getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &size) == 0, pid > 0 else { return nil }
+        return pid
+    }
+
     public var isClosed: Bool {
         lock.lock(); defer { lock.unlock() }
         return closed

@@ -723,7 +723,9 @@ final class HistoryTrackView: NSView {
         // Where the recordings start.
         let firstX = bounds.midX - scrollX
         if firstX - spacing / 2 > 0 {
-            let text = "Recordings go back \(AppRecordings.store.retentionDays) days"
+            // The size limit can delete recordings well before they're a week old.
+            let store = AppRecordings.store
+            let text = "Kept up to \(store.retentionDays) days or \(store.limitMB) MB"
             let attrs = Self.attrs(11, .medium, .white.withAlphaComponent(0.32))
             let size = text.size(withAttributes: attrs)
             text.draw(at: CGPoint(x: firstX - 22 - size.width, y: midY(lane: 0) - size.height / 2), withAttributes: attrs)
