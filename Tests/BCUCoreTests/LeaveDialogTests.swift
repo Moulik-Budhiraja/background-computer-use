@@ -29,4 +29,14 @@ final class LeaveDialogTests: XCTestCase {
     func testNothingIsAnsweredWhileTheUserControlsTheDisplay() {
         XCTAssertFalse(WindowManager.stepAnswersLeave(userInApp: false, userOpenInputMs: began - 1, stepStartMs: began, userControlsDisplay: true))
     }
+
+    /// The user took over another session's display: their input there can
+    /// raise the same app-wide dialog in a browser this session also uses.
+    func testNothingIsAnsweredWhileTheUserControlsAnotherSessionsDisplay() {
+        let hub = Hub()
+        let a = hub.engine(for: "leave-a", client: "a"), b = hub.engine(for: "leave-b", client: "b")
+        XCTAssertTrue(a.answersLeave(pid: 1, stepStartMs: began, userOpenInputMs: began - 1))
+        b.setUserInControl(true)
+        XCTAssertFalse(a.answersLeave(pid: 1, stepStartMs: began, userOpenInputMs: began - 1))
+    }
 }

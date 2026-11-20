@@ -1523,11 +1523,22 @@ public final class Engine {
         let ended = current?.takeAnswers() ?? []
         let pid = w.pid, guardian = focusGuard
         let watch = LeaveWatch(pid: pid, forMs: Self.leaveWatchMs) { [weak self] stepStart in
-            guard let self else { return false }
-            return WindowManager.stepAnswersLeave(userInApp: self.userIsIn(pid), userOpenInputMs: guardian.lastUserOpenInputMs,
-                                                  stepStartMs: stepStart, userControlsDisplay: self.userInControl)
+            self?.answersLeave(pid: pid, stepStartMs: stepStart, userOpenInputMs: guardian.lastUserOpenInputMs) ?? false
         }
         stateLock.lock(); isChromium[pid] = true; leaveWatches[pid] = watch; leaveNotes += ended; stateLock.unlock()
+    }
+
+    /// Whether the user took over any session's display, this one or
+    /// another (set by the hub). The browser's "Leave site?" is app-wide,
+    /// so one the user's input raised in another session's window looks
+    /// the same as this session's.
+    var anyUserInControl: () -> Bool = { false }
+
+    /// Whether a "Leave site?" in `pid` that came up after a step that
+    /// began at `stepStartMs` is this session's to answer.
+    func answersLeave(pid: pid_t, stepStartMs: Double, userOpenInputMs: Double) -> Bool {
+        WindowManager.stepAnswersLeave(userInApp: userIsIn(pid), userOpenInputMs: userOpenInputMs, stepStartMs: stepStartMs,
+                                       userControlsDisplay: userInControl || anyUserInControl())
     }
 
     /// What pages asked and got Leave since the last call, for its result.
