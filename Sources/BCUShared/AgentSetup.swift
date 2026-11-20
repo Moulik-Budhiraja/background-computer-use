@@ -197,12 +197,32 @@ public enum AgentSetup {
                     value = String(value.dropFirst().dropLast())
                 }
                 // Just the command, not any flags the alias adds.
-                if let first = value.split(separator: " ").first, first.hasPrefix("/") || first.hasPrefix("~/") {
-                    claude = String(first)
+                if let first = firstWord(value), first.hasPrefix("/") || first.hasPrefix("~/") {
+                    claude = first
                 }
             }
         }
         return (claude, path)
+    }
+
+    /// The first word of a shell command, with its quotes and backslashes
+    /// undone: `"/opt/Claude Code/claude" --verbose` gives the path.
+    static func firstWord(_ command: String) -> String? {
+        var word = "", quote: Character? = nil, escaped = false, started = false
+        for c in command {
+            if escaped { word.append(c); escaped = false; continue }
+            if let q = quote {
+                if c == q { quote = nil } else if c == "\\" && q == "\"" { escaped = true } else { word.append(c) }
+                continue
+            }
+            switch c {
+            case "\\": escaped = true; started = true
+            case "\"", "'": quote = c; started = true
+            case " ", "\t": if started { return word }
+            default: word.append(c); started = true
+            }
+        }
+        return started ? word : nil
     }
 
     static func expandTilde(_ path: String) -> String {
