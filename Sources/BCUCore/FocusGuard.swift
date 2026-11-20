@@ -1131,18 +1131,16 @@ public final class FocusGuard {
         case wait
         /// A window of the user's has key: send them on.
         case release
-        /// The user left the app: drop them.
+        /// The user left the app: drop them, even mid-swap (the swap's
+        /// end would replay them into the app they're in now).
         case drop
-        /// The user left mid-swap: no longer stranded, the swap's end
-        /// deals with them.
-        case unmark
     }
 
     /// `frontBefore` and `frontAfter`: the front app before and after the
     /// accessibility calls that tried to give key back (they can take a
     /// second); `keySafe` is from those calls.
     static func strandedOutcome(pid: pid_t, frontBefore: pid_t, frontAfter: pid_t, keySafe: Bool, swapping: Bool) -> StrandedOutcome {
-        if pid != frontBefore { return swapping ? .unmark : .drop }
+        if pid != frontBefore { return .drop }
         return keySafe ? .release : .wait
     }
 
