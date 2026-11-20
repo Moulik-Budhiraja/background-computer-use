@@ -53,4 +53,12 @@ final class AppNameMatchTests: XCTestCase {
     func testNoMatch() {
         XCTAssertEqual(AppNameMatch.best("Figma", among: ["Safari", "Notes"]), .none)
     }
+
+    func testALaunchBorrowsTheStartupWindowOnlyWhenTheUserIsntInTheApp() {
+        XCTAssertTrue(WindowManager.mayBorrowStartupWindow(startupWindows: 1, pid: 50, front: 60))
+        // The user went to the app while the open waited its turn.
+        XCTAssertFalse(WindowManager.mayBorrowStartupWindow(startupWindows: 1, pid: 50, front: 50))
+        XCTAssertFalse(WindowManager.mayBorrowStartupWindow(startupWindows: 2, pid: 50, front: 60))
+        XCTAssertFalse(WindowManager.mayBorrowStartupWindow(startupWindows: 0, pid: 50, front: 60))
+    }
 }
