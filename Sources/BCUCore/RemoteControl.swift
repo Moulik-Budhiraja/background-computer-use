@@ -587,7 +587,7 @@ public final class RemoteControl {
     public func key(_ event: CGEvent) {
         guard let e = event.copy() else { return }
         queue.async {
-            guard let w = self.keyTarget ?? self.frontWindow() else { return }
+            guard let w = Self.keyWindow(cached: self.keyTarget, onDisplay: self.windows()) else { return }
             self.makeKey(w)
             // A shortcut like cmd+N can make the app bring itself forward; undo that.
             self.engine.focusGuard.beginAction(pid: w.pid, cause: "your keys in the expanded view", strict: true)
@@ -650,6 +650,12 @@ public final class RemoteControl {
         // A window on the user's screen can reach the agent display's edge; never send it anything.
         guard engine.display.bounds.contains(point) else { return nil }
         return windows().first { $0.bounds.contains(point) }
+    }
+
+    /// Where a key goes: the window the user last clicked, else the front
+    /// window on the agent display (`onDisplay`, front to back).
+    static func keyWindow(cached: WindowInfo?, onDisplay: [WindowInfo]) -> WindowInfo? {
+        cached ?? onDisplay.first { $0.layer == 0 }
     }
 
     private func frontWindow() -> WindowInfo? {
