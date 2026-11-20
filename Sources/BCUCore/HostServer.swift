@@ -234,7 +234,7 @@ public final class HostServer {
         case "rename":
             // The host's name for its session changed, such as the task it's on.
             guard let label = a.string("label")?.trimmingCharacters(in: .whitespacesAndNewlines), !label.isEmpty else { throw ToolError("rename needs label") }
-            try engine(a).rename(label)
+            try engine(a, c).rename(label)
             return ["ok": true]
 
         case "hand_back":
