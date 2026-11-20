@@ -122,6 +122,9 @@ public final class SocketServer {
     /// Who may connect. Read from this process's own signature at `start`
     /// unless set before.
     public var policy: PeerPolicy?
+    /// More trusted names (`PeerPolicy.trusted`), read each time a client
+    /// would be refused.
+    public var trustedLater: (() -> [String])?
     /// Which app owns each session; share it with `HostServer.scope`.
     public let scope = PeerScope()
     /// The sessions that have a window (`Hub.sessions(owningWindow:)`).
@@ -200,7 +203,9 @@ public final class SocketServer {
     /// why (in reply form, so a client waiting for a reply shows it) and is closed.
     private func admit(_ connection: SocketConnection) -> Bool {
         let peer = PeerInspector.identity(fd: connection.fd)
-        let decision = (policy ?? PeerInspector.ownPolicy()).decide(peer) { PeerInspector.shipsBCU(app: $0, peer: $1) }
+        let decision = (policy ?? PeerInspector.ownPolicy()).decide(peer, later: { self.trustedLater?() ?? [] }) {
+            PeerInspector.shipsBCU(app: $0, peer: $1)
+        }
         switch decision {
         case .allow(let trust):
             connection.trust = trust

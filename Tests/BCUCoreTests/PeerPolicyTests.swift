@@ -220,6 +220,21 @@ final class PeerPolicyTests: XCTestCase {
 
     /// `trustClients: [process.execPath]` names Electron's executable, and a
     /// peer running it shows up as its app.
+    /// A host under development runs as Electron's own binary, and the
+    /// menu bar app's engine is already running when its developer names it.
+    func testANameAddedWhileTheEngineRunsLetsARefusedPeerIn() {
+        let electron = "/Users/me/host/node_modules/electron/dist/Electron.app"
+        var asked = 0
+        let later: () -> [String] = { asked += 1; return [electron] }
+        XCTAssertEqual(signed().decide(peer(electron, team: "CCCCCCCCCC"), later: later, shipsBCU: noneShip), .allow(.owner))
+        // Not asked for a peer that gets in anyway.
+        asked = 0
+        XCTAssertEqual(signed().decide(peer(appHome + "/Contents/MacOS/bcu", team: ours), later: later, shipsBCU: noneShip), .allow(.owner))
+        XCTAssertEqual(asked, 0)
+        // Naming one program lets in no other.
+        XCTAssertTrue(isDenied(signed().decide(peer("/usr/bin/nc"), later: later, shipsBCU: noneShip)))
+    }
+
     func testTrustedMainExecutableMeansItsApp() {
         let app = "/Users/me/host/node_modules/electron/dist/Electron.app"
         let exe = "\(app)/Contents/MacOS/Electron"
