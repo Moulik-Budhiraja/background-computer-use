@@ -373,7 +373,7 @@ enum LayoutKeys {
 
     /// Runs `work` on the main thread and waits for it; false if it didn't
     /// run (BCU is quitting).
-    static var runOnMain: (@escaping () -> Void) -> Bool = { work in DispatchQueue.main.sync(execute: work); return true }
+    static var runOnMain: (@escaping () -> Void) -> Bool = onMainUnlessQuitting
 
     /// Drops the tables, as a change of input source does.
     static func forget() { cache.invalidate() }
@@ -384,7 +384,11 @@ enum LayoutKeys {
         if t == nil {
             // Text Input Sources wants the main thread.
             var read: Tables?
-            if Thread.isMainThread { read = load() } else { _ = runOnMain { read = load() } }
+            if Thread.isMainThread {
+                read = load()
+            } else if !runOnMain({ read = load() }) {
+                throw ToolError("BCU is quitting, so no key was pressed")
+            }
             if let read { cache.publish(read, readAt: generation) }
             t = read
         }
