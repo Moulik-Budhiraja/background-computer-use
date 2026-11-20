@@ -78,6 +78,21 @@ public final class WindowManager {
         return registeredAnywhere[id].map { $0.session != session } ?? false
     }
 
+    /// Claims a window for `session` unless another session has it, in one
+    /// step, so two sessions borrowing it at once can't both get it.
+    static func claim(_ id: CGWindowID, pid: pid_t, for session: String) -> Bool {
+        sharedLock.lock(); defer { sharedLock.unlock() }
+        if let owner = registeredAnywhere[id], owner.session != session { return false }
+        registeredAnywhere[id] = (session, pid)
+        return true
+    }
+
+    /// Undo `claim`: the borrow it was for failed.
+    static func unclaim(_ id: CGWindowID, for session: String) {
+        sharedLock.lock(); defer { sharedLock.unlock() }
+        if registeredAnywhere[id]?.session == session { registeredAnywhere[id] = nil }
+    }
+
     /// Windows a session opened or caught, whether or not it still has
     /// them: the only ones cleanup may close (any other is the user's).
     private static var agentMade: Set<CGWindowID> = []
@@ -837,6 +852,12 @@ public final class WindowManager {
         if AX.bool(ax, "AXFullScreen") == true {
             throw ToolError("window \(id) is full screen, and a full-screen window can't be moved. Ask the user to leave full screen in it, then retry.")
         }
+        // Checked and claimed in one step: two sessions borrowing it at once.
+        lock.lock(); let hadIt = registry[id] != nil; lock.unlock()
+        guard Self.claim(id, pid: info.pid, for: sessionKey) else { throw ToolError("window \(id) is another agent's") }
+        // Given back if the borrow fails before the window is registered.
+        var borrowed = false
+        defer { if !borrowed && !hadIt { Self.unclaim(id, for: sessionKey) } }
         // Every other window of the app is the user's, not one this spawned.
         noteBefore(pid: info.pid)
         focusGuard.beginAction(pid: info.pid, cause: "borrowing a window")
@@ -857,6 +878,7 @@ public final class WindowManager {
         }
         let aw = AgentWindow(id: id, pid: info.pid, appName: app?.localizedName ?? info.owner, bundleID: app?.bundleIdentifier, kind: .borrowed, originalFrame: original)
         register(aw)
+        borrowed = true
         return aw
     }
 

@@ -43,6 +43,9 @@ public final class Hub {
     private var attached: [String: Int] = [:]
     /// When each session's last connection went away.
     private var departedAtMs: [String: Double] = [:]
+    /// The relatives (`relative`) whose calls went to a session's windows,
+    /// by the session's id.
+    private var usedBy: [String: Set<String>] = [:]
     /// A session whose agent went away keeps its windows this long, in case
     /// the agent's connection comes back (its `bcu mcp` restarting).
     public static let orphanGraceMs: Double = 30_000
@@ -104,17 +107,64 @@ public final class Hub {
         attached[id] = n == 0 ? nil : n
         departedAtMs[id] = n == 0 && !on ? nowMs() : nil
         let e = byID[id]
+        let leftIDs = !on && n == 0 ? Self.leftWithNobody(after: id, attached: attached, usedBy: usedBy) : []
+        departedAtMs = Self.departedTimes(departedAtMs, left: leftIDs, now: nowMs())
+        let left = leftIDs.compactMap { byID[$0] }
         lock.unlock()
+        for o in left where o !== e {
+            o.agentLeft(graceMs: Self.orphanGraceMs) { [weak self, weak o] in o.flatMap { self?.isAttached($0) } ?? true }
+        }
         guard !on, n == 0, let e else { return }
         Log.info("session \(Self.short(id)): its agent went away")
         e.agentLeft(graceMs: Self.orphanGraceMs) { [weak self, weak e] in e.flatMap { self?.isAttached($0) } ?? true }
+    }
+
+    /// Whether a session's windows are up for another session to take over:
+    /// not while it's `present`, a relative using them included.
+    /// Nor while a viewer is driving its display: its windows are in use.
+    static func abandoned(_ id: String, attached: [String: Int], usedBy: [String: Set<String>], userInControl: Bool = false) -> Bool {
+        !userInControl && !present(id, attached: attached, usedBy: usedBy)
+    }
+
+    /// When each session's agent went away, once `left` have nobody left:
+    /// now, for those, so they get the whole grace from here (one kept by a
+    /// relative may have lost its own connection long ago).
+    static func departedTimes(_ departedAtMs: [String: Double], left: [String], now: Double) -> [String: Double] {
+        var times = departedAtMs
+        for id in left { times[id] = now }
+        return times
+    }
+
+    /// `usedBy` without the sessions `forgetDormant` dropped. A dropped
+    /// session that's still connected stays a user: one that only works in
+    /// a relative's windows looks dormant itself, and comes back under the
+    /// same id on its next call.
+    static func prunedUsers(_ usedBy: [String: Set<String>], gone: [String], attached: [String: Int]) -> [String: Set<String>] {
+        let disconnected = Set(gone.filter { (attached[$0] ?? 0) == 0 })
+        var kept = usedBy.filter { !gone.contains($0.key) }
+        for (owner, users) in kept { kept[owner] = users.subtracting(disconnected) }
+        return kept
+    }
+
+    /// Whether a session's agent is still around: a connection carries its
+    /// calls, or a relative's does that has used its windows. A subagent's
+    /// connection closes when it's idle (`bcu mcp`), while its parent may
+    /// still be working in a window the subagent opened.
+    static func present(_ id: String, attached: [String: Int], usedBy: [String: Set<String>]) -> Bool {
+        (attached[id] ?? 0) > 0 || (usedBy[id] ?? []).contains { (attached[$0] ?? 0) > 0 }
+    }
+
+    /// Sessions whose agent is gone and that nobody is left to use once
+    /// `id`'s last connection has gone: their windows go after the grace.
+    static func leftWithNobody(after id: String, attached: [String: Int], usedBy: [String: Set<String>]) -> [String] {
+        usedBy.filter { $0.key != id && $0.value.contains(id) && !present($0.key, attached: attached, usedBy: usedBy) }.map(\.key).sorted()
     }
 
     /// Whether a connection carries this session's calls now, under any id
     /// (a restarted agent's session goes on under its new one, see `takeOver`).
     private func isAttached(_ e: Engine) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return byID.contains { $0.value === e && (attached[$0.key] ?? 0) > 0 }
+        return byID.contains { $0.value === e && Self.present($0.key, attached: attached, usedBy: usedBy) }
     }
 
     /// The session a subagent's session came from, if it's a subagent's.
@@ -228,7 +278,8 @@ public final class Hub {
         // An agent can hand a window to its subagent (or back): the call goes
         // to the session that owns the window, on that session's display.
         if let windowID = (args["window_id"] as? NSNumber)?.uint32Value, caller.windows.window(windowID) == nil {
-            if let owner = relative(of: id, owning: windowID) {
+            if let (ownerID, owner) = relative(of: id, owning: windowID) {
+                lock.lock(); usedBy[ownerID, default: []].insert(id); lock.unlock()
                 return owner.call(tool: tool, args: args)
             }
             caller = takeOver(windowID, for: caller, id: id)
@@ -250,7 +301,7 @@ public final class Hub {
     private func takeOver(_ window: CGWindowID, for caller: Engine, id callerID: String) -> Engine {
         lock.lock()
         let departed = byID.first { id, e in
-            id != Self.defaultSession && e !== caller && (attached[id] ?? 0) == 0 && e.host == caller.host
+            id != Self.defaultSession && e !== caller && Self.abandoned(id, attached: attached, usedBy: usedBy, userInControl: e.userInControl) && e.host == caller.host
                 && Self.kind(e.label) == Self.kind(caller.label) && e.windows.window(window) != nil
         }
         guard let (oldID, old) = departed else { lock.unlock(); return caller }
@@ -293,12 +344,12 @@ public final class Hub {
 
     /// The session in the same agent family as `id` (its parent, its
     /// subagents, their siblings) that has this window.
-    private func relative(of id: String, owning window: CGWindowID) -> Engine? {
+    private func relative(of id: String, owning window: CGWindowID) -> (String, Engine)? {
         lock.lock()
         let root = parentOf[id] ?? id
-        let family = byID.filter { $0.key != id && ($0.key == root || parentOf[$0.key] == root) }.map(\.value)
+        let family = byID.filter { $0.key != id && ($0.key == root || parentOf[$0.key] == root) }
         lock.unlock()
-        return family.first { $0.windows.window(window) != nil }
+        return family.first { $0.value.windows.window(window) != nil }.map { ($0.key, $0.value) }
     }
 
     /// Main thread.
@@ -374,6 +425,7 @@ public final class Hub {
         lock.lock()
         let gone = byID.filter { $0.key != Self.defaultSession && $0.value.isDormant(idleMs: Self.idleTeardownMs * 2) }.map(\.key)
         for id in gone { byID[id]?.audio.end(); byID[id] = nil; parentOf[id] = nil; departedAtMs[id] = nil }
+        usedBy = Self.prunedUsers(usedBy, gone: gone, attached: attached)
         order.removeAll { gone.contains($0) }
         lock.unlock()
         for id in gone { Log.info("session \(Self.short(id)) ended") }

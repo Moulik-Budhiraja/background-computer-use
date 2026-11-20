@@ -612,12 +612,18 @@ public final class SessionRecorder {
         self.display = display
     }
 
+    /// A run's folder name: when it started, to the millisecond (so folders
+    /// sort by time), then the start of the session for reading and a hash
+    /// of all of it. A subagent's session starts with its parent's, and
+    /// both often start recording in the same second.
     static func runID(session: String, date: Date) -> String {
         let f = DateFormatter()
-        f.dateFormat = "yyyyMMdd-HHmmss"
+        f.dateFormat = "yyyyMMdd-HHmmss-SSS"
         f.locale = Locale(identifier: "en_US_POSIX")
         let safe = session.replacingOccurrences(of: "/", with: "-").prefix(17)
-        return "\(f.string(from: date))-\(safe)"
+        var hash: UInt32 = 2_166_136_261  // FNV-1a: the same in every run of the app
+        for byte in session.utf8 { hash = (hash ^ UInt32(byte)) &* 16_777_619 }
+        return "\(f.string(from: date))-\(safe)-\(String(format: "%08x", hash))"
     }
 
     /// The display just came up. Any thread.
