@@ -183,9 +183,10 @@ public enum PeerInspector {
     private static let cacheLock = NSLock()
     nonisolated(unsafe) private static var shipping: Set<String> = []
 
-    /// `HostCheck.vouches` on the real disk. Remembered once true.
+    /// `HostCheck.vouches` on the real disk. Remembered once true, for that
+    /// code (its cdhash): the same code in the same place passes again.
     public static func shipsBCU(app: String, peer: PeerIdentity) -> Bool {
-        let key = "\(peer.team ?? "") \(app)"
+        let key = "\(peer.team ?? "") \(peer.cdhash?.map { String(format: "%02x", $0) }.joined() ?? "") \(app)"
         cacheLock.lock()
         let known = shipping.contains(key)
         cacheLock.unlock()
@@ -262,6 +263,10 @@ public enum HostCheck {
     /// nothing: anyone can copy a signed program there.
     public static func vouches(app: String, peer: PeerIdentity, disk: CodeOnDisk) -> Bool {
         guard let team = peer.team else { return false }
+        // The peer is code in that app as it is on disk now: the seal below
+        // vouches for what's there, not for whatever the peer was started from.
+        guard let path = peer.path, PeerPolicy.path(path, isInside: app),
+              let cdhash = peer.cdhash, disk.cdhashes(path).contains(cdhash) else { return false }
         var candidates = PeerPolicy.bcuLocations.map { "\(app)/\($0)" }
         let resources = "\(app)/Contents/Resources"
         for sub in disk.subfolders(resources) { candidates.append("\(resources)/\(sub)/bcu") }
