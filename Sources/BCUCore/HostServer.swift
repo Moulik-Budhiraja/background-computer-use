@@ -16,6 +16,10 @@ public final class HostServer {
     private let hub: Hub
     private let ownerName: String
     private let version: String
+    /// The menu bar app shows host apps' sessions with its own controls
+    /// (`hello` says `shows_hosts`), so a host needn't put up a menu bar
+    /// icon of its own. A host's own `bcu serve` doesn't.
+    private let showsHosts: Bool
     /// Another engine asked this one to step aside once its agents are done (`yield`).
     public var onYield: (() -> Void)?
 
@@ -57,21 +61,28 @@ public final class HostServer {
     private let pushQueue = DispatchQueue(label: "bcu.host.push")
     private var observer: Int?
     private var pointerObserver: NSObjectProtocol?
+    private var stopObserver: NSObjectProtocol?
 
-    public init(hub: Hub, ownerName: String, version: String) {
+    public init(hub: Hub, ownerName: String, version: String, showsHosts: Bool = false) {
         self.hub = hub
         self.ownerName = ownerName
         self.version = version
+        self.showsHosts = showsHosts
         observer = hub.addObserver { [weak self] in self?.schedulePush() }
         pointerObserver = NotificationCenter.default.addObserver(forName: Engine.pointerNotification, object: nil, queue: nil) { [weak self] n in
             guard let self, let e = n.object as? Engine, let p = n.userInfo?["pointer"] as? AgentPointer else { return }
             self.sendPointer(e, p)
+        }
+        stopObserver = NotificationCenter.default.addObserver(forName: Engine.stoppedByUserNotification, object: nil, queue: nil) { [weak self] n in
+            guard let self, let e = n.object as? Engine else { return }
+            self.sendStopped(e)
         }
     }
 
     deinit {
         if let observer { hub.removeObserver(observer) }
         if let pointerObserver { NotificationCenter.default.removeObserver(pointerObserver) }
+        if let stopObserver { NotificationCenter.default.removeObserver(stopObserver) }
     }
 
     /// For `SocketServer.hostHandler`. Socket threads.
@@ -129,7 +140,7 @@ public final class HostServer {
             c.subscribed = true
             c.lastSessions = nil
             lock.unlock()
-            if let host { c.release = hub.claim(host: host) }
+            if let host { c.release = hub.claim(host: host, pid: c.connection.peerPID) }
             schedulePush(now: true)
             return ["ok": true]
 
@@ -365,8 +376,8 @@ public final class HostServer {
 
     // MARK: State
 
-    private func engineInfo() -> JSONObject {
-        [
+    func engineInfo() -> JSONObject {
+        var o: JSONObject = [
             "protocol": Self.protocolVersion,
             "version": version,
             "owner": ownerName,
@@ -375,6 +386,8 @@ public final class HostServer {
             "max_displays": AgentDisplay.maxDisplays,
             "display": ["width": AgentDisplay.defaultWidth, "height": AgentDisplay.defaultHeight],
         ]
+        if showsHosts { o["shows_hosts"] = true }
+        return o
     }
 
     static func local(_ p: CGPoint, _ e: Engine) -> CGPoint {
@@ -484,6 +497,16 @@ public final class HostServer {
         case .drag(let to): o["kind"] = "drag"; o["to"] = Self.pointJSON(to, e)
         }
         for c in targets { c.connection.send(o) }
+    }
+
+    /// The user stopped a session from the menu bar app: its windows are
+    /// released, and the clients showing it hear so (a host's own `stop`
+    /// isn't echoed back).
+    private func sendStopped(_ e: Engine) {
+        lock.lock()
+        let targets = clients.values.filter { $0.subscribed && $0.shows(e) }
+        lock.unlock()
+        for c in targets { c.connection.send(["event": "stopped", "session": e.sessionID]) }
     }
 
     private func sendFrame(_ s: Stream, _ image: CGImage, _ connection: SocketConnection) {

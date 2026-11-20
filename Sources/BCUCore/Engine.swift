@@ -61,6 +61,9 @@ public final class Engine {
     /// Posted on the main thread with the engine as object and an
     /// `AgentPointer` under "pointer" just before an action lands somewhere.
     public static let pointerNotification = Notification.Name("bcu.agentPointer")
+    /// Posted with the engine as object after the user stopped it from the
+    /// menu bar app (`stopAll(byUser:)`). Any thread.
+    public static let stoppedByUserNotification = Notification.Name("bcu.stoppedByUser")
     private var _lastPointer: CGPoint?
     /// Where the last action landed, for a preview that opens later.
     public var lastPointer: CGPoint? {
@@ -387,12 +390,16 @@ public final class Engine {
         DispatchQueue.main.async { self.onChange?() }
     }
 
-    /// Stop: release every window and clear waiting state.
-    public func stopAll() {
+    /// Stop: release every window and clear waiting state. `byUser` when
+    /// the user stopped it from the menu bar app, rather than a host app
+    /// stopping its own session: once the windows are released,
+    /// `stoppedByUserNotification` tells the session's host.
+    public func stopAll(byUser: Bool = false) {
         queue.async {
             let results = self.windows.releaseAll()
             self.snapshots.removeAll()
             self.log("Stopped by you: " + (results.isEmpty ? "no windows open" : results.joined(separator: "; ")))
+            if byUser { NotificationCenter.default.post(name: Self.stoppedByUserNotification, object: self) }
         }
     }
 

@@ -57,7 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.hub.setPausedAll(!self.hub.allPaused)
             },
             stop: { [weak self] in
-                guard let self, StopConfirm.confirm(self.hub.shownEngines) else { return }
+                guard let self, StopConfirm.confirm(self.hub.engines) else { return }
                 self.hub.stopAll()
             }
         )
@@ -91,7 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // This app records the sessions it shows; host apps choose for theirs.
         hub.setRecordings(host: nil, AppRecordings.store)
         hub.start()
-        let host = HostServer(hub: hub, ownerName: BCUPaths.appName, version: BCUVersion.current)
+        let host = HostServer(hub: hub, ownerName: BCUPaths.appName, version: BCUVersion.current, showsHosts: true)
         let server = SocketServer { [hub] tool, args in hub.call(tool: tool, args: args) }
         server.hostHandler = { op, req, connection in host.handle(op, req, connection) }
         server.sessionHandler = { [hub] session, on in hub.sessionAttached(session, on) }
@@ -145,12 +145,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if control { viewer.showInControl() } else { viewer.show() }
     }
 
-    /// A viewer whose display was torn down, or whose session a host app
-    /// now shows itself, closes and is dropped.
+    /// A viewer whose display was torn down, or whose session is gone,
+    /// closes and is dropped.
     private func refreshViewers() {
-        let shown = Set(hub.shownEngines.map(\.sessionID))
+        let live = Set(hub.engines.map(\.sessionID))
         for (id, v) in viewers {
-            if v.engine.display.isRunning && shown.contains(id) {
+            if v.engine.display.isRunning && live.contains(id) {
                 v.refresh()
             } else {
                 v.close()
