@@ -77,3 +77,14 @@ final class HandBackTests: XCTestCase {
         XCTAssertNil(Engine.refusal(tool: "screenshot", userInControl: false, paused: true, notes: { XCTFail("taken"); return note }))
     }
 }
+
+/// Pure rules only, like the ones above.
+final class UserReturnTests: XCTestCase {
+    func testResumeAndTheEndOfATakeOverCountAsHandingBack() {
+        XCTAssertTrue(Engine.userReturns(paused: (true, false), inControl: (false, false)))
+        XCTAssertTrue(Engine.userReturns(paused: (false, false), inControl: (true, false)))
+        XCTAssertFalse(Engine.userReturns(paused: (false, true), inControl: (false, false)))
+        XCTAssertFalse(Engine.userReturns(paused: (false, false), inControl: (false, false)))
+        XCTAssertFalse(Engine.userReturns(paused: (true, true), inControl: (false, true)))
+    }
+}
