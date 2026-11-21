@@ -422,6 +422,10 @@ fn dir_size(p: &Path) -> u64 {
 /// oldest frames while the store takes more than its limit (a run left with
 /// no frames goes too). `live`: runs being recorded, which keep their folder.
 pub fn maintain(store: &Store, live: &[String]) {
+    maintain_within(store, live, store.limit_mb.max(MIN_LIMIT_MB) * 1_000_000)
+}
+
+fn maintain_within(store: &Store, live: &[String], limit: u64) {
     let cutoff = wall_ms() - store.retention_days.max(1) as f64 * 86_400_000.0;
     let Ok(entries) = std::fs::read_dir(&store.directory) else { return };
     let mut runs: Vec<(PathBuf, f64)> = Vec::new();
@@ -449,7 +453,6 @@ pub fn maintain(store: &Store, live: &[String]) {
         }
         runs.push((dir, start));
     }
-    let limit = store.limit_mb.max(MIN_LIMIT_MB) * 1_000_000;
     let mut used: u64 = runs.iter().map(|(d, _)| dir_size(d)).sum();
     if used <= limit {
         return;
@@ -518,16 +521,17 @@ mod tests {
             std::fs::create_dir_all(d.join("staging")).unwrap();
             std::fs::write(d.join("meta.json"), json!({"v": 1, "session": "s", "start": start, "end": end}).to_string()).unwrap();
             for i in 0..frames {
-                std::fs::write(d.join("staging").join(format!("{}.jpg", start as i64 + i as i64)), vec![0u8; 10_000_000]).unwrap();
+                std::fs::write(d.join("staging").join(format!("{}.jpg", start as i64 + i as i64)), vec![0u8; 1000]).unwrap();
             }
         };
         make("old", now - 10.0 * 86_400_000.0, now - 9.0 * 86_400_000.0, 1);
         make("a", now - 3000.0, now - 2000.0, 4);
         make("b", now - 1000.0, now - 500.0, 3);
-        maintain(&Store { directory: root.clone(), limit_mb: 50, retention_days: 7 }, &[]);
+        // Each run's meta is a few dozen bytes: 7 frames of 1000 bytes over a 5,300-byte limit.
+        maintain_within(&Store { directory: root.clone(), limit_mb: 50, retention_days: 7 }, &[], 5_300);
         assert!(!root.join("old").exists(), "past retention");
         let left = |id: &str| std::fs::read_dir(root.join(id).join("staging")).map(|d| d.count()).unwrap_or(0);
-        // 70 MB over a 50 MB limit: the oldest two frames of the oldest run go.
+        // The oldest two frames of the oldest run go.
         assert_eq!((left("a"), left("b")), (2, 3));
         let _ = std::fs::remove_dir_all(&root);
     }
