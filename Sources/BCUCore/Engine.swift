@@ -1248,7 +1248,11 @@ public final class Engine {
         // (`KeyScope.afterStep`).
         if !userIsIn(w.pid) {
             let popupOpen = !popupWindows(of: w, frame: AX.window(pid: w.pid, id: w.id).flatMap(AX.frame)).isEmpty
-            switch KeyScope.afterStep(popupOpen: popupOpen, userWindow: focusGuard.userWindow(of: w.pid)) {
+            // The focused element (in the agent's window, which has key) with
+            // its list expanded: a combobox's options shown inside the page.
+            let focused = AX.element(AX.app(w.pid), "AXFocusedUIElement")
+            let listOpen = focused.flatMap { AX.bool($0, "AXExpanded") } == true
+            switch KeyScope.afterStep(popupOpen: popupOpen, listOpen: listOpen, userWindow: focusGuard.userWindow(of: w.pid)) {
             case .park:
                 if scope.keepKey() {
                     focusGuard.park(w.pid, window: w.id, keyWindow: scope.heldBy, owner: sessionID)
