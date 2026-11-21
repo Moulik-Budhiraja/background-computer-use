@@ -774,7 +774,12 @@ public final class FrontGate {
                 adds = []
                 status = -2
             }
-            for p in adds {
+            // The app in front first: once the list holds anyone, WindowServer
+            // drops a front app that isn't on it ("no longer permitted
+            // frontmost"), and no app is in front until the user switches.
+            let front = Self.system.processSerialNumber(Self.system.frontPid())
+            let ordered = adds.contains(front) ? [front] + adds.filter { $0 != front } : Array(adds)
+            for p in ordered {
                 let r = Self.system.updateWindowServerList(p, true)
                 if r == 0 { onWindowServerList.insert(p) } else { status = r }
             }
