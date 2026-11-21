@@ -269,12 +269,14 @@ fn run_session(id: String, rx: mpsc::Receiver<Job>) {
                 let started = Instant::now();
                 let result = engine.call(&r.tool, &r.args);
                 host::called(&id, &r.tool, started.elapsed(), &result.text, result.is_error);
-                let _ = r.reply.send(result);
-                last_call = Instant::now();
+                // Before the reply: a window the call opened is known to be
+                // this session's by the time its agent can pass it on.
                 engine.publish(|v| {
                     v.busy = None;
                     v.last_call = Some(Instant::now());
                 });
+                let _ = r.reply.send(result);
+                last_call = Instant::now();
             }
             Ok(Job::Stop(done)) => {
                 engine.stop_all();
