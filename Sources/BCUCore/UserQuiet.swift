@@ -326,7 +326,9 @@ enum QuietWait {
     /// With `QuietRules.safeTyping`, typing has no cap: the wait goes on
     /// until the user stops, or fails with `typing` at `giveUpAtMs`. With
     /// `typingOnly`, nothing else is waited for (a step that passed
-    /// `priority: "now"`). `willWait` runs once if it isn't quiet already;
+    /// `priority: "now"`). A password field having the keyboard (macOS's
+    /// secure input) counts as typing, with or without the setting.
+    /// `willWait` runs once if it isn't quiet already;
     /// `stop` is checked on every look.
     static func wait(_ activity: UserActivity, pid: pid_t, softMs soft: Double, hardMs hard: Double,
                      typingOnly: Bool = false, giveUpAtMs: Double = .infinity,
@@ -347,8 +349,14 @@ enum QuietWait {
             let s = activity.snapshot
             // Typing that the step may not cut into (looked up on every
             // pass: the user can change the setting during a wait).
-            let typing = QuietRules.safeTyping && Self.typing(s, now: now)
-            let why = typing ? typingReason : (typingOnly ? nil : blocker(s, menuOpen: menu.any, now: now))
+            // With a password field there (secure input on), macOS shows
+            // BCU none of their keys: the step can't tell whether they're
+            // typing, and its swap would put the keys typed while key was
+            // away behind the ones typed after (those go past the guard).
+            // So it waits for the field to let go, whatever the setting.
+            let blind = secureInput()
+            let typing = blind || (QuietRules.safeTyping && Self.typing(s, now: now))
+            let why = blind ? secureReason : typing ? typingReason : (typingOnly ? nil : blocker(s, menuOpen: menu.any, now: now))
             if let why {
                 time[why, default: 0] += now - last
                 if !typing { counted += now - last }
