@@ -23,7 +23,8 @@ usage:
   bcu serve [--owner NAME] [--log-dir DIR] [--no-parent-watch] [--own-engine]
             [--trust-client TEAM_ID|PATH]...
                                 run the engine without the menu bar app, for a host
-                                app (see docs/embedding.md); it stops when its parent does.
+                                app that bundles its own bcu (see docs/embedding.md; the
+                                menu bar app's bcu refuses it); it stops when its parent does.
                                 If the app is installed and set up, starts it and uses
                                 its engine instead, unless --own-engine. --trust-client
                                 lets in a client the code signature check would refuse

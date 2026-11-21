@@ -12,6 +12,12 @@ public enum BCUCopy {
         return nil
     }
 
-    /// Why `executable` won't run `bcu serve`, if it won't. (Every copy runs it for now.)
-    public static func serveRefusal(_ executable: URL) -> String? { nil }
+    /// Why `executable` won't run `bcu serve`, if it won't: it's the menu
+    /// bar app's own `bcu`. That app runs the engine itself, and an engine
+    /// started from its copy kept the app from starting while it ran.
+    /// `serve` is for apps that ship their own `bcu`.
+    public static func serveRefusal(_ executable: URL) -> String? {
+        guard app(containing: executable)?.bundleIdentifier == BCUPaths.bundleID else { return nil }
+        return "bcu: serve is for apps that bundle their own bcu; \(BCUPaths.appName) runs its engine itself, so open the app instead."
+    }
 }

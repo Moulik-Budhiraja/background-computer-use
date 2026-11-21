@@ -17,6 +17,10 @@ import BCUShared
 /// starts the app and uses its engine instead, unless `--own-engine`.
 enum Serve {
     static func run(_ args: [String]) -> Never {
+        if let refusal = BCUCopy.serveRefusal(URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()) {
+            FileHandle.standardError.write(Data((refusal + "\n").utf8))
+            exit(64)
+        }
         var owner = "Background Computer Use engine"
         var watchParent = true
         var ownEngine = false
