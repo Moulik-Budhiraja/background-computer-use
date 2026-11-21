@@ -64,6 +64,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if OnboardingModel.shouldShow() {
             showOnboarding()
+        } else if AgentSetup.isTemporaryLocation(Bundle.main.bundleURL) {
+            // Set up already, and this is the copy in the disk image (or
+            // where it was downloaded): setup's last step says to open the
+            // one in Applications instead.
+            showOnboarding(step: .connect)
         } else {
             if !AX.isTrusted || !Capture.hasPermission { showSettings() }
             // If the app moved since setup, agents' entries point at a bcu that's gone.
@@ -175,9 +180,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         h.show(session: session)
     }
 
-    func showOnboarding() {
+    func showOnboarding(step: OnboardingModel.Step? = nil) {
         if onboarding == nil {
-            let controller = OnboardingWindowController()
+            let controller = OnboardingWindowController(model: OnboardingModel(step: step))
             controller.onClose = { [weak self] in self?.onboarding = nil }
             onboarding = controller
         }
