@@ -17,7 +17,13 @@ export type EngineInfo = {
   // "Background Computer Use" when that app runs it.
   owner: string
   pid: number
-  permissions: { accessibility: boolean; screen_recording: boolean }
+  // "windows" on Windows; absent on a Mac.
+  platform?: 'windows'
+  // On Windows, accessibility and screen_recording are always true, and
+  // agent_screen says whether agents have a screen to work on (see
+  // `bcu screen`), with agent_screen_problem saying why not.
+  permissions: { accessibility: boolean; screen_recording: boolean; agent_screen?: boolean }
+  agent_screen_problem?: string
   max_displays: number
   display: { width: number; height: number }
   // The Background Computer Use app runs this engine and shows your
@@ -31,14 +37,18 @@ export type SessionState = 'idle' | 'working' | 'waiting' | 'paused' | 'user_in_
 export type AgentWindow = {
   id: number
   app: string
+  // The app's bundle ID, on a Mac.
   bundle_id?: string
+  // The app's executable, full path, on Windows.
+  exe?: string
   pid: number
   kind: 'opened' | 'borrowed' | 'caught'
   // Where it is on the agent display. Absent while it's on the user's screen.
   frame?: Rect
   handed_off: boolean
   handoff_reason?: string
-  // The user brought the handed-off window onto their screen.
+  // The user brought the handed-off window onto their screen. On Windows a
+  // handoff puts it there at once, so it's the same as handed_off.
   with_user: boolean
 }
 
