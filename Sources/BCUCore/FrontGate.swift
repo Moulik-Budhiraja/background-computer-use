@@ -971,7 +971,7 @@ public final class FrontGate {
     /// entries off. `owner`: the engine that last started (nil: none since).
     /// `toldToGo`: a SIGTERM, SIGINT or SIGHUP came.
     static func watchdogKeepsTrying(cleared: Bool, owner: pid_t?, engine: pid_t, toldToGo: Bool = false) -> Bool {
-        !cleared && (owner == nil || owner == engine)
+        !cleared && !toldToGo && (owner == nil || owner == engine)
     }
 
     private static var engineURL: URL { BCUPaths.supportDirectory.appendingPathComponent("front-gate.engine") }
