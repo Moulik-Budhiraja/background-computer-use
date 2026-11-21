@@ -210,8 +210,8 @@ public final class Engine {
             agentWaitNotes.append("waited \(String(format: "%.0f", (nowMs() - waitStart) / 1000)) s for a free display, since \(AgentDisplay.maxDisplays) other agents were using theirs")
         }
         var failure: Error?
-        // A new display rearranges them all, and macOS then moves windows to
-        // where they were the last time the displays were like this.
+        // A new display rearranges them all; note the user's windows to see
+        // which macOS moves (a stale tile's gets its tile replaced).
         let userWindows = AgentDisplay.noteUserWindows()
         // Every way out but success gives the display's place back (`stop`
         // does, with or without a display): one kept would leave the next
@@ -223,7 +223,7 @@ public final class Engine {
             _ = onMainUnlessQuitting { self.display.stop(remove: true) }
             throw error
         }
-        if !display.reused { AgentDisplay.restoreUserWindows(userWindows) }
+        if !display.reused { AgentDisplay.startWatchingUserWindows(userWindows) }
         guard display.waitUntilOnline() else {
             _ = onMainUnlessQuitting { self.display.stop(remove: true) }
             throw ToolError("virtual display never came online")

@@ -153,8 +153,6 @@ public final class AgentDisplay {
     protocol UserWindowAccess {
         /// The window's frame now (global, top-left origin); nil once it's gone.
         func frame(_ id: CGWindowID) -> CGRect?
-        /// False when the window can't be reached.
-        func setFrame(pid: pid_t, id: CGWindowID, _ frame: CGRect) -> Bool
         var userDisplays: Set<CGDirectDisplayID> { get }
         /// Where the pointer is while the left button is held; nil when it isn't.
         var dragPointer: CGPoint? { get }
@@ -170,15 +168,6 @@ public final class AgentDisplay {
             guard let b = WindowList.info(id)?.bounds, b != .zero else { return nil }
             return b
         }
-        func setFrame(pid: pid_t, id: CGWindowID, _ frame: CGRect) -> Bool {
-            guard let ax = AX.window(pid: pid, id: id) else { return false }
-            // A window that fills the screen takes its place only
-            // once it's smaller, and its size only once it has moved.
-            AX.setPosition(ax, frame.origin)
-            AX.setSize(ax, frame.size)
-            AX.setPosition(ax, frame.origin)
-            return true
-        }
         var userDisplays: Set<CGDirectDisplayID> { Set(AgentDisplay.userDisplayIDs()) }
         var dragPointer: CGPoint? {
             CGEventSource.buttonState(.hidSystemState, button: .left) ? CGEvent(source: nil)?.location ?? .zero : nil
@@ -188,13 +177,15 @@ public final class AgentDisplay {
         func fixTileLater(pid: pid_t, id: CGWindowID) { AgentDisplay.noteStaleTile(pid: pid, id: id) }
     }
 
-    /// macOS remembers, for each arrangement of displays, where every window
-    /// was the last time the displays were arranged that way, and puts them
-    /// back there when the arrangement returns. An agent display coming or
-    /// going is such a change: a browser window the user has since made
-    /// small goes back to filling their screen the moment an agent starts.
-    /// Note where their windows are before the change (`noteUserWindows`),
-    /// and after it put back any that macOS moved (`restoreUserWindows`).
+    /// Note where the user's windows are before a display change
+    /// (`noteUserWindows`) and watch them after it (`startWatchingUserWindows`).
+    /// A window macOS moves then is left where macOS put it. Putting it back
+    /// through accessibility made it jump again at the next change: on
+    /// macOS 27 AppKit moves a window another process last moved through
+    /// accessibility back to its frame from before that move, once, at the
+    /// next display change (`_displayChangedSoAdjustWindows:`), so a window
+    /// put back jumped at every agent display add and removal. The one move
+    /// acted on is a stale tile's (below), through the app's own menu.
     public static func noteUserWindows() -> UserWindows {
         clearNotedStaleTiles()
         registryLock.lock()
@@ -324,11 +315,9 @@ public final class AgentDisplay {
     }
 
     /// Any thread; returns at once and watches on a thread of its own for
-    /// `quietMs` after the last window it had to put back (macOS moves them
-    /// as the display comes online and again when it's placed), 5 s at most.
-    /// Call it before the change takes effect: a window is put back within
-    /// a frame or two of jumping.
-    public static func restoreUserWindows(_ before: UserWindows, quietMs: Double = 1800) {
+    /// `quietMs` after the last window that moved (macOS moves them as the
+    /// display comes online and again when it's placed), 5 s at most.
+    public static func startWatchingUserWindows(_ before: UserWindows, quietMs: Double = 1800) {
         guard !before.frames.isEmpty else { return }
         let thread = Thread { watchUserWindows(before, quietMs: quietMs, access: LiveUserWindows()) }
         thread.name = "bcu.display.windows"
@@ -340,21 +329,22 @@ public final class AgentDisplay {
     static func watchUserWindows(_ before: UserWindows, quietMs: Double, access: UserWindowAccess) {
         let deadline = nowMs() + 5000
         var lastMoved = nowMs()
-        var moved: Set<CGWindowID> = []
-        // Where each window belongs: where it was, unless the user has
-        // moved it since.
+        // Where each window was, unless the user has moved it since.
         var place: [CGWindowID: CGRect] = [:]
         for w in before.frames { place[w.id] = w.bounds }
+        var last = place
         var dragged: [CGWindowID: (last: CGRect, changes: Int)] = [:]
+        func differs(_ a: CGRect, _ b: CGRect) -> Bool {
+            abs(a.minX - b.minX) > 1 || abs(a.minY - b.minY) > 1 || abs(a.width - b.width) > 1 || abs(a.height - b.height) > 1
+        }
         while nowMs() < deadline && nowMs() - lastMoved < quietMs {
             sleepMs(15)
             // The user's own displays changed too (a monitor unplugged):
             // then where things were no longer says where they belong.
-            guard access.userDisplays == before.displays else { break }
+            guard access.userDisplays == before.displays else { return }
             // A window the user is dragging or resizing isn't macOS's
-            // doing, and where they leave it is where it belongs now.
-            // Theirs is the one under the pointer that moves on every
-            // look; what macOS does to a window is one jump or two.
+            // doing. Theirs is the one under the pointer that moves on
+            // every look; what macOS does to a window is one jump or two.
             if let pointer = access.dragPointer {
                 for w in before.frames {
                     guard let now = access.frame(w.id) else { continue }
@@ -367,26 +357,25 @@ public final class AgentDisplay {
             }
             dragged = [:]
             for w in before.frames {
-                // An agent has taken it since (`borrow_window` moves a
-                // window of the user's onto its display): not put back.
-                if access.isAgents(w.id) { continue }
-                guard let want = place[w.id], let now = access.frame(w.id),
-                      abs(now.minX - want.minX) > 1 || abs(now.minY - want.minY) > 1
-                        || abs(now.width - want.width) > 1 || abs(now.height - want.height) > 1,
-                      access.setFrame(pid: w.pid, id: w.id, want) else { continue }
-                moved.insert(w.id)
-                lastMoved = nowMs()
+                guard let now = access.frame(w.id) else { continue }
+                if let l = last[w.id], differs(now, l) { lastMoved = nowMs() }
+                last[w.id] = now
             }
         }
-        if !moved.isEmpty {
-            Log.info("macOS moved \(moved.count) of the user's windows when the displays changed; put them back where they were")
+        // An agent has taken it since (`borrow_window` moves a window of
+        // the user's onto its display): not the display change's doing.
+        let moved = before.frames.filter { w in
+            guard let was = place[w.id], let now = last[w.id] else { return false }
+            return differs(now, was) && !access.isAgents(w.id)
         }
-        // Why macOS moved it: usually a tile it still holds for a window
-        // that has since gone back to its own size. Clear that, so the
-        // next display change leaves the window alone.
-        for w in before.frames where moved.contains(w.id) {
-            guard let want = place[w.id] else { continue }
-            if !access.fixTile(pid: w.pid, id: w.id, frame: want) { access.fixTileLater(pid: w.pid, id: w.id) }
+        guard !moved.isEmpty else { return }
+        Log.info("macOS moved \(moved.count) of the user's windows when the displays changed; left where macOS put them")
+        // A window that filled its screen and moved is usually one with a
+        // tile macOS still holds though it has since gone back to full
+        // size. Replace that, so the next display change leaves it alone.
+        for w in moved {
+            guard let was = place[w.id] else { continue }
+            if !access.fixTile(pid: w.pid, id: w.id, frame: was) { access.fixTileLater(pid: w.pid, id: w.id) }
         }
     }
 
@@ -455,7 +444,7 @@ public final class AgentDisplay {
             Log.info("agent display \(s.slot + 1) (\(s.id)) removed: no agent has needed it for a while")
         }
         for d in running { d.reconfigured() }
-        restoreUserWindows(before)
+        startWatchingUserWindows(before)
     }
 
     /// Take display `id` away: `release` lets go of it, and macOS removes it.
@@ -666,7 +655,7 @@ public final class AgentDisplay {
         Log.info("agent display \(slot + 1) (\(id)) removed")
         // The ones after it move up the staircase.
         for d in Self.running { d.reconfigured() }
-        Self.restoreUserWindows(before)
+        Self.startWatchingUserWindows(before)
     }
 
     /// The user's real displays: every active display that isn't an agent's.
