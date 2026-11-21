@@ -23,7 +23,8 @@ usage:
   bcu serve [--owner NAME] [--log-dir DIR] [--no-parent-watch] [--own-engine]
             [--trust-client TEAM_ID|PATH]...
                                 run the engine without the menu bar app, for a host
-                                app (see docs/embedding.md); it stops when its parent does.
+                                app that bundles its own bcu (see docs/embedding.md; the
+                                menu bar app's bcu refuses it); it stops when its parent does.
                                 If the app is installed and set up, starts it and uses
                                 its engine instead, unless --own-engine. --trust-client
                                 lets in a client the code signature check would refuse
@@ -38,16 +39,8 @@ usage:
 /// The app this `bcu` was shipped inside, if it isn't this one: a host app
 /// that runs the engine itself (`bcu serve`).
 let hostApp: Bundle? = {
-    let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
-    var dir = exe.deletingLastPathComponent()
-    while dir.path != "/" {
-        if dir.pathExtension == "app" {
-            let b = Bundle(url: dir)
-            return b?.bundleIdentifier == BCUPaths.bundleID ? nil : b
-        }
-        dir = dir.deletingLastPathComponent()
-    }
-    return nil
+    let b = BCUCopy.app(containing: URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath())
+    return b?.bundleIdentifier == BCUPaths.bundleID ? nil : b
 }()
 
 /// Who to open when the engine isn't running.
