@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFil
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { after, before, test } from 'node:test'
-import { EngineClient, startEngine, type EngineStart, type FrameEvent, type PointerEvent, type Session } from '../src/index.ts'
+import { EngineClient, startEngine, type CursorEvent, type DragEvent, type EngineStart, type FrameEvent, type PointerEvent, type Session } from '../src/index.ts'
 
 const live = process.platform === 'win32' && process.env.BCU_WINDOWS_LIVE === '1'
 const bcu = process.env.BCU_BIN ?? resolve(import.meta.dirname, '../../../windows/target/release/bcu.exe')
@@ -113,6 +113,20 @@ async function until<T>(what: string, f: () => T | undefined | false | Promise<T
     await sleep(100)
   }
 }
+
+// The agent closes a Notepad window with changes: it asks about saving, and the agent says don't.
+async function closeUnsaved(window: number) {
+  const asked = await helper.call('release_window', { window_id: window })
+  if (!asked.error) return
+  const dialog = await helper.ok('get_window_state', { window_id: window, screenshot: false, full: true })
+  const dontSave = /\[(\d+)\] Button "Don.t save"/.exec(dialog)
+  assert.ok(dontSave, `release_window: ${asked.text}\n${dialog.slice(0, 1500)}`)
+  // A WinUI button: pressed through UI Automation.
+  await helper.ok('perform_action', { window_id: window, element: Number(dontSave[1]), action: 'invoke' })
+  await until('the window to close', async () => !(await helper.call('release_window', { window_id: window })).error, 10_000)
+}
+
+const fileUrl = (name: string) => 'file:///' + join(dir, name).replace(/\\/g, '/')
 
 // The user clicks the desktop, right of their Notepad: nothing of theirs or the agents' is in front.
 const clickDesktop = () => probeRun('mouse', '1700', '500', 'left')
@@ -244,14 +258,7 @@ test('an agent works in Notepad, streamed to the host', { skip: !live }, async (
   stream.stop()
 
   // Closing it, it asks about saving: the agent answers.
-  const asked = await helper.call('release_window', { window_id: notepad })
-  if (asked.error) {
-    const dialog = await helper.ok('get_window_state', { window_id: notepad, screenshot: false })
-    const dontSave = /\[(\d+)\] Button "Don.t save"/.exec(dialog)
-    assert.ok(dontSave, `release_window: ${asked.text}\n${dialog.slice(0, 1500)}`)
-    await helper.ok('click', { window_id: notepad, element: Number(dontSave[1]) })
-    await helper.ok('release_window', { window_id: notepad })
-  }
+  await closeUnsaved(notepad)
   await until('no windows', () => session('helper-1')?.windows.length === 0)
 })
 
@@ -284,12 +291,9 @@ test('an agent works in Edge while the user types into Notepad in front', { skip
 
   // The agent opens Edge and loads a page, then works in it while the user types.
   edge = Number(/Opened window (\d+)/.exec(await helper.ok('open_window', { app: 'msedge' }))![1])
-  const page = 'file:///' + join(dir, 'page.html').replace(/\\/g, '/')
   writeFileSync(join(dir, 'page.html'), '<title>Host test</title><input aria-label="Probe input"><button onclick="this.textContent=+this.textContent+1">0</button>')
-  const blank = await helper.ok('get_window_state', { window_id: edge, screenshot: false })
-  const bar = /\[(\d+)\] Edit "Address and search bar/.exec(blank)![1]
-  await helper.ok('click', { window_id: edge, element: Number(bar) })
-  await helper.ok('type_text', { window_id: edge, text: page + '\n' })
+  assert.match(await helper.ok('navigate', { window_id: edge, url: fileUrl('page.html') }), /^Loaded file:\/\/\/.*page\.html in window/)
+  await assert.rejects(helper.ok('navigate', { window_id: edge, url: 'cheap flights' }), /isn't a URL/)
   const state = await helper.ok('get_window_state', { window_id: edge, screenshot: false })
   assert.match(state, /Probe input/)
   const input = /\[(\d+)\] Edit "Probe input/.exec(state)![1]
@@ -360,6 +364,118 @@ test('pause, rename and handoff', { skip: !live }, async () => {
   await until('handed back', () => !session('helper-1')?.handoff)
   assert.ok(session('helper-1')!.windows.find((w) => w.id === edge)!.frame, 'back on the agent screen')
 })
+
+test('navigate answers a page that asks "Leave site?"', { skip: !live }, async () => {
+  writeFileSync(join(dir, 'ask.html'), '<title>Asks</title><input aria-label="Ask input"><script>addEventListener("beforeunload", (e) => { e.preventDefault(); e.returnValue = "" })</script>')
+  await helper.ok('navigate', { window_id: edge, url: fileUrl('ask.html') })
+  const st = await helper.ok('get_window_state', { window_id: edge, screenshot: false })
+  // A page may ask only once someone has used it.
+  await helper.ok('click', { window_id: edge, element: Number(/\[(\d+)\] Edit "Ask input/.exec(st)![1]) })
+  await helper.ok('type_text', { window_id: edge, text: 'x' })
+  const left = await helper.ok('navigate', { window_id: edge, url: fileUrl('page.html') })
+  const after = await helper.ok('get_window_state', { window_id: edge, screenshot: false })
+  assert.match(left + after, /asked .*answered Leave/)
+  assert.match(after, /Probe input/)
+})
+
+test('press_menu_item, in Windows 11 Notepad\'s menu bar and in a classic one', { skip: !live }, async () => {
+  // Notepad's menu is its own: it takes the foreground as it opens, and the
+  // guard gives that back, which can close it first. Either it's chosen or
+  // the agent hears why not.
+  const np = Number(/Opened window (\d+)/.exec(await helper.ok('open_window', { app: 'notepad' }))![1])
+  const chose = await helper.call('press_menu_item', { window_id: np, path: ['Edit', 'Time/Date'] })
+  if (chose.error) assert.match(chose.text, /closed as it opened/)
+  else {
+    await until('the date in the document', async () => /Document "Text editor" value="[^"]*\d{1,2}:\d{2}/.test(await helper.ok('get_window_state', { window_id: np, screenshot: false, full: true })))
+    await closeUnsaved(np)
+  }
+  console.log(`Notepad's Edit > Time/Date: ${chose.error ? chose.text : 'chosen'}`)
+  if (chose.error) await helper.ok('release_window', { window_id: np })
+  await assert.rejects(helper.ok('press_menu_item', { window_id: edge, path: ['File'] }), /no menu bar/)
+  // A window with a Win32 menu bar (WinForms' MainMenu), borrowed from the user.
+  const script = join(dir, 'menu.ps1')
+  writeFileSync(script, `Add-Type -AssemblyName System.Windows.Forms
+$f = New-Object Windows.Forms.Form; $f.Text = 'Classic menu'; $f.Width = 500; $f.Height = 300
+$m = New-Object Windows.Forms.MainMenu; $file = $m.MenuItems.Add('&File'); $say = $file.MenuItems.Add('Say &hello...')
+$say.add_Click({ $f.Text = 'Classic menu: hello' }); $f.Menu = $m; [Windows.Forms.Application]::Run($f)`)
+  const form = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script], { stdio: 'ignore' })
+  const hwnd = await until('the form', () => {
+    try {
+      return find('Classic menu') || false
+    } catch {
+      return false
+    }
+  })
+  clickDesktop()
+  const id = parseInt(hwnd, 16)
+  await helper.ok('borrow_window', { window_id: id })
+  assert.match(await helper.ok('press_menu_item', { window_id: id, path: ['File', 'Say hello…'] }), /^Chose File > Say hello/)
+  await until('the menu item ran', () => {
+    try {
+      return find('Classic menu: hello')
+    } catch {
+      return false
+    }
+  })
+  await helper.ok('release_window', { window_id: id })
+  form.kill()
+})
+
+test('the user takes over the helper\'s screen from the host', { skip: !live }, async () => {
+  const cursors: CursorEvent[] = []
+  const drags: DragEvent[] = []
+  host!.on('cursor', (c) => cursors.push(c))
+  host!.on('drag', (d) => drags.push(d))
+  await assert.rejects(host!.input('helper-1', { type: 'mousemove', x: 1, y: 1 }), /take over/)
+  await host!.takeOver('helper-1')
+  try {
+    await takenOver(cursors, drags)
+  } finally {
+    await host!.takeOver('helper-1', false)
+  }
+  await until('given back', () => session('helper-1')?.user_in_control === false)
+  await helper.ok('click', { window_id: edge, x: 5, y: 200 })
+})
+
+async function takenOver(cursors: CursorEvent[], drags: DragEvent[]) {
+  await until('in control', () => session('helper-1')?.status.state === 'user_in_control')
+  assert.equal(session('helper-1')!.user_in_control, true)
+  const refused = await helper.call('click', { window_id: edge, x: 5, y: 5 })
+  assert.ok(refused.error && /took over your display/.test(refused.text), refused.text)
+  // Reading still works, and says where things are.
+  const st = await helper.ok('get_window_state', { window_id: edge, screenshot: false, full: true })
+  const at = (re: RegExp) => {
+    const m = re.exec(st)!
+    const frame = session('helper-1')!.windows.find((w) => w.id === edge)!.frame!
+    return { x: frame.x + Number(m[1]) + Number(m[3]) / 2, y: frame.y + Number(m[2]) + Number(m[4]) / 2 }
+  }
+  const input = at(/Edit "Probe input[^@]*@\((\d+),(\d+) (\d+)x(\d+)\)/)
+  // The user hovers the field, clicks it and types.
+  await host!.input('helper-1', { type: 'mousemove', ...input })
+  await host!.input('helper-1', [
+    { type: 'mousedown', ...input, button: 0, clicks: 1 },
+    { type: 'mouseup', ...input, button: 0, clicks: 1 },
+  ])
+  await until('a text cursor', () => cursors.some((c) => c.session === 'helper-1' && c.css === 'text'), 5000)
+  for (const k of 'hi') await host!.input('helper-1', [{ type: 'keydown', code: `Key${k.toUpperCase()}`, key: k }, { type: 'keyup', code: `Key${k.toUpperCase()}`, key: k }])
+  await until('the typing in the page', async () => /Probe input" value="[^"]*hi/.test(await helper.ok('get_window_state', { window_id: edge, screenshot: false })), 5000)
+  // A shortcut that would quit the browser, the user's windows with it, isn't passed on.
+  await host!.input('helper-1', { type: 'keydown', code: 'KeyQ', key: 'q', ctrlKey: true, shiftKey: true })
+  // The user moves the window by its title bar.
+  const frame = session('helper-1')!.windows.find((w) => w.id === edge)!.frame!
+  const grab = { x: frame.x + frame.width - 300, y: frame.y + 12 }
+  await host!.input('helper-1', [
+    { type: 'mousedown', ...grab, button: 0, clicks: 1 },
+    { type: 'mousemove', x: grab.x + 40, y: grab.y + 30, buttons: 1 },
+    { type: 'mouseup', x: grab.x + 40, y: grab.y + 30, button: 0, clicks: 1 },
+  ])
+  assert.deepEqual(drags.map((d) => d.phase), ['began', 'ended'])
+  const began = drags[0] as Extract<DragEvent, { phase: 'began' }>
+  assert.equal(began.kind.type, 'move')
+  const ended = drags[1]
+  assert.deepEqual([ended.frame.x - began.frame.x, ended.frame.y - began.frame.y], [40, 30])
+  await assert.rejects(host!.menuPick('helper-1', 1, [0]), /click their items/)
+}
 
 test('stop releases a session\'s windows', { skip: !live }, async () => {
   // A Notepad window and Edge: the host stops the session.

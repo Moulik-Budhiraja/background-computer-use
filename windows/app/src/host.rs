@@ -22,6 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOZORDER, SetW
 
 use crate::pipe::Pipe;
 use crate::recorder::{self, Store};
+use crate::remote::Remote;
 use crate::{engine, monitor, sessions, stream, win};
 
 /// Bumped when a change would break an existing client. The Mac's is the same.
@@ -139,6 +140,8 @@ struct Client {
     all: bool,
     last_sessions: Option<Vec<u8>>,
     streams: HashMap<u64, Arc<stream::Stream>>,
+    /// Sessions this client has taken over, with the input path for each.
+    remotes: HashMap<String, Arc<Remote>>,
 }
 
 static CLIENTS: Mutex<Option<HashMap<u64, Client>>> = Mutex::new(None);
@@ -147,15 +150,46 @@ fn with_clients<R>(f: impl FnOnce(&mut HashMap<u64, Client>) -> R) -> R {
     f(lock(&CLIENTS).get_or_insert_with(HashMap::new))
 }
 
-/// The connection closed: its streams end with it.
+/// The connection closed: its streams and take-overs end with it.
 pub fn closed(conn: &Conn) {
     let gone = with_clients(|c| c.remove(&conn.id));
     if let Some(c) = gone {
         for s in c.streams.values() {
             s.stop();
         }
+        for (session, remote) in c.remotes {
+            remote.end();
+            set_control(&session, &controller(conn), false);
+        }
     }
     conn.close();
+}
+
+/// This client, as one of a session's controllers.
+fn controller(conn: &Conn) -> String {
+    format!("host:{}", conn.id)
+}
+
+/// `controller` takes the session's screen over for the user, or gives it
+/// back. The agent gets it back only when no controller holds it.
+fn set_control(session: &str, controller: &str, on: bool) {
+    let changed = with_extras(|x| {
+        let c = &mut x.entry(session.to_string()).or_default().controllers;
+        if on { c.insert(controller.to_string()) } else { c.remove(controller) }
+    });
+    if changed {
+        schedule_push();
+    }
+}
+
+/// Whether the user is driving the session's screen from a host's preview.
+pub fn user_in_control(session: &str) -> bool {
+    with_extras(|x| x.get(session).is_some_and(|e| !e.controllers.is_empty()))
+}
+
+/// Whether the user is driving any session's screen.
+pub fn any_user_in_control() -> bool {
+    with_extras(|x| x.values().any(|e| !e.controllers.is_empty()))
 }
 
 // ---------- what the engine tells hosts about each session ----------
@@ -183,6 +217,8 @@ struct Extra {
     parent: Option<String>,
     windows: Vec<WindowInfo>,
     activity: VecDeque<(f64, String, bool)>,
+    /// The clients that have the user in control of its screen.
+    controllers: HashSet<String>,
 }
 
 static EXTRAS: Mutex<Option<HashMap<String, Extra>>> = Mutex::new(None);
@@ -338,6 +374,7 @@ pub fn handle(conn: &Arc<Conn>, op: &str, req: &Map<String, Value>) -> Value {
             all: false,
             last_sessions: None,
             streams: HashMap::new(),
+            remotes: HashMap::new(),
         });
     });
     match dispatch(conn, op, req) {
@@ -489,6 +526,59 @@ fn dispatch(conn: &Arc<Conn>, op: &str, req: &Map<String, Value>) -> Result<Valu
             Ok(json!({}))
         }
 
+        "take_over" => {
+            let id = session(req)?;
+            if req.get("on").and_then(Value::as_bool).unwrap_or(true) {
+                if monitor::of_session(&id).is_none() {
+                    return Err("that session has no display yet".into());
+                }
+                let fresh = with_clients(|c| c.get(&conn.id).is_some_and(|c| !c.remotes.contains_key(&id)));
+                if fresh {
+                    let remote = Remote::new(&id, conn.clone());
+                    with_clients(|c| {
+                        if let Some(c) = c.get_mut(&conn.id) {
+                            c.remotes.insert(id.clone(), remote);
+                        }
+                    });
+                }
+                set_control(&id, &controller(conn), true);
+                log(&id, "You took over the screen".into(), false);
+            } else {
+                let remote = with_clients(|c| c.get_mut(&conn.id).and_then(|c| c.remotes.remove(&id)));
+                if let Some(r) = remote {
+                    r.end();
+                    log(&id, "You gave the screen back".into(), false);
+                }
+                set_control(&id, &controller(conn), false);
+            }
+            Ok(json!({}))
+        }
+
+        "input" => {
+            let id = session(req)?;
+            let remote = with_clients(|c| c.get(&conn.id).and_then(|c| c.remotes.get(&id).cloned()));
+            let Some(remote) = remote.filter(|_| user_in_control(&id)) else {
+                return Err("take over the session first (take_over)".into());
+            };
+            let events: Vec<Map<String, Value>> = match (req.get("events"), req.get("event")) {
+                (Some(Value::Array(list)), _) => list.iter().filter_map(|e| e.as_object().cloned()).collect(),
+                (_, Some(Value::Object(e))) => vec![e.clone()],
+                _ => Vec::new(),
+            };
+            for e in &events {
+                remote.post(e)?;
+            }
+            Ok(json!({}))
+        }
+
+        "menu_pick" => {
+            let id = session(req)?;
+            if with_clients(|c| c.get(&conn.id).is_none_or(|c| !c.remotes.contains_key(&id))) {
+                return Err("take over the session first (take_over)".into());
+            }
+            Err("there are no menu events to pick from on Windows: menus show in the frames, so click their items".into())
+        }
+
         "yield" => {
             // Only a host's own engine steps aside; the tray app's never does.
             let yields = !owner().shows_hosts;
@@ -621,10 +711,13 @@ fn session_list() -> Vec<(String, Option<String>, Value)> {
 
 fn session_json(v: &sessions::View, e: Option<&Extra>, screen: Option<&RECT>) -> Value {
     let since = |s: u64| v.last_call.is_some_and(|t| t.elapsed() < Duration::from_secs(s));
-    let (state, text) = if v.handoff.is_some() {
-        ("waiting", v.status_text())
+    let in_control = e.is_some_and(|e| !e.controllers.is_empty());
+    let (state, text) = if in_control {
+        ("user_in_control", "You're in control".to_string())
     } else if v.paused {
         ("paused", "Paused".to_string())
+    } else if v.handoff.is_some() {
+        ("waiting", v.status_text())
     } else if v.busy.is_some() || since(8) || v.windows > 0 {
         ("working", v.status_text())
     } else {
@@ -661,7 +754,7 @@ fn session_json(v: &sessions::View, e: Option<&Extra>, screen: Option<&RECT>) ->
         "status": {"state": state, "text": text},
         "active": v.busy.is_some() || since(3),
         "paused": v.paused,
-        "user_in_control": false,
+        "user_in_control": in_control,
         "windows": windows,
         "activity": activity,
     });

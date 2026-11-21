@@ -341,7 +341,10 @@ impl Args<'_> {
     }
 }
 
-const BATCHABLE: [&str; 9] = ["click", "set_value", "perform_action", "type_text", "press_key", "scroll", "drag", "press_menu_item", "wait"];
+/// What an agent may still do while the user has its screen.
+const READ_ONLY: [&str; 7] = ["status", "guard_report", "list_apps", "list_windows", "release_window", "screenshot", "get_window_state"];
+
+const BATCHABLE: [&str; 10] = ["click", "set_value", "perform_action", "type_text", "press_key", "scroll", "drag", "press_menu_item", "navigate", "wait"];
 
 impl Engine {
     fn paused(&self) -> bool {
@@ -440,6 +443,12 @@ impl Engine {
     pub fn call(&mut self, tool: &str, args: &Map<String, Value>) -> ToolResult {
         let args = Args(args);
         let acting = BATCHABLE.contains(&tool) || tool == "open_window" || tool == "borrow_window";
+        // Closing a window the user is working in would pull it out from under them.
+        if (!READ_ONLY.contains(&tool) || tool == "release_window")
+            && (host::user_in_control(&self.id) || args.str("_session").is_some_and(host::user_in_control))
+        {
+            return ToolResult::error("The user took over your display and is using your windows. Wait and retry later, or tell the user you're blocked.");
+        }
         if acting && self.caller_paused(&args) {
             return ToolResult::error("Paused by the user.");
         }
@@ -449,6 +458,8 @@ impl Engine {
         let pid = window.map(|w| w.pid);
         if acting && let Some(w) = window {
             guard::begin_action(w.pid);
+            // The step can leave a page, which can ask "Leave site?" first.
+            crate::navigate::watch_leave(&self.id, w.hwnd);
         }
         let mut result = self.dispatch(tool, &args).unwrap_or_else(ToolResult::error);
         if acting && let Some(pid) = pid {
@@ -458,6 +469,9 @@ impl Engine {
         }
         if acting && let Some(id) = args.int("window_id") {
             self.last_action.insert(id as u64, Instant::now());
+        }
+        if let Some(asked) = crate::navigate::take_answers(&self.id) {
+            result.text += &asked;
         }
         result
     }
@@ -484,8 +498,8 @@ impl Engine {
             "borrow_window" => self.borrow_window(args),
             "handoff" => self.handoff(args),
             "take_back" => self.take_back(args),
-            "press_menu_item" => Err("press_menu_item isn't built on Windows yet. Open the menu with click and pick the item from get_window_state.".into()),
-            "navigate" => Err("navigate isn't built on Windows yet. Click the address bar, type_text the URL and \"\\n\".".into()),
+            "press_menu_item" => self.press_menu_item(args),
+            "navigate" => self.navigate(args),
             _ => Err(format!("unknown tool {tool}")),
         }
     }
@@ -1006,6 +1020,19 @@ impl Engine {
         };
         done.map_err(|err| format!("{action} on element {} failed: {err}. Its actions: {}", n.index, n.patterns.join(", ")))?;
         Ok(ToolResult::ok(format!("Performed {action} on element {}.", n.index)))
+    }
+
+    fn navigate(&mut self, args: &Args) -> Fallible<ToolResult> {
+        let id = self.window(args)?;
+        let w = &self.windows[&id];
+        Ok(ToolResult::ok(crate::navigate::navigate(&self.auto, id, w.hwnd, &w.app, args.need_str("url")?)?))
+    }
+
+    fn press_menu_item(&mut self, args: &Args) -> Fallible<ToolResult> {
+        let id = self.window(args)?;
+        let path: Vec<String> = args.0.get("path").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+        let w = &self.windows[&id];
+        Ok(ToolResult::ok(crate::menus::press(&self.auto, w.hwnd, &w.app, &path)?))
     }
 
     fn release_window(&mut self, args: &Args) -> Fallible<ToolResult> {

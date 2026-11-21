@@ -27,7 +27,7 @@ pub enum Button {
 }
 
 /// The deepest visible child under a screen point, and the point in its client coordinates.
-fn target_at(root: HWND, screen: POINT) -> (HWND, POINT) {
+pub fn target_at(root: HWND, screen: POINT) -> (HWND, POINT) {
     let mut target = root;
     loop {
         let mut local = screen;
@@ -42,7 +42,7 @@ fn target_at(root: HWND, screen: POINT) -> (HWND, POINT) {
     }
 }
 
-fn point_lparam(p: POINT) -> LPARAM {
+pub fn point_lparam(p: POINT) -> LPARAM {
     LPARAM((((p.y as u32 & 0xffff) << 16) | (p.x as u32 & 0xffff)) as i32 as isize)
 }
 
