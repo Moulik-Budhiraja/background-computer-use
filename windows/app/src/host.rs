@@ -712,18 +712,60 @@ fn push() {
 
 // ---------- the sessions a stream may show ----------
 
-/// Whether any other session's window is on `screen` (the shared agent
-/// screen) outside `session`'s family: then a frame of the screen would show
-/// it, and the stream draws the family's windows on their own instead.
+/// Whether anything but `session`'s family's windows (and the shell's
+/// desktop and taskbar) is on `screen`, the shared agent screen: then a
+/// copy of it would show that, and the stream draws the family's windows on
+/// their own instead. Anything counts, not just other sessions' published
+/// windows: a window another agent is opening right now isn't published yet.
 pub fn others_on(session: &str, screen: &RECT) -> bool {
-    let fam: HashSet<String> = family(session).into_iter().collect();
-    all_windows().into_iter().any(|(s, w)| {
-        if fam.contains(&s) || w.handoff.is_some() || !win::is_visible(w.hwnd) || win::is_minimized(w.hwnd) {
+    let mine: HashSet<usize> = shown_windows(session, screen, 0).iter().map(|h| h.0 as usize).collect();
+    win::top_level_windows().into_iter().any(|h| {
+        if mine.contains(&(h.0 as usize)) || !win::is_visible(h) || win::is_minimized(h) || win::is_cloaked(h) || is_shell(h) {
             return false;
         }
-        let f = win::frame(w.hwnd);
+        let f = win::frame(h);
         f.left < screen.right && screen.left < f.right && f.top < screen.bottom && screen.top < f.bottom
     })
+}
+
+/// The desktop and the taskbar Windows puts on every screen.
+fn is_shell(h: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+    let mut buf = [0u16; 64];
+    let n = unsafe { GetClassNameW(h, &mut buf) };
+    matches!(String::from_utf16_lossy(&buf[..n.max(0) as usize]).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
+}
+
+/// The family's windows on `screen` and the popups of their apps over them
+/// (menus, dropdowns), from the top down, without `exclude`: what a frame
+/// of the session shows, and where take-over input goes. A popup counts
+/// when one of the family's windows owns it, or, unowned (a menu), when no
+/// session outside the family has windows in its app: in one browser
+/// process with another session's windows, that session's menus don't.
+pub fn shown_windows(session: &str, screen: &RECT, exclude: u64) -> Vec<HWND> {
+    use windows::Win32::UI::WindowsAndMessaging::{GA_ROOTOWNER, GetAncestor};
+    let family = family(session);
+    let mine = windows_of(&family);
+    let hwnds: HashSet<usize> = mine.iter().filter(|w| w.handoff.is_none()).map(|w| w.hwnd.0 as usize).collect();
+    let others: HashSet<u32> = all_windows().into_iter().filter(|(s, _)| !family.contains(s)).map(|(_, w)| w.pid).collect();
+    let own_pids: HashSet<u32> = mine.iter().map(|w| w.pid).filter(|p| !others.contains(p)).collect();
+    let overlaps = |f: &RECT| f.left < screen.right && screen.left < f.right && f.top < screen.bottom && screen.top < f.bottom;
+    let family_popup = |h: HWND| {
+        if win::is_app_window(h) || crate::guard::is_agent_window(h) {
+            return false;
+        }
+        let owner = unsafe { GetAncestor(h, GA_ROOTOWNER) };
+        if !owner.0.is_null() && owner != h {
+            return hwnds.contains(&(owner.0 as usize));
+        }
+        own_pids.contains(&win::pid_tid(h).0)
+    };
+    // EnumWindows lists top-level windows from the top down.
+    win::top_level_windows()
+        .into_iter()
+        .filter(|h| win::id(*h) != exclude && win::is_visible(*h) && !win::is_minimized(*h) && overlaps(&win::frame(*h)))
+        .filter(|h| hwnds.contains(&(h.0 as usize)) || family_popup(*h))
+        .collect()
 }
 
 /// When the last call of any session ran, and whether any agent has windows:

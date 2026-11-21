@@ -8,14 +8,12 @@
 //! subagents) is on it: then only the family's windows are drawn, each from
 //! its own surface (PrintWindow), in their order on screen.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::UI::WindowsAndMessaging::{GA_ROOTOWNER, GetAncestor};
 
 use crate::host::{self, Conn};
 use crate::jpeg::{self, Bgra};
@@ -130,32 +128,8 @@ fn window_image(hwnd: HWND) -> Option<Bgra> {
 fn compose(session: &str, screen: RECT, exclude: u64) -> Bgra {
     let (w, h) = (screen.right - screen.left, screen.bottom - screen.top);
     let mut canvas = Bgra { w, h, bits: [0x20, 0x20, 0x20, 0xff].repeat((w * h) as usize) };
-    let family = host::family(session);
-    let mine = host::windows_of(&family);
-    let hwnds: HashSet<usize> = mine.iter().filter(|w| w.handoff.is_none()).map(|w| w.hwnd.0 as usize).collect();
-    // Apps only this family's agents have windows in on the agent screen: an
-    // unowned popup of theirs (a menu) is the family's. In an app another
-    // session has windows in too (one browser process), only popups owned by
-    // the family's windows are.
-    let others: HashSet<u32> = host::all_windows().into_iter().filter(|(s, _)| !family.contains(s)).map(|(_, w)| w.pid).collect();
-    let own_pids: HashSet<u32> = mine.iter().map(|w| w.pid).filter(|p| !others.contains(p)).collect();
-    let overlaps = |f: &RECT| f.left < screen.right && screen.left < f.right && f.top < screen.bottom && screen.top < f.bottom;
-    let family_popup = |h: HWND| {
-        if win::is_app_window(h) || crate::guard::is_agent_window(h) {
-            return false;
-        }
-        let owner = unsafe { GetAncestor(h, GA_ROOTOWNER) };
-        if !owner.0.is_null() && owner != h {
-            return hwnds.contains(&(owner.0 as usize));
-        }
-        own_pids.contains(&win::pid_tid(h).0)
-    };
-    // EnumWindows lists top-level windows from the top down.
-    let mut shown: Vec<HWND> = win::top_level_windows()
-        .into_iter()
-        .filter(|h| win::id(*h) != exclude && win::is_visible(*h) && !win::is_minimized(*h) && overlaps(&win::frame(*h)))
-        .filter(|h| hwnds.contains(&(h.0 as usize)) || family_popup(*h))
-        .collect();
+    // Bottom to top.
+    let mut shown = host::shown_windows(session, &screen, exclude);
     shown.reverse();
     for hwnd in shown {
         let f = win::frame(hwnd);
