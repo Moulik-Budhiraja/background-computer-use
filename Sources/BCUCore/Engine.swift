@@ -1427,6 +1427,12 @@ public final class Engine {
         ToolError("the user has been typing in \(appName) for the \(Int(QuietRules.typingPatienceMs / 1000)) s this step waited, and \(cause) would take the keyboard from their window for a moment (what they type would lag), so that wasn't done: their typing goes first. Steps that need no key focus still work meanwhile: set_value, type_text without Return or Tab, a single click on an element that lists press, scroll, get_window_state. Otherwise wait a few seconds and retry.")
     }
 
+    /// The step waited `typingPatienceMs` for a password field in the
+    /// user's app to let go of the keyboard (see `QuietWait.wait`).
+    private static func secureFieldError(appName: String, cause: String) -> ToolError {
+        ToolError("the user has been in a password field in \(appName) for the \(Int(QuietRules.typingPatienceMs / 1000)) s this step waited. macOS hides what they type there, so \(cause) could put their keys out of order; that wasn't done. Steps that need no key focus still work meanwhile: set_value, type_text without Return or Tab, a single click on an element that lists press, scroll, get_window_state. Otherwise retry once they're done.")
+    }
+
     /// The user is typing, and steps wait for that (see `QuietWait.typing`
     /// and `QuietRules.safeTyping`).
     private var userTyping: Bool { QuietRules.safeTyping && QuietWait.typing(focusGuard.activity.snapshot, now: nowMs()) }
@@ -1488,10 +1494,11 @@ public final class Engine {
             throw ToolError("the user is holding a mouse button or key\(where_) (dragging, say), and \(effect) would interrupt it, so nothing was done. Wait a few seconds and retry\(browser && !anywhere ? ", or use navigate to load a URL without keys" : "").")
         }
         if r.outcome == .typing {
-            let note = "waited \(Int(QuietRules.typingPatienceMs / 1000)) s in all\(where_) before \(cause), but the user is still typing"
+            let secure = r.reason == QuietWait.secureReason
+            let note = "waited \(Int(QuietRules.typingPatienceMs / 1000)) s in all\(where_) before \(cause), but the user is still \(secure ? "in a password field" : "typing")"
             UserSim.shared.waited(fromMs: startMs, note)
             Log.info("defer: \(note); failed the step")
-            throw Self.typingError(appName: appName, cause: cause)
+            throw secure ? Self.secureFieldError(appName: appName, cause: cause) : Self.typingError(appName: appName, cause: cause)
         }
         guard r.waitedMs >= 20 else { return }
         var note = "waited \(secs) s for \(r.reason ?? "the user to pause")\(anywhere ? "" : " in \(appName)") before \(cause)"
