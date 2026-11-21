@@ -144,8 +144,48 @@ public final class AgentDisplay {
 
     /// Where the user's windows were before the displays changed.
     public struct UserWindows {
-        fileprivate let frames: [(id: CGWindowID, pid: pid_t, bounds: CGRect)]
-        fileprivate let displays: Set<CGDirectDisplayID>
+        let frames: [(id: CGWindowID, pid: pid_t, bounds: CGRect)]
+        let displays: Set<CGDirectDisplayID>
+    }
+
+    /// What watching the user's windows across a display change reads and
+    /// does, so a test can stand in for the window list.
+    protocol UserWindowAccess {
+        /// The window's frame now (global, top-left origin); nil once it's gone.
+        func frame(_ id: CGWindowID) -> CGRect?
+        /// False when the window can't be reached.
+        func setFrame(pid: pid_t, id: CGWindowID, _ frame: CGRect) -> Bool
+        var userDisplays: Set<CGDirectDisplayID> { get }
+        /// Where the pointer is while the left button is held; nil when it isn't.
+        var dragPointer: CGPoint? { get }
+        /// An agent has the window (`borrow_window`).
+        func isAgents(_ id: CGWindowID) -> Bool
+        /// `clearStaleTile`: false when it has to wait for the user to be in that app.
+        func fixTile(pid: pid_t, id: CGWindowID, frame: CGRect) -> Bool
+        func fixTileLater(pid: pid_t, id: CGWindowID)
+    }
+
+    struct LiveUserWindows: UserWindowAccess {
+        func frame(_ id: CGWindowID) -> CGRect? {
+            guard let b = WindowList.info(id)?.bounds, b != .zero else { return nil }
+            return b
+        }
+        func setFrame(pid: pid_t, id: CGWindowID, _ frame: CGRect) -> Bool {
+            guard let ax = AX.window(pid: pid, id: id) else { return false }
+            // A window that fills the screen takes its place only
+            // once it's smaller, and its size only once it has moved.
+            AX.setPosition(ax, frame.origin)
+            AX.setSize(ax, frame.size)
+            AX.setPosition(ax, frame.origin)
+            return true
+        }
+        var userDisplays: Set<CGDirectDisplayID> { Set(AgentDisplay.userDisplayIDs()) }
+        var dragPointer: CGPoint? {
+            CGEventSource.buttonState(.hidSystemState, button: .left) ? CGEvent(source: nil)?.location ?? .zero : nil
+        }
+        func isAgents(_ id: CGWindowID) -> Bool { WindowManager.isRegistered(id) }
+        func fixTile(pid: pid_t, id: CGWindowID, frame: CGRect) -> Bool { AgentDisplay.clearStaleTile(pid: pid, id: id, frame: frame) }
+        func fixTileLater(pid: pid_t, id: CGWindowID) { AgentDisplay.noteStaleTile(pid: pid, id: id) }
     }
 
     /// macOS remembers, for each arrangement of displays, where every window
@@ -264,7 +304,7 @@ public final class AgentDisplay {
     private static let staleLock = NSLock()
     private static var staleTiles: [CGWindowID: pid_t] = [:]
 
-    private static func noteStaleTile(pid: pid_t, id: CGWindowID) {
+    static func noteStaleTile(pid: pid_t, id: CGWindowID) {
         staleLock.lock(); staleTiles[id] = pid; staleLock.unlock()
     }
 
@@ -290,67 +330,64 @@ public final class AgentDisplay {
     /// a frame or two of jumping.
     public static func restoreUserWindows(_ before: UserWindows, quietMs: Double = 1800) {
         guard !before.frames.isEmpty else { return }
-        let thread = Thread {
-            let deadline = nowMs() + 5000
-            var lastMoved = nowMs()
-            var moved: Set<CGWindowID> = []
-            // Where each window belongs: where it was, unless the user has
-            // moved it since.
-            var place: [CGWindowID: CGRect] = [:]
-            for w in before.frames { place[w.id] = w.bounds }
-            var dragged: [CGWindowID: (last: CGRect, changes: Int)] = [:]
-            while nowMs() < deadline && nowMs() - lastMoved < quietMs {
-                sleepMs(15)
-                // The user's own displays changed too (a monitor unplugged):
-                // then where things were no longer says where they belong.
-                guard Set(userDisplayIDs()) == before.displays else { break }
-                // A window the user is dragging or resizing isn't macOS's
-                // doing, and where they leave it is where it belongs now.
-                // Theirs is the one under the pointer that moves on every
-                // look; what macOS does to a window is one jump or two.
-                if CGEventSource.buttonState(.hidSystemState, button: .left) {
-                    let pointer = CGEvent(source: nil)?.location
-                    for w in before.frames {
-                        guard let now = WindowList.info(w.id)?.bounds, now != .zero else { continue }
-                        var d = dragged[w.id] ?? (now, 0)
-                        if now != d.last { d.changes += 1; d.last = now }
-                        dragged[w.id] = d
-                        if d.changes >= 3, let pointer, now.insetBy(dx: -12, dy: -12).contains(pointer) { place[w.id] = now }
-                    }
-                    continue
-                }
-                dragged = [:]
-                for w in before.frames {
-                    // An agent has taken it since (`borrow_window` moves a
-                    // window of the user's onto its display): not put back.
-                    if WindowManager.isRegistered(w.id) { continue }
-                    guard let want = place[w.id], let now = WindowList.info(w.id)?.bounds, now != .zero,
-                          abs(now.minX - want.minX) > 1 || abs(now.minY - want.minY) > 1
-                            || abs(now.width - want.width) > 1 || abs(now.height - want.height) > 1,
-                          let ax = AX.window(pid: w.pid, id: w.id) else { continue }
-                    // A window that fills the screen takes its place only
-                    // once it's smaller, and its size only once it has moved.
-                    AX.setPosition(ax, want.origin)
-                    AX.setSize(ax, want.size)
-                    AX.setPosition(ax, want.origin)
-                    moved.insert(w.id)
-                    lastMoved = nowMs()
-                }
-            }
-            if !moved.isEmpty {
-                Log.info("macOS moved \(moved.count) of the user's windows when the displays changed; put them back where they were")
-            }
-            // Why macOS moved it: usually a tile it still holds for a window
-            // that has since gone back to its own size. Clear that, so the
-            // next display change leaves the window alone.
-            for w in before.frames where moved.contains(w.id) {
-                guard let want = place[w.id] else { continue }
-                if !clearStaleTile(pid: w.pid, id: w.id, frame: want) { noteStaleTile(pid: w.pid, id: w.id) }
-            }
-        }
+        let thread = Thread { watchUserWindows(before, quietMs: quietMs, access: LiveUserWindows()) }
         thread.name = "bcu.display.windows"
         thread.qualityOfService = .userInteractive
         thread.start()
+    }
+
+    /// The calling thread; returns `quietMs` after the last move, 5 s at most.
+    static func watchUserWindows(_ before: UserWindows, quietMs: Double, access: UserWindowAccess) {
+        let deadline = nowMs() + 5000
+        var lastMoved = nowMs()
+        var moved: Set<CGWindowID> = []
+        // Where each window belongs: where it was, unless the user has
+        // moved it since.
+        var place: [CGWindowID: CGRect] = [:]
+        for w in before.frames { place[w.id] = w.bounds }
+        var dragged: [CGWindowID: (last: CGRect, changes: Int)] = [:]
+        while nowMs() < deadline && nowMs() - lastMoved < quietMs {
+            sleepMs(15)
+            // The user's own displays changed too (a monitor unplugged):
+            // then where things were no longer says where they belong.
+            guard access.userDisplays == before.displays else { break }
+            // A window the user is dragging or resizing isn't macOS's
+            // doing, and where they leave it is where it belongs now.
+            // Theirs is the one under the pointer that moves on every
+            // look; what macOS does to a window is one jump or two.
+            if let pointer = access.dragPointer {
+                for w in before.frames {
+                    guard let now = access.frame(w.id) else { continue }
+                    var d = dragged[w.id] ?? (now, 0)
+                    if now != d.last { d.changes += 1; d.last = now }
+                    dragged[w.id] = d
+                    if d.changes >= 3, now.insetBy(dx: -12, dy: -12).contains(pointer) { place[w.id] = now }
+                }
+                continue
+            }
+            dragged = [:]
+            for w in before.frames {
+                // An agent has taken it since (`borrow_window` moves a
+                // window of the user's onto its display): not put back.
+                if access.isAgents(w.id) { continue }
+                guard let want = place[w.id], let now = access.frame(w.id),
+                      abs(now.minX - want.minX) > 1 || abs(now.minY - want.minY) > 1
+                        || abs(now.width - want.width) > 1 || abs(now.height - want.height) > 1,
+                      access.setFrame(pid: w.pid, id: w.id, want) else { continue }
+                moved.insert(w.id)
+                lastMoved = nowMs()
+            }
+        }
+        if !moved.isEmpty {
+            Log.info("macOS moved \(moved.count) of the user's windows when the displays changed; put them back where they were")
+        }
+        // Why macOS moved it: usually a tile it still holds for a window
+        // that has since gone back to its own size. Clear that, so the
+        // next display change leaves the window alone.
+        for w in before.frames where moved.contains(w.id) {
+            guard let want = place[w.id] else { continue }
+            if !access.fixTile(pid: w.pid, id: w.id, frame: want) { access.fixTileLater(pid: w.pid, id: w.id) }
+        }
     }
 
     // MARK: Spares
