@@ -3,6 +3,9 @@ import Foundation
 /// Blocking line-based client for the app's unix socket.
 public final class SocketClient {
     private let fd: Int32
+    /// The engine's process, read at connect (it can't be once the engine
+    /// has closed the connection).
+    private var peer: pid_t = 0
     private var buffer = LineBuffer()
     private var nextID = 1
 
@@ -32,6 +35,9 @@ public final class SocketClient {
             close(fd)
             throw SocketError.notRunning
         }
+        var pid: pid_t = 0
+        var size = socklen_t(MemoryLayout<pid_t>.size)
+        if getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &size) == 0 { peer = pid }
     }
 
     deinit { close(fd) }
@@ -119,6 +125,9 @@ public final class SocketClient {
 
     private func readLine(deadline: Date, timeout: TimeInterval) throws -> Data {
         var chunk = [UInt8](repeating: 0, count: 65536)
+        // A stopped engine can't answer however long the call may take: it
+        // only looks slow. Looked at between waits of a quarter second.
+        var stoppedSince: Date?
         while true {
             if let line = buffer.nextLine() { return line }
             let ms = Int(deadline.timeIntervalSinceNow * 1000)
@@ -126,8 +135,18 @@ public final class SocketClient {
                 shutdown(fd, SHUT_RDWR)
                 throw SocketError.message("\(BCUPaths.appName) isn't answering (no reply in \(Int(timeout)) s)")
             }
+            if peer > 0 && Self.isStopped(peer) {
+                let since = stoppedSince ?? Date()
+                stoppedSince = since
+                if Date().timeIntervalSince(since) >= Self.stoppedLimit {
+                    shutdown(fd, SHUT_RDWR)
+                    throw SocketError.message("\(BCUPaths.appName)'s engine is stopped (suspended, pid \(peer)), so it can't answer until it's continued")
+                }
+            } else {
+                stoppedSince = nil
+            }
             var p = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-            let ready = poll(&p, 1, Int32(min(ms, Int(Int32.max))))
+            let ready = poll(&p, 1, Int32(min(ms, 250)))
             if ready < 0 && errno == EINTR { continue }
             if ready < 0 { throw SocketError.message("app closed the connection") }
             if ready == 0 { continue }
