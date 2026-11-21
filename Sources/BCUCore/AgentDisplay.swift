@@ -160,7 +160,8 @@ public final class AgentDisplay {
         func isAgents(_ id: CGWindowID) -> Bool
         /// `clearStaleTile`: false when it has to wait for the user to be in that app.
         func fixTile(pid: pid_t, id: CGWindowID, frame: CGRect) -> Bool
-        func fixTileLater(pid: pid_t, id: CGWindowID)
+        /// `frame` is where the window was before the change, `now` where macOS put it.
+        func fixTileLater(pid: pid_t, id: CGWindowID, frame: CGRect, now: CGRect)
     }
 
     struct LiveUserWindows: UserWindowAccess {
@@ -174,7 +175,9 @@ public final class AgentDisplay {
         }
         func isAgents(_ id: CGWindowID) -> Bool { WindowManager.isRegistered(id) }
         func fixTile(pid: pid_t, id: CGWindowID, frame: CGRect) -> Bool { AgentDisplay.clearStaleTile(pid: pid, id: id, frame: frame) }
-        func fixTileLater(pid: pid_t, id: CGWindowID) { AgentDisplay.noteStaleTile(pid: pid, id: id) }
+        func fixTileLater(pid: pid_t, id: CGWindowID, frame: CGRect, now: CGRect) {
+            AgentDisplay.noteStaleTile(NotedTile(pid: pid, id: id, frame: frame, now: now))
+        }
     }
 
     /// Note where the user's windows are before a display change
@@ -293,22 +296,38 @@ public final class AgentDisplay {
     }
 
     private static let staleLock = NSLock()
-    private static var staleTiles: [CGWindowID: pid_t] = [:]
+    private static var staleTiles: [CGWindowID: NotedTile] = [:]
 
-    static func noteStaleTile(pid: pid_t, id: CGWindowID) {
-        staleLock.lock(); staleTiles[id] = pid; staleLock.unlock()
+    /// A stale tile kept for later: the window's frame before the display
+    /// change (`frame`) and where macOS put it (`now`).
+    struct NotedTile {
+        let pid: pid_t
+        let id: CGWindowID
+        let frame: CGRect
+        let now: CGRect
+    }
+
+    /// The frame to decide a noted tile's fix by, given where the window
+    /// is `current`ly; nil to forget it.
+    static func frameForNotedTile(_ t: NotedTile, current: CGRect) -> CGRect? {
+        current
+    }
+
+    static func noteStaleTile(_ t: NotedTile) {
+        staleLock.lock(); staleTiles[t.id] = t; staleLock.unlock()
     }
 
     /// Before a display change: clear what couldn't be cleared last time
     /// (the user wasn't in that app then).
     private static func clearNotedStaleTiles() {
         staleLock.lock(); let noted = staleTiles; staleLock.unlock()
-        for (id, pid) in noted {
-            guard let frame = WindowList.info(id)?.bounds, frame != .zero else {
+        for (id, t) in noted {
+            guard let current = WindowList.info(id)?.bounds, current != .zero,
+                  let frame = frameForNotedTile(t, current: current) else {
                 staleLock.lock(); staleTiles[id] = nil; staleLock.unlock()
                 continue
             }
-            if clearStaleTile(pid: pid, id: id, frame: frame) {
+            if clearStaleTile(pid: t.pid, id: id, frame: frame) {
                 staleLock.lock(); staleTiles[id] = nil; staleLock.unlock()
             }
         }
@@ -375,7 +394,9 @@ public final class AgentDisplay {
         // size. Replace that, so the next display change leaves it alone.
         for w in moved {
             guard let was = place[w.id] else { continue }
-            if !access.fixTile(pid: w.pid, id: w.id, frame: was) { access.fixTileLater(pid: w.pid, id: w.id) }
+            if !access.fixTile(pid: w.pid, id: w.id, frame: was), let now = last[w.id] {
+                access.fixTileLater(pid: w.pid, id: w.id, frame: was, now: now)
+            }
         }
     }
 

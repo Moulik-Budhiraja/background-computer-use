@@ -33,7 +33,7 @@ final class DisplayChangeWindowsTests: XCTestCase {
             tilesFixed.append((id, frame))
             return true
         }
-        func fixTileLater(pid: pid_t, id: CGWindowID) {}
+        func fixTileLater(pid: pid_t, id: CGWindowID, frame: CGRect, now: CGRect) {}
     }
 
     func watch(_ w: Windows) {
