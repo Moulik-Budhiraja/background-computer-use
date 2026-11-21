@@ -181,47 +181,63 @@ public final class WindowManager {
         let dir = BCUPaths.supportDirectory
         let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
             .filter { $0.hasPrefix("windows") && $0.hasSuffix(".json") }
-        // Before this run has a display of its own, every BCU display is
-        // one the last run left.
-        let agentDisplays = AgentDisplay.strayIDs.map { CGDisplayBounds($0) }
-        return files.flatMap { recover(dir.appendingPathComponent($0), agentDisplays: agentDisplays) }
+        return files.flatMap { recover(dir.appendingPathComponent($0)) }
     }
 
     /// Whether recovery closes (or answers for) a window the last run had:
-    /// only one it opened or caught that's still on a display of its. Once
-    /// its display is gone the window is on the user's screen, where they
-    /// may be using it now.
-    static func recoveryCloses(kind: String?, bounds: CGRect, agentDisplays: [CGRect]) -> Bool {
-        kind != AgentWindow.Kind.borrowed.rawValue && agentDisplays.contains { $0.contains(CGPoint(x: bounds.midX, y: bounds.midY)) }
+    /// one it opened or caught, wherever it is now. Its display went with
+    /// the last run, so it's on the user's screen, but it's still the
+    /// agent's and nobody else will close it.
+    static func recoveryCloses(kind: String?) -> Bool {
+        kind == AgentWindow.Kind.opened.rawValue || kind == AgentWindow.Kind.caught.rawValue
     }
 
-    /// Whether recovery closes a window the last run had, wherever it is
-    /// now. (Not yet: only one still on a leftover display is closed.)
-    static func recoveryCloses(kind: String?) -> Bool { false }
-
     /// Whether a window the record names is still the one the last run had:
-    /// its app was already running when the record was written. (Not
-    /// checked yet.)
-    static func recordStillNames(appLaunched: Date?, recordWritten: Date?) -> Bool { true }
+    /// its app was already running when the record was written. One that
+    /// started later (after a restart, or with the pid used again) has a
+    /// window with that id by chance.
+    static func recordStillNames(appLaunched: Date?, recordWritten: Date?) -> Bool {
+        guard let appLaunched, let recordWritten else { return false }
+        return appLaunched <= recordWritten
+    }
 
-    /// Of the buttons on a sheet that asks about unsaved changes, the one
-    /// that throws them away. (None yet.)
-    static func discardButton(_ titles: [String]) -> String? { nil }
+    /// Of the buttons on a sheet that asks about unsaved changes ("Don't
+    /// Save", or "Delete" for a new document, beside Cancel and Save), the
+    /// one that throws them away.
+    static func discardButton(_ titles: [String]) -> String? {
+        guard titles.contains("Cancel"), titles.contains(where: { $0.hasPrefix("Save") }) else { return nil }
+        return titles.first { ["Don’t Save", "Don't Save", "Delete"].contains($0) }
+    }
 
-    private static func recover(_ url: URL, agentDisplays: [CGRect]) -> [String] {
+    /// A sheet on `window` asking whether to save its changes: answer it
+    /// with the button that throws them away. Only for an agent's own
+    /// window that BCU is closing because it's quitting (or its last run
+    /// died): no one is left to answer, and the document is the agent's.
+    @discardableResult
+    static func answerDiscard(_ window: AXUIElement) -> Bool {
+        for sheet in AX.children(window) where AX.string(sheet, "AXRole") == "AXSheet" {
+            let found = buttons(in: sheet)
+            guard let title = discardButton(found.map(\.title)),
+                  let button = found.first(where: { $0.title == title }) else { continue }
+            return AX.perform(button.element, "AXPress") == .success
+        }
+        return false
+    }
+
+    private static func recover(_ url: URL) -> [String] {
         defer { try? FileManager.default.removeItem(at: url) }
         guard let data = try? Data(contentsOf: url),
               let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+        let written = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
         var notes: [String] = []
         func live(_ e: [String: Any]) -> (id: CGWindowID, pid: pid_t, ax: AXUIElement)? {
             guard let id = (e["id"] as? Int).map({ CGWindowID($0) }), let pid = (e["pid"] as? Int).map({ pid_t($0) }),
-                  WindowList.info(id)?.pid == pid, let ax = AX.window(pid: pid, id: id) else { return nil }
+                  WindowList.info(id)?.pid == pid,
+                  recordStillNames(appLaunched: NSRunningApplication(processIdentifier: pid)?.launchDate, recordWritten: written),
+                  let ax = AX.window(pid: pid, id: id) else { return nil }
             return (id, pid, ax)
         }
-        func closes(_ e: [String: Any], _ id: CGWindowID) -> Bool {
-            guard let bounds = WindowList.info(id)?.bounds else { return false }
-            return recoveryCloses(kind: e["kind"] as? String, bounds: bounds, agentDisplays: agentDisplays)
-        }
+        func closes(_ e: [String: Any], _ id: CGWindowID) -> Bool { recoveryCloses(kind: e["kind"] as? String) }
         // A dialog the last run caught that's still asking whether to leave
         // a page would keep that page's window open: answer it first.
         for e in entries where e["kind"] as? String == AgentWindow.Kind.caught.rawValue {
@@ -232,19 +248,31 @@ public final class WindowManager {
         // answering one would throw away what they'd typed there.
         var dialogsBefore: [pid_t: Set<CGWindowID>] = [:]
         var closed: [(id: CGWindowID, pid: pid_t, app: Any)] = []
+        var asking: [(id: CGWindowID, ax: AXUIElement, app: Any)] = []
         for e in entries {
             guard let (id, pid, ax) = live(e) else { continue }
             if e["kind"] as? String == "borrowed", let f = e["frame"] as? [Double], f.count == 4 {
                 AX.setPosition(ax, CGPoint(x: f[0], y: f[1]))
                 AX.setSize(ax, CGSize(width: f[2], height: f[3]))
                 notes.append("returned \(e["app"] ?? "?") window \(id)")
-            } else if !closes(e, id) {
-                notes.append("left \(e["app"] ?? "?") window \(id) where it is: it's on your screen now")
-            } else if let close = AX.element(ax, "AXCloseButton") {
+            } else if closes(e, id), let close = AX.element(ax, "AXCloseButton") {
                 if dialogsBefore[pid] == nil { dialogsBefore[pid] = Self.dialogIDs(pid) }
                 AX.perform(close, "AXPress")
                 closed.append((id, pid, e["app"] ?? "?"))
+                asking.append((id, ax, e["app"] ?? "?"))
                 notes.append("closed leftover \(e["app"] ?? "?") window \(id)")
+            }
+        }
+        // A document with changes asks whether to save them, in a sheet on
+        // its window. Nobody is left to answer for the agent: throw them away.
+        let deadline = nowMs() + 1500
+        while !asking.isEmpty && nowMs() < deadline {
+            sleepMs(50)
+            asking.removeAll { w in
+                guard WindowList.info(w.id) != nil else { return true }
+                guard answerDiscard(w.ax) else { return false }
+                notes.append("threw away the unsaved changes in \(w.app) window \(w.id)")
+                return true
             }
         }
         // A page that asks only now: its dialog is a new window of that app.
@@ -964,7 +992,11 @@ public final class WindowManager {
         return aw
     }
 
-    public func release(_ id: CGWindowID, keepOpen: Bool) throws -> String {
+    /// `discard`: BCU is quitting, so a sheet asking whether to save the
+    /// window's changes is answered by throwing them away (the agent can't
+    /// answer it any more, and the window mustn't end up on the user's
+    /// screen when the display goes).
+    public func release(_ id: CGWindowID, keepOpen: Bool, discard: Bool = false) throws -> String {
         guard let w = window(id) else { throw ToolError("window \(id) isn't one of yours") }
         guard let ax = AX.window(pid: w.pid, id: id) else {
             // (Gone only if the window server says so: see `Engine.agentWindow`.)
@@ -1013,9 +1045,11 @@ public final class WindowManager {
             // from their screen within a frame or two.
             var asked: String?
             var looked: Set<CGWindowID> = []
+            var discarded = false
             func closed(withinMs ms: Double) -> Bool {
                 let deadline = nowMs() + ms
                 while WindowList.info(id) != nil && nowMs() < deadline {
+                    if discard && !discarded { discarded = Self.answerDiscard(ax) }
                     for info in WindowList.of(pid: w.pid, onScreenOnly: true)
                     where info.layer <= 8 && !onScreenBefore.contains(info.id) && !looked.contains(info.id) {
                         // (Not in accessibility yet: look again next time round.)
@@ -1032,6 +1066,7 @@ public final class WindowManager {
                 unregister(id)
                 for other in windows where other.kind == .caught && WindowList.info(other.id) == nil { unregister(other.id) }
                 if let asked { return "closed window \(id) (the page asked \"\(asked)\"; answered Leave)" }
+                if discarded { return "closed window \(id) (threw away its unsaved changes)" }
                 return "closed window \(id)"
             }
             // The app asked before closing, in a window of its own that can
@@ -1377,9 +1412,9 @@ public final class WindowManager {
         if wasWithUser { moveToAgent(ax, size: AX.size(ax) ?? CGSize(width: 1200, height: 800)) }
     }
 
-    /// Close opened windows and return borrowed ones.
-    public func releaseAll() -> [String] {
-        windows.map { (try? release($0.id, keepOpen: false)) ?? "window \($0.id): failed" }
+    /// Close opened windows and return borrowed ones. `discard`: see `release`.
+    public func releaseAll(discard: Bool = false) -> [String] {
+        windows.map { (try? release($0.id, keepOpen: false, discard: discard)) ?? "window \($0.id): failed" }
     }
 
     // MARK: Watchdog
