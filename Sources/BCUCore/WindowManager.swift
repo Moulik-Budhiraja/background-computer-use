@@ -466,6 +466,13 @@ public final class WindowManager {
         }
     }
 
+    /// Whether the app opens a new window as a tab in its full-screen key
+    /// window, from the user's tab preference for it (`AppleWindowTabbingMode`,
+    /// nil: not set).
+    static func opensAsTabInFullScreen(keyIsFullScreen: Bool, tabbingMode: String?) -> Bool {
+        false
+    }
+
     /// Whether a cold launch that got no new window borrows the app's
     /// startup window instead: only an app's only one, and not while the
     /// user is in the app (they may have gone to it while the open waited
