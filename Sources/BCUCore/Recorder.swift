@@ -771,8 +771,10 @@ public final class SessionRecorder {
         let spots = Self.windowSpots(WindowList.all(onScreenOnly: true), on: display.bounds, me: getpid())
         guard Self.wantsCapture(pending: pendingForced, sinceLastCaptureMs: nowMs() - Capture.lastCaptureMs,
                                 windowsChanged: spots != lastSpots) else { return }
+        // A capture that failed (ScreenCaptureKit timed out) is tried again
+        // on a later tick: the frame is still wanted.
+        guard capture(force: pendingForced) else { return }
         lastSpots = spots
-        capture(force: pendingForced)
         pendingForced = false
     }
 
@@ -802,13 +804,16 @@ public final class SessionRecorder {
         }.map { WindowSpot(id: $0.id, bounds: $0.bounds, title: $0.title, alpha: $0.alpha) }
     }
 
-    private func capture(force: Bool) {
-        guard writer != nil, display.isRunning else { return }
+    /// False when nothing could be captured.
+    @discardableResult
+    private func capture(force: Bool) -> Bool {
+        guard writer != nil, display.isRunning else { return false }
         let b = display.bounds
         let w = Int((b.width * Self.pixelsPerPoint).rounded())
         // Window by window through SkyLight, wallpaper and menu bar included.
-        guard let image = Capture.composite(display: display, width: w, wholeDisplay: true) else { return }
+        guard let image = Capture.composite(display: display, width: w, wholeDisplay: true) else { return false }
         record(image, force: force)
+        return true
     }
 
     /// Keeps `image` if it differs from the last frame kept.
