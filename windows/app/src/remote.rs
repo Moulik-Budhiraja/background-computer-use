@@ -42,10 +42,11 @@ struct Drag {
 
 #[derive(Default)]
 struct State {
-    /// Where keys go: the window last clicked.
+    /// Where keys go: the window last clicked (a dialog of the family's included).
     key_window: Option<usize>,
     drag: Option<Drag>,
-    /// The window a button went down in: the rest of the press goes there.
+    /// The control a button went down in: the rest of the press goes there,
+    /// as the mouse capture a real press would take (posted messages don't).
     pressed: Option<usize>,
     /// A caption button pressed (close, maximize), acted on at release.
     caption: Option<(usize, u32)>,
@@ -156,10 +157,9 @@ impl Remote {
                 _ => {}
             }
         }
-        st.pressed = Some(root.0 as usize);
-        if win::is_app_window(root) {
-            st.key_window = Some(root.0 as usize);
-        }
+        let (target, local) = input::target_at(root, p);
+        st.pressed = Some(target.0 as usize);
+        st.key_window = Some(root.0 as usize);
         drop(st);
         let (down, dbl) = match button {
             2 => (WM_RBUTTONDOWN, WM_RBUTTONDBLCLK),
@@ -168,11 +168,23 @@ impl Remote {
         };
         let held = mods.keys() | button_mask(button);
         acting(root, || {
-            let (target, local) = input::target_at(root, p);
             post(target, WM_MOUSEMOVE, mods.keys(), input::point_lparam(local));
             post(target, if clicks == 2 { dbl } else { down }, held, input::point_lparam(local));
         });
         Ok(())
+    }
+
+    /// Where the rest of a press goes: the control it began in, with `p` in
+    /// its client coordinates. Otherwise the control under `p`.
+    fn press_target(&self, pressed: Option<usize>, p: POINT, screen: &RECT) -> Option<(HWND, POINT)> {
+        if let Some(c) = pressed.map(|c| HWND(c as *mut _)).filter(|h| win::exists(*h)) {
+            let mut local = p;
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::ScreenToClient(c, &mut local);
+            }
+            return Some((c, local));
+        }
+        self.window_at(p, screen).map(|root| input::target_at(root, p))
     }
 
     fn mouse_up(&self, p: POINT, button: i64, mods: Mods, screen: &RECT) -> Result<(), String> {
@@ -199,16 +211,15 @@ impl Remote {
             }
             return Ok(());
         }
-        let root = st.pressed.take().map(|w| HWND(w as *mut _)).filter(|h| win::exists(*h)).or_else(|| self.window_at(p, screen));
+        let pressed = st.pressed.take();
         drop(st);
-        let Some(root) = root else { return Ok(()) };
+        let Some((target, local)) = self.press_target(pressed, p, screen) else { return Ok(()) };
         let up = match button {
             2 => WM_RBUTTONUP,
             1 => WM_MBUTTONUP,
             _ => WM_LBUTTONUP,
         };
-        acting(root, || {
-            let (target, local) = input::target_at(root, p);
+        acting(target, || {
             post(target, up, mods.keys(), input::point_lparam(local));
             if button == 2 {
                 // What DefWindowProc sends after a real right click.
@@ -219,7 +230,7 @@ impl Remote {
     }
 
     fn mouse_move(&self, p: POINT, buttons: i64, mods: Mods, screen: &RECT) -> Result<(), String> {
-        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(d) = &st.drag {
             let r = dragged(d, p, screen);
             unsafe {
@@ -227,12 +238,16 @@ impl Remote {
             }
             return Ok(());
         }
-        let root = st.pressed.map(|w| HWND(w as *mut _)).filter(|h| win::exists(*h));
+        // No button held: any press is over (its release may never have come).
+        let pressed = if buttons == 0 { None } else { st.pressed };
+        if buttons == 0 {
+            st.pressed = None;
+        }
         drop(st);
         if let Some(tx) = self.cursor.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let _ = tx.send(p);
         }
-        let Some(root) = root.or_else(|| self.window_at(p, screen)) else { return Ok(()) };
+        let Some((target, local)) = self.press_target(pressed, p, screen) else { return Ok(()) };
         let mut held = mods.keys();
         if buttons & 1 != 0 {
             held |= MK_LBUTTON.0 as usize;
@@ -243,7 +258,6 @@ impl Remote {
         if buttons & 4 != 0 {
             held |= MK_MBUTTON.0 as usize;
         }
-        let (target, local) = input::target_at(root, p);
         post(target, WM_MOUSEMOVE, held, input::point_lparam(local));
         Ok(())
     }
@@ -285,6 +299,8 @@ impl Remote {
         let wanted = st.key_window.map(|w| HWND(w as *mut _));
         drop(st);
         let shown = host::shown_windows(&self.session, screen, 0);
+        // The window last clicked while it's still the family's (a dialog
+        // counts), else the family's topmost window.
         let Some(window) = wanted.filter(|w| shown.contains(w)).or_else(|| shown.into_iter().find(|h| win::is_app_window(*h))) else {
             return Ok(());
         };
