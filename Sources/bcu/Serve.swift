@@ -17,7 +17,10 @@ import BCUShared
 /// starts the app and uses its engine instead, unless `--own-engine`.
 enum Serve {
     static func run(_ args: [String]) -> Never {
-        if let refusal = BCUCopy.serveRefusal(URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()) {
+        // The kernel's path for this executable: argv[0] is a bare name when
+        // `bcu` was found through PATH.
+        let exe = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
+        if let refusal = BCUCopy.serveRefusal(exe.resolvingSymlinksInPath()) {
             FileHandle.standardError.write(Data((refusal + "\n").utf8))
             exit(64)
         }
