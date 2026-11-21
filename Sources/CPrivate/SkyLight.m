@@ -204,6 +204,23 @@ CGImageRef BCUCaptureDisplayRect(CGDirectDisplayID display, CGRect rect) {
     return f ? f(display, rect) : NULL;
 }
 
+typedef CGError (*ConfigureDisplayEnabledFn)(CGDisplayConfigRef, CGDirectDisplayID, bool);
+
+int BCUDisableDisplay(CGDirectDisplayID display) {
+    ConfigureDisplayEnabledFn enable = (ConfigureDisplayEnabledFn)Sym("SLSConfigureDisplayEnabled");
+    if (!enable) enable = (ConfigureDisplayEnabledFn)Sym("CGSConfigureDisplayEnabled");
+    if (!enable || display == kCGNullDirectDisplay) return -1;
+    CGDisplayConfigRef config = NULL;
+    CGError err = CGBeginDisplayConfiguration(&config);
+    if (err != kCGErrorSuccess) return err;
+    err = enable(config, display, false);
+    if (err != kCGErrorSuccess) {
+        CGCancelDisplayConfiguration(config);
+        return err;
+    }
+    return CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
+}
+
 typedef uint64_t (*ManagedDisplayGetCurrentSpaceFn)(uint32_t cid, CFStringRef displayUUID);
 typedef int32_t (*ProcessAssignToSpaceFn)(uint32_t cid, pid_t pid, uint64_t sid);
 
