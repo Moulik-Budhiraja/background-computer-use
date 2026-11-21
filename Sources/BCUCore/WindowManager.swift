@@ -195,6 +195,19 @@ public final class WindowManager {
         kind != AgentWindow.Kind.borrowed.rawValue && agentDisplays.contains { $0.contains(CGPoint(x: bounds.midX, y: bounds.midY)) }
     }
 
+    /// Whether recovery closes a window the last run had, wherever it is
+    /// now. (Not yet: only one still on a leftover display is closed.)
+    static func recoveryCloses(kind: String?) -> Bool { false }
+
+    /// Whether a window the record names is still the one the last run had:
+    /// its app was already running when the record was written. (Not
+    /// checked yet.)
+    static func recordStillNames(appLaunched: Date?, recordWritten: Date?) -> Bool { true }
+
+    /// Of the buttons on a sheet that asks about unsaved changes, the one
+    /// that throws them away. (None yet.)
+    static func discardButton(_ titles: [String]) -> String? { nil }
+
     private static func recover(_ url: URL, agentDisplays: [CGRect]) -> [String] {
         defer { try? FileManager.default.removeItem(at: url) }
         guard let data = try? Data(contentsOf: url),
