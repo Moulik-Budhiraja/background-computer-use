@@ -686,9 +686,25 @@ public final class Engine {
             // Still at work in that window: it keeps its app's key a while longer.
             if let id = windowID { focusGuard.touchParked(window: id) }
         }
+        if let refusal = Self.lockedRefusal(tool: tool, window: windowID != nil, locked: Self.screenLocked()) {
+            throw ToolError(refusal)
+        }
         // Opening or borrowing a window is what needs a display.
         if tool == "open_window" || tool == "borrow_window" { try ensureDisplay() }
         return try dispatch(tool: tool, args: args)
+    }
+
+    /// Whether the user's session is locked (the lock screen, also after
+    /// the display sleeps when the Mac asks for the password then).
+    static func screenLocked() -> Bool {
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        return session?["CGSSessionScreenIsLocked"] as? Bool ?? false
+    }
+
+    /// Why `tool` can't run now, if it can't. `window`: it acts on one of
+    /// the agent's windows.
+    static func lockedRefusal(tool: String, window: Bool, locked: Bool) -> String? {
+        nil
     }
 
     /// Maintenance and test tools (`admin_*`) work only when the app was
