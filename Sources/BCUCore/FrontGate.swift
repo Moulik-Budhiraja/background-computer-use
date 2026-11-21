@@ -969,8 +969,9 @@ public final class FrontGate {
 
     /// Whether the watchdog, its engine gone, keeps trying to take recorded
     /// entries off. `owner`: the engine that last started (nil: none since).
-    static func watchdogKeepsTrying(cleared: Bool, owner: pid_t?, engine: pid_t) -> Bool {
-        !cleared && (owner == nil || owner == engine)
+    /// `toldToGo`: a SIGTERM, SIGINT or SIGHUP came.
+    static func watchdogKeepsTrying(cleared: Bool, owner: pid_t?, engine: pid_t, toldToGo: Bool = false) -> Bool {
+        !cleared && !toldToGo && (owner == nil || owner == engine)
     }
 
     private static var engineURL: URL { BCUPaths.supportDirectory.appendingPathComponent("front-gate.engine") }
@@ -993,7 +994,7 @@ public final class FrontGate {
             while true {
                 let cleared = watchdogClear()
                 let owner = (try? String(contentsOf: engineURL, encoding: .utf8)).flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
-                guard watchdogKeepsTrying(cleared: cleared, owner: owner, engine: engine) else { return }
+                guard watchdogKeepsTrying(cleared: cleared, owner: owner, engine: engine, toldToGo: watchdogToldToGo != 0) else { return }
                 usleep(pause)
                 pause = min(pause * 2, 2_000_000)
             }

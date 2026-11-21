@@ -306,6 +306,15 @@ final class FrontGateWindowServerTests: XCTestCase {
         XCTAssertFalse(FrontGate.watchdogKeepsTrying(cleared: true, owner: 50, engine: 50))
     }
 
+    /// Told to go (SIGTERM, or `pkill` by name) while entries won't come off,
+    /// it goes: they stay recorded, and the next launch takes them off. A
+    /// watchdog that stayed would also stay listed as the app, and opening
+    /// the app again would fail.
+    func testTheWatchdogStopsTryingWhenToldToGo() {
+        XCTAssertFalse(FrontGate.watchdogKeepsTrying(cleared: false, owner: nil, engine: 50, toldToGo: true))
+        XCTAssertFalse(FrontGate.watchdogKeepsTrying(cleared: false, owner: 50, engine: 50, toldToGo: true))
+    }
+
     /// A click right after the watchdog's cleanup, before the next pass:
     /// the list stays down (adding the app kept back alone would keep every
     /// other app out), and comes back up once the click's moment is over.
