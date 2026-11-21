@@ -388,12 +388,17 @@ public final class WindowManager {
     }
 
     /// How an agent's open launches an app that isn't running: hidden,
-    /// without activating it.
+    /// without activating it, and never asking the user. macOS asks before
+    /// some launches (install Rosetta for an Intel app, a downloaded app
+    /// Gatekeeper can't check, a damaged one) in an alert on their screen,
+    /// for a launch they didn't ask for. Then the launch fails instead, and
+    /// the agent is told why.
     static func launchConfiguration() -> NSWorkspace.OpenConfiguration {
         let config = NSWorkspace.OpenConfiguration()
         config.activates = false
         config.hides = true
         config.addsToRecentItems = false
+        config.promptsUserIfNeeded = false
         return config
     }
 
@@ -415,7 +420,9 @@ public final class WindowManager {
         }
         _ = sem.wait(timeout: .now() + 20)
         guard let app = launched else {
-            throw ToolError("could not launch \(name): \(launchError?.localizedDescription ?? "timed out")")
+            // (Asking the user is the one thing it was told not to do:
+            // what it would have asked is in the error.)
+            throw ToolError("could not launch \(name): \(launchError?.localizedDescription ?? "timed out"). If macOS has to ask the user before it opens \(name), ask them to open it once themselves.")
         }
         let pid = app.processIdentifier
         focusGuard.beginAction(pid: pid, cause: "launching \(name)")
