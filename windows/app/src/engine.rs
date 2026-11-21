@@ -444,8 +444,9 @@ impl Engine {
         let args = Args(args);
         let acting = BATCHABLE.contains(&tool) || tool == "open_window" || tool == "borrow_window";
         // Closing a window the user is working in would pull it out from under them.
+        // The user drives a session's whole family's windows (`host::shown_windows`).
         if (!READ_ONLY.contains(&tool) || tool == "release_window")
-            && (host::user_in_control(&self.id) || args.str("_session").is_some_and(host::user_in_control))
+            && (host::family_in_control(&self.id) || args.str("_session").is_some_and(host::family_in_control))
         {
             return ToolResult::error("The user took over your display and is using your windows. Wait and retry later, or tell the user you're blocked.");
         }

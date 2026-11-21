@@ -270,15 +270,15 @@ pub fn watch_leave(session: &str, hwnd: HWND) {
     }
     let session = session.to_string();
     let key = hwnd.0 as usize;
+    // Dialogs already up are someone else's business: noted now, before the
+    // step runs and can raise one of its own.
+    let mut looked: Vec<usize> = dialogs_of(hwnd).iter().map(|h| h.0 as usize).collect();
     std::thread::spawn(move || {
         let hwnd = HWND(key as *mut _);
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
         let auto: Option<IUIAutomation> = unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER).ok() };
-        // Dialogs already up are someone else's business.
-        let before: Vec<HWND> = dialogs_of(hwnd);
-        let mut looked: Vec<usize> = before.iter().map(|h| h.0 as usize).collect();
         loop {
             let over = {
                 let mut w = WATCHES.lock().unwrap_or_else(|e| e.into_inner());

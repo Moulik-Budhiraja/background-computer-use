@@ -442,6 +442,11 @@ async function takenOver(cursors: CursorEvent[], drags: DragEvent[]) {
   assert.equal(session('helper-1')!.user_in_control, true)
   const refused = await helper.call('click', { window_id: edge, x: 5, y: 5 })
   assert.ok(refused.error && /took over your display/.test(refused.text), refused.text)
+  // A subagent too: the user has the family's windows.
+  const sub = await helper.call('status', {}, { threadId: 'sub-thread' })
+  assert.ok(!sub.error)
+  const subRefused = await helper.call('open_window', { app: 'notepad' }, { threadId: 'sub-thread' })
+  assert.ok(subRefused.error && /took over your display/.test(subRefused.text), subRefused.text)
   // Reading still works, and says where things are.
   const st = await helper.ok('get_window_state', { window_id: edge, screenshot: false, full: true })
   const at = (re: RegExp) => {

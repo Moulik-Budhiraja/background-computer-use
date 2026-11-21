@@ -187,6 +187,12 @@ pub fn user_in_control(session: &str) -> bool {
     with_extras(|x| x.get(session).is_some_and(|e| !e.controllers.is_empty()))
 }
 
+/// Whether the user is driving the screen of the session or one of its
+/// family: take-over reaches every window of the family.
+pub fn family_in_control(session: &str) -> bool {
+    family(session).iter().any(|s| user_in_control(s))
+}
+
 /// Whether the user is driving any session's screen.
 pub fn any_user_in_control() -> bool {
     with_extras(|x| x.values().any(|e| !e.controllers.is_empty()))
