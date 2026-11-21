@@ -382,11 +382,16 @@ public final class AgentDisplay {
         guard !gone.isEmpty else { return }
         let before = noteUserWindows()
         for s in gone {
-            s.display.invalidate()
+            Self.remove(s.id, disable: { _ in }, release: s.display.invalidate)
             Log.info("agent display \(s.slot + 1) (\(s.id)) removed: no agent has needed it for a while")
         }
         for d in running { d.reconfigured() }
         restoreUserWindows(before)
+    }
+
+    /// Take display `id` away: `release` lets go of it, and macOS removes it.
+    static func remove(_ id: CGDirectDisplayID, disable: (CGDirectDisplayID) -> Void, release: () -> Void) {
+        release()
     }
 
     /// Spare displays there are (for the status line and tests).
@@ -497,7 +502,7 @@ public final class AgentDisplay {
             register()
             return
         }
-        spare?.display.invalidate()
+        if let spare { Self.remove(spare.id, disable: { _ in }, release: spare.display.invalidate) }
         reused = false
         Self.noteChange()
         self.slot = slot
@@ -582,7 +587,7 @@ public final class AgentDisplay {
             return
         }
         let before = Self.noteUserWindows()
-        vd.invalidate()
+        Self.remove(id, disable: { _ in }, release: vd.invalidate)
         Log.info("agent display \(slot + 1) (\(id)) removed")
         // The ones after it move up the staircase.
         for d in Self.running { d.reconfigured() }
