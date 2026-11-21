@@ -161,6 +161,7 @@ public final class WindowManager {
         lock.lock()
         let entries: [[String: Any]] = registry.values.map { w in
             var e: [String: Any] = ["id": Int(w.id), "pid": Int(w.pid), "app": w.appName, "kind": w.kind.rawValue]
+            if Self.handedToUser(handedOff: w.handedOff, withUser: w.withUser) { e["handedToUser"] = true }
             if let f = w.originalFrame { e["frame"] = [f.minX, f.minY, f.width, f.height] }
             return e
         }
@@ -197,9 +198,8 @@ public final class WindowManager {
     /// started later (after a restart, or with the pid used again) has a
     /// window with that id by chance.
     /// Whether a window the agent handed to the user is theirs to finish:
-    /// quitting doesn't throw its changes away, and recovery leaves it. (Not
-    /// yet: every window of the agent's is treated alike.)
-    static func handedToUser(handedOff: Bool, withUser: Bool) -> Bool { false }
+    /// quitting doesn't throw its changes away, and recovery leaves it.
+    static func handedToUser(handedOff: Bool, withUser: Bool) -> Bool { handedOff || withUser }
 
     static func recordStillNames(appLaunched: Date?, recordWritten: Date?) -> Bool {
         guard let appLaunched, let recordWritten else { return false }
@@ -242,7 +242,9 @@ public final class WindowManager {
                   let ax = AX.window(pid: pid, id: id) else { return nil }
             return (id, pid, ax)
         }
-        func closes(_ e: [String: Any], _ id: CGWindowID) -> Bool { recoveryCloses(kind: e["kind"] as? String) }
+        func closes(_ e: [String: Any], _ id: CGWindowID) -> Bool {
+            recoveryCloses(kind: e["kind"] as? String) && e["handedToUser"] as? Bool != true
+        }
         // A dialog the last run caught that's still asking whether to leave
         // a page would keep that page's window open: answer it first.
         for e in entries where e["kind"] as? String == AgentWindow.Kind.caught.rawValue {
@@ -1383,6 +1385,7 @@ public final class WindowManager {
         w.handedOff = true
         w.handoffReason = reason
         w.withUser = false
+        persist()
     }
 
     /// The user asked for a handed-off window: center it on `area` (global
@@ -1396,6 +1399,7 @@ public final class WindowManager {
             AX.setSize(ax, CGSize(width: w2, height: h2))
             AX.setPosition(ax, CGPoint(x: (area.midX - w2 / 2).rounded(), y: (area.midY - h2 / 2).rounded()))
             w.withUser = true
+            persist()
         }
         // The user asked for it, so it takes the front.
         focusGuard.noteUserSwitch()
@@ -1414,12 +1418,16 @@ public final class WindowManager {
         w.handedOff = false
         w.handoffReason = nil
         w.withUser = false
+        persist()
         if wasWithUser { moveToAgent(ax, size: AX.size(ax) ?? CGSize(width: 1200, height: 800)) }
     }
 
     /// Close opened windows and return borrowed ones. `discard`: see `release`.
     public func releaseAll(discard: Bool = false) -> [String] {
-        windows.map { (try? release($0.id, keepOpen: false, discard: discard)) ?? "window \($0.id): failed" }
+        windows.map { w in
+            let discards = discard && !Self.handedToUser(handedOff: w.handedOff, withUser: w.withUser)
+            return (try? release(w.id, keepOpen: false, discard: discards)) ?? "window \(w.id): failed"
+        }
     }
 
     // MARK: Watchdog
