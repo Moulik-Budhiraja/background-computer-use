@@ -510,6 +510,22 @@ public final class WindowManager {
         }
     }
 
+    /// Whether the app opens a new window as a tab in its full-screen key
+    /// window, from the user's tab preference for it (`AppleWindowTabbingMode`,
+    /// nil: not set). Unless the preference is "never" ("manual"), AppKit
+    /// puts the new window in that window's tab group, on the user's
+    /// screen, whatever window is key when it's asked for.
+    static func opensAsTabInFullScreen(keyIsFullScreen: Bool, tabbingMode: String?) -> Bool {
+        keyIsFullScreen && tabbingMode != "manual"
+    }
+
+    /// The user's tab preference for an app: its own setting, else the
+    /// system-wide one (System Settings, "Prefer tabs when opening documents").
+    static func tabbingMode(bundleID: String?) -> String? {
+        CFPreferencesCopyAppValue("AppleWindowTabbingMode" as CFString,
+                                  (bundleID ?? kCFPreferencesAnyApplication as String) as CFString) as? String
+    }
+
     /// Whether a cold launch that got no new window borrows the app's
     /// startup window instead: only an app's only one, and not while the
     /// user is in the app (they may have gone to it while the open waited
@@ -586,6 +602,15 @@ public final class WindowManager {
         // below): say so before holding the user's input.
         if scripted == nil, trigger != "key", Self.newWindowMenuItem(pid: pid) == nil {
             throw ToolError("\(name) has no menu item for a new window, so no window was opened. It may not support multiple windows: use list_windows with app=\"\(name)\" and borrow_window.")
+        }
+        // An app whose key window is full screen opens the new window as a
+        // tab in it, on the user's screen (see `opensAsTabInFullScreen`),
+        // unless an agent window of the app can be made key first.
+        if scripted == nil, !(placement.contains(.anchor) && anchorWindow(pid: pid) != nil),
+           let key = previousKey, let keyAX = AX.window(pid: pid, id: key),
+           Self.opensAsTabInFullScreen(keyIsFullScreen: AX.bool(keyAX, "AXFullScreen") == true,
+                                       tabbingMode: Self.tabbingMode(bundleID: bundleID)) {
+            throw ToolError("\(name)'s window on the user's screen is full screen, and \(name) would open a new window as a tab in it, where the user sees it. No window was opened. Ask the user to take \(name) out of full screen, then retry.")
         }
         if scripted == nil { hold?.start() }
         var scope: KeyScope?
