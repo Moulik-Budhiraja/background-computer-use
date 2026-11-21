@@ -2,7 +2,10 @@
 name = "background-computer-use"
 version = "0.1.0"
 edition = "2024"
-description = "The tray app. Owns the agent monitor, the agents' windows and the focus guard, and serves tool calls over a named pipe."
+description = "The engine (the agent monitor, the agents' windows, the focus guard and the named pipe), as a library, and the tray app that runs it."
+
+[lib]
+path = "src/lib.rs"
 
 [[bin]]
 name = "BackgroundComputerUse"

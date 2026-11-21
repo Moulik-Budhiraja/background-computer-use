@@ -73,29 +73,34 @@ const REMOTE: &str = "this is a Remote Desktop session. The agent screen is a di
 /// Why agents have no screen right now, for the agent and the user. None
 /// when it's on.
 pub fn screen_problem() -> Option<String> {
-    const TRAY: &str = "from the Background Computer Use tray icon";
+    // Where the user sets the agent screen up: the tray app, or the host app
+    // whose `bcu serve` runs the engine.
+    let (set_up, turn_on) = match crate::host::host_app() {
+        None => ("choose Set up… from the Background Computer Use tray icon".to_string(), "from the Background Computer Use tray icon (Agent screen)".to_string()),
+        Some(app) => (format!("set up the agent screen in {app}"), format!("in {app}")),
+    };
     if monitor::remote_session() {
         return Some(REMOTE.into());
     }
     if let Ok(why) = std::fs::read_to_string(marker(SCREEN_SLOW)) {
-        return Some(format!("{} The user can turn it on again {TRAY} (Agent screen).", why.trim()));
+        return Some(format!("{} The user can turn it on again {turn_on}.", why.trim()));
     }
     if marker(SCREEN_OFF).exists() {
-        return Some(format!("the user turned the agent screen off. They can turn it on {TRAY} (Agent screen)."));
+        return Some(format!("the user turned the agent screen off. They can turn it on {turn_on}."));
     }
     if BUSY.load(Ordering::SeqCst) {
         return Some("the agent screen is being set up. Try again in a minute.".into());
     }
     if !monitor::driver_installed() {
-        return Some(format!("the agent screen isn't set up yet. Ask the user to choose Set up… {TRAY}."));
+        return Some(format!("the agent screen isn't set up yet. Ask the user to {set_up}."));
     }
     if !monitor::driver_running() {
         return Some(format!(
-            "the agent screen's driver is installed, but Windows didn't start it. Ask the user to choose Set up… {TRAY}; restarting the PC can also help."
+            "the agent screen's driver is installed, but Windows didn't start it. Ask the user to {set_up}; restarting the PC can also help."
         ));
     }
     if !monitor::installed() {
-        return Some(format!("the agent screen isn't on. Ask the user to choose Set up… {TRAY}."));
+        return Some(format!("the agent screen isn't on. Ask the user to {set_up}."));
     }
     None
 }

@@ -1,5 +1,8 @@
 //! bcu: command-line front end for Background Computer Use on Windows.
-//!   bcu mcp                      stdio MCP server (what agents run)
+//!   bcu mcp [--host H] [--session S] [--label L]
+//!                                stdio MCP server (what agents run)
+//!   bcu serve --owner <name>     the engine, for a host app (docs/embedding.md)
+//!   bcu screen [status|on|off]   the agent screen, for a host app's setup
 //!   bcu call <tool> ['<json>']   call one tool and print the result
 //!   bcu status                   same as `bcu call status`
 //!   bcu tools                    list tool names
@@ -9,13 +12,21 @@
 mod mcp;
 mod pipe;
 mod setup;
-mod tools;
+mod subagents;
 
-use serde_json::{Map, Value};
+use background_computer_use::{serve, tools};
+use serde_json::{Map, Value, json};
 
 const USAGE: &str = "\
 usage:
-  bcu mcp                       run the MCP server on stdin/stdout
+  bcu mcp [--host <id>] [--session <id>] [--label <name>]
+                                run the MCP server on stdin/stdout. A host app passes
+                                its ID, its own ID for the session and the session's name
+  bcu serve --owner <name> [--log-dir <dir>] [--own-engine]
+                                run the engine for a host app, or say which one runs
+                                (first line on stdout); stops on a quit line on stdin
+  bcu screen [status|on|off]    the agent screen agents work on: whether it's on, why
+                                not, and turning it on (Windows asks for admin once) or off
   bcu call <tool> ['{json}' | key=value ...]
                                 call one tool (images are saved to %TEMP%\\bcu-*.png)
   bcu status                    show the app's status
@@ -27,10 +38,20 @@ usage:
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
-        Some("mcp") => {
-            mcp::Server::new().run();
-            0
-        }
+        Some("mcp") => match mcp_options(&args[1..]) {
+            Ok(o) => {
+                mcp::Server::new(o).run();
+                0
+            }
+            Err(e) => {
+                eprintln!("bcu: {e}");
+                64
+            }
+        },
+        Some("serve") => serve::run(&args[1..]),
+        // What `bcu serve` starts: the engine itself.
+        Some("serve-engine") => serve::run_engine(&args[1..]),
+        Some("screen") => screen(args.get(1).map(String::as_str).unwrap_or("status")),
         Some("call") if args.len() >= 2 => match parse_args(&args[2..]) {
             Ok(tool_args) => call_and_print(&args[1], tool_args),
             Err(e) => {
@@ -71,6 +92,53 @@ fn main() {
     std::process::exit(code);
 }
 
+fn mcp_options(rest: &[String]) -> Result<mcp::Options, String> {
+    let mut o = mcp::Options { host: None, session: None, label: None };
+    let mut it = rest.iter();
+    while let Some(flag) = it.next() {
+        let value = it.next().cloned().ok_or_else(|| format!("{flag} needs a value"))?;
+        match flag.as_str() {
+            "--host" => o.host = Some(value),
+            "--session" => o.session = Some(value),
+            "--label" => o.label = Some(value),
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    Ok(o)
+}
+
+/// `bcu screen`: one JSON line saying whether agents have a screen to work
+/// on, and why not. `on` sets it up (installing its driver the first time,
+/// which Windows asks admin for, with install-monitor.ps1 next to bcu.exe).
+fn screen(action: &str) -> i32 {
+    use background_computer_use::{monitor, setup};
+    let state = |message: Option<String>| {
+        let problem = setup::screen_problem();
+        let mut o = json!({"on": problem.is_none(), "driver_installed": monitor::driver_installed()});
+        if let Some(p) = problem {
+            o["problem"] = json!(p);
+        }
+        if let Some(m) = message {
+            o["message"] = json!(m);
+        }
+        o
+    };
+    let (out, code) = match action {
+        "status" => (state(None), 0),
+        "on" => match setup::enable_screen() {
+            Ok(m) => (state(Some(m)), 0),
+            Err(m) => (state(Some(m)), 2),
+        },
+        "off" => (state(Some(setup::disable_screen())), 0),
+        other => {
+            eprintln!("bcu: unknown screen action {other}: use status, on or off");
+            return 64;
+        }
+    };
+    println!("{out}");
+    code
+}
+
 /// Tool arguments: one JSON object, or key=value pairs (a value that parses as
 /// JSON, like 5, true or ["ctrl"], is used as JSON; anything else is a string).
 /// key=value is easier from PowerShell, which mangles quotes in native arguments.
@@ -102,7 +170,7 @@ fn call_and_print(tool: &str, mut args: Map<String, Value>) -> i32 {
             args.entry(key).or_insert(Value::String(v));
         }
     }
-    let result = pipe::connect_or_launch().and_then(|mut c| c.call(tool, args));
+    let result = pipe::connect_or_launch(true).and_then(|mut c| c.call(tool, args));
     match result {
         Ok(r) => {
             println!("{}", r.text);
