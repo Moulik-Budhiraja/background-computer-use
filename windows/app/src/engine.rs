@@ -342,6 +342,12 @@ impl Engine {
         sessions::get(&self.id).is_some_and(|v| v.paused)
     }
 
+    /// Whether the session that made the call is paused: this one, or a
+    /// relative whose call on this session's window came here (`submit`).
+    fn caller_paused(&self, args: &Args) -> bool {
+        self.paused() || args.str("_session").is_some_and(|c| c != self.id && sessions::get(c).is_some_and(|v| v.paused))
+    }
+
     /// Tell the tray what this session has now.
     fn publish(&self, also: impl FnOnce(&mut sessions::View)) {
         let mut ws: Vec<&AgentWindow> = self.windows.values().collect();
@@ -428,7 +434,7 @@ impl Engine {
     pub fn call(&mut self, tool: &str, args: &Map<String, Value>) -> ToolResult {
         let args = Args(args);
         let acting = BATCHABLE.contains(&tool) || tool == "open_window" || tool == "borrow_window";
-        if acting && self.paused() {
+        if acting && self.caller_paused(&args) {
             return ToolResult::error("Paused by the user.");
         }
         // Activations of the app the agent acts on are the agent's doing: the

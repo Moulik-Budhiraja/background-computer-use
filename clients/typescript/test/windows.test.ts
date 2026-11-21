@@ -315,6 +315,11 @@ test('a subagent gets its own session, and can use its parent\'s windows', { ski
   assert.equal(sub.host, HOST)
   // The window stays its parent's.
   assert.equal(sub.windows.length, 0)
+  // Paused, the subagent can't act on it, though its parent isn't paused.
+  await host!.pause('helper-1/sub-thread', true)
+  const refused = await helper.call('click', { window_id: edge, x: 5, y: 5 }, { threadId: 'sub-thread' })
+  assert.ok(refused.error && /Paused/.test(refused.text), refused.text)
+  await host!.pause('helper-1/sub-thread', false)
 })
 
 test('pause, rename and handoff', { skip: !live }, async () => {
