@@ -308,9 +308,14 @@ public final class AgentDisplay {
     }
 
     /// The frame to decide a noted tile's fix by, given where the window
-    /// is `current`ly; nil to forget it.
+    /// is `current`ly; nil to forget it. Nothing puts the window back after
+    /// macOS drops it into the tile, so it's judged by where it was before
+    /// the change, while it's still where macOS put it. One the user has
+    /// moved or resized since is theirs to keep.
     static func frameForNotedTile(_ t: NotedTile, current: CGRect) -> CGRect? {
-        current
+        let same = abs(current.minX - t.now.minX) <= 2 && abs(current.minY - t.now.minY) <= 2
+            && abs(current.width - t.now.width) <= 2 && abs(current.height - t.now.height) <= 2
+        return same ? t.frame : nil
     }
 
     static func noteStaleTile(_ t: NotedTile) {
