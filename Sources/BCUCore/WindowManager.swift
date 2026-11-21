@@ -387,17 +387,58 @@ public final class WindowManager {
         return try launch(url: url, name: target.name, bundleID: target.bundleID)
     }
 
-    /// Launch a not-running app hidden and without activation, move its first
-    /// windows onto the agent display, then unhide it there.
-    private func launch(url: URL, name: String, bundleID: String?) throws -> OpenResult {
-        // An app that starts up brings itself forward when it's ready,
-        // whatever it was asked: kept from the front from the moment it appears.
-        if let bundleID { focusGuard.willLaunch(bundleID: bundleID) }
-        defer { if let bundleID { focusGuard.launched(bundleID: bundleID) } }
+    /// How an agent's open launches an app that isn't running: hidden,
+    /// without activating it, and never asking the user. macOS asks before
+    /// some launches (install Rosetta for an Intel app, a downloaded app
+    /// Gatekeeper can't check, a damaged one) in an alert on their screen,
+    /// for a launch they didn't ask for. Then the launch fails instead, and
+    /// the agent is told why.
+    static func launchConfiguration() -> NSWorkspace.OpenConfiguration {
         let config = NSWorkspace.OpenConfiguration()
         config.activates = false
         config.hides = true
         config.addsToRecentItems = false
+        config.promptsUserIfNeeded = false
+        return config
+    }
+
+    /// Whether macOS asks the user before it opens the app the first time,
+    /// from its quarantine mark (`com.apple.quarantine`, nil: none). A
+    /// downloaded app keeps the mark, and Gatekeeper asks ("downloaded from
+    /// the Internet", or "Not Opened" when it can't check it) until the
+    /// user has opened it once, which sets the mark's approved flag (0x40).
+    /// A mark that can't be read is taken as one that asks.
+    static func asksBeforeFirstLaunch(quarantine: String?) -> Bool {
+        guard let quarantine else { return false }
+        guard let field = quarantine.split(separator: ";", omittingEmptySubsequences: false).first,
+              let flags = UInt32(field, radix: 16) else { return true }
+        return flags & 0x40 == 0
+    }
+
+    /// The app bundle's quarantine mark, nil if it has none.
+    static func quarantineMark(_ url: URL) -> String? {
+        url.withUnsafeFileSystemRepresentation { path -> String? in
+            guard let path else { return nil }
+            let size = getxattr(path, "com.apple.quarantine", nil, 0, 0, 0)
+            guard size > 0 else { return nil }
+            var bytes = [UInt8](repeating: 0, count: size)
+            let got = getxattr(path, "com.apple.quarantine", &bytes, size, 0, 0)
+            return got > 0 ? String(decoding: bytes.prefix(got), as: UTF8.self) : nil
+        }
+    }
+
+    /// Launch a not-running app hidden and without activation, move its first
+    /// windows onto the agent display, then unhide it there.
+    private func launch(url: URL, name: String, bundleID: String?) throws -> OpenResult {
+        // Gatekeeper's question isn't one the launch can be told not to ask.
+        if Self.asksBeforeFirstLaunch(quarantine: Self.quarantineMark(url)) {
+            throw ToolError("\(name) was downloaded and hasn't been opened yet, so macOS would ask the user before opening it. It wasn't opened: ask the user to open \(name) once themselves, then retry.")
+        }
+        // An app that starts up brings itself forward when it's ready,
+        // whatever it was asked: kept from the front from the moment it appears.
+        if let bundleID { focusGuard.willLaunch(bundleID: bundleID) }
+        defer { if let bundleID { focusGuard.launched(bundleID: bundleID) } }
+        let config = Self.launchConfiguration()
         var launched: NSRunningApplication?
         var launchError: Error?
         let sem = DispatchSemaphore(value: 0)
@@ -408,7 +449,10 @@ public final class WindowManager {
         }
         _ = sem.wait(timeout: .now() + 20)
         guard let app = launched else {
-            throw ToolError("could not launch \(name): \(launchError?.localizedDescription ?? "timed out")")
+            // (Asking the user is the one thing it was told not to do:
+            // what it would have asked is in the error.)
+            let why = launchError.map { $0.localizedDescription.trimmingCharacters(in: CharacterSet(charactersIn: ". ")) } ?? "timed out"
+            throw ToolError("could not launch \(name): \(why). If macOS has to ask the user before it opens \(name), ask them to open it once themselves.")
         }
         let pid = app.processIdentifier
         focusGuard.beginAction(pid: pid, cause: "launching \(name)")
