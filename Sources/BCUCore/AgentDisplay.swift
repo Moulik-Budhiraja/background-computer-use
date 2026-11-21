@@ -170,30 +170,22 @@ public final class AgentDisplay {
 
     // MARK: Stale tiles
 
-    /// On macOS 26 and later a window the user tiled and then set back to
-    /// its own size can keep its tile in WindowManager, which puts the window
-    /// back in the tile at every display change. Nothing outside the app can
-    /// drop that tile; the app's own Window > Move & Resize > Return to
-    /// Previous Size does, and macOS only enables it while the app is in
-    /// front. So it's pressed for a window macOS has just moved, when the
-    /// user is in that app with that window; any other is kept
-    /// (`noteStaleTile`) and tried again before the next display change.
-    static let untileIdentifier = "_zoomUntile:"
-
-    /// Whether the menu item may be pressed for this window: it acts on the
-    /// app's main window, so that has to be the one, in the app in front,
-    /// and the app has to say the window is tiled (the item is enabled).
-    static func mayUntile(front: pid_t, pid: pid_t, mainWindow: CGWindowID?, id: CGWindowID, itemEnabled: Bool) -> Bool {
-        front == pid && mainWindow == id && itemEnabled
-    }
-
-    private static func untileItem(_ pid: pid_t) -> AXUIElement? {
-        menuItem(pid, identifier: untileIdentifier)
-    }
+    /// On macOS 26 and later a window the user tiled and then zoomed back to
+    /// full size can keep its tile in WindowManager, which puts the window
+    /// back in the tile at every display change (a full-height window drops
+    /// to the top half). Nothing outside the app can change that tile, and
+    /// the app's Return to Previous Size drops it by shrinking the window to
+    /// its size from before the tile. Its Window > Fill gives the window the
+    /// tile of the frame it has, so display changes leave it where it is.
+    /// macOS only enables the item while the app is in front, and it acts on
+    /// the main window: it's pressed when the user is in that app with that
+    /// window; any other is kept (`noteStaleTile`) and tried again before
+    /// the next display change.
+    static let fillIdentifier = "_zoomFill:"
 
     private static func menuItem(_ pid: pid_t, identifier: String) -> AXUIElement? {
         guard let bar = AX.element(AX.app(pid), "AXMenuBar") else { return nil }
-        // Menu bar item > menu > Move & Resize > menu > the item.
+        // Menu bar item > menu > (Move & Resize > menu >) the item.
         func find(_ el: AXUIElement, depth: Int) -> AXUIElement? {
             for child in AX.children(el) {
                 if AX.string(child, "AXIdentifier") == identifier { return child }
@@ -207,10 +199,8 @@ public final class AgentDisplay {
     /// What to do about the tile behind a window of the user's that macOS
     /// just moved at a display change.
     enum TileFix: Equatable {
-        /// Nothing: the window has no tile, or none BCU should change.
+        /// Nothing: no tile BCU can replace without changing the window.
         case nothing
-        /// Press Window > Move & Resize > Return to Previous Size.
-        case untile
         /// Press Window > Fill.
         case fill
         /// Not now (the user isn't in that app with that window): before the next display change.
@@ -220,13 +210,22 @@ public final class AgentDisplay {
     /// `want` is where the window belongs, `visible` its screen's visible
     /// frame (global, top-left origin), `margins` whether tiled windows get
     /// margins. `front` is the app in front, `mainWindow` that app's main
-    /// window, `untileEnabled` whether Return to Previous Size is enabled.
+    /// window. `untileEnabled` (whether the app says the window is tiled)
+    /// doesn't count: on 27.3 the app doesn't know the tile WindowManager holds.
     static func tileFix(want: CGRect, visible: CGRect, margins: Bool, front: pid_t, pid: pid_t,
                         mainWindow: CGWindowID?, id: CGWindowID, untileEnabled: Bool) -> TileFix {
-        guard front == pid else { return .later }
-        // In front, with this window, and nothing to return from: no tile.
-        if mainWindow == id && !untileEnabled { return .nothing }
-        return mayUntile(front: front, pid: pid, mainWindow: mainWindow, id: id, itemEnabled: untileEnabled) ? .untile : .later
+        // Fill puts the window at the visible frame (inset, with margins):
+        // only for a window that's already there.
+        let fills = !visible.isNull && abs(want.minX - visible.minX) <= 2 && abs(want.minY - visible.minY) <= 2
+            && abs(want.width - visible.width) <= 2 && abs(want.height - visible.height) <= 2
+        guard fills, !margins else { return .nothing }
+        return front == pid && mainWindow == id ? .fill : .later
+    }
+
+    /// Whether WindowManager gives tiled windows margins (System Settings >
+    /// Desktop & Dock > Tiled windows have margins).
+    static var tileMargins: Bool {
+        CFPreferencesCopyAppValue("EnableTiledWindowMargins" as CFString, "com.apple.WindowManager" as CFString) as? Bool ?? false
     }
 
     /// The visible frame (no menu bar or Dock) of the screen most of `rect`
@@ -249,30 +248,16 @@ public final class AgentDisplay {
     @discardableResult
     static func clearStaleTile(pid: pid_t, id: CGWindowID, frame want: CGRect) -> Bool {
         guard WindowList.info(id)?.pid == pid else { return true }
-        guard BCUFrontProcessPID() == pid, let item = untileItem(pid) else { return false }
-        let enabled = AX.bool(item, "AXEnabled") ?? false
         let main = AX.element(AX.app(pid), "AXMainWindow").flatMap { AX.windowID($0) }
-        switch tileFix(want: want, visible: visibleFrame(of: want) ?? .null, margins: false, front: BCUFrontProcessPID(), pid: pid,
-                       mainWindow: main, id: id, untileEnabled: enabled) {
+        switch tileFix(want: want, visible: visibleFrame(of: want) ?? .null, margins: tileMargins, front: BCUFrontProcessPID(), pid: pid,
+                       mainWindow: main, id: id, untileEnabled: false) {
         case .nothing: return true
-        case .later, .fill: return false
-        case .untile: break
+        case .later: return false
+        case .fill: break
         }
-        guard AX.perform(item, "AXPress") == .success else { return false }
-        // Returning to the previous size can change the frame: the window
-        // belongs where the user had it.
-        let until = nowMs() + 600
-        while nowMs() < until {
-            sleepMs(15)
-            guard let now = WindowList.info(id)?.bounds, now != .zero else { break }
-            if abs(now.minX - want.minX) > 1 || abs(now.minY - want.minY) > 1 || abs(now.width - want.width) > 1 || abs(now.height - want.height) > 1,
-               let ax = AX.window(pid: pid, id: id) {
-                AX.setPosition(ax, want.origin)
-                AX.setSize(ax, want.size)
-                AX.setPosition(ax, want.origin)
-            }
-        }
-        Log.info("cleared a stale tile on a window of the user's (pid \(pid), window \(id)), so display changes leave it alone")
+        guard let item = menuItem(pid, identifier: fillIdentifier), AX.bool(item, "AXEnabled") ?? false,
+              AX.perform(item, "AXPress") == .success else { return false }
+        Log.info("gave a window of the user's that fills its screen (pid \(pid), window \(id)) the Fill tile, so display changes leave it where it is")
         return true
     }
 
