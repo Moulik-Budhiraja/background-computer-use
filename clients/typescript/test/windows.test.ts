@@ -315,6 +315,8 @@ test('a subagent gets its own session, and can use its parent\'s windows', { ski
   assert.equal(sub.host, HOST)
   // The window stays its parent's.
   assert.equal(sub.windows.length, 0)
+  // A batch that names the window only in its actions goes there too.
+  await helper.ok('batch', { actions: [{ tool: 'scroll', window_id: edge, dy: 1 }], state: false }, { threadId: 'sub-thread' })
   // Paused, the subagent can't act on it, though its parent isn't paused.
   await host!.pause('helper-1/sub-thread', true)
   const refused = await helper.call('click', { window_id: edge, x: 5, y: 5 }, { threadId: 'sub-thread' })

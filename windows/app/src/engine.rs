@@ -130,8 +130,11 @@ pub fn submit(r: Request) {
     let mut queues = queues();
     queues.entry(id.clone()).or_insert_with(|| spawn(id.clone(), client.as_deref(), label.as_deref()));
     // An agent can hand a window to its subagent (or back): the call goes to
-    // the session that has the window.
-    if let Some(w) = r.args.get("window_id").and_then(Value::as_u64)
+    // the session that has the window. A batch can name it only in its actions.
+    let window = r.args.get("window_id").and_then(Value::as_u64).or_else(|| {
+        r.args.get("actions").and_then(Value::as_array).and_then(|steps| steps.iter().find_map(|s| s.get("window_id").and_then(Value::as_u64)))
+    });
+    if let Some(w) = window
         && let Some(owner) = host::relative_owning(&id, w)
         && queues.contains_key(&owner)
     {
