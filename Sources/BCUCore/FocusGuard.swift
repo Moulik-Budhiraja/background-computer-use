@@ -365,8 +365,10 @@ public final class FocusGuard {
     /// Returns whether the cursor is near the agent display.
     @discardableResult
     private func checkCursor() -> Bool {
+        // Not only while an agent display is up: removing the last one can
+        // leave the cursor off every display.
         let fenced = AgentDisplay.fencedBounds
-        guard !fenced.isEmpty, let p = CGEvent(source: nil)?.location else { return false }
+        guard let p = CGEvent(source: nil)?.location else { return false }
         let users = AgentDisplay.userDisplayIDs().map { CGDisplayBounds($0) }
         let near = fenced.contains { $0.insetBy(dx: -400, dy: -400).contains(p) }
         guard let fix = Self.cursorFix(p, fenced: fenced, users: users, msSinceUserMove: nowMs() - lastUserMoveMs.withLock { $0 }) else {
@@ -402,15 +404,15 @@ public final class FocusGuard {
     /// display it was on (nil: it was off every display), or nil to leave
     /// it. `fenced` are the displays it must stay off, `users` the user's.
     static func cursorFix(_ p: CGPoint, fenced: [CGRect], users: [CGRect], msSinceUserMove: Double) -> (to: CGPoint, agent: CGRect?)? {
-        guard !fenced.isEmpty else { return nil }
         // An agent display lying over one of the user's (macOS wouldn't
         // place it while the screens slept): the cursor there is on their
         // screen, where it belongs. Warping it to the same spot every few
         // ms would end every hover effect under it. (The tap lets it be too.)
         guard let agent = AgentDisplay.fenced(at: p, agents: fenced, users: users) else {
-            // Off every display (an event posted with a far-off location can
-            // leave it there): just as invisible, and macOS only brings it
-            // back when the displays change.
+            // Off every display (an event posted with a far-off location, or
+            // the removal of the display it was on, can leave it there): just
+            // as invisible, and macOS only brings it back when the displays
+            // change.
             guard !users.contains(where: { $0.contains(p) }) else { return nil }
             let q = nearestUserPoint(p, agent: .null, users: users, fenced: fenced)
             return q != p && !fenced.contains(where: { $0.contains(q) }) ? (q, nil) : nil
