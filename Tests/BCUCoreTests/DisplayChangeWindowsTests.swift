@@ -67,3 +67,23 @@ final class DisplayChangeWindowsTests: XCTestCase {
         XCTAssertTrue(w.tilesFixed.isEmpty)
     }
 }
+
+/// A stale tile whose app wasn't in front at the display change waits for
+/// the next one. The window is still where macOS dropped it then, and the
+/// fix is decided by where it was before (it filled its screen).
+final class NotedTileTests: XCTestCase {
+    let full = CGRect(x: 0, y: 30, width: 1920, height: 960)
+    let top = CGRect(x: 0, y: 30, width: 1920, height: 480)
+
+    func testAWindowStillWhereMacOSDroppedItIsJudgedByItsFrameFromBefore() {
+        let t = AgentDisplay.NotedTile(pid: 10, id: 7, frame: full, now: top)
+        XCTAssertEqual(AgentDisplay.frameForNotedTile(t, current: top), full)
+        // The window list can be a point off.
+        XCTAssertEqual(AgentDisplay.frameForNotedTile(t, current: CGRect(x: 0, y: 30, width: 1920, height: 481)), full)
+    }
+
+    func testAWindowTheUserHasMovedOrResizedSinceIsForgotten() {
+        let t = AgentDisplay.NotedTile(pid: 10, id: 7, frame: full, now: top)
+        XCTAssertNil(AgentDisplay.frameForNotedTile(t, current: CGRect(x: 100, y: 100, width: 1000, height: 700)))
+    }
+}
