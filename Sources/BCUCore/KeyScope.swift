@@ -27,6 +27,8 @@ public final class KeyScope {
     private var confirmed = true
 
     private static let settleMs: Double = 120
+    /// The gap between the records of the first try at giving key back.
+    static let giveBackSettleMs: Double = 5
 
     private init(pid: pid_t, target: CGWindowID, keyWindow: CGWindowID, previous: CGWindowID?, primed: Prime, wasInactive: Bool) {
         self.pid = pid
@@ -139,7 +141,7 @@ public final class KeyScope {
             if BCUFrontProcessPID() != pid { _ = BCUPostFocusRecord(pid, held, false) }
             return true
         }
-        for settle in [5.0, Self.settleMs] {
+        for settle in [Self.giveBackSettleMs, Self.settleMs] {
             switch primed {
             case .records:
                 _ = KeyScope.postRecords(pid: pid, from: held, to: previous, settle: settle)
