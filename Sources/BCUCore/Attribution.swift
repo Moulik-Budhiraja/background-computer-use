@@ -219,8 +219,6 @@ enum NewWindow {
         case user
         /// The agent's step opened it: it's the session's.
         case agent
-        /// Can't tell: it stays where it is, and nobody's.
-        case unclear
     }
 
     struct Facts {
@@ -240,8 +238,12 @@ enum NewWindow {
     /// How long after an agent's step began a new window is the step's.
     static let agentMs = 10_000.0
 
-    /// With no step of the session's to explain it, a new window in the app
-    /// the user is in is theirs, as it always was.
+    /// With no step of the session's to explain it, a new window is the
+    /// user's, whatever app the guard takes them to be in: they may have
+    /// opened it from another app (a link, the Dock), and on an agent
+    /// display nobody would ever see it. Nor does a step explain a window
+    /// once the session has no window left in the app: releasing its last
+    /// one opens none, and it has nothing there to work in.
     ///
     /// A window that wasn't there when the session's step on the app began,
     /// and came up within `agentMs` of it, is the step's: a sign-in popup
@@ -251,8 +253,8 @@ enum NewWindow {
     /// the user. A window of theirs left on the agent display can't be
     /// seen, and what they type next goes into it.
     static func cause(_ f: Facts) -> Cause {
-        guard let began = f.agentBeganMs, f.firstSeenMs >= began, f.firstSeenMs - began < agentMs else {
-            return f.userInApp ? .user : .unclear
+        guard f.agentHasWindow, let began = f.agentBeganMs, f.firstSeenMs >= began, f.firstSeenMs - began < agentMs else {
+            return .user
         }
         return f.userInApp && f.userOpenInputMs >= began ? .user : .agent
     }
