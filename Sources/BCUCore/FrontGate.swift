@@ -93,6 +93,9 @@ public final class FrontGate {
         var windowServerListAvailable: () -> Bool = { BCUPermittedFrontAvailable() }
         var processSerialNumber: (pid_t) -> UInt64 = { BCUProcessPSN($0) }
         var updateWindowServerList: (_ psn: UInt64, _ add: Bool) -> Int32 = { BCUPermittedFrontUpdate($0, $1) }
+        /// Open this process's connection to WindowServer (calls to it open
+        /// one when there's none).
+        var connectWindowServer: () -> Void = { _ = BCUWindowServerConnect() }
         /// Not a background-only process (those never come to the front).
         var canComeForward: (pid_t) -> Bool = { NSRunningApplication(processIdentifier: $0)?.activationPolicy != .prohibited }
         /// Write a file in full; whether it was.
@@ -975,6 +978,10 @@ public final class FrontGate {
 
     private static var engineURL: URL { BCUPaths.supportDirectory.appendingPathComponent("front-gate.engine") }
 
+    /// The watchdog's first moments, while its engine runs.
+    static func watchdogStarting() {
+    }
+
     /// Call first thing in `main`: when this process was started as the
     /// gate's watchdog, it runs that and never returns.
     public static func runWatchdogIfAsked() {
@@ -985,6 +992,7 @@ public final class FrontGate {
         // The handler only sets a flag; `poll` returns when a signal lands.
         for s in [SIGTERM, SIGINT, SIGHUP] { signal(s) { _ in watchdogToldToGo = 1 } }
         let engine = getppid()
+        watchdogStarting()
         /// On the way out: until every recorded entry is off (the engine may
         /// be finishing an update, or an entry won't come off yet), or a new
         /// engine has started and taken them over.

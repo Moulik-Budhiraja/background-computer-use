@@ -70,6 +70,10 @@ int BCUSetFrontProcess(pid_t pid, uint32_t windowID, uint32_t options);
 /// SLPSAddToPermittedFrontPSNList / SLPSRemoveFromPermittedFrontPSNList exist.
 BOOL BCUPermittedFrontAvailable(void);
 
+/// This process's connection to WindowServer, opened now if it has none.
+/// Its id, 0 if there's none to be had.
+uint32_t BCUWindowServerConnect(void);
+
 /// `pid`'s process serial number as (high << 32) | low, 0 if it has none.
 /// Serial numbers aren't reused within a login session, unlike pids.
 uint64_t BCUProcessPSN(pid_t pid);
