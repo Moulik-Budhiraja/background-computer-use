@@ -39,10 +39,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // A host app's `bcu serve` reads this to start this app rather than run
         // an engine of its own. Kept current as permissions are granted or taken away.
         var record = AppRecord.current()
-        record.write()
+        AppRecord.keep(record, from: Bundle.main.bundleURL)
         recordTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
             let now = AppRecord.current()
-            if now != record { record = now; now.write() }
+            if now != record { record = now; AppRecord.keep(now, from: Bundle.main.bundleURL) }
         }
         if !startEngine() { waitForEngine() }
 

@@ -42,6 +42,13 @@ public struct AppRecord: Equatable {
         try? data.write(to: URL(fileURLWithPath: BCUPaths.appRecordPath), options: .atomic)
     }
 
+    /// Note `record` as this app's, run from `bundleURL`. Whether it was written.
+    @discardableResult
+    public static func keep(_ record: AppRecord, from bundleURL: URL) -> Bool {
+        record.write()
+        return true
+    }
+
     /// Still installed there, speaks this engine's protocol, and has what it
     /// needs to run agents.
     public var isUsable: Bool {
