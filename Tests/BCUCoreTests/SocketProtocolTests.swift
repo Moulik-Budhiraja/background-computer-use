@@ -46,6 +46,7 @@ final class SocketProtocolTests: XCTestCase {
         path = "/tmp/bcu-test-\(getpid())-\(Int.random(in: 0..<1_000_000)).sock"
         server = SocketServer(path: path) { tool, args in
             if tool == "slow" { usleep(300_000) }
+            if tool == "hang" { usleep(2_000_000) }
             return ToolResult(text: "\(tool) \(args["n"] as? Int ?? 0)")
         }
         XCTAssertNoThrow(try server.start())
@@ -66,6 +67,31 @@ final class SocketProtocolTests: XCTestCase {
     func testTimeoutFailsInsteadOfHanging() throws {
         let client = try SocketClient(path: path)
         XCTAssertThrowsError(try client.call(tool: "slow", args: [:], timeout: 0.05))
+    }
+
+    /// An engine that's stopped (SIGSTOP, a debugger) can't answer: the call
+    /// says so within seconds instead of waiting out its whole timeout.
+    func testAStoppedEngineFailsTheCallSoon() throws {
+        let client = try SocketClient(path: path)
+        let isStopped = SocketClient.isStopped, limit = SocketClient.stoppedLimit
+        defer { SocketClient.isStopped = isStopped; SocketClient.stoppedLimit = limit }
+        SocketClient.isStopped = { _ in true }
+        SocketClient.stoppedLimit = 0.2
+        let start = Date()
+        XCTAssertThrowsError(try client.call(tool: "hang", args: [:], timeout: 10)) { error in
+            XCTAssertTrue("\(error)".contains("stopped"), "\(error)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1.5)
+    }
+
+    /// One that's only slow still answers.
+    func testASlowEngineThatIsntStoppedStillAnswers() throws {
+        let client = try SocketClient(path: path)
+        let isStopped = SocketClient.isStopped, limit = SocketClient.stoppedLimit
+        defer { SocketClient.isStopped = isStopped; SocketClient.stoppedLimit = limit }
+        SocketClient.isStopped = { _ in false }
+        SocketClient.stoppedLimit = 0.05
+        XCTAssertEqual(try client.call(tool: "slow", args: ["n": 1], timeout: 10).text, "slow 1")
     }
 
     func testMalformedLineGetsAnError() throws {
