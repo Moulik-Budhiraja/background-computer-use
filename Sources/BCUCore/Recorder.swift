@@ -762,9 +762,36 @@ public final class SessionRecorder {
     /// so the recorder never brings on the screen-sharing indicator. A frame
     /// wanted after a call waits for that too.
     private func tick() {
-        guard writer != nil, nowMs() - Capture.lastCaptureMs >= Self.minGapMs else { return }
+        guard writer != nil, Self.wantsCapture(pending: pendingForced, sinceLastCaptureMs: nowMs() - Capture.lastCaptureMs,
+                                               windowsChanged: true) else { return }
         capture(force: pendingForced)
         pendingForced = false
+    }
+
+    /// Whether a tick takes a frame: `pending` when a frame is wanted (the
+    /// run's first, or one after a call), `windowsChanged` when the agent
+    /// display's windows aren't where they were at the last frame.
+    static func wantsCapture(pending: Bool, sinceLastCaptureMs: Double, windowsChanged: Bool) -> Bool {
+        sinceLastCaptureMs >= minGapMs
+    }
+
+    /// What the window list says about the agent display (no capture): its
+    /// apps' windows front to back, where they are and what they're called.
+    /// The app's own windows and the menu bar are left out, as the agent's
+    /// screenshots leave them out.
+    struct WindowSpot: Equatable {
+        let id: CGWindowID
+        let bounds: CGRect
+        let title: String
+        let alpha: Double
+    }
+
+    static func windowSpots(_ windows: [WindowInfo], on display: CGRect, me: pid_t) -> [WindowSpot] {
+        let systemOwners: Set<String> = ["Window Server", "Dock", "Control Center", "SystemUIServer", "Notification Center"]
+        return windows.filter {
+            display.intersects($0.bounds) && $0.alpha > 0 && $0.bounds.width > 2 && $0.bounds.height > 2 && $0.pid != me
+                && !systemOwners.contains($0.owner) && $0.layer != 24 && $0.layer != 25
+        }.map { WindowSpot(id: $0.id, bounds: $0.bounds, title: $0.title, alpha: $0.alpha) }
     }
 
     private func capture(force: Bool) {
