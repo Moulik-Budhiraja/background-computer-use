@@ -387,6 +387,16 @@ public final class WindowManager {
         return try launch(url: url, name: target.name, bundleID: target.bundleID)
     }
 
+    /// How an agent's open launches an app that isn't running: hidden,
+    /// without activating it.
+    static func launchConfiguration() -> NSWorkspace.OpenConfiguration {
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = false
+        config.hides = true
+        config.addsToRecentItems = false
+        return config
+    }
+
     /// Launch a not-running app hidden and without activation, move its first
     /// windows onto the agent display, then unhide it there.
     private func launch(url: URL, name: String, bundleID: String?) throws -> OpenResult {
@@ -394,10 +404,7 @@ public final class WindowManager {
         // whatever it was asked: kept from the front from the moment it appears.
         if let bundleID { focusGuard.willLaunch(bundleID: bundleID) }
         defer { if let bundleID { focusGuard.launched(bundleID: bundleID) } }
-        let config = NSWorkspace.OpenConfiguration()
-        config.activates = false
-        config.hides = true
-        config.addsToRecentItems = false
+        let config = Self.launchConfiguration()
         var launched: NSRunningApplication?
         var launchError: Error?
         let sem = DispatchSemaphore(value: 0)
