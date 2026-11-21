@@ -466,11 +466,17 @@ async function takenOver(cursors: CursorEvent[], drags: DragEvent[]) {
   await until('the typing in the page', async () => /Probe input" value="[^"]*hi/.test(await helper.ok('get_window_state', { window_id: edge, screenshot: false })), 5000)
   // A shortcut that would quit the browser, the user's windows with it, isn't passed on.
   await host!.input('helper-1', { type: 'keydown', code: 'KeyQ', key: 'q', ctrlKey: true, shiftKey: true })
-  // The user moves the window by its title bar.
+  // The user moves the window by its title bar: an empty spot of Edge's tab
+  // strip, left of its caption buttons (where the tabs end varies).
   const frame = session('helper-1')!.windows.find((w) => w.id === edge)!.frame!
-  const grab = { x: frame.x + frame.width - 300, y: frame.y + 12 }
+  let grab = { x: 0, y: frame.y + 10 }
+  for (const fromRight of [160, 200, 240]) {
+    grab = { x: frame.x + frame.width - fromRight, y: frame.y + 10 }
+    await host!.input('helper-1', { type: 'mousedown', ...grab, button: 0, clicks: 1 })
+    if (drags.length) break
+    await host!.input('helper-1', { type: 'mouseup', ...grab, button: 0, clicks: 1 })
+  }
   await host!.input('helper-1', [
-    { type: 'mousedown', ...grab, button: 0, clicks: 1 },
     { type: 'mousemove', x: grab.x + 40, y: grab.y + 30, buttons: 1 },
     { type: 'mouseup', x: grab.x + 40, y: grab.y + 30, button: 0, clicks: 1 },
   ])
