@@ -16,7 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::BSTR;
 
 use crate::snapshot::{self, Node, Snapshot};
-use crate::{apps, browser, capture, guard, input, monitor, sessions, win};
+use crate::{apps, browser, capture, guard, host, input, monitor, sessions, win};
 
 pub struct Image {
     pub mime: String,
@@ -118,13 +118,29 @@ fn queues() -> std::sync::MutexGuard<'static, HashMap<String, mpsc::Sender<Job>>
 }
 
 /// Run a call on its session's thread (from the pipe threads). `_session`
-/// and `_client` say which session it's for.
+/// and `_client` say which session it's for; `_label` what to call it,
+/// `_host` the host app that shows it and `_parent` the session a
+/// subagent's came from (`bcu mcp --host --session --label`).
 pub fn submit(r: Request) {
     monitor::wait_ready();
-    let id = r.args.get("_session").and_then(Value::as_str).unwrap_or("cli").to_string();
+    let mut id = r.args.get("_session").and_then(Value::as_str).unwrap_or("cli").to_string();
     let client = r.args.get("_client").and_then(Value::as_str).map(String::from);
+    let label = r.args.get("_label").and_then(Value::as_str).map(str::trim).filter(|l| !l.is_empty()).map(String::from);
+    host::note_call(&id, &r.args);
     let mut queues = queues();
-    let tx = queues.entry(id.clone()).or_insert_with(|| spawn(id.clone(), client.as_deref()));
+    queues.entry(id.clone()).or_insert_with(|| spawn(id.clone(), client.as_deref(), label.as_deref()));
+    // An agent can hand a window to its subagent (or back): the call goes to
+    // the session that has the window. A batch can name it only in its actions.
+    let window = r.args.get("window_id").and_then(Value::as_u64).or_else(|| {
+        r.args.get("actions").and_then(Value::as_array).and_then(|steps| steps.iter().find_map(|s| s.get("window_id").and_then(Value::as_u64)))
+    });
+    if let Some(w) = window
+        && let Some(owner) = host::relative_owning(&id, w)
+        && queues.contains_key(&owner)
+    {
+        id = owner;
+    }
+    let tx = queues.get(&id).expect("the session's queue");
     if let Err(mpsc::SendError(Job::Call(r))) = tx.send(Job::Call(r)) {
         let _ = r.reply.send(ToolResult::error("the session's engine stopped; try again"));
     }
@@ -138,9 +154,26 @@ fn send(session: Option<&str>, job: impl Fn() -> Job) {
     }
 }
 
-/// The tray's Stop: close the windows of one session, or all.
+/// The tray's Stop: close the windows of one session, or all. The host apps
+/// showing those sessions hear so once their windows are released.
 pub fn stop(session: Option<&str>) {
-    send(session, || Job::Stop(None));
+    for (id, tx) in queues().iter() {
+        if session.is_none_or(|s| s == id) {
+            let (done, stopped) = mpsc::channel();
+            if tx.send(Job::Stop(Some(done))).is_ok() {
+                let id = id.clone();
+                std::thread::spawn(move || {
+                    let _ = stopped.recv_timeout(Duration::from_secs(10));
+                    host::stopped_by_user(&id);
+                });
+            }
+        }
+    }
+}
+
+/// A host app's stop of its own session: its windows are released.
+pub fn stop_session(session: &str) {
+    send(Some(session), || Job::Stop(None));
 }
 
 /// Before the app quits (Quit, or an update): stop every session's call at the
@@ -162,6 +195,7 @@ pub fn stop_for_quit(limit: Duration) {
             break;
         }
     }
+    crate::recorder::finish_all();
 }
 
 /// The tray's Done on a handoff: the window goes back to the agent.
@@ -197,8 +231,8 @@ fn describe(tool: &str) -> &'static str {
     }
 }
 
-fn spawn(id: String, client: Option<&str>) -> mpsc::Sender<Job> {
-    sessions::add(&id, sessions::label_for(client));
+fn spawn(id: String, client: Option<&str>, label: Option<&str>) -> mpsc::Sender<Job> {
+    sessions::add(&id, label.map(sessions::label_named).unwrap_or_else(|| sessions::label_for(client)));
     let (tx, rx) = mpsc::channel::<Job>();
     std::thread::Builder::new()
         .name(format!("session {}", id.chars().take(8).collect::<String>()))
@@ -233,13 +267,17 @@ fn run_session(id: String, rx: mpsc::Receiver<Job>) {
                     v.busy = Some(busy);
                     v.last_call = Some(Instant::now());
                 });
+                let started = Instant::now();
                 let result = engine.call(&r.tool, &r.args);
-                let _ = r.reply.send(result);
-                last_call = Instant::now();
+                host::called(&id, &r.tool, started.elapsed(), &result.text, result.is_error);
+                // Before the reply: a window the call opened is known to be
+                // this session's by the time its agent can pass it on.
                 engine.publish(|v| {
                     v.busy = None;
                     v.last_call = Some(Instant::now());
                 });
+                let _ = r.reply.send(result);
+                last_call = Instant::now();
             }
             Ok(Job::Stop(done)) => {
                 engine.stop_all();
@@ -303,11 +341,20 @@ impl Args<'_> {
     }
 }
 
-const BATCHABLE: [&str; 9] = ["click", "set_value", "perform_action", "type_text", "press_key", "scroll", "drag", "press_menu_item", "wait"];
+/// What an agent may still do while the user has its screen.
+const READ_ONLY: [&str; 7] = ["status", "guard_report", "list_apps", "list_windows", "release_window", "screenshot", "get_window_state"];
+
+const BATCHABLE: [&str; 10] = ["click", "set_value", "perform_action", "type_text", "press_key", "scroll", "drag", "press_menu_item", "navigate", "wait"];
 
 impl Engine {
     fn paused(&self) -> bool {
         sessions::get(&self.id).is_some_and(|v| v.paused)
+    }
+
+    /// Whether the session that made the call is paused: this one, or a
+    /// relative whose call on this session's window came here (`submit`).
+    fn caller_paused(&self, args: &Args) -> bool {
+        self.paused() || args.str("_session").is_some_and(|c| c != self.id && sessions::get(c).is_some_and(|v| v.paused))
     }
 
     /// Tell the tray what this session has now.
@@ -317,6 +364,20 @@ impl Engine {
         let apps = ws.iter().map(|w| sessions::AppTag { name: w.app.clone(), exe: win::exe_path(w.pid).unwrap_or_default() }).collect();
         let handoff = ws.iter().find_map(|w| w.handoff.clone().map(|r| (w.app.clone(), r)));
         let count = ws.len();
+        host::published(
+            &self.id,
+            ws.iter()
+                .map(|w| host::WindowInfo {
+                    id: win::id(w.hwnd),
+                    hwnd: w.hwnd,
+                    pid: w.pid,
+                    app: w.app.clone(),
+                    exe: win::exe_path(w.pid),
+                    kind: if w.kind == Kind::Opened { "opened" } else { "borrowed" },
+                    handoff: w.handoff.clone(),
+                })
+                .collect(),
+        );
         sessions::update(&self.id, |v| {
             v.apps = apps;
             v.windows = count;
@@ -325,10 +386,12 @@ impl Engine {
         });
     }
 
-    /// Where the agent points now, for the preview's cursor.
-    fn point_at(&self, p: POINT) {
-        sessions::update(&self.id, |v| v.pointer = Some((p, Instant::now())));
+    /// Where the agent points now, for the preview's cursor: `kind` is
+    /// "click", "move", or "drag" (from `p` to `to`).
+    fn point_at(&self, p: POINT, kind: &str, to: Option<POINT>) {
+        sessions::update(&self.id, |v| v.pointer = Some((to.unwrap_or(p), Instant::now())));
         guard::note_point(p);
+        host::pointer(&self.id, p, kind, to);
     }
 
     /// The screens can change under the windows: Remote Desktop connecting
@@ -380,7 +443,14 @@ impl Engine {
     pub fn call(&mut self, tool: &str, args: &Map<String, Value>) -> ToolResult {
         let args = Args(args);
         let acting = BATCHABLE.contains(&tool) || tool == "open_window" || tool == "borrow_window";
-        if acting && self.paused() {
+        // Closing a window the user is working in would pull it out from under them.
+        // The user drives a session's whole family's windows (`host::shown_windows`).
+        if (!READ_ONLY.contains(&tool) || tool == "release_window")
+            && (host::family_in_control(&self.id) || args.str("_session").is_some_and(host::family_in_control))
+        {
+            return ToolResult::error("The user took over your display and is using your windows. Wait and retry later, or tell the user you're blocked.");
+        }
+        if acting && self.caller_paused(&args) {
             return ToolResult::error("Paused by the user.");
         }
         // Activations of the app the agent acts on are the agent's doing: the
@@ -389,6 +459,8 @@ impl Engine {
         let pid = window.map(|w| w.pid);
         if acting && let Some(w) = window {
             guard::begin_action(w.pid);
+            // The step can leave a page, which can ask "Leave site?" first.
+            crate::navigate::watch_leave(&self.id, w.hwnd);
         }
         let mut result = self.dispatch(tool, &args).unwrap_or_else(ToolResult::error);
         if acting && let Some(pid) = pid {
@@ -398,6 +470,9 @@ impl Engine {
         }
         if acting && let Some(id) = args.int("window_id") {
             self.last_action.insert(id as u64, Instant::now());
+        }
+        if let Some(asked) = crate::navigate::take_answers(&self.id) {
+            result.text += &asked;
         }
         result
     }
@@ -424,8 +499,8 @@ impl Engine {
             "borrow_window" => self.borrow_window(args),
             "handoff" => self.handoff(args),
             "take_back" => self.take_back(args),
-            "press_menu_item" => Err("press_menu_item isn't built on Windows yet. Open the menu with click and pick the item from get_window_state.".into()),
-            "navigate" => Err("navigate isn't built on Windows yet. Click the address bar, type_text the URL and \"\\n\".".into()),
+            "press_menu_item" => self.press_menu_item(args),
+            "navigate" => self.navigate(args),
             _ => Err(format!("unknown tool {tool}")),
         }
     }
@@ -804,7 +879,7 @@ impl Engine {
             // foreground. UI Automation's actions can: Chromium activates its
             // window when an element is invoked.
             if let Some(p) = self.element_point(id, &n) {
-                self.point_at(p);
+                self.point_at(p, "click", None);
                 input::click(self.target(id, p).unwrap_or(hwnd), p, button, count)?;
                 return Ok(ToolResult::ok(format!("Clicked element {} ({}) at its center.", n.index, snapshot::role_name(n.control_type))));
             }
@@ -820,7 +895,7 @@ impl Engine {
             return Err(format!("element {} is outside the visible window. Scroll it into view first.", n.index));
         }
         let p = self.point(id, args)?;
-        self.point_at(p);
+        self.point_at(p, "click", None);
         input::click(self.target(id, p).unwrap_or(hwnd), p, button, count)?;
         Ok(ToolResult::ok(format!("Clicked at ({}, {}).", args.num("x").unwrap_or(0.0) as i64, args.num("y").unwrap_or(0.0) as i64)))
     }
@@ -834,7 +909,7 @@ impl Engine {
             // caret at the end so the text is added after what's there.
             let n = self.node(id, args)?;
             let p = self.element_point(id, &n).ok_or_else(|| format!("element {} is outside the visible window. Scroll it into view first.", n.index))?;
-            self.point_at(p);
+            self.point_at(p, "click", None);
             input::click(self.target(id, p).unwrap_or(hwnd), p, input::Button::Left, 1)?;
             input::press_key(hwnd, input::key_for("end")?, &[input::modifier_for("ctrl")?])?;
         }
@@ -877,7 +952,7 @@ impl Engine {
         if dx == 0 && dy == 0 {
             return Err("give dx or dy (lines; positive dy scrolls down)".into());
         }
-        self.point_at(p);
+        self.point_at(p, "move", None);
         input::scroll(self.target(id, p).unwrap_or(hwnd), p, dx, dy)?;
         Ok(ToolResult::ok(format!("Scrolled dx={dx} dy={dy}.")))
     }
@@ -889,9 +964,9 @@ impl Engine {
         let get = |k: &str| args.num(k).ok_or_else(|| format!("missing `{k}`"));
         let from = POINT { x: f.left + get("from_x")? as i32, y: f.top + get("from_y")? as i32 };
         let to = POINT { x: f.left + get("to_x")? as i32, y: f.top + get("to_y")? as i32 };
-        self.point_at(from);
+        self.point_at(from, "drag", Some(to));
         input::drag(hwnd, from, to)?;
-        self.point_at(to);
+        guard::note_point(to);
         Ok(ToolResult::ok("Dragged."))
     }
 
@@ -946,6 +1021,19 @@ impl Engine {
         };
         done.map_err(|err| format!("{action} on element {} failed: {err}. Its actions: {}", n.index, n.patterns.join(", ")))?;
         Ok(ToolResult::ok(format!("Performed {action} on element {}.", n.index)))
+    }
+
+    fn navigate(&mut self, args: &Args) -> Fallible<ToolResult> {
+        let id = self.window(args)?;
+        let w = &self.windows[&id];
+        Ok(ToolResult::ok(crate::navigate::navigate(&self.auto, id, w.hwnd, &w.app, args.need_str("url")?)?))
+    }
+
+    fn press_menu_item(&mut self, args: &Args) -> Fallible<ToolResult> {
+        let id = self.window(args)?;
+        let path: Vec<String> = args.0.get("path").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+        let w = &self.windows[&id];
+        Ok(ToolResult::ok(crate::menus::press(&self.auto, w.hwnd, &w.app, &path)?))
     }
 
     fn release_window(&mut self, args: &Args) -> Fallible<ToolResult> {

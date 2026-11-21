@@ -429,7 +429,7 @@
     "name": "navigate",
     "description": {
       "macos": "Load a URL in your browser window (Chromium browsers: Helium, Chrome, Brave, Edge…). No keystrokes: with the user in another app it only waits while they hold a mouse button or key or have a menu open. With the user in that same browser it waits for a pause in their input, as a key step does. Prefer it to clicking the address bar and typing.",
-      "windows": "Not built on Windows yet: click the address bar, type_text the URL and \"\\n\"."
+      "windows": "Load a URL in your browser window. It sets the address bar through UI Automation and presses Return in your window only, so nothing the user types is touched. Prefer it to clicking the address bar and typing."
     },
     "inputSchema": {
       "type": "object",
@@ -493,7 +493,7 @@
     "name": "batch",
     "description": {
       "macos": "Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {\"tool\": \"click\", \"element\": 6}, {\"tool\": \"type_text\", \"text\": \"example.com\\n\"}, {\"tool\": \"wait\", \"ms\": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, navigate, choose_file, wait. Element numbers refer to your last get_window_state. Steps that take key focus in an app the user is in wait for a pause in their input once, and back-to-back steps like that then run together.",
-      "windows": "Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {\"tool\": \"click\", \"element\": 6}, {\"tool\": \"type_text\", \"text\": \"example.com\\n\"}, {\"tool\": \"wait\", \"ms\": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, wait. Element numbers refer to your last get_window_state."
+      "windows": "Run several actions in order in one call, stopping at the first failure, then return the window's state (changes only, like get_window_state). Each action is an object with `tool` and that tool's arguments, e.g. {\"tool\": \"click\", \"element\": 6}, {\"tool\": \"type_text\", \"text\": \"example.com\\n\"}, {\"tool\": \"wait\", \"ms\": 500}. Allowed tools: click, set_value, perform_action, type_text, press_key, scroll, drag, press_menu_item, navigate, wait. Element numbers refer to your last get_window_state."
     },
     "inputSchema": {
       "type": "object",

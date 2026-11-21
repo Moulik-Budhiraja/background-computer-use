@@ -75,6 +75,7 @@ fn changed() {
     if let Some(f) = NOTIFY.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         f();
     }
+    crate::host::schedule_push();
 }
 
 /// "Claude Code", "Codex", or the client's own name; numbered when two
@@ -91,6 +92,16 @@ pub fn label_for(client: Option<&str>) -> String {
     } else {
         name.to_string()
     };
+    numbered(base)
+}
+
+/// The name a host app gave the session (`bcu mcp --label`), as it is;
+/// numbered when two sessions would share it.
+pub fn label_named(name: &str) -> String {
+    numbered(name.to_string())
+}
+
+fn numbered(base: String) -> String {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let taken = |l: &str| views.iter().any(|v| v.label == l);
     if !taken(&base) {
