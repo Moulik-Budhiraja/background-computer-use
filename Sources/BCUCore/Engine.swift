@@ -686,9 +686,30 @@ public final class Engine {
             // Still at work in that window: it keeps its app's key a while longer.
             if let id = windowID { focusGuard.touchParked(window: id) }
         }
+        if let refusal = Self.lockedRefusal(tool: tool, window: windowID != nil, locked: Self.screenLocked()) {
+            throw ToolError(refusal)
+        }
         // Opening or borrowing a window is what needs a display.
         if tool == "open_window" || tool == "borrow_window" { try ensureDisplay() }
         return try dispatch(tool: tool, args: args)
+    }
+
+    /// Whether the user's session is locked (the lock screen, also after
+    /// the display sleeps when the Mac asks for the password then).
+    static func screenLocked() -> Bool {
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        return session?["CGSSessionScreenIsLocked"] as? Bool ?? false
+    }
+
+    /// Why `tool` can't run now, if it can't. `window`: it acts on one of
+    /// the agent's windows.
+    /// While the session is locked, macOS gives accessibility clients the
+    /// app in place of each of its windows (no window ids, no frames), so no
+    /// window can be found, moved or read: a window opened then stays on the
+    /// user's screen.
+    static func lockedRefusal(tool: String, window: Bool, locked: Bool) -> String? {
+        guard locked, window || tool == "open_window" || tool == "borrow_window" else { return nil }
+        return "the Mac's screen is locked, and until the user unlocks it macOS doesn't let this app reach any app's windows. Nothing was done. Try again later, or tell the user you're blocked."
     }
 
     /// Maintenance and test tools (`admin_*`) work only when the app was
