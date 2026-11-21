@@ -233,6 +233,8 @@ enum NewWindow {
         /// When the session's last step on the app began, if the window
         /// wasn't there before it. nil: no such step.
         var agentBeganMs: Double?
+        /// The session still has a window in the app.
+        var agentHasWindow = true
     }
 
     /// How long after an agent's step began a new window is the step's.
