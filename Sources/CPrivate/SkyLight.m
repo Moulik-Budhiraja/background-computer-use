@@ -243,6 +243,11 @@ BOOL BCUPermittedFrontAvailable(void) {
         && Sym("GetProcessForPID") != NULL;
 }
 
+uint32_t BCUWindowServerConnect(void) {
+    MainConnectionIDFn cid = (MainConnectionIDFn)Sym("CGSMainConnectionID");
+    return cid ? cid() : 0;
+}
+
 uint64_t BCUProcessPSN(pid_t pid) {
     GetProcessForPIDFn forPid = (GetProcessForPIDFn)Sym("GetProcessForPID");
     if (!forPid || pid <= 0) return 0;

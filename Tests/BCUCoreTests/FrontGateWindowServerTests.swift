@@ -323,6 +323,37 @@ final class FrontGateWindowServerTests: XCTestCase {
         XCTAssertEqual(list, [])
     }
 
+    /// A connection to WindowServer the watchdog first opens while
+    /// WindowServer is handling its engine's death is dropped: the first
+    /// call goes through and every later one fails (on macOS 26.7 after
+    /// 3 of 14 kill -9s, MACH_SEND_INVALID_DEST). So the watchdog connects
+    /// when it starts, and its cleanup after a kill takes every entry off.
+    func testTheWatchdogConnectsBeforeItsEngineDies() {
+        let gate = makeGate()
+        for _ in 0..<3 { _ = gate.passForTests() }
+        XCTAssertEqual(list, [psn(user), psn(other)])
+        // The watchdog's process, as WindowServer treats it.
+        var connected = false, droppedLater = false, engineDead = false, callsMade = 0
+        func connect() {
+            guard !connected else { return }
+            connected = true
+            droppedLater = engineDead
+        }
+        let update = FrontGate.system.updateWindowServerList
+        FrontGate.system.connectWindowServer = connect
+        FrontGate.system.updateWindowServerList = { p, add in
+            connect()
+            callsMade += 1
+            return droppedLater && callsMade > 1 ? 0x1000_0003 : update(p, add)
+        }
+        FrontGate.watchdogStarting()
+        engineDead = true
+        XCTAssertTrue(FrontGate.watchdogClear())
+        XCTAssertEqual(list, [])
+        FrontGate.system.updateWindowServerList = update
+        gate.stop()
+    }
+
     /// With entries still recorded, the watchdog keeps trying after its
     /// engine is gone (nothing else would until the next launch), and stops
     /// once they're off or a new engine has started (it takes them over).
