@@ -153,8 +153,9 @@ final class AttributionTests: XCTestCase {
 final class NewWindowTests: XCTestCase {
     private let seen = 10_000.0
 
-    private func cause(userInApp: Bool, userInput: Double = -1e9, agentBegan: Double? = nil) -> NewWindow.Cause {
-        NewWindow.cause(NewWindow.Facts(firstSeenMs: seen, userInApp: userInApp, userOpenInputMs: userInput, agentBeganMs: agentBegan))
+    private func cause(userInApp: Bool, userInput: Double = -1e9, agentBegan: Double? = nil, agentHasWindow: Bool = true) -> NewWindow.Cause {
+        NewWindow.cause(NewWindow.Facts(firstSeenMs: seen, userInApp: userInApp, userOpenInputMs: userInput, agentBeganMs: agentBegan,
+                                        agentHasWindow: agentHasWindow))
     }
 
     // MARK: What an agent's step opened is the agent's
@@ -206,12 +207,27 @@ final class NewWindowTests: XCTestCase {
     func testAnOldStepExplainsNothing() {
         XCTAssertEqual(cause(userInApp: true, agentBegan: seen - 10_001), .user)
         XCTAssertEqual(cause(userInApp: true, agentBegan: seen + 5), .user)
-        XCTAssertEqual(cause(userInApp: false, agentBegan: seen - 10_001), .unclear)
+        XCTAssertEqual(cause(userInApp: false, agentBegan: seen - 10_001), .user)
     }
 
-    func testAWindowNobodyExplainsStaysWhereItIs() {
-        XCTAssertEqual(cause(userInApp: false), .unclear)
-        XCTAssertEqual(cause(userInApp: false, userInput: seen - 100), .unclear)
+    /// An agent has held an idle browser window for 25 s, and the user
+    /// opens a new window of that browser from another app (a link, the
+    /// Dock): the browser puts it next to the agent's, on the agent
+    /// display. No step of the agent's explains it, and nobody sees it
+    /// there, so it goes to the user, whatever app the guard takes them
+    /// to be in.
+    func testAWindowNobodyExplainsGoesToTheUser() {
+        XCTAssertEqual(cause(userInApp: false), .user)
+        XCTAssertEqual(cause(userInApp: false, userInput: seen - 100), .user)
+        XCTAssertEqual(cause(userInApp: false, agentBegan: seen - 25_000), .user)
+    }
+
+    /// The agent closed its only browser window 1 s ago, and the user then
+    /// opens one from another app. Releasing a window opens none, and the
+    /// agent has nothing left in the app to work in.
+    func testAWindowAfterTheAgentReleasedItsLastWindowInTheAppIsTheUsers() {
+        XCTAssertEqual(cause(userInApp: false, agentBegan: seen - 1000, agentHasWindow: false), .user)
+        XCTAssertEqual(cause(userInApp: true, userInput: seen - 20_000, agentBegan: seen - 1000, agentHasWindow: false), .user)
     }
 }
 
@@ -221,8 +237,10 @@ final class NewWindowTests: XCTestCase {
 final class NewWindowOnUserScreenTests: XCTestCase {
     private let seen = 10_000.0
 
-    private func verdict(userInApp: Bool, userInput: Double = -1e9, agentBegan: Double?, age: Double = 0) -> NewWindow.Cause? {
-        NewWindow.fromUserScreen(NewWindow.Facts(firstSeenMs: seen, userInApp: userInApp, userOpenInputMs: userInput, agentBeganMs: agentBegan),
+    private func verdict(userInApp: Bool, userInput: Double = -1e9, agentBegan: Double?, age: Double = 0,
+                         agentHasWindow: Bool = true) -> NewWindow.Cause? {
+        NewWindow.fromUserScreen(NewWindow.Facts(firstSeenMs: seen, userInApp: userInApp, userOpenInputMs: userInput, agentBeganMs: agentBegan,
+                                                 agentHasWindow: agentHasWindow),
                                nowMs: seen + age)
     }
 
@@ -232,6 +250,13 @@ final class NewWindowOnUserScreenTests: XCTestCase {
     /// app and hasn't touched anything since.
     func testASavePanelThatComesUpAfterTheStepEndedIsTheAgents() {
         XCTAssertEqual(verdict(userInApp: false, agentBegan: seen - 1200), .agent)
+    }
+
+    /// The agent closed its only window in the browser 1 s ago; the user
+    /// clicks a link in another app, and the browser opens a window on
+    /// their screen. It stays with them.
+    func testAWindowAfterTheAgentReleasedItsLastWindowInTheAppStaysWithTheUser() {
+        XCTAssertEqual(verdict(userInApp: false, agentBegan: seen - 1000, agentHasWindow: false), .user)
     }
 
     /// The same while the user reads in that browser, with no click or

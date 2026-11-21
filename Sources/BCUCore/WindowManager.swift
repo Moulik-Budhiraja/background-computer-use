@@ -1439,7 +1439,8 @@ public final class WindowManager {
             guard age < Self.agentJudgeMs, info.bounds.width > 100, info.bounds.height > 100 else { continue }
             let cause = NewWindow.cause(NewWindow.Facts(
                 firstSeenMs: firstSeen, userInApp: info.pid == front && info.pid == focusGuard.userFront,
-                userOpenInputMs: focusGuard.lastUserOpenInputMs, agentBeganMs: agentBegan))
+                userOpenInputMs: focusGuard.lastUserOpenInputMs, agentBeganMs: agentBegan,
+                agentHasWindow: agent.values.contains { $0.pid == info.pid }))
             if cause == .agent {
                 // What this session's step opened (a sign-in popup, a second
                 // window) is the session's: its agent finds it in
@@ -1505,7 +1506,8 @@ public final class WindowManager {
             let userInApp = info.pid == front && info.pid == focusGuard.userFront
             guard let cause = NewWindow.fromUserScreen(NewWindow.Facts(
                 firstSeenMs: firstSeen, userInApp: userInApp,
-                userOpenInputMs: focusGuard.lastUserOpenInputMs, agentBeganMs: agentBegan), nowMs: nowMs()) else { continue }
+                userOpenInputMs: focusGuard.lastUserOpenInputMs, agentBeganMs: agentBegan,
+                agentHasWindow: agent.values.contains { $0.pid == info.pid }), nowMs: nowMs()) else { continue }
             // Judged once: a window the user's input explains stays theirs.
             // The step's is looked at again until accessibility answers (an
             // app can be busy while it shows a dialog), for at most
