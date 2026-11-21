@@ -196,6 +196,11 @@ public final class WindowManager {
     /// its app was already running when the record was written. One that
     /// started later (after a restart, or with the pid used again) has a
     /// window with that id by chance.
+    /// Whether a window the agent handed to the user is theirs to finish:
+    /// quitting doesn't throw its changes away, and recovery leaves it. (Not
+    /// yet: every window of the agent's is treated alike.)
+    static func handedToUser(handedOff: Bool, withUser: Bool) -> Bool { false }
+
     static func recordStillNames(appLaunched: Date?, recordWritten: Date?) -> Bool {
         guard let appLaunched, let recordWritten else { return false }
         return appLaunched <= recordWritten
