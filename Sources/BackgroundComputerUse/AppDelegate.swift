@@ -39,10 +39,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // A host app's `bcu serve` reads this to start this app rather than run
         // an engine of its own. Kept current as permissions are granted or taken away.
         var record = AppRecord.current()
-        record.write()
+        AppRecord.keep(record, from: Bundle.main.bundleURL)
         recordTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
             let now = AppRecord.current()
-            if now != record { record = now; now.write() }
+            if now != record { record = now; AppRecord.keep(now, from: Bundle.main.bundleURL) }
         }
         if !startEngine() { waitForEngine() }
 
@@ -64,6 +64,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if OnboardingModel.shouldShow() {
             showOnboarding()
+        } else if AgentSetup.isTemporaryLocation(Bundle.main.bundleURL) {
+            // Set up already, and this is the copy in the disk image (or
+            // where it was downloaded): setup's last step says to open the
+            // one in Applications instead.
+            showOnboarding(step: .connect)
         } else {
             if !AX.isTrusted || !Capture.hasPermission { showSettings() }
             // If the app moved since setup, agents' entries point at a bcu that's gone.
@@ -175,9 +180,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         h.show(session: session)
     }
 
-    func showOnboarding() {
+    func showOnboarding(step: OnboardingModel.Step? = nil) {
         if onboarding == nil {
-            let controller = OnboardingWindowController()
+            let controller = OnboardingWindowController(model: OnboardingModel(step: step))
             controller.onClose = { [weak self] in self?.onboarding = nil }
             onboarding = controller
         }

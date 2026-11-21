@@ -42,6 +42,18 @@ public struct AppRecord: Equatable {
         try? data.write(to: URL(fileURLWithPath: BCUPaths.appRecordPath), options: .atomic)
     }
 
+    /// Note `record` as this app's, run from `bundleURL`. Whether it was written.
+    /// Not from a copy that won't stay (the one inside the disk image, or the
+    /// one macOS runs where the app was downloaded): `bcu` and host apps
+    /// would look for the app there once it's gone, while the installed
+    /// copy is still where the record said.
+    @discardableResult
+    public static func keep(_ record: AppRecord, from bundleURL: URL) -> Bool {
+        if AgentSetup.isTemporaryLocation(bundleURL) { return false }
+        record.write()
+        return true
+    }
+
     /// Still installed there, speaks this engine's protocol, and has what it
     /// needs to run agents.
     public var isUsable: Bool {
