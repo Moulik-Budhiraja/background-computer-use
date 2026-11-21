@@ -28,7 +28,12 @@ public final class KeyScope {
 
     private static let settleMs: Double = 120
     /// The gap between the records of the first try at giving key back.
-    static let giveBackSettleMs: Double = 5
+    /// The app has to handle the defocus record before the focus record
+    /// arrives: on macOS 27 Chromium ignored most sets sent 5 ms apart
+    /// (key stayed on the agent's window until the second try, about half
+    /// a second later, while the user's keys waited), and took every set
+    /// sent 40 ms apart.
+    static let giveBackSettleMs: Double = 40
 
     private init(pid: pid_t, target: CGWindowID, keyWindow: CGWindowID, previous: CGWindowID?, primed: Prime, wasInactive: Bool) {
         self.pid = pid
