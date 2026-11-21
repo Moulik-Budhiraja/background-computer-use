@@ -97,6 +97,13 @@ CGImageRef _Nullable BCUCaptureWindowRect(uint32_t windowID, CGRect rect, uint32
 /// the SDK no longer declares it. NULL if it's gone or fails.
 CGImageRef _Nullable BCUCaptureDisplayRect(CGDirectDisplayID display, CGRect rect) CF_RETURNS_RETAINED;
 
+#pragma mark - Displays
+
+/// Disable a display for this login session (CGSConfigureDisplayEnabled in
+/// a session-only display configuration), as before it's removed. Returns
+/// the CGError (0 = done), -1 if the call isn't there.
+int BCUDisableDisplay(CGDirectDisplayID display);
+
 #pragma mark - Spaces
 
 /// The current Space of a display (SLSManagedDisplayGetCurrentSpace). 0 if unknown.
