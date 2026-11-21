@@ -2,8 +2,9 @@
 name = "bcu"
 version = "0.1.0"
 edition = "2024"
-description = "Command-line front end for Background Computer Use on Windows: `bcu mcp` is the MCP server agents run."
+description = "Command-line front end for Background Computer Use on Windows: `bcu mcp` is the MCP server agents run, and `bcu serve` runs the engine for a host app."
 
 [dependencies]
 serde_json.workspace = true
 windows.workspace = true
+background-computer-use = { path = "../app" }

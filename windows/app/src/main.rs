@@ -1,28 +1,12 @@
 //! Background Computer Use for Windows: the tray app.
 #![windows_subsystem = "windows"]
 //!
-//! Serves the tools over a named pipe to `bcu mcp`, gives each agent session
-//! its own monitor, and shows them in the tray. Debug entry point:
+//! Serves the tools over a named pipe to `bcu mcp` (and host apps' requests,
+//! host.rs), runs each agent session on the agent screen, and shows them in
+//! the tray. Debug entry point:
 //!   BackgroundComputerUse.exe --snapshot <hwnd> [max]
 
-mod apps;
-mod browser;
-mod capture;
-mod engine;
-mod gfx;
-mod guard;
-mod input;
-mod monitor;
-mod offscreen;
-mod onboarding;
-mod pipe;
-mod sessions;
-mod setup;
-mod snapshot;
-mod tray;
-mod ui;
-mod updater;
-mod win;
+use background_computer_use::{gfx, guard, host, monitor, offscreen, pipe, serve, setup, snapshot, tray, updater};
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
@@ -59,13 +43,21 @@ fn main() {
         setup::uninstall(args.iter().any(|a| a == "--silent"));
         return;
     }
+    // One engine per user. Another copy of the app runs it: this one exits. A
+    // host app's runs it (`bcu serve`): it steps aside once its agents are
+    // done, and this app takes over.
+    if !serve::wait_turn() {
+        return;
+    }
+    host::configure(host::APP_NAME, true);
     offscreen::start();
     guard::start();
     gfx::startup();
     updater::start(tray::request_quit);
     println!("serving {}", pipe::pipe_name());
     std::thread::spawn(move || {
-        if let Err(e) = pipe::serve() {
+        // Where this app is, so a host's `bcu serve` can start it.
+        if let Err(e) = pipe::serve_then(serve::write_app_record) {
             eprintln!("Background Computer Use: {e}");
             std::process::exit(1);
         }

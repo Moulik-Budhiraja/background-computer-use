@@ -118,4 +118,38 @@ A Swift host can link the `BCUCore` library product instead. The menu bar app do
 
 ## Windows
 
-The Windows app (`windows/`) is a single binary that doesn't have this split yet. The engine modules (`engine.rs`, `sessions.rs`, `guard.rs` and the rest) would move into a library crate, with `bcu serve` and the same socket protocol over its named pipe.
+The Windows engine speaks the same protocol over a named pipe, and a host runs it the same way: `bcu serve` as a child process, `bcu mcp --host --session --label` for each agent, and the TypeScript client for the rest. `bcu.exe` is the engine as well as its command line (the engine is a library, `windows/app/src/lib.rs`, that the tray app runs too).
+
+```
+host app (Electron, say)
+├── bcu serve            a relay: the engine runs as `bcu serve-engine`, its own process
+│     └── pipe           \\.\pipe\BackgroundComputerUse-<user>
+├── host UI              talks to the pipe: sessions, frames, stop, handoff
+└── agents
+      └── bcu mcp --host <id> --session <id> --label <name>
+```
+
+### Shipping it
+
+1. Build with `cargo build --release` in `windows/` and ship `bcu.exe`, `bcu_hook.dll` and `install-monitor.ps1` together in one folder of the host (for electron-builder, `extraResources`, outside `app.asar`). The engine loads `bcu_hook.dll` into the apps agents open windows in, from next to `bcu.exe`.
+2. Agents work on a virtual monitor, from the Virtual Display Driver. `hello` says whether it's on (`permissions.agent_screen`) and, when it isn't, why (`agent_screen_problem`, which is also what agents are told). `bcu screen on` turns it on, installing the driver the first time (Windows asks for admin once, which needs `install-monitor.ps1` next to `bcu.exe`); `bcu screen` (status) and `bcu screen off` are the rest. Each prints one JSON line: `{"on", "driver_installed", "problem"?, "message"?}`. A PC where the Background Computer Use app is set up already has it. Windows asks for nothing like Accessibility or Screen Recording, so those two are always `true`.
+3. When the host launches, `bcu serve --owner "<Host name>" [--log-dir <dir>]`, as on the Mac (`startEngine` hides its console window). The engine stops, releasing its agents' windows first (it closes the ones they opened and puts borrowed ones back), when the host exits or crashes, when the host kills the process it started (Node's `kill()`, whatever the signal), when the host writes `quit` on its stdin or closes it, and on Ctrl+C. Node starts children in a job that kills them all when it exits, which would end the engine before it could release anything, so the process the host starts is a relay that runs the engine outside that job and waits for it; the engine watches the relay and the host.
+4. Give each agent `bcu mcp --host <host id> --session <your id for it> --label "<name>"`. A subagent's session is `<session>/<agent>`, for Claude Code's subagents and Codex's threads, as on the Mac, and a call a subagent makes on its parent's window (or the other way round) goes to the session that has it. A `bcu` inside a host never starts the Background Computer Use app; with no engine up, it waits up to 15 s for one.
+
+### One engine per user
+
+The pipe is per user, and creating it is what makes a process the engine. When `bcu serve` finds an engine on it (the tray app's, or another host's), it says `running` and exits. When the tray app is installed and set up (its onboarding done, the driver installed) but not running, `bcu serve` starts it and uses its engine, as on the Mac, unless `--own-engine`; the app records where it is and which protocol it speaks in `%APPDATA%\BackgroundComputerUse\app.json`. When the tray app starts while a host's engine runs, it asks that engine to `yield`, and starts its own once the host's has stopped, which it does once its agents have no windows and made no call in the last 3 seconds. The tray app shows a host's sessions with its own (`hello` says `shows_hosts`), and when the user stops one from it the host gets `stopped`.
+
+### Who can connect
+
+The pipe lets in the signed-in user's processes and SYSTEM, and no remote clients. There's no code signature check like the Mac's, so every process of the user can connect, a host's included; `--trust-client` is accepted and changes nothing, and every client sees every session it asks for.
+
+### What's different from the Mac
+
+- `socket` is the pipe's name. `socketPath()` in the TypeScript client gives it on Windows.
+- Agents share one agent screen, 1600x1000 at 100% (`max_displays` is 1), so points are pixels and a frame is at most 1600 wide. A session has a `display` from its first window until a minute after its last one closes.
+- A frame is a copy of the agent screen. When a window of a session outside the stream's session family (itself, its parent, its subagents) is on the screen too, the frame is drawn from the family's own windows and their menus instead, so it doesn't show other agents' work. A frame that shows nothing new is sent at most once a second.
+- A window has `exe`, the app's executable's full path, where the Mac has `bundle_id`. `kind` is `opened` or `borrowed`.
+- `handoff` puts the window on the user's screen at once, so `with_user` is the same as `handed_off`. `open_handoff` brings it to the front, inside `area` when given (screen pixels). `hand_back` takes it back unless it's the window in front, the way the agent's own `take_back` does.
+- `hello` has `platform: "windows"`, and `permissions.agent_screen` and `agent_screen_problem` as above.
+- Not built yet: `recordings`, `take_over`, `input`, `menu_pick` and their events (`cursor`, `menu`, `drag`), and the `navigate` and `press_menu_item` tools. Requests for them get `unknown op`.
