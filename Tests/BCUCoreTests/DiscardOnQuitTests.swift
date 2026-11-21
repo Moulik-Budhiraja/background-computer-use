@@ -35,3 +35,13 @@ final class DiscardOnQuitTests: XCTestCase {
         XCTAssertNil(WindowManager.discardButton(["OK"]))
     }
 }
+
+final class HandedOffDiscardTests: XCTestCase {
+    func testAWindowHandedToTheUserKeepsItsChanges() {
+        XCTAssertFalse(WindowManager.handedToUser(handedOff: false, withUser: false))
+        // Waiting for the user, or on their screen: their edits stay.
+        XCTAssertTrue(WindowManager.handedToUser(handedOff: true, withUser: false))
+        XCTAssertTrue(WindowManager.handedToUser(handedOff: true, withUser: true))
+        XCTAssertTrue(WindowManager.handedToUser(handedOff: false, withUser: true))
+    }
+}
