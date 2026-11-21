@@ -703,8 +703,13 @@ public final class Engine {
 
     /// Why `tool` can't run now, if it can't. `window`: it acts on one of
     /// the agent's windows.
+    /// While the session is locked, macOS gives accessibility clients the
+    /// app in place of each of its windows (no window ids, no frames), so no
+    /// window can be found, moved or read: a window opened then stays on the
+    /// user's screen.
     static func lockedRefusal(tool: String, window: Bool, locked: Bool) -> String? {
-        nil
+        guard locked, window || tool == "open_window" || tool == "borrow_window" else { return nil }
+        return "the Mac's screen is locked, and until the user unlocks it macOS doesn't let this app reach any app's windows. Nothing was done. Try again later, or tell the user you're blocked."
     }
 
     /// Maintenance and test tools (`admin_*`) work only when the app was
