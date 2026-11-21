@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import CoreGraphics
 import os
 
@@ -214,6 +215,7 @@ enum QuietWait {
     }
 
     static let typingReason = "the user to stop typing"
+    static let secureReason = "the user to leave the password field"
 
     /// The user is typing: a key went down within `typingMs`. A key kept
     /// down counts for as long as it repeats.
@@ -328,6 +330,7 @@ enum QuietWait {
     /// `stop` is checked on every look.
     static func wait(_ activity: UserActivity, pid: pid_t, softMs soft: Double, hardMs hard: Double,
                      typingOnly: Bool = false, giveUpAtMs: Double = .infinity,
+                     secureInput: () -> Bool = { IsSecureEventInputEnabled() },
                      stop: () -> Bool = { false }, willWait: () -> Void = {}) -> Result {
         let start = nowMs()
         var menu = menus(pid: pid)
