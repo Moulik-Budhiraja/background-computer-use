@@ -38,16 +38,8 @@ usage:
 /// The app this `bcu` was shipped inside, if it isn't this one: a host app
 /// that runs the engine itself (`bcu serve`).
 let hostApp: Bundle? = {
-    let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
-    var dir = exe.deletingLastPathComponent()
-    while dir.path != "/" {
-        if dir.pathExtension == "app" {
-            let b = Bundle(url: dir)
-            return b?.bundleIdentifier == BCUPaths.bundleID ? nil : b
-        }
-        dir = dir.deletingLastPathComponent()
-    }
-    return nil
+    let b = BCUCopy.app(containing: URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath())
+    return b?.bundleIdentifier == BCUPaths.bundleID ? nil : b
 }()
 
 /// Who to open when the engine isn't running.
