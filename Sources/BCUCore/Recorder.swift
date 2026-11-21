@@ -576,11 +576,12 @@ final class RunWriter {
 
 }
 
-/// Records one session's agent display while it exists: a frame whenever the
-/// picture changes (checked twice a second and right after each call), what
-/// the agent did, and where its actions landed. Frames go to disk as JPEGs
-/// first, so they can be watched right away and survive a crash, and every
-/// minute or so they're packed into a video.
+/// Records one session's agent display while it exists: a frame after each
+/// call and whenever the display's windows move, open, close or change
+/// title, what the agent did, and where its actions landed. An idle display
+/// is never captured: every capture can light macOS's purple capture dot.
+/// Frames go to disk as JPEGs first, so they can be watched right away and
+/// survive a crash, and every minute or so they're packed into a video.
 public final class SessionRecorder {
     private let sessionID: String
     private var label: String
@@ -596,6 +597,8 @@ public final class SessionRecorder {
     private var lastImage: CGImage?
     private var pendingForced = false
     private var lastPreviewMs = 0.0
+    /// The agent display's windows at the recorder's last capture.
+    private var lastSpots: [WindowSpot]?
     private var bundleByPid: [pid_t: String?] = [:]
 
     /// How often the recorder looks: whether it may capture, or a preview frame to keep.
@@ -666,6 +669,7 @@ public final class SessionRecorder {
         self.writer = writer
         lastThumb = nil
         lastImage = nil
+        lastSpots = nil
         pendingForced = true
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + 0.2, repeating: Self.sampleInterval, leeway: .milliseconds(50))
@@ -758,12 +762,16 @@ public final class SessionRecorder {
         }
     }
 
-    /// Captures only once nothing in the app has captured for `minGapMs`,
-    /// so the recorder never brings on the screen-sharing indicator. A frame
-    /// wanted after a call waits for that too.
+    /// Captures only when there's something new to see (a call finished, or
+    /// the window list shows the display's windows changed), and only once
+    /// nothing in the app has captured for `minGapMs`. Reading the window
+    /// list isn't a capture, so an idle display costs no captures at all.
     private func tick() {
-        guard writer != nil, Self.wantsCapture(pending: pendingForced, sinceLastCaptureMs: nowMs() - Capture.lastCaptureMs,
-                                               windowsChanged: true) else { return }
+        guard writer != nil, display.isRunning else { return }
+        let spots = Self.windowSpots(WindowList.all(onScreenOnly: true), on: display.bounds, me: getpid())
+        guard Self.wantsCapture(pending: pendingForced, sinceLastCaptureMs: nowMs() - Capture.lastCaptureMs,
+                                windowsChanged: spots != lastSpots) else { return }
+        lastSpots = spots
         capture(force: pendingForced)
         pendingForced = false
     }
@@ -772,7 +780,7 @@ public final class SessionRecorder {
     /// run's first, or one after a call), `windowsChanged` when the agent
     /// display's windows aren't where they were at the last frame.
     static func wantsCapture(pending: Bool, sinceLastCaptureMs: Double, windowsChanged: Bool) -> Bool {
-        sinceLastCaptureMs >= minGapMs
+        (pending || windowsChanged) && sinceLastCaptureMs >= minGapMs
     }
 
     /// What the window list says about the agent display (no capture): its
