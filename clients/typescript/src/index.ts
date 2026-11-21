@@ -26,8 +26,10 @@ export type * from './types.ts'
 // The protocol this client speaks. `hello` says the engine's.
 export const PROTOCOL = 1
 
-// Where the engine listens. One engine runs per Mac, whoever started it.
+// Where the engine listens. One engine runs per Mac, whoever started it. On
+// Windows it's a named pipe of the signed-in user's, and one engine runs per user.
 export function socketPath(home = process.env.BCU_HOME): string {
+  if (process.platform === 'win32') return `\\\\.\\pipe\\BackgroundComputerUse-${process.env.USERNAME ?? 'user'}`
   return join(home || join(homedir(), 'Library/Application Support/BackgroundComputerUse'), 'bcu.sock')
 }
 
@@ -55,25 +57,30 @@ export type StartOptions = {
   ownEngine?: boolean
   // Clients the engine's code signature check would refuse: team IDs, or
   // paths of programs, apps or folders (your development build, say). Your
-  // signed app and its `bcu` don't need this.
+  // signed app and its `bcu` don't need this. On Windows every process of
+  // the user may connect, so this changes nothing there.
   trustClients?: string[]
   env?: NodeJS.ProcessEnv
 }
 
 // Start the engine as a child of this process, so macOS counts its
 // Accessibility and Screen Recording permissions as your app's. It stops when
-// this process exits. If an engine is already running, resolves with
-// kind "running" and that engine is the one to use. If the Background
-// Computer Use app is installed and has its permissions, starts it (in the
-// background) and resolves with kind "running": its engine runs your agents
-// and its menu bar shows them beside its own (`hello` says `shows_hosts`).
-// Can take up to 25 s then.
+// this process exits, or when you kill `process` (SIGTERM; on Windows any
+// kill, or "quit\n" on its stdin), and releases its windows first. If an
+// engine is already running, resolves with kind "running" and that engine is
+// the one to use. If the Background Computer Use app is installed and has
+// its permissions, starts it (in the background) and resolves with kind
+// "running": its engine runs your agents and its menu bar (or tray) shows
+// them beside its own (`hello` says `shows_hosts`). Can take up to 25 s then.
 export function startEngine(opts: StartOptions): Promise<EngineStart> {
   const args = ['serve', '--owner', opts.owner]
   if (opts.logDir) args.push('--log-dir', opts.logDir)
   if (opts.ownEngine) args.push('--own-engine')
   for (const c of opts.trustClients ?? []) args.push('--trust-client', c)
-  const child = spawn(opts.bcu, args, { stdio: ['ignore', 'pipe', 'ignore'], env: opts.env ?? process.env })
+  // On Windows: no console window, and a stdin the engine reads `quit` from
+  // and sees close when this process goes.
+  const windows = process.platform === 'win32'
+  const child = spawn(opts.bcu, args, { stdio: [windows ? 'pipe' : 'ignore', 'pipe', 'ignore'], env: opts.env ?? process.env, windowsHide: true })
   return new Promise((resolve, reject) => {
     let buffer = ''
     const fail = (why: string) => reject(new Error(`bcu serve: ${why}`))
