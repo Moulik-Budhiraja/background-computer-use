@@ -58,3 +58,60 @@ final class KeyRefusalTests: XCTestCase {
         XCTAssertNil(text.range(of: #"\d{4,}"#, options: .regularExpression))
     }
 }
+
+/// What choose_file reads back of the panel's selection after Go to Folder.
+final class PanelSelectionTests: XCTestCase {
+    final class Node {
+        let role: String
+        var value: String?
+        var kids: [Node]
+        var selected: [String: [Node]] = [:]
+        init(_ role: String, value: String? = nil, _ kids: [Node] = []) { self.role = role; self.value = value; self.kids = kids }
+    }
+
+    private let reader = Panel.Reader<Node>(role: { $0.role }, children: { $0.kids }, elements: { $0.selected[$1] ?? [] }, value: { $0.value })
+
+    /// A row of a list: a cell, or a column view's item (an icon and the name).
+    private func item(_ name: String, _ role: String = "AXGroup") -> Node {
+        Node(role, [Node("AXImage"), Node("AXTextField", value: name)])
+    }
+
+    private func list(_ names: [String], selected: String, role: String = "AXList", attribute: String = "AXSelectedChildren", itemRole: String = "AXGroup") -> Node {
+        let items = names.map { item($0, itemRole) }
+        let l = Node(role, items)
+        l.selected[attribute] = items.filter { $0.kids.last?.value == selected }
+        return l
+    }
+
+    /// The open panel on macOS 27.3 after Go to Folder ~/Library/Caches/x.txt
+    /// (read from the panel): the sidebar has the home folder selected, and
+    /// the column view one list per column, the last with x.txt selected.
+    /// choose_file said "the panel selected "admin" instead of "x.txt"".
+    private func columnViewPanel() -> Node {
+        let sidebar = list(["Recents", "Applications", "Desktop", "admin"], selected: "admin", role: "AXOutline", attribute: "AXSelectedRows", itemRole: "AXRow")
+        let columns = [list(["Desktop", "Library", "Movies"], selected: "Library"),
+                       list(["Accessibility", "Caches", "Containers"], selected: "Caches"),
+                       list(["askpermissiond", "x.txt", "y.txt"], selected: "x.txt")]
+        let browser = Node("AXBrowser", [Node("AXScrollArea", columns.map { Node("AXScrollArea", [$0, Node("AXScrollBar")]) })])
+        return Node("AXSheet", [Node("AXSplitGroup", [Node("AXScrollArea", [sidebar]), Node("AXSplitGroup", [browser]),
+                                                       Node("AXButton", value: nil)])])
+    }
+
+    func testTheFileSelectedInColumnViewIsRead() {
+        XCTAssertTrue(Panel.selectedNames(columnViewPanel(), reader).contains("x.txt"))
+    }
+
+    /// The folders chosen in the columns before it aren't the selection.
+    func testOnlyTheLastColumnsSelectionCounts() {
+        let names = Panel.selectedNames(columnViewPanel(), reader)
+        XCTAssertFalse(names.contains("Library"))
+        XCTAssertFalse(names.contains("Caches"))
+    }
+
+    /// List view: the file list is an outline of rows.
+    func testTheFileSelectedInListViewIsRead() {
+        let files = list(["a.txt", "x.txt"], selected: "x.txt", role: "AXOutline", attribute: "AXSelectedRows", itemRole: "AXRow")
+        let panel = Node("AXSheet", [Node("AXScrollArea", [files])])
+        XCTAssertEqual(Panel.selectedNames(panel, reader), ["x.txt"])
+    }
+}
