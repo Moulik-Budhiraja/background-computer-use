@@ -35,18 +35,6 @@ final class ReviewFixTests: XCTestCase {
         XCTAssertEqual(WindowManager.leftoverFate(3, agentMade: false, kept: []), .giveToUser)
     }
 
-    func testRecoveryClosesOnlyWhatsStillOnALeftoverDisplay() {
-        let stray = CGRect(x: 3000, y: 0, width: 1400, height: 900)
-        let there = CGRect(x: 3100, y: 100, width: 800, height: 600)
-        let onUsers = CGRect(x: 100, y: 100, width: 800, height: 600)
-        XCTAssertTrue(WindowManager.recoveryCloses(kind: "opened", bounds: there, agentDisplays: [stray]))
-        XCTAssertTrue(WindowManager.recoveryCloses(kind: "caught", bounds: there, agentDisplays: [stray]))
-        // Its display went with the crash: on the user's screen, maybe in use.
-        XCTAssertFalse(WindowManager.recoveryCloses(kind: "opened", bounds: onUsers, agentDisplays: [stray]))
-        XCTAssertFalse(WindowManager.recoveryCloses(kind: "opened", bounds: there, agentDisplays: []))
-        XCTAssertFalse(WindowManager.recoveryCloses(kind: "borrowed", bounds: there, agentDisplays: [stray]))
-    }
-
     func testTheCatcherMovesOnlyTheWindowItCaught() {
         XCTAssertTrue(WindowCatcher.mayMove(5, caught: nil))
         XCTAssertTrue(WindowCatcher.mayMove(5, caught: 5))

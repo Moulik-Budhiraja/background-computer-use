@@ -345,11 +345,14 @@ public final class Engine {
 
     /// Release windows (closing opened, returning borrowed) on the session's
     /// queue; `group` is left when done. Release doesn't need the main thread,
-    /// which may be busy quitting.
+    /// which may be busy quitting. Unsaved changes in the agent's documents
+    /// are thrown away: a save sheet left up keeps its window open, and the
+    /// window lands on the user's screen when the display goes.
     public func releaseForShutdown(_ group: DispatchGroup) {
         group.enter()
         queue.async {
-            _ = self.windows.releaseAll()
+            let results = self.windows.releaseAll(discard: true)
+            if !results.isEmpty { Log.info("quitting: " + results.joined(separator: "; ")) }
             group.leave()
         }
     }
