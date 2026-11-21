@@ -48,9 +48,9 @@ The first launch opens a setup window, like the Mac app's onboarding: what the a
 
 ## Status
 
-Built: keeping new windows off the user's screen from inside the app (`bcu_hook.dll`), the MCP server (`bcu.exe mcp`), the pipe between it and the app, running the engine inside another app (`bcu serve`, the host protocol and its frames: see [docs/embedding.md](../docs/embedding.md#windows)), the UI Automation listing and diff, posted click/type/key/scroll/drag, set_value, perform_action, batch, screenshots, open_window, borrow_window, release_window, handoff/take_back, the focus guard, the agent screen (shared, a thread per agent session), the tray icon and its live preview, and the first-run setup window.
+Built: keeping new windows off the user's screen from inside the app (`bcu_hook.dll`), the MCP server (`bcu.exe mcp`), the pipe between it and the app, running the engine inside another app (`bcu serve`, the host protocol, its frames and recordings: see [docs/embedding.md](../docs/embedding.md#windows)), the UI Automation listing and diff, posted click/type/key/scroll/drag, set_value, perform_action, batch, screenshots, open_window, borrow_window, release_window, handoff/take_back, the focus guard, the agent screen (shared, a thread per agent session), the tray icon and its live preview, and the first-run setup window.
 
-Not yet: taking over an agent's monitor from the expanded view or a host app, recordings for host apps, `press_menu_item`, `navigate`, sound, crash cleanup, testing on a real PC with a real agent. Agents share one agent screen, so their windows can cover each other.
+Not yet: taking over an agent's monitor from the expanded view or a host app, `press_menu_item`, `navigate`, sound, crash cleanup, testing on a real PC with a real agent. Agents share one agent screen, so their windows can cover each other.
 
 ## Install, updates and releases
 
@@ -62,7 +62,7 @@ Not yet: taking over an agent's monitor from the expanded view or a host app, re
 
 On Windows: `cargo build --release` in this folder (Rust with the MSVC toolchain). The engine is a library (`app/src/lib.rs`) that both the tray app and `bcu.exe` (for `bcu serve`) are built on.
 
-`BCU_WINDOWS_LIVE=1 node --test test/windows.test.ts` in `clients/typescript` tests a host's side end to end on a PC or VM with the agent screen on and no engine running: `bcu serve`, helper agents in Notepad and Edge while a simulated user types in front, frames, stop, pause, handoff, quitting, and the tray app running the engine.
+`BCU_WINDOWS_LIVE=1 node --test test/windows.test.ts` in `clients/typescript` tests a host's side end to end on a PC or VM with the agent screen on and no engine running: `bcu serve`, helper agents in Notepad and Edge while a simulated user types in front, frames, recordings, stop, pause, handoff, quitting, and the tray app running the engine.
 
 On a Mac, for test loops: `./build-from-mac.sh` cross-compiles with its own rustup and the MSVC libraries fetched by `xwin`, and `./pack-for-vm.sh` uploads a zip of the binaries and probe scripts for a test VM to download.
 

@@ -17,6 +17,7 @@ pub mod monitor;
 pub mod offscreen;
 pub mod onboarding;
 pub mod pipe;
+pub mod recorder;
 pub mod serve;
 pub mod sessions;
 pub mod setup;

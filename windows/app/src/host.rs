@@ -21,6 +21,7 @@ use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, SwitchToThisWindow};
 
 use crate::pipe::Pipe;
+use crate::recorder::{self, Store};
 use crate::{engine, monitor, sessions, stream, win};
 
 /// Bumped when a change would break an existing client. The Mac's is the same.
@@ -227,11 +228,13 @@ pub fn called(session: &str, tool: &str, took: Duration, text: &str, error: bool
         format!("{tool} ({} ms): {first}", took.as_millis())
     };
     log(session, line, error);
+    recorder::capture_soon(session);
 }
 
 /// A line of the session's activity.
 pub fn log(session: &str, text: String, error: bool) {
     let text: String = text.chars().take(300).collect();
+    recorder::note(session, &text, error);
     with_extras(|x| {
         let a = &mut x.entry(session.to_string()).or_default().activity;
         a.push_back((wall_ms(), text, error));
@@ -240,6 +243,11 @@ pub fn log(session: &str, text: String, error: bool) {
         }
     });
     schedule_push();
+}
+
+/// The host app that shows the session, if one does.
+pub fn host_of(session: &str) -> Option<String> {
+    with_extras(|x| x.get(session).and_then(|e| e.host.clone()))
 }
 
 /// The session a subagent's session came from, if it's a subagent's.
@@ -288,6 +296,8 @@ pub fn all_windows() -> Vec<(String, WindowInfo)> {
 pub fn pointer(session: &str, p: POINT, kind: &str, to: Option<POINT>) {
     let Some(m) = monitor::of_session(session) else { return };
     let host = with_extras(|x| x.get(session).map(|e| e.host.clone()));
+    let at = to.unwrap_or(p);
+    recorder::pointer(session, at.x - m.rect.left, at.y - m.rect.top, kind == "click");
     let mut o = json!({"event": "pointer", "session": session, "x": p.x - m.rect.left, "y": p.y - m.rect.top, "kind": kind});
     if let Some(t) = to {
         o["to"] = json!({"x": t.x - m.rect.left, "y": t.y - m.rect.top});
@@ -368,6 +378,29 @@ fn dispatch(conn: &Arc<Conn>, op: &str, req: &Map<String, Value>) -> Result<Valu
             Ok(json!({}))
         }
 
+        "recordings" => {
+            // A host chooses whether its own sessions are recorded, and
+            // where. Until it does, they aren't.
+            let host = s(req, "host").filter(|h| !h.is_empty()).ok_or("recordings needs host: your host ID")?;
+            let Some(dir) = s(req, "directory") else {
+                recorder::set_store(host, None);
+                return Ok(json!({"recording": false}));
+            };
+            let directory = std::path::PathBuf::from(dir);
+            if !directory.is_absolute() {
+                return Err("directory must be an absolute path".into());
+            }
+            std::fs::create_dir_all(&directory).map_err(|e| format!("can't create {dir}: {e}"))?;
+            let store = Store {
+                directory,
+                limit_mb: int(req, "limit_mb").map(|n| n.max(0) as u64).unwrap_or(recorder::DEFAULT_LIMIT_MB).max(recorder::MIN_LIMIT_MB),
+                retention_days: int(req, "retention_days").map(|n| n.max(1) as u64).unwrap_or(recorder::DEFAULT_RETENTION_DAYS),
+            };
+            let reply = json!({"recording": true, "directory": dir, "limit_mb": store.limit_mb, "retention_days": store.retention_days});
+            recorder::set_store(host, Some(store));
+            Ok(reply)
+        }
+
         "unsubscribe" => {
             with_clients(|c| {
                 if let Some(c) = c.get_mut(&conn.id) {
@@ -404,6 +437,7 @@ fn dispatch(conn: &Arc<Conn>, op: &str, req: &Map<String, Value>) -> Result<Valu
             let id = session(req)?;
             let label = s(req, "label").map(str::trim).filter(|l| !l.is_empty()).ok_or("rename needs label")?;
             sessions::update(&id, |v| v.label = label.to_string());
+            recorder::rename(&id, label);
             Ok(json!({}))
         }
 

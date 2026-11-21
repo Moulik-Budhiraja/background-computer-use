@@ -73,7 +73,7 @@ impl Stream {
             let o = self.options();
             let started = Instant::now();
             if self.conn.backlog() < 2
-                && let Some((img, whole)) = frame(&self.session, &o)
+                && let Some((img, whole)) = picture(&self.session, &o)
             {
                 let print = jpeg::fingerprint(&img.bits);
                 if last.is_none_or(|(p, at)| p != print || at.elapsed() >= Duration::from_secs(1))
@@ -98,8 +98,9 @@ impl Stream {
     }
 }
 
-/// The picture to send now, and the screen it shows (None for one window).
-fn frame(session: &str, o: &Options) -> Option<(Bgra, Option<RECT>)> {
+/// What a preview of the session shows now, and the screen it shows (None
+/// for one window). Recordings keep the same picture (recorder.rs).
+pub fn picture(session: &str, o: &Options) -> Option<(Bgra, Option<RECT>)> {
     if o.window != 0 {
         // A window shows only while the session (or its family) has it.
         let w = host::windows_of(&host::family(session)).into_iter().find(|w| w.id == o.window)?;

@@ -195,6 +195,7 @@ pub fn stop_for_quit(limit: Duration) {
             break;
         }
     }
+    crate::recorder::finish_all();
 }
 
 /// The tray's Done on a handoff: the window goes back to the agent.

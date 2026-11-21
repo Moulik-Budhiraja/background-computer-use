@@ -9,7 +9,7 @@
 // windows/target/release), BCU_PROBE bcu-probe.exe (default: next to it).
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { after, before, test } from 'node:test'
@@ -184,6 +184,17 @@ test('hello and catalog', { skip: !live }, async () => {
 let helper: Mcp
 let notepad = 0
 let edge = 0
+
+test('a host chooses whether its sessions are recorded, and where', { skip: !live }, async () => {
+  await assert.rejects(host!.request('recordings', { directory: join(dir, 'rec') }), /host/)
+  await assert.rejects(host!.setRecordings({ host: HOST, directory: 'relative\\dir' }), /absolute/)
+  const rec = join(dir, 'recordings')
+  const on = await host!.setRecordings({ host: HOST, directory: rec, limitMB: 10, retentionDays: 2 })
+  assert.deepEqual(on, { recording: true, directory: rec, limit_mb: 50, retention_days: 2 })
+  assert.ok(existsSync(rec), 'the folder is made')
+  assert.deepEqual(await host!.setRecordings({ host: HOST, directory: null }), { recording: false })
+  await host!.setRecordings({ host: HOST, directory: rec })
+})
 
 test('a helper session has the host, ID and label it was started with', { skip: !live }, async () => {
   helper = new Mcp(['--host', HOST, '--session', 'helper-1', '--label', 'Research helper'])
@@ -395,6 +406,28 @@ test('when the host quits, the engine gives the windows back first', { skip: !li
   await sleep(500)
   assert.equal(rect(userNp), before, 'the borrowed window is back where it was')
   await until('the window it opened to close', () => rect(opened) === 'gone')
+})
+
+test('the helper\'s work is recorded, in the Mac\'s layout', { skip: !live }, async () => {
+  const rec = join(dir, 'recordings')
+  const runs = readdirSync(rec).filter((d) => existsSync(join(rec, d, 'meta.json')))
+  const mine = runs.map((d) => ({ d, meta: JSON.parse(readFileSync(join(rec, d, 'meta.json'), 'utf8')) })).filter((r) => r.meta.session === 'helper-1')
+  assert.equal(mine.length, 1, `one run for helper-1: ${runs.join(', ')}`)
+  const { d, meta } = mine[0]
+  assert.match(d, /^\d{8}-\d{6}-\d{3}-helper-1-[0-9a-f]{8}$/)
+  assert.equal(meta.label, 'Get Google Approval', 'renamed while recording')
+  assert.deepEqual([meta.w, meta.h], [1600, 1000])
+  assert.ok(meta.end > meta.start, 'ended when the engine stopped')
+  const lines = (f: string) => readFileSync(join(rec, d, f), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  const frames = lines('frames.jsonl')
+  const staged = new Set(readdirSync(join(rec, d, 'staging')))
+  assert.ok(frames.length >= 3, `frames: ${frames.length}`)
+  assert.ok(frames.every((f) => staged.has(`${Math.trunc(f.t)}.jpg`)), 'every frame has its JPEG')
+  assert.ok(frames.some((f) => /notepad\.exe$/i.test(f.b ?? '')) && frames.some((f) => /msedge\.exe$/i.test(f.b ?? '')), 'frames say which app was in front')
+  const events = lines('events.jsonl')
+  assert.ok(events.some((e) => e.x?.startsWith('open_window (')), 'the activity')
+  assert.ok(events.some((e) => e.x?.startsWith('release_window')), 'closing a window, which the history reads')
+  assert.ok(events.some((e) => Array.isArray(e.p) && e.c === true), 'where clicks landed')
 })
 
 test('the tray app takes over from a host\'s engine once its agents are done', { skip: !live }, async () => {
