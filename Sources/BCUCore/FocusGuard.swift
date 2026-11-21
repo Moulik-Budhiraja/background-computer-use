@@ -368,34 +368,22 @@ public final class FocusGuard {
         let fenced = AgentDisplay.fencedBounds
         guard !fenced.isEmpty, let p = CGEvent(source: nil)?.location else { return false }
         let users = AgentDisplay.userDisplayIDs().map { CGDisplayBounds($0) }
-        // An agent display lying over one of the user's (macOS wouldn't
-        // place it while the screens slept): the cursor there is on their
-        // screen, where it belongs. Warping it to the same spot every few
-        // ms would end every hover effect under it. (The tap lets it be too.)
-        guard let agent = AgentDisplay.fenced(at: p, agents: fenced, users: users) else {
-            // Off every display (an event posted with a far-off location can
-            // leave it there): just as invisible, and macOS only brings it
-            // back when the displays change.
-            if !users.contains(where: { $0.contains(p) }) {
-                let q = nearestUserPoint(p, agent: .null)
-                if q != p && !fenced.contains(where: { $0.contains(q) }) {
-                    CGWarpMouseCursorPosition(q)
-                    CGAssociateMouseAndMouseCursorPosition(1)
-                    lock.lock()
-                    let log = nowMs() - lastEscapeLogMs > 2000
-                    if log { lastEscapeLogMs = nowMs() }
-                    lock.unlock()
-                    if log { Log.info("guard: cursor was off every display at \(Int(p.x)),\(Int(p.y)); moved it back to \(Int(q.x)),\(Int(q.y))") }
-                }
-                return true
-            }
-            return fenced.contains { $0.insetBy(dx: -400, dy: -400).contains(p) }
+        let near = fenced.contains { $0.insetBy(dx: -400, dy: -400).contains(p) }
+        guard let fix = Self.cursorFix(p, fenced: fenced, users: users, msSinceUserMove: nowMs() - lastUserMoveMs.withLock { $0 }) else {
+            // Left be on an agent display (nowhere better): not near. Off every display: near.
+            if AgentDisplay.fenced(at: p, agents: fenced, users: users) != nil { return false }
+            return !users.contains { $0.contains(p) } || near
         }
-        let q = returnPoint(p, agent: agent, msSinceUserMove: nowMs() - lastUserMoveMs.withLock { $0 })
-        // Nowhere better to put it (no user display): leave it be.
-        guard q != p, !fenced.contains(where: { $0.contains(q) }) else { return false }
-        CGWarpMouseCursorPosition(q)
+        CGWarpMouseCursorPosition(fix.to)
         CGAssociateMouseAndMouseCursorPosition(1)
+        lock.lock()
+        let log = nowMs() - lastEscapeLogMs > 2000
+        if log { lastEscapeLogMs = nowMs() }
+        lock.unlock()
+        guard let agent = fix.agent else {
+            if log { Log.info("guard: cursor was off every display at \(Int(p.x)),\(Int(p.y)); moved it back to \(Int(fix.to.x)),\(Int(fix.to.y))") }
+            return true
+        }
         let tapState: String
         if let tap {
             let on = CGEvent.tapIsEnabled(tap: tap)
@@ -404,14 +392,33 @@ public final class FocusGuard {
         } else {
             tapState = "tap not installed"
         }
-        lock.lock()
-        let log = nowMs() - lastEscapeLogMs > 2000
-        if log { lastEscapeLogMs = nowMs() }
-        lock.unlock()
         if log {
-            Log.info("guard: cursor was on the agent display at \(Int(p.x)),\(Int(p.y)); moved it back to \(Int(q.x)),\(Int(q.y)) (\(tapState); agent display at \(agent.short))")
+            Log.info("guard: cursor was on the agent display at \(Int(p.x)),\(Int(p.y)); moved it back to \(Int(fix.to.x)),\(Int(fix.to.y)) (\(tapState); agent display at \(agent.short))")
         }
         return true
+    }
+
+    /// Where the cursor watch moves a cursor found at `p`, and the agent
+    /// display it was on (nil: it was off every display), or nil to leave
+    /// it. `fenced` are the displays it must stay off, `users` the user's.
+    static func cursorFix(_ p: CGPoint, fenced: [CGRect], users: [CGRect], msSinceUserMove: Double) -> (to: CGPoint, agent: CGRect?)? {
+        guard !fenced.isEmpty else { return nil }
+        // An agent display lying over one of the user's (macOS wouldn't
+        // place it while the screens slept): the cursor there is on their
+        // screen, where it belongs. Warping it to the same spot every few
+        // ms would end every hover effect under it. (The tap lets it be too.)
+        guard let agent = AgentDisplay.fenced(at: p, agents: fenced, users: users) else {
+            // Off every display (an event posted with a far-off location can
+            // leave it there): just as invisible, and macOS only brings it
+            // back when the displays change.
+            guard !users.contains(where: { $0.contains(p) }) else { return nil }
+            let q = nearestUserPoint(p, agent: .null, users: users, fenced: fenced)
+            return q != p && !fenced.contains(where: { $0.contains(q) }) ? (q, nil) : nil
+        }
+        let q = returnPoint(p, agent: agent, users: users, fenced: fenced, msSinceUserMove: msSinceUserMove)
+        // Nowhere better to put it (no user display): leave it be.
+        guard q != p, !fenced.contains(where: { $0.contains(q) }) else { return nil }
+        return (q, agent)
     }
 
     // MARK: Agent actions
@@ -2079,10 +2086,6 @@ public final class FocusGuard {
         if held.isEmpty { heldSinceMs = nowMs() }
         held.append((copy, front))
         lock.unlock()
-    }
-
-    private func nearestUserPoint(_ p: CGPoint, agent: CGRect) -> CGPoint {
-        Self.nearestUserPoint(p, agent: agent, users: AgentDisplay.userDisplayIDs().map { CGDisplayBounds($0) }, fenced: AgentDisplay.fencedBounds)
     }
 
     private func returnPoint(_ p: CGPoint, agent: CGRect, msSinceUserMove: Double) -> CGPoint {
