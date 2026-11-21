@@ -232,7 +232,20 @@ fn tick() {
         if with(|s| !s.runs.contains_key(&session))
             && let Some(r) = begin(store, &session, &h, &label)
         {
-            with(|s| s.runs.insert(session.clone(), r));
+            // The host may have stopped recording or picked another folder
+            // since `stores` was read: only a run for the store it has now.
+            let unwanted = with(|s| {
+                if s.stores.get(&h) == Some(store) && !s.runs.contains_key(&session) {
+                    s.runs.insert(session.clone(), r);
+                    None
+                } else {
+                    Some(r)
+                }
+            });
+            if let Some(r) = unwanted {
+                finish(r);
+                continue;
+            }
         }
         capture(&session);
     }
