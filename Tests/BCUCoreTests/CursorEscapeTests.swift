@@ -65,3 +65,24 @@ final class CursorEscapeTests: XCTestCase {
         XCTAssertEqual(q, CGPoint(x: user.maxX - 1 - FocusGuard.escapeInset, y: user.maxY - 1 - FocusGuard.escapeInset))
     }
 }
+
+/// The cursor after the last agent display goes: macOS can leave it just
+/// past the corner the display touched, off every display, where the user
+/// can't see it. With no agent display left, nothing is fenced, and the
+/// watch must still bring it back.
+final class CursorAfterRemovalTests: XCTestCase {
+    let main = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+
+    func testACursorLeftOffEveryDisplayByTheLastRemovalComesBack() {
+        let fix = FocusGuard.cursorFix(CGPoint(x: 1920, y: 1080), fenced: [], users: [main], msSinceUserMove: 5000)
+        XCTAssertNotNil(fix)
+        guard let fix else { return }
+        XCTAssertNil(fix.agent)
+        XCTAssertTrue(main.insetBy(dx: 24, dy: 24).contains(fix.to), "\(fix.to)")
+    }
+
+    func testACursorOnTheUsersScreenIsLeftAloneWithNoAgentDisplay() {
+        XCTAssertNil(FocusGuard.cursorFix(CGPoint(x: 700, y: 500), fenced: [], users: [main], msSinceUserMove: 5000))
+        XCTAssertNil(FocusGuard.cursorFix(CGPoint(x: 1919, y: 1079), fenced: [], users: [main], msSinceUserMove: 5000))
+    }
+}
