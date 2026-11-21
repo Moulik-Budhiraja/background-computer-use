@@ -978,8 +978,12 @@ public final class FrontGate {
 
     private static var engineURL: URL { BCUPaths.supportDirectory.appendingPathComponent("front-gate.engine") }
 
-    /// The watchdog's first moments, while its engine runs.
+    /// The watchdog's first moments, while its engine runs. Its connection
+    /// to WindowServer is opened now: one first opened while WindowServer
+    /// handles the engine's death (a kill -9) is dropped after its first
+    /// call, and every entry after the first would stay on the list.
     static func watchdogStarting() {
+        if system.windowServerListAvailable() { system.connectWindowServer() }
     }
 
     /// Call first thing in `main`: when this process was started as the
