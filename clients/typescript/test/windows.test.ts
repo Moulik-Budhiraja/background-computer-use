@@ -425,7 +425,8 @@ test('the helper\'s work is recorded, in the Mac\'s layout', { skip: !live }, as
   assert.ok(frames.every((f) => staged.has(`${Math.trunc(f.t)}.jpg`)), 'every frame has its JPEG')
   assert.ok(frames.some((f) => /notepad\.exe$/i.test(f.b ?? '')) && frames.some((f) => /msedge\.exe$/i.test(f.b ?? '')), 'frames say which app was in front')
   const events = lines('events.jsonl')
-  assert.ok(events.some((e) => e.x?.startsWith('open_window (')), 'the activity')
+  // Its first call too, which got it the screen before the run began.
+  assert.ok(events.some((e) => e.x?.startsWith('open_window (') && e.x.includes('of Notepad')), 'the activity, from the first call')
   assert.ok(events.some((e) => e.x?.startsWith('release_window')), 'closing a window, which the history reads')
   assert.ok(events.some((e) => Array.isArray(e.p) && e.c === true), 'where clicks landed')
 })

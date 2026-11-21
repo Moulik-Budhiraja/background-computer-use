@@ -62,8 +62,15 @@ struct State {
     stores: HashMap<String, Store>,
     /// Live runs, by session.
     runs: HashMap<String, Run>,
+    /// Activity and pointer lines of a recorded host's session from before
+    /// its run began (its first call gets it the screen; the run begins at
+    /// the next look), with its host and when each came.
+    early: HashMap<String, (String, Vec<(Instant, Value)>)>,
     last_maintain: Option<Instant>,
 }
+
+/// How far back a new run takes in its session's activity.
+const EARLY: Duration = Duration::from_secs(30);
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 static WAKE: Condvar = Condvar::new();
@@ -91,6 +98,7 @@ pub fn set_store(host: &str, store: Option<Store>) {
             return Vec::new();
         }
         let ids: Vec<String> = s.runs.iter().filter(|(_, r)| r.host == host).map(|(id, _)| id.clone()).collect();
+        s.early.retain(|_, (h, _)| h != host);
         ids.into_iter().filter_map(|id| s.runs.remove(&id)).collect()
     });
     for r in ended {
@@ -111,28 +119,32 @@ fn live_ids() -> Vec<String> {
 
 /// A line of a session's activity.
 pub fn note(session: &str, text: &str, error: bool) {
-    let t = wall_ms();
-    with(|s| {
-        if let Some(r) = s.runs.get_mut(session) {
-            let mut line = json!({"t": t, "x": text.chars().take(300).collect::<String>()});
-            if error {
-                line["e"] = json!(true);
-            }
-            write_line(&mut r.events, &line);
-        }
-    });
+    let mut line = json!({"t": wall_ms(), "x": text.chars().take(300).collect::<String>()});
+    if error {
+        line["e"] = json!(true);
+    }
+    event(session, line);
 }
 
 /// Where an action is about to land, in points on the agent screen.
 pub fn pointer(session: &str, x: i32, y: i32, click: bool) {
-    let t = wall_ms();
+    let mut line = json!({"t": wall_ms(), "p": [x, y]});
+    if click {
+        line["c"] = json!(true);
+    }
+    event(session, line);
+}
+
+/// Into the session's run, or kept for the run about to begin.
+fn event(session: &str, line: Value) {
+    let host = host::host_of(session);
     with(|s| {
         if let Some(r) = s.runs.get_mut(session) {
-            let mut line = json!({"t": t, "p": [x, y]});
-            if click {
-                line["c"] = json!(true);
-            }
             write_line(&mut r.events, &line);
+        } else if let Some(h) = host.filter(|h| s.stores.contains_key(h)) {
+            let (_, lines) = s.early.entry(session.to_string()).or_insert_with(|| (h, Vec::new()));
+            lines.retain(|(t, _)| t.elapsed() < EARLY);
+            lines.push((Instant::now(), line));
         }
     });
 }
@@ -197,13 +209,14 @@ fn tick() {
         return;
     }
     // Captures wait while the user types or clicks, 2 s at most.
-    {
+    let hold = {
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-        if user_busy() && held.get_or_insert_with(Instant::now).elapsed() < Duration::from_secs(2) {
-            return;
+        let hold = user_busy() && held.get_or_insert_with(Instant::now).elapsed() < Duration::from_secs(2);
+        if !hold {
+            *held = None;
         }
-        *held = None;
-    }
+        hold
+    };
     // Which sessions are recorded now: a host's that asked, while they have the screen.
     let screens: HashMap<String, windows::Win32::Foundation::RECT> = monitor::slots().into_iter().collect();
     let wanted: Vec<(String, String, String)> = sessions::all()
@@ -236,6 +249,15 @@ fn tick() {
             // since `stores` was read: only a run for the store it has now.
             let unwanted = with(|s| {
                 if s.stores.get(&h) == Some(store) && !s.runs.contains_key(&session) {
+                    let mut r = r;
+                    // What the session did just before: its first call, say.
+                    if let Some((_, lines)) = s.early.remove(&session) {
+                        for (t, line) in lines {
+                            if t.elapsed() < EARLY {
+                                write_line(&mut r.events, &line);
+                            }
+                        }
+                    }
                     s.runs.insert(session.clone(), r);
                     None
                 } else {
@@ -247,7 +269,9 @@ fn tick() {
                 continue;
             }
         }
-        capture(&session);
+        if !hold {
+            capture(&session);
+        }
     }
     let due = with(|s| {
         let due = s.last_maintain.is_none_or(|t| t.elapsed() > Duration::from_secs(3600));
