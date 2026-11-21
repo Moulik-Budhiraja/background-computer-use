@@ -104,41 +104,69 @@ public enum Panel {
     }
 
     static func collect(_ root: AXUIElement, limit: Int = 1500, _ match: (AXUIElement, String) -> Bool) -> [AXUIElement] {
-        var out: [AXUIElement] = []
-        var queue = AX.children(root)
+        collect(root, axReader, limit: limit, match)
+    }
+
+    /// How `selectedNames` reads the panel: through accessibility in the
+    /// app, a stand-in tree in tests.
+    struct Reader<E> {
+        let role: (E) -> String
+        let children: (E) -> [E]
+        let elements: (E, String) -> [E]
+        let value: (E) -> String?
+    }
+
+    static let axReader = Reader<AXUIElement>(role: { AX.string($0, "AXRole") ?? "" }, children: { AX.children($0) },
+                                              elements: { AX.elements($0, $1) }, value: { AX.string($0, "AXValue") })
+
+    static func collect<E>(_ root: E, _ r: Reader<E>, limit: Int = 1500, _ match: (E, String) -> Bool) -> [E] {
+        var out: [E] = []
+        var queue = r.children(root)
         var seen = 0
         while !queue.isEmpty && seen < limit {
             let el = queue.removeFirst()
             seen += 1
-            let role = AX.string(el, "AXRole") ?? ""
+            let role = r.role(el)
             if match(el, role) { out.append(el) }
             if role == "AXSheet" || role == "AXOutline" || role == "AXTable" || role == "AXList" || role == "AXBrowser" { continue }
-            queue.append(contentsOf: AX.children(el))
+            queue.append(contentsOf: r.children(el))
         }
         return out
     }
 
     /// The names of the files selected in the panel's file list.
     static func selectedNames(_ panel: AXUIElement) -> [String] {
-        let lists = collect(panel) { _, role in role == "AXOutline" || role == "AXTable" || role == "AXList" || role == "AXBrowser" }
+        selectedNames(panel, axReader)
+    }
+
+    static func selectedNames<E>(_ panel: E, _ r: Reader<E>) -> [String] {
+        let lists = collect(panel, r) { _, role in role == "AXOutline" || role == "AXTable" || role == "AXList" || role == "AXBrowser" }
+        func selection(_ list: E) -> [E] { r.elements(list, "AXSelectedRows") + r.elements(list, "AXSelectedChildren") }
         var names: [String] = []
         for list in lists {
-            for row in AX.elements(list, "AXSelectedRows") + AX.elements(list, "AXSelectedChildren") {
-                if let n = firstText(row) { names.append(n) }
+            var selected = selection(list)
+            // Column view: a list per column, each with the folder chosen in
+            // it, and the file selected in the last one.
+            if r.role(list) == "AXBrowser" {
+                let columns = collect(list, r) { _, role in role == "AXList" || role == "AXOutline" || role == "AXTable" }
+                selected = columns.map(selection).last { !$0.isEmpty } ?? selected
+            }
+            for row in selected {
+                if let n = firstText(row, r) { names.append(n) }
             }
         }
         return names
     }
 
-    private static func firstText(_ el: AXUIElement) -> String? {
+    private static func firstText<E>(_ el: E, _ r: Reader<E>) -> String? {
         var queue = [el]
         var seen = 0
         while !queue.isEmpty && seen < 30 {
             let e = queue.removeFirst()
             seen += 1
-            let role = AX.string(e, "AXRole")
-            if role == "AXTextField" || role == "AXStaticText", let v = AX.string(e, "AXValue"), !v.isEmpty { return v }
-            queue.append(contentsOf: AX.children(e))
+            let role = r.role(e)
+            if role == "AXTextField" || role == "AXStaticText", let v = r.value(e), !v.isEmpty { return v }
+            queue.append(contentsOf: r.children(e))
         }
         return nil
     }
