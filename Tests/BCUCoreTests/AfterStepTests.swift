@@ -21,3 +21,16 @@ final class AfterStepTests: XCTestCase {
         XCTAssertEqual(KeyScope.afterStep(popupOpen: false, userWindow: nil), .park)
     }
 }
+
+final class AfterStepListTests: XCTestCase {
+    /// A combobox whose list is part of the page (aria-expanded, no window
+    /// of its own): the page blurs when its window loses key, and a field
+    /// like that clears itself and closes the list on blur.
+    func testKeyStaysWithAnInPageListOpen() {
+        XCTAssertEqual(KeyScope.afterStep(popupOpen: false, listOpen: true, userWindow: 7), .park)
+    }
+
+    func testKeyGoesToTheUsersWindowWithTheListClosed() {
+        XCTAssertEqual(KeyScope.afterStep(popupOpen: false, listOpen: false, userWindow: 7), .handTo(7))
+    }
+}

@@ -166,12 +166,15 @@ public final class KeyScope {
 
     /// The agent's window keeps key only while it has a menu, dropdown or
     /// suggestion list open: those close when their window loses key, and the
-    /// agent's next step would find them gone. Otherwise key goes to the
+    /// agent's next step would find them gone. `popupOpen` is one in a window
+    /// of its own; `listOpen` is one inside the page, an expanded combobox
+    /// (a browser blurs the page when its window loses key, and such a field
+    /// empties itself and closes the list on blur). Otherwise key goes to the
     /// user's window, because the app treats the window that last had key as
     /// its current one: a browser opens a link from another app there, and
     /// the user's link would land in the agent's hidden window.
-    public static func afterStep(popupOpen: Bool, userWindow: CGWindowID?) -> AfterStep {
-        guard !popupOpen, let userWindow else { return .park }
+    public static func afterStep(popupOpen: Bool, listOpen: Bool = false, userWindow: CGWindowID?) -> AfterStep {
+        guard !popupOpen, !listOpen, let userWindow else { return .park }
         return .handTo(userWindow)
     }
 
