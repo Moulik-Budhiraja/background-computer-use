@@ -576,11 +576,12 @@ final class RunWriter {
 
 }
 
-/// Records one session's agent display while it exists: a frame whenever the
-/// picture changes (checked twice a second and right after each call), what
-/// the agent did, and where its actions landed. Frames go to disk as JPEGs
-/// first, so they can be watched right away and survive a crash, and every
-/// minute or so they're packed into a video.
+/// Records one session's agent display while it exists: a frame after each
+/// call and whenever the display's windows move, open, close or change
+/// title, what the agent did, and where its actions landed. An idle display
+/// is never captured: every capture can light macOS's purple capture dot.
+/// Frames go to disk as JPEGs first, so they can be watched right away and
+/// survive a crash, and every minute or so they're packed into a video.
 public final class SessionRecorder {
     private let sessionID: String
     private var label: String
@@ -596,6 +597,8 @@ public final class SessionRecorder {
     private var lastImage: CGImage?
     private var pendingForced = false
     private var lastPreviewMs = 0.0
+    /// The agent display's windows at the recorder's last capture.
+    private var lastSpots: [WindowSpot]?
     private var bundleByPid: [pid_t: String?] = [:]
 
     /// How often the recorder looks: whether it may capture, or a preview frame to keep.
@@ -666,6 +669,7 @@ public final class SessionRecorder {
         self.writer = writer
         lastThumb = nil
         lastImage = nil
+        lastSpots = nil
         pendingForced = true
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + 0.2, repeating: Self.sampleInterval, leeway: .milliseconds(50))
@@ -758,22 +762,58 @@ public final class SessionRecorder {
         }
     }
 
-    /// Captures only once nothing in the app has captured for `minGapMs`,
-    /// so the recorder never brings on the screen-sharing indicator. A frame
-    /// wanted after a call waits for that too.
+    /// Captures only when there's something new to see (a call finished, or
+    /// the window list shows the display's windows changed), and only once
+    /// nothing in the app has captured for `minGapMs`. Reading the window
+    /// list isn't a capture, so an idle display costs no captures at all.
     private func tick() {
-        guard writer != nil, nowMs() - Capture.lastCaptureMs >= Self.minGapMs else { return }
-        capture(force: pendingForced)
+        guard writer != nil, display.isRunning else { return }
+        let spots = Self.windowSpots(WindowList.all(onScreenOnly: true), on: display.bounds, me: getpid())
+        guard Self.wantsCapture(pending: pendingForced, sinceLastCaptureMs: nowMs() - Capture.lastCaptureMs,
+                                windowsChanged: spots != lastSpots) else { return }
+        // A capture that failed (ScreenCaptureKit timed out) is tried again
+        // on a later tick: the frame is still wanted.
+        guard capture(force: pendingForced) else { return }
+        lastSpots = spots
         pendingForced = false
     }
 
-    private func capture(force: Bool) {
-        guard writer != nil, display.isRunning else { return }
+    /// Whether a tick takes a frame: `pending` when a frame is wanted (the
+    /// run's first, or one after a call), `windowsChanged` when the agent
+    /// display's windows aren't where they were at the last frame.
+    static func wantsCapture(pending: Bool, sinceLastCaptureMs: Double, windowsChanged: Bool) -> Bool {
+        (pending || windowsChanged) && sinceLastCaptureMs >= minGapMs
+    }
+
+    /// What the window list says about the agent display (no capture): its
+    /// apps' windows front to back, where they are and what they're called.
+    /// The app's own windows and the menu bar are left out, as the agent's
+    /// screenshots leave them out.
+    struct WindowSpot: Equatable {
+        let id: CGWindowID
+        let bounds: CGRect
+        let title: String
+        let alpha: Double
+    }
+
+    static func windowSpots(_ windows: [WindowInfo], on display: CGRect, me: pid_t) -> [WindowSpot] {
+        let systemOwners: Set<String> = ["Window Server", "Dock", "Control Center", "SystemUIServer", "Notification Center"]
+        return windows.filter {
+            display.intersects($0.bounds) && $0.alpha > 0 && $0.bounds.width > 2 && $0.bounds.height > 2 && $0.pid != me
+                && !systemOwners.contains($0.owner) && $0.layer != 24 && $0.layer != 25
+        }.map { WindowSpot(id: $0.id, bounds: $0.bounds, title: $0.title, alpha: $0.alpha) }
+    }
+
+    /// False when nothing could be captured.
+    @discardableResult
+    private func capture(force: Bool) -> Bool {
+        guard writer != nil, display.isRunning else { return false }
         let b = display.bounds
         let w = Int((b.width * Self.pixelsPerPoint).rounded())
         // Window by window through SkyLight, wallpaper and menu bar included.
-        guard let image = Capture.composite(display: display, width: w, wholeDisplay: true) else { return }
+        guard let image = Capture.composite(display: display, width: w, wholeDisplay: true) else { return false }
         record(image, force: force)
+        return true
     }
 
     /// Keeps `image` if it differs from the last frame kept.
