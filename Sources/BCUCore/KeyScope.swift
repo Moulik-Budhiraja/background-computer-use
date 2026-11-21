@@ -170,7 +170,7 @@ public final class KeyScope {
     /// user's window, because the app treats the window that last had key as
     /// its current one: a browser opens a link from another app there, and
     /// the user's link would land in the agent's hidden window.
-    public static func afterStep(popupOpen: Bool, userWindow: CGWindowID?) -> AfterStep {
+    public static func afterStep(popupOpen: Bool, listOpen: Bool = false, userWindow: CGWindowID?) -> AfterStep {
         guard !popupOpen, let userWindow else { return .park }
         return .handTo(userWindow)
     }
