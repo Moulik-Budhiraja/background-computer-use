@@ -60,6 +60,33 @@ final class FrontGateWindowServerTests: XCTestCase {
         gate.stop()
     }
 
+    /// WindowServer drops the app in front (the user's) as soon as its list
+    /// holds anyone but that app ("no longer permitted frontmost"), and then
+    /// no app is in front until the user switches. So the app in front goes
+    /// on first, before any other entry.
+    func testTheAppInFrontGoesOnFirst() {
+        var dropped = 0
+        let update = FrontGate.system.updateWindowServerList
+        FrontGate.system.updateWindowServerList = { [unowned self] p, add in
+            let r = update(p, add)
+            if !list.isEmpty && !list.contains(psn(user)) { dropped += 1 }
+            return r
+        }
+        // Enough other apps, different each round, that the user's coming
+        // first by chance is rare.
+        for round in 0..<5 {
+            let others = (0..<30).map { pid_t(1000 + round * 100 + $0) }
+            let apps = ([user, agent] + others).map { FrontGate.App(asn: "\($0)" as CFString, pid: $0, bundleID: "test.app.\($0)") }
+            FrontGate.system.runningApps = { apps }
+            let gate = makeGate()
+            for _ in 0..<3 { _ = gate.passForTests() }
+            XCTAssertTrue(gate.blocks(agent))
+            gate.stop()
+            XCTAssertEqual(list, [])
+        }
+        XCTAssertEqual(dropped, 0, "the list held other apps before the one in front")
+    }
+
     /// A click (or any key that could switch apps) puts the agent's app on
     /// the list at once, before the event goes on, so the user can go to it.
     func testTheUsersClickLetsTheAgentsAppThrough() {
