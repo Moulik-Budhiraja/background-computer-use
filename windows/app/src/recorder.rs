@@ -12,7 +12,8 @@
 //! while they have the agent screen. A frame is kept when the picture changed
 //! (checked twice a second, and right after each call), and is what a host's
 //! preview of the session shows (stream.rs). Runs older than the host's
-//! retention go, and the oldest frames go first past its size limit.
+//! retention go, and the oldest frames go first past its size limit, checked
+//! every minute.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -273,8 +274,10 @@ fn tick() {
             capture(&session);
         }
     }
+    // Every minute, so a busy session can't take far more room than the
+    // host allows before its runs are trimmed.
     let due = with(|s| {
-        let due = s.last_maintain.is_none_or(|t| t.elapsed() > Duration::from_secs(3600));
+        let due = s.last_maintain.is_none_or(|t| t.elapsed() > Duration::from_secs(60));
         if due {
             s.last_maintain = Some(Instant::now());
         }
