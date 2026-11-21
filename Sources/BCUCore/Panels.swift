@@ -141,9 +141,17 @@ public enum Panel {
 
     static func selectedNames<E>(_ panel: E, _ r: Reader<E>) -> [String] {
         let lists = collect(panel, r) { _, role in role == "AXOutline" || role == "AXTable" || role == "AXList" || role == "AXBrowser" }
+        func selection(_ list: E) -> [E] { r.elements(list, "AXSelectedRows") + r.elements(list, "AXSelectedChildren") }
         var names: [String] = []
         for list in lists {
-            for row in r.elements(list, "AXSelectedRows") + r.elements(list, "AXSelectedChildren") {
+            var selected = selection(list)
+            // Column view: a list per column, each with the folder chosen in
+            // it, and the file selected in the last one.
+            if r.role(list) == "AXBrowser" {
+                let columns = collect(list, r) { _, role in role == "AXList" || role == "AXOutline" || role == "AXTable" }
+                selected = columns.map(selection).last { !$0.isEmpty } ?? selected
+            }
+            for row in selected {
                 if let n = firstText(row, r) { names.append(n) }
             }
         }
