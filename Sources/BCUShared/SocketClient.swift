@@ -36,6 +36,18 @@ public final class SocketClient {
 
     deinit { close(fd) }
 
+    /// Whether a process is stopped (SIGSTOP, or held by a debugger): it
+    /// can't answer anything until it's continued.
+    nonisolated(unsafe) public static var isStopped: (pid_t) -> Bool = { pid in
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        return proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size && info.pbi_status == UInt32(SSTOP)
+    }
+
+    /// How long the engine may stay stopped while a reply is due before the
+    /// call gives up on it.
+    nonisolated(unsafe) public static var stoppedLimit: TimeInterval = 5
+
     /// False once the app has closed this connection (it quit or restarted).
     /// Checked before a call, so a stale connection is replaced before the
     /// request goes out rather than after, when it may already have run.
