@@ -402,6 +402,12 @@ public final class WindowManager {
         return config
     }
 
+    /// Whether macOS asks the user before it opens the app the first time,
+    /// from its quarantine mark (`com.apple.quarantine`, nil: none).
+    static func asksBeforeFirstLaunch(quarantine: String?) -> Bool {
+        false
+    }
+
     /// Launch a not-running app hidden and without activation, move its first
     /// windows onto the agent display, then unhide it there.
     private func launch(url: URL, name: String, bundleID: String?) throws -> OpenResult {
