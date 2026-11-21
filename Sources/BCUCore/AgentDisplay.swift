@@ -188,16 +188,60 @@ public final class AgentDisplay {
     }
 
     private static func untileItem(_ pid: pid_t) -> AXUIElement? {
+        menuItem(pid, identifier: untileIdentifier)
+    }
+
+    private static func menuItem(_ pid: pid_t, identifier: String) -> AXUIElement? {
         guard let bar = AX.element(AX.app(pid), "AXMenuBar") else { return nil }
         // Menu bar item > menu > Move & Resize > menu > the item.
         func find(_ el: AXUIElement, depth: Int) -> AXUIElement? {
             for child in AX.children(el) {
-                if AX.string(child, "AXIdentifier") == untileIdentifier { return child }
+                if AX.string(child, "AXIdentifier") == identifier { return child }
                 if depth > 0, let found = find(child, depth: depth - 1) { return found }
             }
             return nil
         }
         return find(bar, depth: 4)
+    }
+
+    /// What to do about the tile behind a window of the user's that macOS
+    /// just moved at a display change.
+    enum TileFix: Equatable {
+        /// Nothing: the window has no tile, or none BCU should change.
+        case nothing
+        /// Press Window > Move & Resize > Return to Previous Size.
+        case untile
+        /// Press Window > Fill.
+        case fill
+        /// Not now (the user isn't in that app with that window): before the next display change.
+        case later
+    }
+
+    /// `want` is where the window belongs, `visible` its screen's visible
+    /// frame (global, top-left origin), `margins` whether tiled windows get
+    /// margins. `front` is the app in front, `mainWindow` that app's main
+    /// window, `untileEnabled` whether Return to Previous Size is enabled.
+    static func tileFix(want: CGRect, visible: CGRect, margins: Bool, front: pid_t, pid: pid_t,
+                        mainWindow: CGWindowID?, id: CGWindowID, untileEnabled: Bool) -> TileFix {
+        guard front == pid else { return .later }
+        // In front, with this window, and nothing to return from: no tile.
+        if mainWindow == id && !untileEnabled { return .nothing }
+        return mayUntile(front: front, pid: pid, mainWindow: mainWindow, id: id, itemEnabled: untileEnabled) ? .untile : .later
+    }
+
+    /// The visible frame (no menu bar or Dock) of the screen most of `rect`
+    /// is on, in global top-left coordinates; nil when it's on none.
+    static func visibleFrame(of rect: CGRect) -> CGRect? {
+        guard let mainHeight = NSScreen.screens.first?.frame.height else { return nil }
+        let flipped = NSScreen.screens.map { s -> (CGRect, CGRect) in
+            let f = s.frame, v = s.visibleFrame
+            return (CGRect(x: f.minX, y: mainHeight - f.maxY, width: f.width, height: f.height),
+                    CGRect(x: v.minX, y: mainHeight - v.maxY, width: v.width, height: v.height))
+        }
+        func area(_ r: CGRect) -> CGFloat { r.isNull ? 0 : r.width * r.height }
+        guard let best = flipped.max(by: { area($0.0.intersection(rect)) < area($1.0.intersection(rect)) }),
+              area(best.0.intersection(rect)) > 0 else { return nil }
+        return best.1
     }
 
     /// Any thread but main isn't needed; never holds a lock. True when the
@@ -208,9 +252,12 @@ public final class AgentDisplay {
         guard BCUFrontProcessPID() == pid, let item = untileItem(pid) else { return false }
         let enabled = AX.bool(item, "AXEnabled") ?? false
         let main = AX.element(AX.app(pid), "AXMainWindow").flatMap { AX.windowID($0) }
-        // In front, with this window, and nothing to return from: no tile.
-        if main == id && !enabled { return true }
-        guard mayUntile(front: BCUFrontProcessPID(), pid: pid, mainWindow: main, id: id, itemEnabled: enabled) else { return false }
+        switch tileFix(want: want, visible: visibleFrame(of: want) ?? .null, margins: false, front: BCUFrontProcessPID(), pid: pid,
+                       mainWindow: main, id: id, untileEnabled: enabled) {
+        case .nothing: return true
+        case .later, .fill: return false
+        case .untile: break
+        }
         guard AX.perform(item, "AXPress") == .success else { return false }
         // Returning to the previous size can change the frame: the window
         // belongs where the user had it.
